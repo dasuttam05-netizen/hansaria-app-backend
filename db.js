@@ -194,10 +194,43 @@ if (true) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       outward_id INTEGER,
       inward_id INTEGER,
+      palti_lorry_id INTEGER,
+      source_type TEXT DEFAULT 'inward',
       qty REAL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(outward_id) REFERENCES outward(id),
-      FOREIGN KEY(inward_id) REFERENCES inward(id)
+      FOREIGN KEY(inward_id) REFERENCES inward(id),
+      FOREIGN KEY(palti_lorry_id) REFERENCES palti_lorry_entries(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS palti_lorry_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      expense_id INTEGER UNIQUE,
+      voucher_no TEXT,
+      expense_date TEXT,
+      warehouse_id INTEGER,
+      employee_id INTEGER,
+      product_id INTEGER,
+      company_id INTEGER,
+      reg_from_consignee_id INTEGER,
+      reg_from_company_id INTEGER,
+      reg_lorry_no TEXT,
+      balance REAL DEFAULT 0,
+      new_lorry_no TEXT,
+      new_weight REAL DEFAULT 0,
+      created_by INTEGER,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(expense_id) REFERENCES expenses(id),
+      FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(employee_id) REFERENCES employees(id),
+      FOREIGN KEY(product_id) REFERENCES products(id),
+      FOREIGN KEY(company_id) REFERENCES companies(id),
+      FOREIGN KEY(reg_from_consignee_id) REFERENCES consignee_names(id),
+      FOREIGN KEY(reg_from_company_id) REFERENCES companies(id),
+      FOREIGN KEY(created_by) REFERENCES employees(id)
     )
   `);
 
@@ -423,6 +456,9 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN gst_no TEXT`, "transporters gst_no");
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN aadhar_no TEXT`, "transporters aadhar_no");
   addColIgnoreDup(`ALTER TABLE outward ADD COLUMN inv_no TEXT`, "outward inv_no");
+  addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN palti_lorry_id INTEGER`, "adjustment palti_lorry_id");
+  addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN source_type TEXT DEFAULT 'inward'`, "adjustment source_type");
+  addColIgnoreDup(`ALTER TABLE palti_lorry_entries ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP`, "palti_lorry_entries updated_at");
 
   db.run(
     `ALTER TABLE employees ADD COLUMN role TEXT DEFAULT 'staff'`,
