@@ -88,6 +88,21 @@ const alterQueries = [
 
   `
   ALTER TABLE expenses
+  ADD COLUMN shortage REAL DEFAULT 0
+  `,
+
+  `
+  ALTER TABLE expenses
+  ADD COLUMN excess REAL DEFAULT 0
+  `,
+
+  `
+  ALTER TABLE expenses
+  ADD COLUMN shortage_excess REAL DEFAULT 0
+  `,
+
+  `
+  ALTER TABLE expenses
   ADD COLUMN balance REAL DEFAULT 0
   `,
 
