@@ -55,13 +55,30 @@ router.get("/", async (req, res) => {
     }
 
     const rows = await CompanyAccount.find()
-      .populate("company_id")
-      .sort({ created_at: -1 });
+      .sort({ created_at: -1 })
+      .lean();
+
+    const companyIds = Array.from(
+      new Set(
+        rows
+          .map((row) => row.company_id)
+          .filter(Boolean)
+          .map((id) => String(id))
+      )
+    );
+
+    const companies = await Company.find({
+      _id: { $in: companyIds },
+    }).lean();
+
+    const companyMap = new Map(
+      companies.map((c) => [String(c._id), c.name])
+    );
 
     const formatted = rows.map((row) => ({
-      ...row.toObject(),
+      ...row,
       company_name:
-        row.company_id?.name || "",
+        companyMap.get(String(row.company_id)) || "",
     }));
 
     res.json(formatted);
@@ -105,6 +122,13 @@ router.post("/", async (req, res) => {
     ) {
       return res.status(400).json({
         error: "Required fields missing",
+      });
+    }
+
+    // Validate company_id is a valid ObjectId
+    if (!require("mongoose").Types.ObjectId.isValid(company_id)) {
+      return res.status(400).json({
+        error: "Invalid company ID format",
       });
     }
 
@@ -410,6 +434,13 @@ router.put("/:id", async (req, res) => {
       pan_no,
       mobile,
     } = req.body;
+
+    // Validate company_id is a valid ObjectId
+    if (company_id && !require("mongoose").Types.ObjectId.isValid(company_id)) {
+      return res.status(400).json({
+        error: "Invalid company ID format",
+      });
+    }
 
     const updated =
       await CompanyAccount.findByIdAndUpdate(
