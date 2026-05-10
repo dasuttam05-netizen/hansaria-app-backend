@@ -77,14 +77,22 @@ async function createSqliteMasterFromMongo(sqliteTable, doc) {
 
   if (sqliteTable === "employees") {
     const locationId = await resolveMongoMasterId(doc.location_id, MongoLocation, "locations");
+    const username = String(doc.username || "").trim() || null;
+    if (username) {
+      const existingByUsername = await dbGet(
+        "SELECT id FROM employees WHERE username = ? ORDER BY id ASC LIMIT 1",
+        [username]
+      );
+      if (existingByUsername?.id) return existingByUsername.id;
+    }
     const result = await dbRun(
       "INSERT INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
       [
         doc.name || "",
         doc.address || "",
         locationId || null,
-        doc.username || "",
-        doc.password || "",
+        username,
+        doc.password || null,
         doc.role || "staff",
         JSON.stringify(doc.permissions || []),
       ]
