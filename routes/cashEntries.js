@@ -699,6 +699,14 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: "Required fields missing" });
   }
 
+  const normalizedMode = String(transaction_mode || "").toLowerCase();
+  const effectiveEntryType =
+    normalizedMode === "payment"
+      ? "expense"
+      : normalizedMode === "receipt"
+      ? "income"
+      : entry_type;
+
   let resolvedIds;
   try {
     resolvedIds = await resolveCashEntryMasterIds({
@@ -740,7 +748,7 @@ router.post("/", async (req, res) => {
       [
         finalVoucherNo,
         entry_date,
-        entry_type,
+        effectiveEntryType,
         resolvedIds.warehouse_id || null,
         resolvedIds.company_id || null,
         resolvedIds.company_account_id || null,
@@ -782,8 +790,7 @@ router.post("/", async (req, res) => {
 
         if (cleanAdjustments.length === 0) {
           // Check if we need to create a companion staff entry
-          const normalizedMode = String(transaction_mode || "").toLowerCase();
-          const normalizedEntryType = String(entry_type || "").toLowerCase();
+          const normalizedEntryType = String(effectiveEntryType || "").toLowerCase();
           const shouldCreateStaffEntry =
             auto_staff_entry === true ||
             auto_staff_entry === "true" ||
@@ -862,7 +869,7 @@ router.post("/", async (req, res) => {
                         details: {
                           main_entry: newEntryId,
                           staff_entry: staffEntryId,
-                          entry_type,
+                          entry_type: effectiveEntryType,
                           amount: Number(amount || 0),
                           status: status || "pending",
                           employee_id: resolvedIds.employee_id || null,
@@ -874,7 +881,7 @@ upsertCashEntryToMongo({
                         id: newEntryId,
                         voucher_no: finalVoucherNo,
                         entry_date,
-                        entry_type,
+                        entry_type: effectiveEntryType,
                         warehouse_id: warehouse_id || null,
                         company_id: company_id || null,
                         company_account_id: company_account_id || null,
@@ -944,6 +951,7 @@ upsertCashEntryToMongo({
             voucher_no: finalVoucherNo,
             details: {
               entry_type,
+              saved_entry_type: effectiveEntryType,
               amount: Number(amount || 0),
               status: status || "pending",
               has_adjustments: false,
@@ -954,17 +962,17 @@ upsertCashEntryToMongo({
             id: newEntryId,
             voucher_no: finalVoucherNo,
             entry_date,
-            entry_type,
-            warehouse_id: warehouse_id || null,
-            company_id: company_id || null,
-            company_account_id: company_account_id || null,
+            entry_type: effectiveEntryType,
+            warehouse_id: resolvedIds.warehouse_id || null,
+            company_id: resolvedIds.company_id || null,
+            company_account_id: resolvedIds.company_account_id || null,
             description: baseDescriptionText(description),
             amount,
             payment_method: payment_method || "Cash",
             reference_no: reference_no || null,
             narration: narration || null,
             created_by: req.user?.id || created_by || null,
-            employee_id: employee_id || null,
+            employee_id: resolvedIds.employee_id || null,
             journal_group_no: journal_group_no || null,
             fund_source: String(fund_source || "main_cash"),
             status: status || "pending",
@@ -1021,14 +1029,14 @@ upsertCashEntryToMongo({
                 return;
               }
 
-              if (String(target.company_id || "") !== String(company_id || "")) {
+              if (String(target.company_id || "") !== String(resolvedIds.company_id || "")) {
                 db.run("DELETE FROM cash_entries WHERE id = ?", [newEntryId], () => {
                   return res.status(400).json({ error: "Adjustment target company mismatch" });
                 });
                 return;
               }
 
-              if (String(target.entry_type) === String(entry_type)) {
+              if (String(target.entry_type) === String(effectiveEntryType)) {
                 db.run("DELETE FROM cash_entries WHERE id = ?", [newEntryId], () => {
                   return res.status(400).json({ error: "Adjustment requires opposite entry type" });
                 });
@@ -1104,7 +1112,7 @@ upsertCashEntryToMongo({
 
   const runInsertFlow = () => {
     if (voucher_no) return insertEntry(voucher_no);
-    const prefix = getVoucherPrefix({ transaction_mode, entry_type });
+    const prefix = getVoucherPrefix({ transaction_mode, entry_type: effectiveEntryType });
     getNextVoucherNo(prefix, (voucherErr, generatedVoucherNo) => {
       if (voucherErr) return res.status(500).json({ error: voucherErr.message });
       insertEntry(generatedVoucherNo);
