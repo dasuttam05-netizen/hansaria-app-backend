@@ -708,6 +708,43 @@ if (true) {
   addCashCol(`ALTER TABLE cash_entries ADD COLUMN linked_entry_id INTEGER`, "cash_entries linked_entry_id");
   addCashCol(`ALTER TABLE cash_entries ADD COLUMN fund_source TEXT DEFAULT 'main_cash'`, "cash_entries fund_source");
 
+  db.run(
+    `
+    UPDATE cash_entries
+    SET fund_source = 'main_cash'
+    WHERE fund_source IS NULL OR TRIM(fund_source) = ''
+    `,
+    (err) => {
+      if (err) {
+        console.log("cash_entries fund_source backfill error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `
+    UPDATE cash_entries
+    SET employee_id = (
+      SELECT expenses.employee_id
+      FROM expenses
+      WHERE expenses.id = cash_entries.source_expense_id
+    )
+    WHERE (employee_id IS NULL OR employee_id = 0)
+      AND source_expense_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM expenses
+        WHERE expenses.id = cash_entries.source_expense_id
+          AND expenses.employee_id IS NOT NULL
+      )
+    `,
+    (err) => {
+      if (err) {
+        console.log("cash_entries employee_id backfill error:", err.message);
+      }
+    }
+  );
+
   db.run(`
     CREATE TABLE IF NOT EXISTS cash_entry_adjustments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
