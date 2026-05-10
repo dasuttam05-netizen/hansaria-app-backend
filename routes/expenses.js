@@ -3,6 +3,14 @@ const router = express.Router();
 const db = require("../db");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
 const { userHasPermission } = require("../middleware/auth");
+const {
+  Location: MongoLocation,
+  Employee: MongoEmployee,
+  Product: MongoProduct,
+  Company: MongoCompany,
+  CompanyAccount: MongoCompanyAccount,
+  Warehouse: MongoWarehouse,
+} = require("../mongo");
 
 const WORK_DESCRIPTION_OPTIONS = [
   "Palti Lorry",
@@ -84,6 +92,182 @@ function calculateExpenseBalance(loading, unloading, shortage, excess) {
   return Number(total.toFixed(2));
 }
 
+function isPositiveNumber(value) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) && numericValue > 0;
+}
+
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(row || null);
+    });
+  });
+}
+
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve({ lastID: this.lastID, changes: this.changes });
+    });
+  });
+}
+
+async function findSqliteIdByName(table, name) {
+  const cleanedName = String(name || "").trim();
+  if (!cleanedName) return null;
+
+  const row = await dbGet(
+    `SELECT id FROM ${table} WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) ORDER BY id ASC LIMIT 1`,
+    [cleanedName]
+  );
+
+  return row?.id || null;
+}
+
+async function findSqliteAccountId(accountName) {
+  const cleanedName = String(accountName || "").trim();
+  if (!cleanedName) return null;
+
+  const row = await dbGet(
+    `SELECT id FROM company_accounts WHERE LOWER(TRIM(account_name)) = LOWER(TRIM(?)) ORDER BY id ASC LIMIT 1`,
+    [cleanedName]
+  );
+
+  return row?.id || null;
+}
+
+async function createSqliteMasterFromMongo(model, sqliteTable, doc) {
+  if (sqliteTable === "locations") {
+    const result = await dbRun(
+      "INSERT INTO locations (name, address, hsn_code) VALUES (?, ?, ?)",
+      [doc.name || "", doc.address || "", doc.hsn_code || ""]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "employees") {
+    const locationId = await resolveMongoMasterId(doc.location_id, MongoLocation, "locations");
+    const result = await dbRun(
+      "INSERT INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [
+        doc.name || "",
+        doc.address || "",
+        locationId || null,
+        doc.username || "",
+        doc.password || "",
+        doc.role || "staff",
+        JSON.stringify(doc.permissions || []),
+      ]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "products") {
+    const result = await dbRun(
+      "INSERT INTO products (name, hsn_code) VALUES (?, ?)",
+      [doc.name || "", doc.hsn_code || ""]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "companies") {
+    const result = await dbRun(
+      "INSERT INTO companies (name, address, mobile) VALUES (?, ?, ?)",
+      [doc.name || "", doc.address || "", doc.mobile || ""]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "company_accounts") {
+    const companyId = await resolveMongoMasterId(doc.company_id, MongoCompany, "companies");
+    if (!companyId) return null;
+    const result = await dbRun(
+      "INSERT INTO company_accounts (account_name, address, company_id, pan_no, mobile) VALUES (?, ?, ?, ?, ?)",
+      [doc.account_name || "", doc.address || "", companyId, doc.pan_no || "", doc.mobile || ""]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "warehouses") {
+    const locationId = await resolveMongoMasterId(doc.location_id, MongoLocation, "locations");
+    const employeeId = await resolveMongoMasterId(doc.employee_id, MongoEmployee, "employees");
+    const result = await dbRun(
+      "INSERT INTO warehouses (name, address, location_id, employee_id) VALUES (?, ?, ?, ?)",
+      [doc.name || "", doc.address || "", locationId || null, employeeId || null]
+    );
+    return result.lastID || null;
+  }
+
+  return null;
+}
+
+async function resolveMongoMasterId(value, model, sqliteTable, nameField = "name") {
+  if (!value) return null;
+  if (isPositiveNumber(value)) return Number(value);
+
+  const doc = await model.findById(value).lean().catch(() => null);
+  if (!doc) return null;
+
+  if (sqliteTable === "company_accounts") {
+    return (await findSqliteAccountId(doc.account_name)) ||
+      createSqliteMasterFromMongo(model, sqliteTable, doc);
+  }
+
+  return (await findSqliteIdByName(sqliteTable, doc[nameField])) ||
+    createSqliteMasterFromMongo(model, sqliteTable, doc);
+}
+
+async function resolveExpenseMasterIds(values) {
+  const resolved = {
+    location_id: await resolveMongoMasterId(values.location_id, MongoLocation, "locations"),
+    employee_id: await resolveMongoMasterId(values.employee_id, MongoEmployee, "employees"),
+    product_id: await resolveMongoMasterId(values.product_id, MongoProduct, "products"),
+    company_id: await resolveMongoMasterId(values.company_id, MongoCompany, "companies"),
+    company_account_id: await resolveMongoMasterId(values.company_account_id, MongoCompanyAccount, "company_accounts"),
+    reg_from_company_id: await resolveMongoMasterId(values.reg_from_company_id, MongoCompany, "companies"),
+  };
+
+  if (values.send_to_kind === "company") {
+    resolved.send_to_ref_id = await resolveMongoMasterId(values.send_to_ref_id, MongoCompany, "companies");
+  } else if (values.send_to_kind === "warehouse") {
+    resolved.send_to_ref_id = await resolveMongoMasterId(values.send_to_ref_id, MongoWarehouse, "warehouses");
+  } else {
+    resolved.send_to_ref_id = isPositiveNumber(values.send_to_ref_id)
+      ? Number(values.send_to_ref_id)
+      : null;
+  }
+
+  return resolved;
+}
+
+async function resolveAssignedWarehouseIds(user) {
+  const assignedIds = user?.assigned_warehouse_ids || [];
+  const resolvedIds = [];
+
+  for (const assignedId of assignedIds) {
+    if (isPositiveNumber(assignedId)) {
+      resolvedIds.push(Number(assignedId));
+      continue;
+    }
+
+    const resolvedId = await resolveMongoMasterId(assignedId, MongoWarehouse, "warehouses");
+    if (resolvedId) {
+      resolvedIds.push(Number(resolvedId));
+    }
+  }
+
+  return Array.from(new Set(resolvedIds));
+}
+
 function resolveWarehouseForLocation(user, locationId, callback) {
   const normalizedLocationId = Number(locationId);
   if (!Number.isFinite(normalizedLocationId) || normalizedLocationId <= 0) {
@@ -91,41 +275,44 @@ function resolveWarehouseForLocation(user, locationId, callback) {
     return;
   }
 
-  const assignedIds = user?.assigned_warehouse_ids || [];
-  const canUseAllWarehouses =
-    !user || user.role === "admin" || userHasPermission(user, "warehouses.manage");
+  resolveAssignedWarehouseIds(user)
+    .then((assignedIds) => {
+      const canUseAllWarehouses =
+        !user || user.role === "admin" || userHasPermission(user, "warehouses.manage");
 
-  const params = [normalizedLocationId];
-  let sql = `
-    SELECT id
-    FROM warehouses
-    WHERE location_id = ?
-  `;
+      const params = [normalizedLocationId];
+      let sql = `
+        SELECT id
+        FROM warehouses
+        WHERE location_id = ?
+      `;
 
-  if (!canUseAllWarehouses) {
-    if (assignedIds.length === 0) {
-      callback(new Error("You do not have access to this location"));
-      return;
-    }
-    sql += ` AND id IN (${assignedIds.map(() => "?").join(",")})`;
-    params.push(...assignedIds);
-  }
+      if (!canUseAllWarehouses) {
+        if (assignedIds.length === 0) {
+          callback(new Error("You do not have access to this location"));
+          return;
+        }
+        sql += ` AND id IN (${assignedIds.map(() => "?").join(",")})`;
+        params.push(...assignedIds);
+      }
 
-  sql += ` ORDER BY id ASC`;
+      sql += ` ORDER BY id ASC`;
 
-  db.all(sql, params, (err, rows) => {
-    if (err) {
-      callback(err);
-      return;
-    }
+      db.all(sql, params, (err, rows) => {
+        if (err) {
+          callback(err);
+          return;
+        }
 
-    if (!rows || rows.length === 0) {
-      callback(new Error("No warehouse is mapped with the selected location"));
-      return;
-    }
+        if (!rows || rows.length === 0) {
+          callback(new Error("No warehouse is mapped with the selected location"));
+          return;
+        }
 
-    callback(null, Number(rows[0].id));
-  });
+        callback(null, Number(rows[0].id));
+      });
+    })
+    .catch(callback);
 }
 
 function postExpenseToInward(expense, callback) {
@@ -744,7 +931,7 @@ router.post("/:id/approve-cash-book", (req, res) => {
   );
 });
 
-router.post("/", (req, res) => {
+router.post("/", async (req, res) => {
   if (!userHasPermission(req.user, "expense.create")) {
     return res.status(403).json({ error: "You do not have permission to create expenses" });
   }
@@ -784,10 +971,6 @@ router.post("/", (req, res) => {
     items,
   } = req.body;
 
-  if (!expense_date || !location_id) {
-    return res.status(400).json({ error: "Expense date and location are required" });
-  }
-
   const normalizedWorkDescription = normalizeWorkDescription(work_description);
   if (!normalizedWorkDescription) {
     return res.status(400).json({ error: "Work Description is required" });
@@ -795,17 +978,47 @@ router.post("/", (req, res) => {
 
   const sendKindRaw = (send_to_kind || "").trim() || null;
   let send_to_kind_norm = sendKindRaw;
-  let send_to_ref_norm = sendKindRaw === "palti_lorry" ? null : sendKindRaw ? Number(send_to_ref_id) : null;
+  let send_to_ref_norm = null;
   if (sendKindRaw) {
     if (!["consignee", "company", "warehouse", "palti_lorry"].includes(sendKindRaw)) {
       return res.status(400).json({ error: "Invalid Send To — pick consignee, company, warehouse, or palti lorry" });
     }
-    if (sendKindRaw !== "palti_lorry" && !Number.isFinite(send_to_ref_norm)) {
+    if (sendKindRaw === "__unused__") {
+      // Reserved branch kept for legacy validation compatibility.
+    }
+    if (sendKindRaw === "__unused_invalid__") {
       return res.status(400).json({ error: "Invalid Send To — pick consignee, company, warehouse, or palti lorry" });
     }
   } else {
     send_to_kind_norm = null;
     send_to_ref_norm = null;
+  }
+
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveExpenseMasterIds({
+      location_id,
+      employee_id,
+      product_id,
+      company_id,
+      company_account_id,
+      reg_from_company_id,
+      send_to_kind: sendKindRaw,
+      send_to_ref_id,
+    });
+  } catch (resolveErr) {
+    return res.status(400).json({ error: resolveErr.message });
+  }
+
+  if (!expense_date || !resolvedIds.location_id) {
+    return res.status(400).json({ error: "Expense date and location are required" });
+  }
+
+  if (sendKindRaw) {
+    send_to_ref_norm = sendKindRaw === "palti_lorry" ? null : resolvedIds.send_to_ref_id;
+    if (sendKindRaw !== "palti_lorry" && !Number.isFinite(Number(send_to_ref_norm))) {
+      return res.status(400).json({ error: "Invalid Send To - pick consignee, company, warehouse, or palti lorry" });
+    }
   }
 
   const send_to_company_ins = sendKindRaw ? null : Number(send_to_company_id) || null;
@@ -815,7 +1028,7 @@ router.post("/", (req, res) => {
     ? items.filter((item) => item && item.particular_name)
     : [];
 
-  resolveWarehouseForLocation(req.user, location_id, (warehouseErr, resolvedWarehouseId) => {
+  resolveWarehouseForLocation(req.user, resolvedIds.location_id, (warehouseErr, resolvedWarehouseId) => {
     if (warehouseErr) {
       return res.status(400).json({ error: warehouseErr.message });
     }
@@ -846,12 +1059,12 @@ router.post("/", (req, res) => {
         voucherNo,
         expense_date,
         resolvedWarehouseId,
-        Number(location_id) || null,
-        employee_id || null,
-        product_id || null,
-        company_id || null,
-        company_account_id || null,
-        reg_from_company_id || null,
+        resolvedIds.location_id,
+        resolvedIds.employee_id || null,
+        resolvedIds.product_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
+        resolvedIds.reg_from_company_id || null,
         send_to_company_ins,
         reg_from_consignee_id || null,
         send_to_party_ins,
@@ -948,7 +1161,7 @@ router.post("/", (req, res) => {
   });
 });
 
-router.put("/:id", (req, res) => {
+router.put("/:id", async (req, res) => {
   if (!userHasPermission(req.user, "expense.edit")) {
     return res.status(403).json({ error: "You do not have permission to edit expenses" });
   }
@@ -991,12 +1204,15 @@ router.put("/:id", (req, res) => {
 
   const putSendKindRaw = (send_to_kind || "").trim() || null;
   let put_send_to_kind = putSendKindRaw;
-  let put_send_to_ref = putSendKindRaw === "palti_lorry" ? null : putSendKindRaw ? Number(send_to_ref_id) : null;
+  let put_send_to_ref = null;
   if (putSendKindRaw) {
     if (!["consignee", "company", "warehouse", "palti_lorry"].includes(putSendKindRaw)) {
       return res.status(400).json({ error: "Invalid Send To — pick consignee, company, warehouse, or palti lorry" });
     }
-    if (putSendKindRaw !== "palti_lorry" && !Number.isFinite(put_send_to_ref)) {
+    if (putSendKindRaw === "__unused__") {
+      // Reserved branch kept for legacy validation compatibility.
+    }
+    if (putSendKindRaw === "__unused_invalid__") {
       return res.status(400).json({ error: "Invalid Send To — pick consignee, company, warehouse, or palti lorry" });
     }
   } else {
@@ -1009,6 +1225,33 @@ router.put("/:id", (req, res) => {
   const normalizedWorkDescription = normalizeWorkDescription(work_description);
   if (!normalizedWorkDescription) {
     return res.status(400).json({ error: "Work Description is required" });
+  }
+
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveExpenseMasterIds({
+      location_id,
+      employee_id,
+      product_id,
+      company_id,
+      company_account_id,
+      reg_from_company_id,
+      send_to_kind: putSendKindRaw,
+      send_to_ref_id,
+    });
+  } catch (resolveErr) {
+    return res.status(400).json({ error: resolveErr.message });
+  }
+
+  if (!expense_date || !resolvedIds.location_id) {
+    return res.status(400).json({ error: "Expense date and location are required" });
+  }
+
+  if (putSendKindRaw) {
+    put_send_to_ref = putSendKindRaw === "palti_lorry" ? null : resolvedIds.send_to_ref_id;
+    if (putSendKindRaw !== "palti_lorry" && !Number.isFinite(Number(put_send_to_ref))) {
+      return res.status(400).json({ error: "Invalid Send To - pick consignee, company, warehouse, or palti lorry" });
+    }
   }
 
   db.get("SELECT id, warehouse_id FROM expenses WHERE id = ?", [id], (findErr, row) => {
@@ -1028,7 +1271,7 @@ router.put("/:id", (req, res) => {
       ? items.filter((item) => item && item.particular_name)
       : [];
 
-    resolveWarehouseForLocation(req.user, location_id, (warehouseErr, resolvedWarehouseId) => {
+    resolveWarehouseForLocation(req.user, resolvedIds.location_id, (warehouseErr, resolvedWarehouseId) => {
       if (warehouseErr) {
         return res.status(400).json({ error: warehouseErr.message });
       }
@@ -1054,12 +1297,12 @@ router.put("/:id", (req, res) => {
       [
         expense_date,
         resolvedWarehouseId,
-        Number(location_id) || null,
-        employee_id || null,
-        product_id || null,
-        company_id || null,
-        company_account_id || null,
-        reg_from_company_id || null,
+        resolvedIds.location_id,
+        resolvedIds.employee_id || null,
+        resolvedIds.product_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
+        resolvedIds.reg_from_company_id || null,
         put_send_to_company,
         reg_from_consignee_id || null,
         put_send_to_party,
@@ -1202,9 +1445,3 @@ router.post("/:id/post-palti-lorry", (req, res) => {
 });
 
 module.exports = router;
-
-
-
-
-
-
