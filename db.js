@@ -458,7 +458,57 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE outward ADD COLUMN inv_no TEXT`, "outward inv_no");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN palti_lorry_id INTEGER`, "adjustment palti_lorry_id");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN source_type TEXT DEFAULT 'inward'`, "adjustment source_type");
-  addColIgnoreDup(`ALTER TABLE palti_lorry_entries ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP`, "palti_lorry_entries updated_at");
+  addColIgnoreDup(`ALTER TABLE palti_lorry_entries ADD COLUMN updated_at TEXT`, "palti_lorry_entries updated_at");
+
+  db.run(
+    `
+    INSERT OR IGNORE INTO palti_lorry_entries (
+      expense_id,
+      voucher_no,
+      expense_date,
+      warehouse_id,
+      employee_id,
+      product_id,
+      company_id,
+      reg_from_consignee_id,
+      reg_from_company_id,
+      reg_lorry_no,
+      balance,
+      new_lorry_no,
+      new_weight,
+      created_at,
+      updated_at
+    )
+    SELECT
+      x.id,
+      x.voucher_no,
+      x.expense_date,
+      x.warehouse_id,
+      x.employee_id,
+      x.product_id,
+      x.company_id,
+      x.reg_from_consignee_id,
+      x.reg_from_company_id,
+      x.reg_lorry_no,
+      IFNULL(x.balance, 0),
+      COALESCE(NULLIF(TRIM(x.new_lorry_no), ''), NULLIF(TRIM(x.reg_lorry_no), ''), ''),
+      IFNULL(x.new_weight, 0),
+      COALESCE(x.created_at, CURRENT_TIMESTAMP),
+      COALESCE(x.updated_at, CURRENT_TIMESTAMP)
+    FROM expenses x
+    WHERE (x.send_to_kind = 'palti_lorry' OR LOWER(TRIM(x.work_description)) = 'palti lorry')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM palti_lorry_entries p
+        WHERE p.expense_id = x.id
+      )
+    `,
+    (err) => {
+      if (err) {
+        console.log("palti_lorry_entries backfill error:", err.message);
+      }
+    }
+  );
 
   db.run(
     `ALTER TABLE employees ADD COLUMN role TEXT DEFAULT 'staff'`,
@@ -814,42 +864,4 @@ if (true) {
       adjusted_amount REAL NOT NULL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(source_entry_id) REFERENCES cash_entries(id) ON DELETE CASCADE,
-      FOREIGN KEY(target_entry_id) REFERENCES cash_entries(id) ON DELETE CASCADE
-    )
-  `);
-
-  // Reset cash entries on startup only when explicitly requested.
-  if (process.env.RESET_CASH_ENTRIES_ON_START === "true") {
-    db.run(`DELETE FROM cash_entry_adjustments`, (adjErr) => {
-      if (adjErr) {
-        console.log("cash_entry_adjustments reset error:", adjErr.message);
-      }
-    });
-    db.run(`DELETE FROM cash_entries`, (entryErr) => {
-      if (entryErr) {
-        console.log("cash_entries reset error:", entryErr.message);
-      }
-    });
-    db.run(
-      `DELETE FROM sqlite_sequence WHERE name IN ('cash_entries','cash_entry_adjustments')`,
-      (seqErr) => {
-        if (seqErr) {
-          console.log("cash_entries sequence reset error:", seqErr.message);
-        } else {
-          console.log("Cash entries reset: voucher will restart from 00001");
-        }
-      }
-    );
-  } else if (process.env.NODE_ENV !== "production") {
-    console.log("Skipping cash entries reset on startup. Set RESET_CASH_ENTRIES_ON_START=true to enable.");
-  }
-  });
-} else {
-  console.log("Running in production mode - SQLite disabled, using MongoDB only");
-}
-
-if (db) {
-  installSqliteMongoMirror(db);
-}
-
-module.exports = db;
+      FOREIGN KEY(target_entry_id) REFERENCES cash_entries
