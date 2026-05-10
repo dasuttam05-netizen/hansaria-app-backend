@@ -301,6 +301,9 @@ if (true) {
       reg_lorry_no TEXT,
       loading REAL DEFAULT 0,
       unloading REAL DEFAULT 0,
+      shortage REAL DEFAULT 0,
+      excess REAL DEFAULT 0,
+      shortage_excess REAL DEFAULT 0,
       balance REAL DEFAULT 0,
       net_weight REAL DEFAULT 0,
       new_lorry_no TEXT,
@@ -353,6 +356,9 @@ if (true) {
   db.run(`ALTER TABLE expenses ADD COLUMN reg_lorry_no TEXT`, () => {});
   db.run(`ALTER TABLE expenses ADD COLUMN loading REAL DEFAULT 0`, () => {});
   db.run(`ALTER TABLE expenses ADD COLUMN unloading REAL DEFAULT 0`, () => {});
+  db.run(`ALTER TABLE expenses ADD COLUMN shortage REAL DEFAULT 0`, () => {});
+  db.run(`ALTER TABLE expenses ADD COLUMN excess REAL DEFAULT 0`, () => {});
+  db.run(`ALTER TABLE expenses ADD COLUMN shortage_excess REAL DEFAULT 0`, () => {});
   db.run(`ALTER TABLE expenses ADD COLUMN balance REAL DEFAULT 0`, () => {});
   db.run(`ALTER TABLE expenses ADD COLUMN net_weight REAL DEFAULT 0`, () => {});
   db.run(`ALTER TABLE expenses ADD COLUMN new_lorry_no TEXT`, () => {});
