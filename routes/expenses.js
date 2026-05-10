@@ -819,9 +819,11 @@ router.post("/:id/approve-cash-book", (req, res) => {
                   reference_no,
                   narration,
                   created_by,
+                  employee_id,
+                  fund_source,
                   status,
                   source_expense_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 `,
                 [
                   expense.voucher_no || null,
@@ -836,6 +838,8 @@ router.post("/:id/approve-cash-book", (req, res) => {
                   expense.voucher_no || null,
                   expense.narration || null,
                   req.user?.id || null,
+                  expense.employee_id || null,
+                  "main_cash",
                   "pending",
                   expense.id,
                 ],
