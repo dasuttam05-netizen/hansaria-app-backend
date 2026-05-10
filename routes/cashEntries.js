@@ -784,18 +784,24 @@ router.post("/", async (req, res) => {
           // Check if we need to create a companion staff entry
           const normalizedMode = String(transaction_mode || "").toLowerCase();
           const normalizedEntryType = String(entry_type || "").toLowerCase();
+          const shouldCreateStaffEntry =
+            auto_staff_entry === true ||
+            auto_staff_entry === "true" ||
+            auto_staff_entry === 1 ||
+            auto_staff_entry === "1";
+          const isMainCash = String(fund_source || "main_cash") === "main_cash";
           const isReceiptFromEmployee =
-            auto_staff_entry === true &&
-            employee_id &&
+            shouldCreateStaffEntry &&
+            resolvedIds.employee_id &&
             normalizedMode === "receipt" &&
-            normalizedEntryType === "income" &&
-            String(fund_source || "main_cash") === "main_cash";
+            (normalizedEntryType === "income" || normalizedEntryType === "receipt") &&
+            isMainCash;
           const isPaymentToEmployee =
-            auto_staff_entry === true &&
-            employee_id &&
+            shouldCreateStaffEntry &&
+            resolvedIds.employee_id &&
             normalizedMode === "payment" &&
             normalizedEntryType === "expense" &&
-            String(fund_source || "main_cash") === "main_cash";
+            isMainCash;
 
           if (isReceiptFromEmployee || isPaymentToEmployee) {
             const staffEntryType = isPaymentToEmployee ? "income" : "expense";
@@ -859,7 +865,7 @@ router.post("/", async (req, res) => {
                           entry_type,
                           amount: Number(amount || 0),
                           status: status || "pending",
-                          employee_id,
+                          employee_id: resolvedIds.employee_id || null,
                           staff_entry_type: staffEntryType,
                         },
                       });
@@ -878,7 +884,7 @@ upsertCashEntryToMongo({
                         reference_no: reference_no || null,
                         narration: narration || null,
                         created_by: req.user?.id || created_by || null,
-                        employee_id: employee_id || null,
+                        employee_id: resolvedIds.employee_id || null,
                         journal_group_no: journal_group_no || null,
                         fund_source: String(fund_source || "main_cash"),
                         status: status || "pending",
@@ -895,8 +901,8 @@ upsertCashEntryToMongo({
                         id: staffEntryId,
                         voucher_no: staffVoucherNo,
                         entry_date,
-                        entry_type: "income",
-                        warehouse_id: warehouse_id || null,
+                        entry_type: staffEntryType,
+                        warehouse_id: resolvedIds.warehouse_id || null,
                         company_id: null,
                         company_account_id: null,
                         description: baseDescriptionText(description),
@@ -905,7 +911,7 @@ upsertCashEntryToMongo({
                         reference_no: reference_no || null,
                         narration: narration || null,
                         created_by: req.user?.id || created_by || null,
-                        employee_id: employee_id || null,
+                        employee_id: resolvedIds.employee_id || null,
                         journal_group_no: journal_group_no || null,
                         fund_source: "employee_cash",
                         status: status || "pending",
