@@ -864,4 +864,42 @@ if (true) {
       adjusted_amount REAL NOT NULL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(source_entry_id) REFERENCES cash_entries(id) ON DELETE CASCADE,
-      FOREIGN KEY(target_entry_id) REFERENCES cash_entries
+      FOREIGN KEY(target_entry_id) REFERENCES cash_entries(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Reset cash entries on startup only when explicitly requested.
+  if (process.env.RESET_CASH_ENTRIES_ON_START === "true") {
+    db.run(`DELETE FROM cash_entry_adjustments`, (adjErr) => {
+      if (adjErr) {
+        console.log("cash_entry_adjustments reset error:", adjErr.message);
+      }
+    });
+    db.run(`DELETE FROM cash_entries`, (entryErr) => {
+      if (entryErr) {
+        console.log("cash_entries reset error:", entryErr.message);
+      }
+    });
+    db.run(
+      `DELETE FROM sqlite_sequence WHERE name IN ('cash_entries','cash_entry_adjustments')`,
+      (seqErr) => {
+        if (seqErr) {
+          console.log("cash_entries sequence reset error:", seqErr.message);
+        } else {
+          console.log("Cash entries reset: voucher will restart from 00001");
+        }
+      }
+    );
+  } else if (process.env.NODE_ENV !== "production") {
+    console.log("Skipping cash entries reset on startup. Set RESET_CASH_ENTRIES_ON_START=true to enable.");
+  }
+  });
+} else {
+  console.log("Running in production mode - SQLite disabled, using MongoDB only");
+}
+
+if (db) {
+  installSqliteMongoMirror(db);
+}
+
+module.exports = db;
