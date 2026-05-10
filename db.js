@@ -708,6 +708,31 @@ if (true) {
   addCashCol(`ALTER TABLE cash_entries ADD COLUMN linked_entry_id INTEGER`, "cash_entries linked_entry_id");
   addCashCol(`ALTER TABLE cash_entries ADD COLUMN fund_source TEXT DEFAULT 'main_cash'`, "cash_entries fund_source");
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cash_book_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      main_opening_balance REAL DEFAULT 0,
+      main_opening_type TEXT DEFAULT 'dr',
+      updated_by INTEGER,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.run(
+    `
+    INSERT OR IGNORE INTO cash_book_settings (
+      id,
+      main_opening_balance,
+      main_opening_type
+    ) VALUES (1, 0, 'dr')
+    `,
+    (err) => {
+      if (err) {
+        console.log("cash_book_settings seed error:", err.message);
+      }
+    }
+  );
+
   db.run(
     `
     UPDATE cash_entries
