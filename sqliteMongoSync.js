@@ -18,6 +18,7 @@ const TRACKED_TABLES = new Set([
   "inward",
   "outward",
   "adjustment",
+  "palti_lorry_entries",
   "outward_settlement",
   "transporters",
   "transport_bilti",
