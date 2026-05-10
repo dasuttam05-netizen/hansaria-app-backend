@@ -211,7 +211,7 @@ router.get("/", (req, res) => {
     params.push(entry_type);
   }
   if (status) {
-    where.push("ce.status = ?");
+    where.push("COALESCE(ce.status, 'pending') = ?");
     params.push(status);
   }
 
@@ -241,13 +241,13 @@ router.get("/", (req, res) => {
       ce.payment_method,
       ce.reference_no,
       ce.narration,
-      ce.fund_source,
-      ce.status,
+      COALESCE(ce.fund_source, 'main_cash') AS fund_source,
+      COALESCE(ce.status, 'pending') AS status,
       ce.source_expense_id,
       ce.created_by,
       e.name AS created_by_name,
-      ce.employee_id,
-      assignedEmp.name AS employee_name,
+      COALESCE(ce.employee_id, x.employee_id) AS employee_id,
+      COALESCE(assignedEmp.name, expEmp.name) AS employee_name,
       ce.created_at,
       ce.updated_at,
       x.voucher_no AS source_expense_voucher_no,
@@ -421,13 +421,13 @@ router.get("/:id(\\d+)", (req, res) => {
       ce.payment_method,
       ce.reference_no,
       ce.narration,
-      ce.fund_source,
-      ce.status,
+      COALESCE(ce.fund_source, 'main_cash') AS fund_source,
+      COALESCE(ce.status, 'pending') AS status,
       ce.source_expense_id,
       ce.created_by,
       e.name AS created_by_name,
-      ce.employee_id,
-      assignedEmp.name AS employee_name,
+      COALESCE(ce.employee_id, x.employee_id) AS employee_id,
+      COALESCE(assignedEmp.name, expEmp.name) AS employee_name,
       ce.created_at,
       ce.updated_at,
       x.voucher_no AS source_expense_voucher_no,
