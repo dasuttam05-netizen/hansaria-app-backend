@@ -6,9 +6,183 @@ const isMongoMirrorReady = () => false;
 const fs = require("fs");
 const path = require("path");
 const { userHasPermission } = require("../middleware/auth");
+const {
+  Location: MongoLocation,
+  Employee: MongoEmployee,
+  Company: MongoCompany,
+  CompanyAccount: MongoCompanyAccount,
+  Warehouse: MongoWarehouse,
+} = require("../mongo");
 
 const CASH_AUDIT_LOG_FILE = path.join(__dirname, "..", "logs", "cash-entry-audit.log");
 const ADJ_DETAIL_MARKER = " | Adj Details -> ";
+
+function isPositiveNumber(value) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) && numericValue > 0;
+}
+
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(row || null);
+    });
+  });
+}
+
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve({ lastID: this.lastID, changes: this.changes });
+    });
+  });
+}
+
+async function findSqliteIdByName(table, name) {
+  const cleanedName = String(name || "").trim();
+  if (!cleanedName) return null;
+  const row = await dbGet(
+    `SELECT id FROM ${table} WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) ORDER BY id ASC LIMIT 1`,
+    [cleanedName]
+  );
+  return row?.id || null;
+}
+
+async function findSqliteAccountId(accountName) {
+  const cleanedName = String(accountName || "").trim();
+  if (!cleanedName) return null;
+  const row = await dbGet(
+    `SELECT id FROM company_accounts WHERE LOWER(TRIM(account_name)) = LOWER(TRIM(?)) ORDER BY id ASC LIMIT 1`,
+    [cleanedName]
+  );
+  return row?.id || null;
+}
+
+async function createSqliteMasterFromMongo(sqliteTable, doc) {
+  if (sqliteTable === "locations") {
+    const result = await dbRun(
+      "INSERT INTO locations (name, address, hsn_code) VALUES (?, ?, ?)",
+      [doc.name || "", doc.address || "", doc.hsn_code || ""]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "employees") {
+    const locationId = await resolveMongoMasterId(doc.location_id, MongoLocation, "locations");
+    const result = await dbRun(
+      "INSERT INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [
+        doc.name || "",
+        doc.address || "",
+        locationId || null,
+        doc.username || "",
+        doc.password || "",
+        doc.role || "staff",
+        JSON.stringify(doc.permissions || []),
+      ]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "companies") {
+    const result = await dbRun(
+      "INSERT INTO companies (name, address, mobile) VALUES (?, ?, ?)",
+      [doc.name || "", doc.address || "", doc.mobile || ""]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "company_accounts") {
+    const companyId = await resolveMongoMasterId(doc.company_id, MongoCompany, "companies");
+    if (!companyId) return null;
+    const result = await dbRun(
+      "INSERT INTO company_accounts (account_name, address, company_id, pan_no, mobile) VALUES (?, ?, ?, ?, ?)",
+      [doc.account_name || "", doc.address || "", companyId, doc.pan_no || "", doc.mobile || ""]
+    );
+    return result.lastID || null;
+  }
+
+  if (sqliteTable === "warehouses") {
+    const locationId = await resolveMongoMasterId(doc.location_id, MongoLocation, "locations");
+    const employeeId = await resolveMongoMasterId(doc.employee_id, MongoEmployee, "employees");
+    const result = await dbRun(
+      "INSERT INTO warehouses (name, address, location_id, employee_id) VALUES (?, ?, ?, ?)",
+      [doc.name || "", doc.address || "", locationId || null, employeeId || null]
+    );
+    return result.lastID || null;
+  }
+
+  return null;
+}
+
+async function resolveMongoMasterId(value, model, sqliteTable) {
+  if (!value) return null;
+  if (isPositiveNumber(value)) return Number(value);
+
+  const doc = await model.findById(value).lean().catch(() => null);
+  if (!doc) return null;
+
+  if (sqliteTable === "company_accounts") {
+    return (await findSqliteAccountId(doc.account_name)) ||
+      createSqliteMasterFromMongo(sqliteTable, doc);
+  }
+
+  return (await findSqliteIdByName(sqliteTable, doc.name)) ||
+    createSqliteMasterFromMongo(sqliteTable, doc);
+}
+
+async function resolveCashEntryMasterIds(values) {
+  return {
+    warehouse_id: await resolveMongoMasterId(values.warehouse_id, MongoWarehouse, "warehouses"),
+    company_id: await resolveMongoMasterId(values.company_id, MongoCompany, "companies"),
+    company_account_id: await resolveMongoMasterId(values.company_account_id, MongoCompanyAccount, "company_accounts"),
+    employee_id: await resolveMongoMasterId(values.employee_id, MongoEmployee, "employees"),
+  };
+}
+
+async function enrichCashRowsWithMongoNames(rows = []) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const companyIds = Array.from(
+    new Set(
+      safeRows
+        .filter((row) => !row.company_name && row.company_id && !isPositiveNumber(row.company_id))
+        .map((row) => String(row.company_id))
+    )
+  );
+  const employeeIds = Array.from(
+    new Set(
+      safeRows
+        .filter((row) => !row.employee_name && row.employee_id && !isPositiveNumber(row.employee_id))
+        .map((row) => String(row.employee_id))
+    )
+  );
+
+  const [mongoCompanies, mongoEmployees] = await Promise.all([
+    companyIds.length
+      ? MongoCompany.find({ _id: { $in: companyIds } }).lean().catch(() => [])
+      : Promise.resolve([]),
+    employeeIds.length
+      ? MongoEmployee.find({ _id: { $in: employeeIds } }).lean().catch(() => [])
+      : Promise.resolve([]),
+  ]);
+
+  const companyMap = new Map((mongoCompanies || []).map((row) => [String(row._id), row.name || ""]));
+  const employeeMap = new Map((mongoEmployees || []).map((row) => [String(row._id), row.name || ""]));
+
+  return safeRows.map((row) => ({
+    ...row,
+    company_name: row.company_name || companyMap.get(String(row.company_id)) || row.company_name,
+    employee_name: row.employee_name || employeeMap.get(String(row.employee_id)) || row.employee_name,
+  }));
+}
 
 function buildMongoCashEntryPayload(entry) {
   return {
@@ -271,9 +445,10 @@ router.get("/", (req, res) => {
     ORDER BY ce.entry_date DESC, ce.id DESC
   `;
 
-  db.all(sql, params, (err, rows) => {
+  db.all(sql, params, async (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json(rows || []);
+    const enrichedRows = await enrichCashRowsWithMongoNames(rows || []);
+    res.json(enrichedRows);
   });
 });
 
@@ -452,9 +627,10 @@ router.get("/:id(\\d+)", (req, res) => {
     GROUP BY ce.id
   `;
 
-  db.get(sql, [req.params.id], (err, row) => {
+  db.get(sql, [req.params.id], async (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ error: "Entry not found" });
+    const [enrichedRow] = await enrichCashRowsWithMongoNames([row]);
 
     db.all(
       `
@@ -474,7 +650,7 @@ router.get("/:id(\\d+)", (req, res) => {
       (adjErr, adjustmentRows) => {
         if (adjErr) return res.status(500).json({ error: adjErr.message });
         return res.json({
-          ...row,
+          ...enrichedRow,
           adjustments: Array.isArray(adjustmentRows) ? adjustmentRows : [],
         });
       }
@@ -483,7 +659,7 @@ router.get("/:id(\\d+)", (req, res) => {
 });
 
 // Create cash entry
-router.post("/", (req, res) => {
+router.post("/", async (req, res) => {
   if (!userHasPermission(req.user, "cash.create")) {
     return res.status(403).json({ error: "You do not have permission to create cash entries" });
   }
@@ -513,6 +689,18 @@ router.post("/", (req, res) => {
 
   if (!entry_date || !entry_type || !description || !amount) {
     return res.status(400).json({ error: "Required fields missing" });
+  }
+
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveCashEntryMasterIds({
+      warehouse_id,
+      company_id,
+      company_account_id,
+      employee_id,
+    });
+  } catch (resolveErr) {
+    return res.status(400).json({ error: resolveErr.message });
   }
 
   const insertEntry = (finalVoucherNo, linkedEntryId = null) => {
@@ -545,16 +733,16 @@ router.post("/", (req, res) => {
         finalVoucherNo,
         entry_date,
         entry_type,
-        warehouse_id || null,
-        company_id || null,
-        company_account_id || null,
+        resolvedIds.warehouse_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
         baseDescriptionText(description),
         amount,
         payment_method || "Cash",
         reference_no || null,
         narration || null,
         req.user?.id || created_by || null,
-        employee_id || null,
+        resolvedIds.employee_id || null,
         journal_group_no || null,
         String(fund_source || "main_cash"),
         status || "pending",
@@ -620,7 +808,7 @@ router.post("/", (req, res) => {
                   staffVoucherNo,
                   entry_date,
                   staffEntryType,
-                  warehouse_id || null,
+                  resolvedIds.warehouse_id || null,
                   null,
                   null,
                   baseDescriptionText(description),
@@ -629,7 +817,7 @@ router.post("/", (req, res) => {
                   reference_no || null,
                   narration || null,
                   req.user?.id || created_by || null,
-                  employee_id,
+                  resolvedIds.employee_id || null,
                   journal_group_no || null,
                   "employee_cash",
                   status || "pending",
@@ -928,7 +1116,7 @@ upsertCashEntryToMongo({
 });
 
 // Update cash entry
-router.put("/:id(\\d+)", (req, res) => {
+router.put("/:id(\\d+)", async (req, res) => {
   if (!userHasPermission(req.user, "cash.edit")) {
     return res.status(403).json({ error: "You do not have permission to edit cash entries" });
   }
@@ -950,6 +1138,18 @@ router.put("/:id(\\d+)", (req, res) => {
     fund_source,
     adjustments,
   } = req.body;
+
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveCashEntryMasterIds({
+      warehouse_id,
+      company_id,
+      company_account_id,
+      employee_id,
+    });
+  } catch (resolveErr) {
+    return res.status(400).json({ error: resolveErr.message });
+  }
 
   const sql = `
     UPDATE cash_entries
@@ -982,15 +1182,15 @@ router.put("/:id(\\d+)", (req, res) => {
       [
         entry_date,
         entry_type,
-        warehouse_id || null,
-        company_id || null,
-        company_account_id || null,
+        resolvedIds.warehouse_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
         baseDescriptionText(description),
         amount,
         payment_method || "Cash",
         reference_no || null,
         narration || null,
-        employee_id || null,
+        resolvedIds.employee_id || null,
         journal_group_no === undefined ? oldRow.journal_group_no || null : journal_group_no || null,
         String(fund_source || "main_cash"),
         status || "pending",
