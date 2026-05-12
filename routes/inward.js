@@ -3,17 +3,27 @@ const router = express.Router();
 const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
+const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
 
 function formatVoucher(slNo) {
   return `INV${String(slNo).padStart(3, "0")}`;
 }
 
-router.get("/", (req, res) => {
+router.get("/", async (req, res) => {
   if (!userHasPermission(req.user, "inward.view")) {
     return res.status(403).json({ error: "You do not have permission to view inward entries" });
   }
 
-  const warehouseScope = assignedWarehouseFilter(req.user, "i.warehouse_id");
+  const rawWarehouseScope = assignedWarehouseFilter(req.user, "i.warehouse_id");
+  const resolvedWarehouseIds = await resolveWarehouseIds(db, rawWarehouseScope.params).catch(() => []);
+  const warehouseScope = rawWarehouseScope.clause
+    ? resolvedWarehouseIds.length > 0
+      ? {
+          clause: ` AND i.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")})`,
+          params: resolvedWarehouseIds,
+        }
+      : { clause: " AND 1 = 0", params: [] }
+    : rawWarehouseScope;
   const sql = `
     SELECT i.*,
       l.name AS location_name,
@@ -43,7 +53,7 @@ router.get("/", (req, res) => {
   });
 });
 
-router.post("/", (req, res) => {
+router.post("/", async (req, res) => {
   if (!userHasPermission(req.user, "inward.create")) {
     return res.status(403).json({ error: "You do not have permission to create inward entries" });
   }
@@ -64,7 +74,14 @@ router.post("/", (req, res) => {
     return res.status(400).json({ error: "Date is required" });
   }
 
-  if (!canAccessWarehouse(req.user, warehouse_id)) {
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveEntryMasterIds(db, req.body);
+  } catch (resolveErr) {
+    return res.status(500).json({ error: resolveErr.message });
+  }
+
+  if (!canAccessWarehouse(req.user, warehouse_id) && !canAccessWarehouse(req.user, resolvedIds.warehouse_id)) {
     return res.status(403).json({ error: "You can only create entries for your assigned warehouse" });
   }
 
@@ -88,12 +105,12 @@ router.post("/", (req, res) => {
         nextSl,
         voucher_no,
         date,
-        employee_id || null,
-        location_id || null,
-        warehouse_id || null,
-        product_id || null,
-        company_id || null,
-        company_account_id || null,
+        resolvedIds.employee_id || null,
+        resolvedIds.location_id || null,
+        resolvedIds.warehouse_id || null,
+        resolvedIds.product_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
         lorry_no || null,
         w,
         w,
@@ -113,7 +130,7 @@ router.post("/", (req, res) => {
   });
 });
 
-router.put("/:id", (req, res) => {
+router.put("/:id", async (req, res) => {
   if (!userHasPermission(req.user, "inward.edit")) {
     return res.status(403).json({ error: "You do not have permission to edit inward entries" });
   }
@@ -132,12 +149,21 @@ router.put("/:id", (req, res) => {
   } = req.body;
 
   const w = Number(weight) || 0;
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveEntryMasterIds(db, req.body);
+  } catch (resolveErr) {
+    return res.status(500).json({ error: resolveErr.message });
+  }
 
   db.get(`SELECT warehouse_id FROM inward WHERE id = ?`, [id], (findErr, inwardRow) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!inwardRow) return res.status(404).json({ error: "Inward not found" });
 
-    if (!canAccessWarehouse(req.user, inwardRow.warehouse_id) || !canAccessWarehouse(req.user, warehouse_id)) {
+    if (
+      !canAccessWarehouse(req.user, inwardRow.warehouse_id) ||
+      (!canAccessWarehouse(req.user, warehouse_id) && !canAccessWarehouse(req.user, resolvedIds.warehouse_id))
+    ) {
       return res.status(403).json({ error: "You can only edit entries for your assigned warehouse" });
     }
 
@@ -151,12 +177,12 @@ router.put("/:id", (req, res) => {
       sql,
       [
         date,
-        employee_id || null,
-        location_id || null,
-        warehouse_id || null,
-        product_id || null,
-        company_id || null,
-        company_account_id || null,
+        resolvedIds.employee_id || null,
+        resolvedIds.location_id || null,
+        resolvedIds.warehouse_id || null,
+        resolvedIds.product_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
         lorry_no || null,
         w,
         w,
