@@ -109,12 +109,16 @@ router.get("/:outward_id", async (req, res) => {
       c.name AS company_name,
       ca.account_name AS account_name,
       w.name AS warehouse_name,
+      COALESCE(o.location_id, w.location_id) AS effective_location_id,
+      COALESCE(l.name, wl.name) AS location_name,
       p.name AS product_name
     FROM outward o
     LEFT JOIN outward_settlement s ON s.outward_id = o.id
     LEFT JOIN companies c ON o.company_id = c.id
     LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
     LEFT JOIN warehouses w ON o.warehouse_id = w.id
+    LEFT JOIN locations l ON l.id = o.location_id
+    LEFT JOIN locations wl ON wl.id = w.location_id
     LEFT JOIN products p ON o.product_id = p.id
     WHERE o.id = ?
   `;
@@ -146,6 +150,8 @@ router.get("/:outward_id", async (req, res) => {
         company_name: row.company_name,
         account_name: row.account_name,
         warehouse_name: row.warehouse_name,
+        location_id: row.effective_location_id || null,
+        location_name: row.location_name || null,
         product_name: row.product_name,
         outward_quantity: defaultDispatch,
         adjustment_details: adjustment_details.map((item) => ({
@@ -364,6 +370,8 @@ router.get("/report/list", (req, res) => {
       c.name AS company_name,
       ca.account_name AS account_name,
       w.name AS warehouse_name,
+      COALESCE(o.location_id, w.location_id) AS effective_location_id,
+      COALESCE(l.name, wl.name) AS location_name,
       p.name AS product_name,
       o.buyer_name,
       o.consignee_name,
@@ -389,6 +397,8 @@ router.get("/report/list", (req, res) => {
     LEFT JOIN companies c ON o.company_id = c.id
     LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
     LEFT JOIN warehouses w ON o.warehouse_id = w.id
+    LEFT JOIN locations l ON l.id = o.location_id
+    LEFT JOIN locations wl ON wl.id = w.location_id
     LEFT JOIN products p ON o.product_id = p.id
     WHERE ${where.join(" AND ")}
     ORDER BY o.date DESC, s.id DESC
