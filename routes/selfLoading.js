@@ -2,9 +2,10 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const { assignedWarehouseFilter } = require("../helpers/access");
+const { resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
 const { userHasPermission } = require("../middleware/auth");
 
-router.get("/", (req, res) => {
+router.get("/", async (req, res) => {
   if (!userHasPermission(req.user, "expense.selfLoading")) {
     return res.status(403).json({ error: "You do not have permission to view Self Loading entries" });
   }
@@ -14,7 +15,7 @@ router.get("/", (req, res) => {
   let warehouseClause = "";
   let params = [];
   const warehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
-  const assignedIds = warehouseScope.params || [];
+  const assignedIds = await resolveWarehouseIds(db, warehouseScope.params || []).catch(() => []);
   if (warehouseScope.clause && warehouseScope.clause.includes("1 = 0")) {
     warehouseClause = ` AND o.warehouse_id IS NULL`;
   } else if (assignedIds.length > 0) {
