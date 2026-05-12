@@ -133,6 +133,18 @@ async function findSqliteIdByName(table, name) {
   return row?.id || null;
 }
 
+async function findSqliteEmployeeIdByUsername(username) {
+  const cleanedUsername = String(username || "").trim();
+  if (!cleanedUsername) return null;
+
+  const row = await dbGet(
+    "SELECT id FROM employees WHERE LOWER(TRIM(username)) = LOWER(TRIM(?)) ORDER BY id ASC LIMIT 1",
+    [cleanedUsername]
+  );
+
+  return row?.id || null;
+}
+
 async function findSqliteAccountId(accountName) {
   const cleanedName = String(accountName || "").trim();
   if (!cleanedName) return null;
@@ -156,19 +168,36 @@ async function createSqliteMasterFromMongo(model, sqliteTable, doc) {
 
   if (sqliteTable === "employees") {
     const locationId = await resolveMongoMasterId(doc.location_id, MongoLocation, "locations");
-    const result = await dbRun(
-      "INSERT INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [
-        doc.name || "",
-        doc.address || "",
-        locationId || null,
-        doc.username || "",
-        doc.password || "",
-        doc.role || "staff",
-        JSON.stringify(doc.permissions || []),
-      ]
-    );
-    return result.lastID || null;
+    const username = String(doc.username || "").trim() || null;
+
+    if (username) {
+      const existingByUsername = await findSqliteEmployeeIdByUsername(username);
+      if (existingByUsername) return existingByUsername;
+    }
+
+    try {
+      const result = await dbRun(
+        "INSERT INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+          doc.name || "",
+          doc.address || "",
+          locationId || null,
+          username,
+          doc.password || null,
+          doc.role || "staff",
+          JSON.stringify(doc.permissions || []),
+        ]
+      );
+      return result.lastID || null;
+    } catch (err) {
+      if (
+        username &&
+        String(err?.message || "").includes("UNIQUE constraint failed: employees.username")
+      ) {
+        return findSqliteEmployeeIdByUsername(username);
+      }
+      throw err;
+    }
   }
 
   if (sqliteTable === "products") {
@@ -219,6 +248,12 @@ async function resolveMongoMasterId(value, model, sqliteTable, nameField = "name
 
   if (sqliteTable === "company_accounts") {
     return (await findSqliteAccountId(doc.account_name)) ||
+      createSqliteMasterFromMongo(model, sqliteTable, doc);
+  }
+
+  if (sqliteTable === "employees") {
+    return (await findSqliteEmployeeIdByUsername(doc.username)) ||
+      (await findSqliteIdByName(sqliteTable, doc[nameField])) ||
       createSqliteMasterFromMongo(model, sqliteTable, doc);
   }
 
