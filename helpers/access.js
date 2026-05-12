@@ -10,7 +10,8 @@ function canAccessWarehouse(user, warehouseId) {
   }
 
   const assignedIds = user.assigned_warehouse_ids || [];
-  return assignedIds.includes(Number(warehouseId));
+  const target = String(warehouseId || "");
+  return assignedIds.some((id) => String(id) === target || Number(id) === Number(warehouseId));
 }
 
 function assignedWarehouseFilter(user, columnName = "warehouse_id") {
