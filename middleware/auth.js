@@ -2,7 +2,7 @@ const jwt = require("jsonwebtoken");
 
 const db = require("../db");
 
-const { Employee } = require("../mongo");
+const { Employee, Warehouse } = require("../mongo");
 
 const SECRET =
   process.env.JWT_SECRET ||
@@ -79,6 +79,42 @@ const ROLE_DEFAULT_PERMISSIONS = {
   ],
 };
 
+const LEGACY_PERMISSION_MAP = {
+  "employees.create": ["employees.manage"],
+  "employees.edit": ["employees.manage"],
+  "employees.delete": ["employees.manage"],
+  "inward.view": ["inward.manage"],
+  "inward.create": ["inward.manage"],
+  "inward.edit": ["inward.manage"],
+  "inward.delete": ["inward.manage"],
+  "outward.view": ["outward.manage"],
+  "outward.create": ["outward.manage"],
+  "outward.edit": ["outward.manage"],
+  "outward.delete": ["outward.manage"],
+  "expense.view": ["expense.manage", "expense.entry"],
+  "expense.create": ["expense.manage", "expense.entry"],
+  "expense.edit": ["expense.manage"],
+  "expense.delete": ["expense.manage"],
+  "expense.entry": ["expense.view", "expense.manage"],
+  "expense.postedInward": ["expense.view", "inward.view"],
+  "expense.palti": ["expense.view", "report.expense"],
+  "expense.selfLoading": ["expense.view", "report.expense", "outward.view"],
+  "expense.localSale": ["expense.view", "report.expense"],
+  "expense.pending": ["cash.view"],
+  "settlement.view": ["reports.view"],
+  "report.inward": ["reports.view"],
+  "report.erp": ["reports.view"],
+  "report.partyLedger": ["reports.view"],
+  "report.partyStock": ["reports.view"],
+  "report.warehouseRentLedger": ["reports.view"],
+  "report.warehouseRentMonthEnd": ["reports.view"],
+  "report.outwardSettlement": ["reports.view"],
+  "report.expense": ["reports.view"],
+  "report.paltiLorryAdjustment": ["report.expense", "reports.view"],
+  "report.cash": ["reports.view"],
+  "warehouses.view": ["warehouses.manage"],
+};
+
 function normalizeRole(
   role = "staff"
 ) {
@@ -106,15 +142,62 @@ function parsePermissions(
     return ["all"];
   }
 
-  if (
-    Array.isArray(
-      permissions
-    )
-  ) {
-    return permissions;
+  if (Array.isArray(permissions)) {
+    return permissions
+      .map((item) =>
+        String(item || "")
+          .trim()
+      )
+      .filter((item) => item);
+  }
+
+  if (typeof permissions === "string") {
+    const raw = permissions.trim();
+    if (!raw) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((item) =>
+            String(item || "")
+              .trim()
+          )
+          .filter((item) => item);
+      }
+    } catch (_err) {
+      // Fall back to comma-separated parsing.
+    }
+
+    return raw
+      .split(",")
+      .map((item) =>
+        String(item || "")
+          .trim()
+      )
+      .filter((item) => item);
   }
 
   return [];
+}
+
+async function loadAssignedWarehouseIds(userId) {
+  if (!userId) return [];
+
+  const warehouses = await Warehouse.find(
+    { employee_id: userId },
+    { _id: 1 }
+  );
+
+  return (warehouses || [])
+    .map((row) =>
+      row?._id
+        ? String(row._id)
+        : ""
+    )
+    .filter((item) => item);
 }
 
 function buildUserPayload(
@@ -166,14 +249,28 @@ function userHasPermission(
       user.role
     );
 
+  const legacyMatches =
+    (LEGACY_PERMISSION_MAP[permission] || [])
+      .some((item) =>
+        permissions.includes(item)
+      );
+
   return (
     permissions.includes(
       "all"
     ) ||
     permissions.includes(
       permission
-    )
+    ) ||
+    legacyMatches
   );
+}
+
+async function buildAuthenticatedUserPayload(user) {
+  const payload = buildUserPayload(user);
+  payload.assigned_warehouse_ids =
+    await loadAssignedWarehouseIds(payload.id);
+  return payload;
 }
 
 function isAdminUser(
@@ -264,7 +361,7 @@ async function authenticate(
     }
 
     req.user =
-      buildUserPayload(
+      await buildAuthenticatedUserPayload(
         user
       );
 
