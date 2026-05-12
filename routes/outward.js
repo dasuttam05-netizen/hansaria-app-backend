@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
+const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
 
 const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
 const safeText = (v) => (v ? v : null);
@@ -73,13 +74,20 @@ function validateOutwardStock({ warehouse_id, product_id, qty, outwardId }, call
   });
 }
 
-router.get("/available-stock", (req, res) => {
+router.get("/available-stock", async (req, res) => {
   if (!userHasPermission(req.user, "outward.view") && !userHasPermission(req.user, "outward.create") && !userHasPermission(req.user, "outward.edit")) {
     return res.status(403).json({ error: "You do not have permission to view outward stock" });
   }
 
-  const warehouseId = safeNumber(req.query.warehouse_id);
-  const productId = safeNumber(req.query.product_id);
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveEntryMasterIds(db, req.query);
+  } catch (resolveErr) {
+    return res.status(500).json({ error: resolveErr.message });
+  }
+
+  const warehouseId = resolvedIds.warehouse_id || safeNumber(req.query.warehouse_id);
+  const productId = resolvedIds.product_id || safeNumber(req.query.product_id);
   const outwardId = safeNumber(req.query.outward_id);
 
   if (!warehouseId || !productId) {
@@ -90,7 +98,7 @@ router.get("/available-stock", (req, res) => {
     });
   }
 
-  if (!canAccessWarehouse(req.user, warehouseId)) {
+  if (!canAccessWarehouse(req.user, req.query.warehouse_id) && !canAccessWarehouse(req.user, warehouseId)) {
     return res.status(403).json({ error: "You can only view stock for your assigned warehouse" });
   }
 
@@ -100,12 +108,21 @@ router.get("/available-stock", (req, res) => {
   });
 });
 
-router.get("/pending", (req, res) => {
+router.get("/pending", async (req, res) => {
   if (!userHasPermission(req.user, "outward.view")) {
     return res.status(403).json({ error: "You do not have permission to view outward entries" });
   }
 
-  const warehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
+  const rawWarehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
+  const resolvedWarehouseIds = await resolveWarehouseIds(db, rawWarehouseScope.params).catch(() => []);
+  const warehouseScope = rawWarehouseScope.clause
+    ? resolvedWarehouseIds.length > 0
+      ? {
+          clause: ` AND o.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")})`,
+          params: resolvedWarehouseIds,
+        }
+      : { clause: " AND 1 = 0", params: [] }
+    : rawWarehouseScope;
   const sql = `
     SELECT o.*, 
       w.name AS warehouse_name,
@@ -224,12 +241,21 @@ router.put("/complete/:id", (req, res) => {
   });
 });
 
-router.get("/", (req, res) => {
+router.get("/", async (req, res) => {
   if (!userHasPermission(req.user, "outward.view")) {
     return res.status(403).json({ error: "You do not have permission to view outward entries" });
   }
 
-  const warehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
+  const rawWarehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
+  const resolvedWarehouseIds = await resolveWarehouseIds(db, rawWarehouseScope.params).catch(() => []);
+  const warehouseScope = rawWarehouseScope.clause
+    ? resolvedWarehouseIds.length > 0
+      ? {
+          clause: ` AND o.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")})`,
+          params: resolvedWarehouseIds,
+        }
+      : { clause: " AND 1 = 0", params: [] }
+    : rawWarehouseScope;
   const sql = `
     SELECT o.*, 
       l.name AS location_name,
@@ -256,7 +282,7 @@ router.get("/", (req, res) => {
   });
 });
 
-router.post("/", (req, res) => {
+router.post("/", async (req, res) => {
   if (!userHasPermission(req.user, "outward.create")) {
     return res.status(403).json({ error: "You do not have permission to create outward entries" });
   }
@@ -283,9 +309,16 @@ router.post("/", (req, res) => {
   const rateVal = safeNumber(rate);
   const amount = qty * rateVal;
   const isSelfLoading = String(self_loading || "No").trim().toLowerCase() === "yes";
-  const normalizedWarehouseId = isSelfLoading ? null : safeNumber(warehouse_id);
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveEntryMasterIds(db, req.body);
+  } catch (resolveErr) {
+    return res.status(500).json({ error: resolveErr.message });
+  }
 
-  if (!isSelfLoading && !canAccessWarehouse(req.user, warehouse_id)) {
+  const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
+
+  if (!isSelfLoading && !canAccessWarehouse(req.user, warehouse_id) && !canAccessWarehouse(req.user, normalizedWarehouseId)) {
     return res.status(403).json({ error: "You can only create entries for your assigned warehouse" });
   }
 
@@ -312,12 +345,12 @@ router.post("/", (req, res) => {
           sl_no,
           voucher_no,
           safeText(date),
-          safeNumber(employee_id),
-          safeNumber(location_id),
+          resolvedIds.employee_id || null,
+          resolvedIds.location_id || null,
           normalizedWarehouseId,
-          safeNumber(product_id),
-          safeNumber(company_id),
-          safeNumber(company_account_id),
+          resolvedIds.product_id || null,
+          resolvedIds.company_id || null,
+          resolvedIds.company_account_id || null,
           safeText(buyer_name),
           safeText(consignee_name),
           safeText(lorry_no),
@@ -347,7 +380,7 @@ router.post("/", (req, res) => {
     return continueInsert();
   }
 
-  validateOutwardStock({ warehouse_id, product_id, qty }, (stockErr, validation) => {
+  validateOutwardStock({ warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty }, (stockErr, validation) => {
     if (stockErr) {
       return res.status(500).json({ error: stockErr.message });
     }
@@ -358,7 +391,7 @@ router.post("/", (req, res) => {
   });
 });
 
-router.put("/:id", (req, res) => {
+router.put("/:id", async (req, res) => {
   if (!userHasPermission(req.user, "outward.edit")) {
     return res.status(403).json({ error: "You do not have permission to edit outward entries" });
   }
@@ -385,14 +418,24 @@ router.put("/:id", (req, res) => {
   const rateVal = safeNumber(rate);
   const amount = qty * rateVal;
   const isSelfLoading = String(self_loading || "No").trim().toLowerCase() === "yes";
-  const normalizedWarehouseId = isSelfLoading ? null : safeNumber(warehouse_id);
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveEntryMasterIds(db, req.body);
+  } catch (resolveErr) {
+    return res.status(500).json({ error: resolveErr.message });
+  }
+
+  const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
 
   db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!row) return res.status(404).json({ error: "Outward not found" });
 
     const canAccessExistingWarehouse = !row.warehouse_id || canAccessWarehouse(req.user, row.warehouse_id);
-    const canAccessNewWarehouse = isSelfLoading || canAccessWarehouse(req.user, warehouse_id);
+    const canAccessNewWarehouse =
+      isSelfLoading ||
+      canAccessWarehouse(req.user, warehouse_id) ||
+      canAccessWarehouse(req.user, normalizedWarehouseId);
 
     if (!canAccessExistingWarehouse || !canAccessNewWarehouse) {
       return res.status(403).json({ error: "You can only edit entries for your assigned warehouse" });
@@ -412,12 +455,12 @@ router.put("/:id", (req, res) => {
         `,
         [
           safeText(date),
-          safeNumber(employee_id),
-          safeNumber(location_id),
+          resolvedIds.employee_id || null,
+          resolvedIds.location_id || null,
           normalizedWarehouseId,
-          safeNumber(product_id),
-          safeNumber(company_id),
-          safeNumber(company_account_id),
+          resolvedIds.product_id || null,
+          resolvedIds.company_id || null,
+          resolvedIds.company_account_id || null,
           safeText(buyer_name),
           safeText(consignee_name),
           safeText(lorry_no),
@@ -440,7 +483,7 @@ router.put("/:id", (req, res) => {
       return continueUpdate();
     }
 
-    validateOutwardStock({ warehouse_id, product_id, qty, outwardId: req.params.id }, (stockErr, validation) => {
+    validateOutwardStock({ warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty, outwardId: req.params.id }, (stockErr, validation) => {
       if (stockErr) {
         return res.status(500).json({ error: stockErr.message });
       }
