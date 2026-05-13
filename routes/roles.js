@@ -4,26 +4,144 @@ const { isAdminUser } = require("../middleware/auth");
 
 const router = express.Router();
 
+const DEFAULT_ROLES = [
+  {
+    name: "HO",
+    is_admin: 0,
+    permissions: [
+      "dashboard.view",
+      "employees.view",
+      "employees.edit.non_admin",
+      "companies.manage",
+      "companyAccounts.manage",
+      "locations.manage",
+      "warehouses.manage",
+      "products.manage",
+      "inward.view",
+      "inward.create",
+      "inward.edit",
+      "inward.delete",
+      "outward.view",
+      "outward.create",
+      "outward.edit",
+      "outward.delete",
+      "adjustment.manage",
+      "settlement.view",
+      "expense.entry",
+      "expense.view",
+      "expense.create",
+      "expense.edit",
+      "expense.delete",
+      "expense.postedInward",
+      "expense.palti",
+      "expense.selfLoading",
+      "expense.localSale",
+      "expense.pending",
+      "cash.mainBook.view",
+      "cash.mainBook.create",
+      "cash.mainBook.edit",
+      "cash.mainBook.delete",
+      "cash.partiesBook.view",
+      "cash.partiesBook.create",
+      "cash.partiesBook.edit",
+      "cash.partiesBook.delete",
+      "cash.employeeBook.view",
+      "cash.employeeBook.create",
+      "cash.employeeBook.edit",
+      "cash.employeeBook.delete",
+      "report.inward",
+      "report.erp",
+      "report.partyLedger",
+      "report.partyStock",
+      "report.warehouseRentLedger",
+      "report.warehouseRentMonthEnd",
+      "report.outwardSettlement",
+      "report.expense",
+      "report.paltiLorryAdjustment",
+      "report.cash",
+      "transport.manage",
+    ],
+  },
+  {
+    name: "BM",
+    is_admin: 0,
+    permissions: [
+      "dashboard.view",
+      "inward.view",
+      "inward.create",
+      "inward.edit",
+      "outward.view",
+      "outward.create",
+      "outward.edit",
+      "adjustment.manage",
+      "settlement.view",
+      "expense.entry",
+      "expense.view",
+      "expense.create",
+      "expense.edit",
+      "expense.postedInward",
+      "expense.palti",
+      "expense.selfLoading",
+      "expense.localSale",
+      "expense.pending",
+      "cash.mainBook.view",
+      "cash.mainBook.create",
+      "cash.employeeBook.view",
+      "cash.employeeBook.create",
+      "report.inward",
+      "report.outwardSettlement",
+      "report.expense",
+      "report.cash",
+    ],
+  },
+];
+
 function normalizePermissions(permissions) {
   const raw = Array.isArray(permissions) ? permissions : [];
   return Array.from(new Set(raw.filter(Boolean).map((item) => String(item).trim()).filter(Boolean)));
 }
 
+function ensureDefaultRoles(callback) {
+  db.all("SELECT LOWER(name) AS name FROM roles", [], (selectErr, rows) => {
+    if (selectErr) {
+      callback(selectErr);
+      return;
+    }
+
+    const existingNames = new Set((rows || []).map((row) => row.name));
+    const missingRoles = DEFAULT_ROLES.filter((role) => !existingNames.has(role.name.toLowerCase()));
+    if (missingRoles.length === 0) {
+      callback(null);
+      return;
+    }
+
+    const stmt = db.prepare("INSERT INTO roles (name, permissions, is_admin) VALUES (?, ?, ?)");
+    missingRoles.forEach((role) => {
+      stmt.run([role.name, JSON.stringify(role.permissions), role.is_admin]);
+    });
+    stmt.finalize(callback);
+  });
+}
+
 router.get("/", (req, res) => {
-  db.all("SELECT * FROM roles ORDER BY LOWER(name) ASC", [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    return res.json(
-      (rows || []).map((row) => ({
-        ...row,
-        permissions: (() => {
-          try {
-            return JSON.parse(row.permissions || "[]");
-          } catch (error) {
-            return [];
-          }
-        })(),
-      }))
-    );
+  ensureDefaultRoles((seedErr) => {
+    if (seedErr) return res.status(500).json({ error: seedErr.message });
+
+    db.all("SELECT * FROM roles ORDER BY LOWER(name) ASC", [], (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      return res.json(
+        (rows || []).map((row) => ({
+          ...row,
+          permissions: (() => {
+            try {
+              return JSON.parse(row.permissions || "[]");
+            } catch (error) {
+              return [];
+            }
+          })(),
+        }))
+      );
+    });
   });
 });
 
