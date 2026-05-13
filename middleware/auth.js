@@ -217,18 +217,37 @@ async function loadAssignedWarehouseAccess(userId) {
   if (!userId) {
     return {
       assigned_warehouse_ids: [],
+      assigned_sqlite_warehouse_ids: [],
       location_ids: [],
     };
   }
 
   const warehouses = await Warehouse.find(
     { employee_id: userId },
-    { _id: 1, location_id: 1 }
-  );
+    { _id: 1, name: 1, location_id: 1 }
+  ).lean();
 
   const assignedWarehouseIds = (warehouses || [])
     .map((row) => (row?._id ? String(row._id) : ""))
     .filter((item) => item);
+
+  const assignedSqliteWarehouseIds = [];
+  for (const row of warehouses || []) {
+    const warehouseName = String(row?.name || "").trim();
+    if (!warehouseName) continue;
+
+    const sqliteRow = await new Promise((resolve) => {
+      db.get(
+        "SELECT id FROM warehouses WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) ORDER BY id ASC LIMIT 1",
+        [warehouseName],
+        (err, result) => resolve(err ? null : result || null)
+      );
+    });
+
+    if (sqliteRow?.id) {
+      assignedSqliteWarehouseIds.push(Number(sqliteRow.id));
+    }
+  }
 
   const locationIds = Array.from(
     new Set(
@@ -244,6 +263,7 @@ async function loadAssignedWarehouseAccess(userId) {
 
   return {
     assigned_warehouse_ids: assignedWarehouseIds,
+    assigned_sqlite_warehouse_ids: Array.from(new Set(assignedSqliteWarehouseIds)),
     location_ids: locationIds,
   };
 }
@@ -338,6 +358,8 @@ async function buildAuthenticatedUserPayload(user) {
 
   payload.assigned_warehouse_ids =
     access.assigned_warehouse_ids;
+  payload.assigned_sqlite_warehouse_ids =
+    access.assigned_sqlite_warehouse_ids;
   payload.location_ids =
     mergedLocationIds;
 
