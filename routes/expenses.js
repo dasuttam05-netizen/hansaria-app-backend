@@ -585,96 +585,124 @@ router.get("/", (req, res) => {
   const whereParts = ["1 = 1"];
   const params = [];
 
-  if (status) {
-    whereParts.push("x.status = ?");
-    params.push(status);
+  const loadEntries = (currentEmployeeId = null) => {
+    const queryWhereParts = [...whereParts];
+    const queryParams = [...params];
+
+    if (status) {
+      queryWhereParts.push("x.status = ?");
+      queryParams.push(status);
+    }
+
+    if (currentEmployeeId) {
+      queryWhereParts.push("x.employee_id = ?");
+      queryParams.push(currentEmployeeId);
+    }
+
+    queryParams.push(...warehouseFilter.params);
+    db.all(
+      `
+      SELECT
+        x.*,
+        COALESCE(x.location_id, w.location_id) AS effective_location_id,
+        COALESCE(loc.name, wl.name) AS location_name,
+        w.name AS warehouse_name,
+        e.name AS employee_name,
+        p.name AS product_name,
+        c.name AS company_name,
+        ca.account_name AS company_account_name,
+        COALESCE(rcn.name, rf.name) AS reg_from_company_name,
+        COALESCE(
+          CASE x.send_to_kind
+            WHEN 'consignee' THEN cn_st.name
+            WHEN 'company' THEN c_st.name
+            WHEN 'warehouse' THEN wh_st.name
+            WHEN 'palti_lorry' THEN 'Palti Lorry'
+            ELSE NULL
+          END,
+          bpn.name,
+          st.name
+        ) AS send_to_company_name
+      FROM expenses x
+      LEFT JOIN warehouses w ON w.id = x.warehouse_id
+      LEFT JOIN locations loc ON loc.id = x.location_id
+      LEFT JOIN locations wl ON wl.id = w.location_id
+      LEFT JOIN employees e ON e.id = x.employee_id
+      LEFT JOIN products p ON p.id = x.product_id
+      LEFT JOIN companies c ON c.id = x.company_id
+      LEFT JOIN company_accounts ca ON ca.id = x.company_account_id
+      LEFT JOIN consignee_names rcn ON rcn.id = x.reg_from_consignee_id
+      LEFT JOIN companies rf ON rf.id = x.reg_from_company_id
+      LEFT JOIN consignee_names cn_st ON x.send_to_kind = 'consignee' AND cn_st.id = x.send_to_ref_id
+      LEFT JOIN companies c_st ON x.send_to_kind = 'company' AND c_st.id = x.send_to_ref_id
+      LEFT JOIN warehouses wh_st ON x.send_to_kind = 'warehouse' AND wh_st.id = x.send_to_ref_id
+      LEFT JOIN buyer_names bpn ON bpn.id = x.send_to_party_id
+      LEFT JOIN companies st ON st.id = x.send_to_company_id
+      WHERE ${queryWhereParts.join(" AND ")} ${warehouseFilter.clause}
+      ORDER BY x.id DESC
+      `,
+      queryParams,
+      (err, rows) => {
+        if (err) {
+          return res.status(500).json({ error: err.message });
+        }
+
+        const entries = rows || [];
+        if (entries.length === 0) {
+          return res.json([]);
+        }
+
+        const expenseIds = entries.map((entry) => entry.id);
+        db.all(
+          `
+          SELECT expense_id, id, line_no, particular_name, bags, rate, amount
+          FROM expense_items
+          WHERE expense_id IN (${expenseIds.map(() => "?").join(",")})
+          ORDER BY line_no ASC, id ASC
+          `,
+          expenseIds,
+          (itemsErr, items) => {
+            if (itemsErr) {
+              return res.status(500).json({ error: itemsErr.message });
+            }
+
+            const itemMap = new Map();
+            (items || []).forEach((item) => {
+              if (!itemMap.has(item.expense_id)) {
+                itemMap.set(item.expense_id, []);
+              }
+              itemMap.get(item.expense_id).push(item);
+            });
+
+            return res.json(
+              entries.map((entry) => ({
+                ...entry,
+                items: itemMap.get(entry.id) || [],
+              }))
+            );
+          }
+        );
+      }
+    );
+  };
+
+  const shouldScopeToOwnEmployee =
+    req.user?.role !== "admin" &&
+    !userHasPermission(req.user, "employees.view") &&
+    !userHasPermission(req.user, "cash.create");
+
+  if (!shouldScopeToOwnEmployee) {
+    loadEntries();
+    return;
   }
 
-  params.push(...warehouseFilter.params);
-  db.all(
-    `
-    SELECT
-      x.*,
-      COALESCE(x.location_id, w.location_id) AS effective_location_id,
-      COALESCE(loc.name, wl.name) AS location_name,
-      w.name AS warehouse_name,
-      e.name AS employee_name,
-      p.name AS product_name,
-      c.name AS company_name,
-      ca.account_name AS company_account_name,
-      COALESCE(rcn.name, rf.name) AS reg_from_company_name,
-      COALESCE(
-        CASE x.send_to_kind
-          WHEN 'consignee' THEN cn_st.name
-          WHEN 'company' THEN c_st.name
-          WHEN 'warehouse' THEN wh_st.name
-          WHEN 'palti_lorry' THEN 'Palti Lorry'
-          ELSE NULL
-        END,
-        bpn.name,
-        st.name
-      ) AS send_to_company_name
-    FROM expenses x
-    LEFT JOIN warehouses w ON w.id = x.warehouse_id
-    LEFT JOIN locations loc ON loc.id = x.location_id
-    LEFT JOIN locations wl ON wl.id = w.location_id
-    LEFT JOIN employees e ON e.id = x.employee_id
-    LEFT JOIN products p ON p.id = x.product_id
-    LEFT JOIN companies c ON c.id = x.company_id
-    LEFT JOIN company_accounts ca ON ca.id = x.company_account_id
-    LEFT JOIN consignee_names rcn ON rcn.id = x.reg_from_consignee_id
-    LEFT JOIN companies rf ON rf.id = x.reg_from_company_id
-    LEFT JOIN consignee_names cn_st ON x.send_to_kind = 'consignee' AND cn_st.id = x.send_to_ref_id
-    LEFT JOIN companies c_st ON x.send_to_kind = 'company' AND c_st.id = x.send_to_ref_id
-    LEFT JOIN warehouses wh_st ON x.send_to_kind = 'warehouse' AND wh_st.id = x.send_to_ref_id
-    LEFT JOIN buyer_names bpn ON bpn.id = x.send_to_party_id
-    LEFT JOIN companies st ON st.id = x.send_to_company_id
-    WHERE ${whereParts.join(" AND ")} ${warehouseFilter.clause}
-    ORDER BY x.id DESC
-    `,
-    params,
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-
-      const entries = rows || [];
-      if (entries.length === 0) {
-        return res.json([]);
-      }
-
-      const expenseIds = entries.map((entry) => entry.id);
-      db.all(
-        `
-        SELECT expense_id, id, line_no, particular_name, bags, rate, amount
-        FROM expense_items
-        WHERE expense_id IN (${expenseIds.map(() => "?").join(",")})
-        ORDER BY line_no ASC, id ASC
-        `,
-        expenseIds,
-        (itemsErr, items) => {
-          if (itemsErr) {
-            return res.status(500).json({ error: itemsErr.message });
-          }
-
-          const itemMap = new Map();
-          (items || []).forEach((item) => {
-            if (!itemMap.has(item.expense_id)) {
-              itemMap.set(item.expense_id, []);
-            }
-            itemMap.get(item.expense_id).push(item);
-          });
-
-          return res.json(
-            entries.map((entry) => ({
-              ...entry,
-              items: itemMap.get(entry.id) || [],
-            }))
-          );
-        }
-      );
-    }
-  );
+  resolveMongoMasterId(req.user?.id, MongoEmployee, "employees")
+    .then((currentEmployeeId) => {
+      loadEntries(currentEmployeeId || -1);
+    })
+    .catch((err) => {
+      res.status(500).json({ error: err.message });
+    });
 });
 
 
