@@ -90,6 +90,7 @@ router.get("/", async (req, res) => {
     const employees =
       await Employee.find()
         .populate("location_id")
+        .populate("location_ids")
         .sort({ created_at: -1 });
 
     const formatted =
@@ -101,6 +102,11 @@ router.get("/", async (req, res) => {
 
         location_id:
           getRecordId(row.location_id),
+
+        location_ids:
+          Array.isArray(row.location_ids)
+            ? row.location_ids.map(getRecordId)
+            : [],
 
         employee_id:
           row.employee_id || "",
@@ -138,7 +144,9 @@ router.get("/:id", async (req, res) => {
     const row =
       await Employee.findById(
         req.params.id
-      );
+      )
+        .populate("location_id")
+        .populate("location_ids");
 
     if (!row) {
 
@@ -152,6 +160,11 @@ router.get("/:id", async (req, res) => {
       ...row.toObject(),
 
       id: row._id,
+
+      location_ids:
+        Array.isArray(row.location_ids)
+          ? row.location_ids.map(getRecordId)
+          : [],
 
       employee_id:
         row.employee_id || "",
@@ -195,6 +208,7 @@ router.post("/", async (req, res) => {
       username,
       password,
       location_id,
+      location_ids,
       role,
       permissions,
       opening_balance,
@@ -211,6 +225,23 @@ router.post("/", async (req, res) => {
       return res.status(400).json({
         error:
           "Name, username, and password are required",
+      });
+    }
+
+    // PREVENT ROLE ESCALATION
+    const safeRole =
+      normalizeRole(
+        role || "staff"
+      );
+
+    if (
+      safeRole === "admin" &&
+      !isAdminUser(req.user)
+    ) {
+
+      return res.status(403).json({
+        error:
+          "Only admin can create admin users",
       });
     }
 
@@ -232,41 +263,73 @@ router.post("/", async (req, res) => {
     // GENERATE EMPLOYEE ID
     // =========================
 
-    const lastEmployee =
-      await Employee.findOne()
-        .sort({ createdAt: -1 });
+    let employee_id = "EMP001";
 
-    let nextNumber = 1;
+    if (location_id) {
 
-    if (
-      lastEmployee &&
-      lastEmployee.employee_id
-    ) {
-
-      const lastNumber =
-        parseInt(
-          lastEmployee.employee_id.replace(
-            "EMP",
-            ""
-          )
+      const location =
+        await Location.findById(
+          location_id
         );
 
-      nextNumber =
-        lastNumber + 1;
+      if (location && location.abbr) {
+
+        const abbr =
+          String(location.abbr)
+            .trim()
+            .toUpperCase();
+
+        // Count existing employees for this location
+        const count =
+          await Employee.countDocuments({
+            location_id,
+          });
+
+        const nextSeq =
+          (count + 1)
+            .toString()
+            .padStart(2, "0");
+
+        employee_id =
+          abbr + nextSeq;
+      }
     }
 
-    const employee_id =
-      "EMP" +
-      String(nextNumber).padStart(
-        3,
-        "0"
-      );
+    // Fallback if no location abbr
+    if (
+      employee_id === "EMP001"
+    ) {
 
+      const lastEmployee =
+        await Employee.findOne()
+          .sort({ createdAt: -1 });
 
-    const safeRole =
-      normalizeRole(
-        role || "staff"
-      );
+      let nextNumber = 1;
+
+      if (
+        lastEmployee &&
+        lastEmployee.employee_id
+      ) {
+
+        const lastNumber =
+          parseInt(
+            lastEmployee
+              .employee_id
+              .replace(/\D/g, "")
+          );
+
+        if (!isNaN(lastNumber)) {
+
+          nextNumber =
+            lastNumber + 1;
+        }
+      }
+
+      employee_id =
+        "EMP" +
+        String(nextNumber)
+          .padStart(3, "0");
+    }
 
     const safePermissions =
       safeRole === "admin"
@@ -281,6 +344,16 @@ router.post("/", async (req, res) => {
         password,
         10
       );
+
+    // Parse location_ids array
+    const safeLocationIds =
+      Array.isArray(location_ids)
+        ? location_ids
+          .map((id) =>
+            String(id).trim()
+          )
+          .filter((id) => id)
+        : [];
 
     const employee =
       await Employee.create({
@@ -298,6 +371,9 @@ router.post("/", async (req, res) => {
 
         location_id:
           location_id || null,
+
+        location_ids:
+          safeLocationIds,
 
         role: safeRole,
 
@@ -339,6 +415,9 @@ router.post("/", async (req, res) => {
 
       location_id:
         employee.location_id,
+
+      location_ids:
+        employee.location_ids,
 
       role:
         employee.role,
@@ -405,6 +484,7 @@ router.put("/:id", async (req, res) => {
       username,
       password,
       location_id,
+      location_ids,
       role,
       permissions,
       opening_balance,
@@ -424,12 +504,42 @@ router.put("/:id", async (req, res) => {
       });
     }
 
+    // PREVENT ROLE ESCALATION
     const safeRole =
       normalizeRole(
         role ||
           target.role ||
           "staff"
       );
+
+    // Check if trying to set admin role without being admin
+    if (
+      safeRole === "admin" &&
+      !admin
+    ) {
+
+      return res.status(403).json({
+        error:
+          "Only admin can set admin role",
+      });
+    }
+
+    // Check if trying to change admin's role
+    const targetIsAdmin =
+      target.role === "admin" ||
+      (Array.isArray(target.permissions) &&
+        target.permissions.includes("all"));
+
+    if (
+      targetIsAdmin &&
+      !admin
+    ) {
+
+      return res.status(403).json({
+        error:
+          "Only admin can edit admin user",
+      });
+    }
 
     const safePermissions =
       safeRole === "admin"
@@ -438,6 +548,16 @@ router.put("/:id", async (req, res) => {
             permissions,
             safeRole
           );
+
+    // Parse location_ids array
+    const safeLocationIds =
+      Array.isArray(location_ids)
+        ? location_ids
+          .map((id) =>
+            String(id).trim()
+          )
+          .filter((id) => id)
+        : [];
 
     const updateData = {
 
@@ -450,6 +570,9 @@ router.put("/:id", async (req, res) => {
 
       location_id:
         location_id || null,
+
+      location_ids:
+        safeLocationIds,
 
       role:
         safeRole,
