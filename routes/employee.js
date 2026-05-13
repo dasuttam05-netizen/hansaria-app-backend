@@ -90,7 +90,6 @@ router.get("/", async (req, res) => {
     const employees =
       await Employee.find()
         .populate("location_id")
-        .populate("location_ids")
         .sort({ created_at: -1 });
 
     const formatted =
@@ -145,8 +144,7 @@ router.get("/:id", async (req, res) => {
       await Employee.findById(
         req.params.id
       )
-        .populate("location_id")
-        .populate("location_ids");
+        .populate("location_id");
 
     if (!row) {
 
