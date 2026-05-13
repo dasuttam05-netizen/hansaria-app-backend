@@ -53,10 +53,18 @@ const ROLE_DEFAULT_PERMISSIONS = {
     "expense.selfLoading",
     "expense.localSale",
     "expense.pending",
-    "cash.view",
-    "cash.create",
-    "cash.edit",
-    "cash.delete",
+    "cash.mainBook.view",
+    "cash.mainBook.create",
+    "cash.mainBook.edit",
+    "cash.mainBook.delete",
+    "cash.partiesBook.view",
+    "cash.partiesBook.create",
+    "cash.partiesBook.edit",
+    "cash.partiesBook.delete",
+    "cash.employeeBook.view",
+    "cash.employeeBook.create",
+    "cash.employeeBook.edit",
+    "cash.employeeBook.delete",
     "transport.manage",
     ...REPORT_PERMISSION_KEYS,
   ],
@@ -100,7 +108,7 @@ const LEGACY_PERMISSION_MAP = {
   "expense.palti": ["expense.view", "report.expense"],
   "expense.selfLoading": ["expense.view", "report.expense", "outward.view"],
   "expense.localSale": ["expense.view", "report.expense"],
-  "expense.pending": ["cash.view"],
+  "expense.pending": ["cash.mainBook.view"],
   "settlement.view": ["reports.view"],
   "report.inward": ["reports.view"],
   "report.erp": ["reports.view"],
@@ -113,6 +121,11 @@ const LEGACY_PERMISSION_MAP = {
   "report.paltiLorryAdjustment": ["report.expense", "reports.view"],
   "report.cash": ["reports.view"],
   "warehouses.view": ["warehouses.manage"],
+  // Backward compatibility for old cash permissions
+  "cash.view": ["cash.mainBook.view", "cash.partiesBook.view", "cash.employeeBook.view"],
+  "cash.create": ["cash.mainBook.create", "cash.partiesBook.create", "cash.employeeBook.create"],
+  "cash.edit": ["cash.mainBook.edit", "cash.partiesBook.edit", "cash.employeeBook.edit"],
+  "cash.delete": ["cash.mainBook.delete", "cash.partiesBook.delete", "cash.employeeBook.delete"],
 };
 
 function normalizeRole(
@@ -309,13 +322,27 @@ async function buildAuthenticatedUserPayload(user) {
   const access =
     await loadAssignedWarehouseAccess(payload.id);
 
+  // Merge warehouse location IDs with employee's own location_ids
+  const employeeLocationIds = Array.isArray(user.location_ids)
+    ? user.location_ids
+      .map((id) => (id?._id ? String(id._id) : String(id)))
+      .filter((id) => id)
+    : [];
+
+  const mergedLocationIds = Array.from(
+    new Set([
+      ...access.location_ids,
+      ...employeeLocationIds,
+    ])
+  );
+
   payload.assigned_warehouse_ids =
     access.assigned_warehouse_ids;
   payload.location_ids =
-    access.location_ids;
+    mergedLocationIds;
 
-  if (!payload.location_id && access.location_ids.length) {
-    payload.location_id = access.location_ids[0];
+  if (!payload.location_id && mergedLocationIds.length) {
+    payload.location_id = mergedLocationIds[0];
   }
 
   return payload;
