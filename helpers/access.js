@@ -1,5 +1,10 @@
 const { userHasPermission } = require("../middleware/auth");
 
+function assignedWarehouseIdsForSql(user) {
+  const sqliteIds = user?.assigned_sqlite_warehouse_ids || [];
+  return sqliteIds.length > 0 ? sqliteIds : user?.assigned_warehouse_ids || [];
+}
+
 function canAccessWarehouse(user, warehouseId) {
   if (!user) {
     return false;
@@ -9,7 +14,7 @@ function canAccessWarehouse(user, warehouseId) {
     return true;
   }
 
-  const assignedIds = user.assigned_warehouse_ids || [];
+  const assignedIds = assignedWarehouseIdsForSql(user);
   const target = String(warehouseId || "");
   return assignedIds.some((id) => String(id) === target || Number(id) === Number(warehouseId));
 }
@@ -19,7 +24,7 @@ function assignedWarehouseFilter(user, columnName = "warehouse_id") {
     return { clause: "", params: [] };
   }
 
-  const assignedIds = user.assigned_warehouse_ids || [];
+  const assignedIds = assignedWarehouseIdsForSql(user);
   if (assignedIds.length === 0) {
     return { clause: ` AND 1 = 0`, params: [] };
   }
