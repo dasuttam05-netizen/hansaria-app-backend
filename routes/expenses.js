@@ -285,7 +285,10 @@ async function resolveExpenseMasterIds(values) {
 }
 
 async function resolveAssignedWarehouseIds(user) {
-  const assignedIds = user?.assigned_warehouse_ids || [];
+  const assignedIds = [
+    ...(user?.assigned_sqlite_warehouse_ids || []),
+    ...(user?.assigned_warehouse_ids || []),
+  ];
   const resolvedIds = [];
 
   for (const assignedId of assignedIds) {
@@ -340,6 +343,11 @@ function resolveWarehouseForLocation(user, locationId, callback) {
         }
 
         if (!rows || rows.length === 0) {
+          if (!canUseAllWarehouses && assignedIds.length === 1) {
+            callback(null, Number(assignedIds[0]));
+            return;
+          }
+
           callback(new Error("No warehouse is mapped with the selected location"));
           return;
         }
