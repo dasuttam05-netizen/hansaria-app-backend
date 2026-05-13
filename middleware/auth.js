@@ -200,6 +200,41 @@ async function loadAssignedWarehouseIds(userId) {
     .filter((item) => item);
 }
 
+async function loadAssignedWarehouseAccess(userId) {
+  if (!userId) {
+    return {
+      assigned_warehouse_ids: [],
+      location_ids: [],
+    };
+  }
+
+  const warehouses = await Warehouse.find(
+    { employee_id: userId },
+    { _id: 1, location_id: 1 }
+  );
+
+  const assignedWarehouseIds = (warehouses || [])
+    .map((row) => (row?._id ? String(row._id) : ""))
+    .filter((item) => item);
+
+  const locationIds = Array.from(
+    new Set(
+      (warehouses || [])
+        .map((row) => {
+          const location = row?.location_id;
+          if (!location) return "";
+          return location._id ? String(location._id) : String(location);
+        })
+        .filter((item) => item)
+    )
+  );
+
+  return {
+    assigned_warehouse_ids: assignedWarehouseIds,
+    location_ids: locationIds,
+  };
+}
+
 function buildUserPayload(
   user
 ) {
@@ -226,8 +261,11 @@ function buildUserPayload(
       ),
 
     location_id:
-      user.location_id ||
-      null,
+      user.location_id?._id
+        ? String(user.location_id._id)
+        : user.location_id
+        ? String(user.location_id)
+        : null,
   };
 }
 
@@ -268,8 +306,18 @@ function userHasPermission(
 
 async function buildAuthenticatedUserPayload(user) {
   const payload = buildUserPayload(user);
+  const access =
+    await loadAssignedWarehouseAccess(payload.id);
+
   payload.assigned_warehouse_ids =
-    await loadAssignedWarehouseIds(payload.id);
+    access.assigned_warehouse_ids;
+  payload.location_ids =
+    access.location_ids;
+
+  if (!payload.location_id && access.location_ids.length) {
+    payload.location_id = access.location_ids[0];
+  }
+
   return payload;
 }
 
