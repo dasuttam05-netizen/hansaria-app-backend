@@ -12,6 +12,8 @@ const locationSchema =
     name: String,
 
     address: String,
+
+    abbr: String,
   });
 
 
