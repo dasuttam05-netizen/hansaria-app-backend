@@ -64,7 +64,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const { name, address } = req.body;
+    const { name, address, abbr } = req.body;
 
     if (!name || !address) {
       return res.status(400).json({
@@ -76,6 +76,7 @@ router.post("/", async (req, res) => {
     const location = await Location.create({
       name,
       address,
+      abbr: abbr || "",
     });
 
     res.json(location);
@@ -100,7 +101,7 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    const { name, address } = req.body;
+    const { name, address, abbr } = req.body;
 
     const updated =
       await Location.findByIdAndUpdate(
@@ -108,6 +109,7 @@ router.put("/:id", async (req, res) => {
         {
           name,
           address,
+          abbr: abbr || "",
         },
         {
           new: true,
