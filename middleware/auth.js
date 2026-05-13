@@ -137,11 +137,11 @@ function normalizeRole(
       .trim()
       .toLowerCase();
 
-  return ROLE_DEFAULT_PERMISSIONS[
-    normalized
-  ]
-    ? normalized
-    : "staff";
+  if (ROLE_DEFAULT_PERMISSIONS[normalized]) {
+    return normalized;
+  }
+
+  return String(role || "staff").trim() || "staff";
 }
 
 function parsePermissions(
