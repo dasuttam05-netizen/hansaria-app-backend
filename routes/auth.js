@@ -17,16 +17,45 @@ const {
 
 const router = express.Router();
 
+function getRecordId(value) {
+  if (!value) return null;
+  if (value._id) return String(value._id);
+  if (value.id) return String(value.id);
+  return String(value);
+}
+
 async function attachAssignedWarehousesMongo(user) {
   const warehouses = await Warehouse.find({
     employee_id: user.id,
-  }).sort({ name: 1 });
+  })
+    .populate("location_id", "name")
+    .sort({ name: 1 });
+
+  const normalizedWarehouses = (warehouses || []).map((row) => {
+    const plain = row.toObject ? row.toObject() : row;
+    return {
+      ...plain,
+      id: getRecordId(row),
+      location_id: getRecordId(row.location_id),
+      location_name: row.location_id?.name || plain.location_name || "",
+    };
+  });
+
+  const locationIds = Array.from(
+    new Set(
+      normalizedWarehouses
+        .map((row) => row.location_id)
+        .filter((item) => item)
+    )
+  );
 
   return {
     ...user,
-    assigned_warehouses: warehouses || [],
-    assigned_warehouse_ids: (warehouses || []).map(
-      (row) => row._id
+    location_id: getRecordId(user.location_id) || locationIds[0] || null,
+    location_ids: locationIds,
+    assigned_warehouses: normalizedWarehouses,
+    assigned_warehouse_ids: normalizedWarehouses.map(
+      (row) => row.id
     ),
   };
 }
