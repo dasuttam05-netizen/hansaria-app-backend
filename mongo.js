@@ -44,6 +44,12 @@ const employeeSchema =
       ref: "Location",
     },
 
+    location_ids: [{
+      type:
+        mongoose.Schema.Types.ObjectId,
+      ref: "Location",
+    }],
+
     role: String,
 
     permissions: [String],
