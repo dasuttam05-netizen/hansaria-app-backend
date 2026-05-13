@@ -33,6 +33,13 @@ function parseWarehouseIds(input) {
   );
 }
 
+function getRecordId(value) {
+  if (!value) return null;
+  if (value._id) return String(value._id);
+  if (value.id) return String(value.id);
+  return String(value);
+}
+
 async function syncEmployeeWarehouses(
   employeeId,
   assignedWarehouseIds
@@ -91,6 +98,9 @@ router.get("/", async (req, res) => {
         ...row.toObject(),
 
         id: row._id,
+
+        location_id:
+          getRecordId(row.location_id),
 
         employee_id:
           row.employee_id || "",
@@ -299,9 +309,9 @@ router.post("/", async (req, res) => {
             opening_balance || 0
           ),
 
-        opening_balance_type:
+      opening_balance_type:
           String(
-            opening_balance || "dr"
+            opening_balance_type || "dr"
           ).toLowerCase() === "cr"
             ? "cr"
             : "dr",
