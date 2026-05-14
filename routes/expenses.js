@@ -821,7 +821,9 @@ router.get("/:id", (req, res) => {
 });
 
 router.post("/:id/approve-cash-book", (req, res) => {
-  if (!userHasPermission(req.user, "expense.edit") || !userHasPermission(req.user, "cash.create")) {
+  const roleName = String(req.user?.role || "").trim().toLowerCase();
+  const canApproveAsRole = roleName === "ho" || roleName === "bm";
+  if (!userHasPermission(req.user, "expense.edit") || (!userHasPermission(req.user, "cash.create") && !canApproveAsRole)) {
     return res.status(403).json({ error: "You need both expense edit and cash create permission to approve to cash book" });
   }
   const { id } = req.params;
