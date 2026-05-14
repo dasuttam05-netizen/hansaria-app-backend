@@ -343,6 +343,32 @@ async function resolveAssignedWarehouseIds(user) {
   return Array.from(new Set(resolvedIds));
 }
 
+async function resolveUserAccessibleLocationIds(user) {
+  const rawLocationIds = [
+    user?.location_id,
+    ...(Array.isArray(user?.location_ids) ? user.location_ids : []),
+  ].filter(Boolean);
+
+  const resolvedIds = [];
+  for (const rawLocationId of rawLocationIds) {
+    if (isPositiveNumber(rawLocationId)) {
+      resolvedIds.push(Number(rawLocationId));
+      continue;
+    }
+
+    const resolvedLocationId = await resolveMongoMasterId(
+      rawLocationId,
+      MongoLocation,
+      "locations"
+    );
+    if (resolvedLocationId) {
+      resolvedIds.push(Number(resolvedLocationId));
+    }
+  }
+
+  return Array.from(new Set(resolvedIds));
+}
+
 async function resolveCurrentSqliteEmployeeId(user) {
   const usernameCandidates = [];
   const directUsername = String(user?.username || "").trim();
@@ -407,9 +433,17 @@ function resolveWarehouseForLocation(user, locationId, callback) {
   }
 
   resolveAssignedWarehouseIds(user)
-    .then((assignedIds) => {
+    .then(async (assignedIds) => {
       const canUseAllWarehouses =
         !user || user.role === "admin" || userHasPermission(user, "warehouses.manage");
+      const accessibleLocationIds = canUseAllWarehouses
+        ? []
+        : await resolveUserAccessibleLocationIds(user);
+      const hasExplicitLocationScope = !canUseAllWarehouses && accessibleLocationIds.length > 0;
+      const hasLocationAccess = canUseAllWarehouses
+        ? true
+        : !hasExplicitLocationScope || accessibleLocationIds.includes(normalizedLocationId);
+      const applyWarehouseAssignmentFilter = !canUseAllWarehouses && assignedIds.length > 0;
 
       const params = [normalizedLocationId];
       let sql = `
@@ -418,11 +452,12 @@ function resolveWarehouseForLocation(user, locationId, callback) {
         WHERE location_id = ?
       `;
 
-      if (!canUseAllWarehouses) {
-        if (assignedIds.length === 0) {
-          callback(new Error("You do not have access to this location"));
-          return;
-        }
+      if (!canUseAllWarehouses && !hasLocationAccess) {
+        callback(new Error("You do not have access to this location"));
+        return;
+      }
+
+      if (applyWarehouseAssignmentFilter) {
         sql += ` AND id IN (${assignedIds.map(() => "?").join(",")})`;
         params.push(...assignedIds);
       }
@@ -436,7 +471,7 @@ function resolveWarehouseForLocation(user, locationId, callback) {
         }
 
         if (!rows || rows.length === 0) {
-          if (!canUseAllWarehouses && assignedIds.length === 1) {
+          if (applyWarehouseAssignmentFilter && assignedIds.length === 1) {
             callback(null, Number(assignedIds[0]));
             return;
           }
