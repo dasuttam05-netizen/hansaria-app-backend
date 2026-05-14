@@ -545,8 +545,8 @@ router.get("/opening/main", (req, res) => {
 });
 
 router.put("/opening/main", (req, res) => {
-  if (!isAdminUser(req.user)) {
-    return res.status(403).json({ error: "Only admin can update main cash opening balance" });
+  if (!userHasPermission(req.user, "cash.mainBook.edit")) {
+    return res.status(403).json({ error: "You do not have permission to update main cash opening balance" });
   }
 
   const openingAmount = Number(req.body?.main_opening_balance || 0);
