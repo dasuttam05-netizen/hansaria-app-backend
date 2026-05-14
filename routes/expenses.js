@@ -916,9 +916,12 @@ router.get("/:id", (req, res) => {
       `
       SELECT
         e.*,
+        COALESCE(e.location_id, w.location_id) AS effective_location_id,
+        COALESCE(l.name, wl.name) AS effective_location_name,
         l.name AS location_name,
         w.name AS warehouse_name,
         w.location_id AS warehouse_location_id,
+        wl.name AS warehouse_location_name,
         emp.name AS employee_name,
         pr.name AS product_name,
         c.name AS company_name,
@@ -929,6 +932,7 @@ router.get("/:id", (req, res) => {
       FROM expenses e
       LEFT JOIN locations l ON l.id = e.location_id
       LEFT JOIN warehouses w ON w.id = e.warehouse_id
+      LEFT JOIN locations wl ON wl.id = w.location_id
       LEFT JOIN employees emp ON emp.id = e.employee_id
       LEFT JOIN products pr ON pr.id = e.product_id
       LEFT JOIN companies c ON c.id = e.company_id
