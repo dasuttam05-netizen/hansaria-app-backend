@@ -21,6 +21,40 @@ const WORK_DESCRIPTION_OPTIONS = [
   "Others",
 ];
 
+const EXPENSE_PARTICULAR_DEFAULTS = [
+  "KANTA",
+  "JALPANI",
+  "PARKING",
+  "PALTI",
+  "SAZAI",
+  "LOADING",
+  "UNLOADING",
+  "NEW BAGS",
+  "ADVANCE",
+  "REFILLING",
+  "KAMALI",
+  "DALA",
+  "SUTULI",
+  "EXTRA",
+  "VEHICLE FREIGHT",
+  "BUSINESS TRAVEL",
+  "HOTEL",
+  "FOODING",
+  "GODOWN RENT",
+  "BIKE KM",
+];
+
+function buildDefaultExpenseItems() {
+  return EXPENSE_PARTICULAR_DEFAULTS.map((name, index) => ({
+    id: null,
+    line_no: index + 1,
+    particular_name: name,
+    bags: 0,
+    rate: 0,
+    amount: 0,
+  }));
+}
+
 function nextVoucher(callback) {
   db.get(
     "SELECT id FROM expenses ORDER BY id DESC LIMIT 1",
@@ -959,9 +993,14 @@ router.get("/:id", (req, res) => {
             return res.status(500).json({ error: itemsErr.message });
           }
 
+          const normalizedItems =
+            Array.isArray(items) && items.length > 0
+              ? items
+              : buildDefaultExpenseItems();
+
           return res.json({
             ...row,
-            items: Array.isArray(items) ? items : [],
+            items: normalizedItems,
           });
         });
       }
@@ -1516,9 +1555,10 @@ router.put("/:id", async (req, res) => {
         (await resolveCurrentSqliteEmployeeId(req.user).catch(() => null));
     }
 
-    const safeItems = Array.isArray(items)
+    const hasItemsPayload = Array.isArray(items);
+    const safeItems = hasItemsPayload
       ? items.filter((item) => item && item.particular_name)
-      : [];
+      : null;
 
     const updateExpenseWithWarehouse = (resolvedWarehouseId) => {
       const computedBalance = calculateExpenseBalance(
@@ -1581,16 +1621,20 @@ router.put("/:id", async (req, res) => {
           return res.status(500).json({ error: updateErr.message });
         }
 
+        if (!hasItemsPayload) {
+          return res.json({ updated: true });
+        }
+
+        if (!safeItems || safeItems.length === 0) {
+          return res.json({ updated: true });
+        }
+
         db.run("DELETE FROM expense_items WHERE expense_id = ?", [id], (deleteErr) => {
           if (deleteErr) {
             return res.status(500).json({ error: deleteErr.message });
           }
 
-          if (safeItems.length === 0) {
-            return res.json({ updated: true });
-          }
-
-        const stmt = db.prepare(
+          const stmt = db.prepare(
             `
             INSERT INTO expense_items (expense_id, line_no, particular_name, bags, rate, amount)
             VALUES (?, ?, ?, ?, ?, ?)
