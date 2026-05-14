@@ -713,8 +713,10 @@ router.get("/", (req, res) => {
     );
   };
 
+  const normalizedRole = String(req.user?.role || "").trim().toLowerCase();
+  const hasGlobalExpenseViewRole = ["admin", "ho", "bm"].includes(normalizedRole);
   const shouldScopeToOwnEmployee =
-    req.user?.role !== "admin" &&
+    !hasGlobalExpenseViewRole &&
     !userHasPermission(req.user, "employees.view") &&
     !userHasPermission(req.user, "cash.create");
 
@@ -1375,11 +1377,7 @@ router.put("/:id", async (req, res) => {
       ? items.filter((item) => item && item.particular_name)
       : [];
 
-    resolveWarehouseForLocation(req.user, resolvedIds.location_id, (warehouseErr, resolvedWarehouseId) => {
-      if (warehouseErr) {
-        return res.status(400).json({ error: warehouseErr.message });
-      }
-
+    const updateExpenseWithWarehouse = (resolvedWarehouseId) => {
       const computedBalance = calculateExpenseBalance(
         loading,
         unloading,
@@ -1477,6 +1475,27 @@ router.put("/:id", async (req, res) => {
         });
       }
       );
+    };
+
+    resolveWarehouseForLocation(req.user, resolvedIds.location_id, (warehouseErr, resolvedWarehouseId) => {
+      if (warehouseErr) {
+        const isNoWarehouseMappedError = String(warehouseErr.message || "").includes(
+          "No warehouse is mapped with the selected location"
+        );
+        const existingWarehouseId = Number(row.warehouse_id) || null;
+
+        if (
+          isNoWarehouseMappedError &&
+          existingWarehouseId &&
+          canAccessWarehouse(req.user, existingWarehouseId)
+        ) {
+          return updateExpenseWithWarehouse(existingWarehouseId);
+        }
+
+        return res.status(400).json({ error: warehouseErr.message });
+      }
+
+      return updateExpenseWithWarehouse(resolvedWarehouseId);
     });
   });
 });
