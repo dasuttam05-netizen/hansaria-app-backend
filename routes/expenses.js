@@ -169,17 +169,23 @@ async function createSqliteMasterFromMongo(model, sqliteTable, doc) {
   if (sqliteTable === "employees") {
     const locationId = await resolveMongoMasterId(doc.location_id, MongoLocation, "locations");
     const username = String(doc.username || "").trim() || null;
+    const employeeName = String(doc.name || "").trim();
 
     if (username) {
       const existingByUsername = await findSqliteEmployeeIdByUsername(username);
       if (existingByUsername) return existingByUsername;
     }
 
+    if (employeeName) {
+      const existingByName = await findSqliteIdByName("employees", employeeName);
+      if (existingByName) return existingByName;
+    }
+
     try {
       const result = await dbRun(
-        "INSERT INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
-          doc.name || "",
+          employeeName,
           doc.address || "",
           locationId || null,
           username,
@@ -188,13 +194,34 @@ async function createSqliteMasterFromMongo(model, sqliteTable, doc) {
           JSON.stringify(doc.permissions || []),
         ]
       );
-      return result.lastID || null;
+
+      if ((Number(result?.changes) || 0) > 0 && Number(result?.lastID) > 0) {
+        return Number(result.lastID);
+      }
+
+      if (username) {
+        const existingByUsername = await findSqliteEmployeeIdByUsername(username);
+        if (existingByUsername) return existingByUsername;
+      }
+
+      if (employeeName) {
+        const existingByName = await findSqliteIdByName("employees", employeeName);
+        if (existingByName) return existingByName;
+      }
+
+      return null;
     } catch (err) {
       if (
         username &&
         String(err?.message || "").includes("UNIQUE constraint failed: employees.username")
       ) {
-        return findSqliteEmployeeIdByUsername(username);
+        const existingByUsername = await findSqliteEmployeeIdByUsername(username);
+        if (existingByUsername) return existingByUsername;
+      }
+
+      if (employeeName) {
+        const existingByName = await findSqliteIdByName("employees", employeeName);
+        if (existingByName) return existingByName;
       }
       throw err;
     }
