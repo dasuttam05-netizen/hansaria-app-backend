@@ -97,6 +97,16 @@ function isPositiveNumber(value) {
   return Number.isFinite(numericValue) && numericValue > 0;
 }
 
+function shouldRestrictToOwnEmployee(user) {
+  const normalizedRole = String(user?.role || "").trim().toLowerCase();
+  const hasGlobalExpenseViewRole = ["admin", "ho", "bm"].includes(normalizedRole);
+  return (
+    !hasGlobalExpenseViewRole &&
+    !userHasPermission(user, "employees.view") &&
+    !userHasPermission(user, "cash.create")
+  );
+}
+
 function dbGet(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => {
@@ -331,6 +341,62 @@ async function resolveAssignedWarehouseIds(user) {
   }
 
   return Array.from(new Set(resolvedIds));
+}
+
+async function resolveCurrentSqliteEmployeeId(user) {
+  const usernameCandidates = [];
+  const directUsername = String(user?.username || "").trim();
+  if (directUsername) {
+    usernameCandidates.push(directUsername);
+  }
+
+  const userId = user?.id;
+  let mongoUserDoc = null;
+  if (userId && !isPositiveNumber(userId)) {
+    mongoUserDoc = await MongoEmployee.findById(userId).lean().catch(() => null);
+  }
+
+  const mongoUsername = String(mongoUserDoc?.username || "").trim();
+  if (
+    mongoUsername &&
+    !usernameCandidates.some((value) => value.toLowerCase() === mongoUsername.toLowerCase())
+  ) {
+    usernameCandidates.push(mongoUsername);
+  }
+
+  for (const candidateUsername of usernameCandidates) {
+    const sqliteEmployeeId = await findSqliteEmployeeIdByUsername(candidateUsername);
+    if (sqliteEmployeeId) {
+      return Number(sqliteEmployeeId);
+    }
+  }
+
+  const nameCandidates = [];
+  const directName = String(user?.name || "").trim();
+  if (directName) {
+    nameCandidates.push(directName);
+  }
+
+  const mongoName = String(mongoUserDoc?.name || "").trim();
+  if (
+    mongoName &&
+    !nameCandidates.some((value) => value.toLowerCase() === mongoName.toLowerCase())
+  ) {
+    nameCandidates.push(mongoName);
+  }
+
+  for (const candidateName of nameCandidates) {
+    const sqliteEmployeeId = await findSqliteIdByName("employees", candidateName);
+    if (sqliteEmployeeId) {
+      return Number(sqliteEmployeeId);
+    }
+  }
+
+  if (isPositiveNumber(userId)) {
+    return Number(userId);
+  }
+
+  return null;
 }
 
 function resolveWarehouseForLocation(user, locationId, callback) {
@@ -612,9 +678,10 @@ router.get("/", (req, res) => {
   const whereParts = ["1 = 1"];
   const params = [];
 
-  const loadEntries = (currentEmployeeId = null) => {
+  const loadEntries = (currentEmployeeId = null, bypassWarehouseScope = false) => {
     const queryWhereParts = [...whereParts];
     const queryParams = [...params];
+    const warehouseClause = bypassWarehouseScope ? "" : warehouseFilter.clause;
 
     if (status) {
       queryWhereParts.push("x.status = ?");
@@ -626,7 +693,9 @@ router.get("/", (req, res) => {
       queryParams.push(currentEmployeeId);
     }
 
-    queryParams.push(...warehouseFilter.params);
+    if (!bypassWarehouseScope) {
+      queryParams.push(...warehouseFilter.params);
+    }
     db.all(
       `
       SELECT
@@ -665,7 +734,7 @@ router.get("/", (req, res) => {
       LEFT JOIN warehouses wh_st ON x.send_to_kind = 'warehouse' AND wh_st.id = x.send_to_ref_id
       LEFT JOIN buyer_names bpn ON bpn.id = x.send_to_party_id
       LEFT JOIN companies st ON st.id = x.send_to_company_id
-      WHERE ${queryWhereParts.join(" AND ")} ${warehouseFilter.clause}
+      WHERE ${queryWhereParts.join(" AND ")} ${warehouseClause}
       ORDER BY x.id DESC
       `,
       queryParams,
@@ -713,21 +782,16 @@ router.get("/", (req, res) => {
     );
   };
 
-  const normalizedRole = String(req.user?.role || "").trim().toLowerCase();
-  const hasGlobalExpenseViewRole = ["admin", "ho", "bm"].includes(normalizedRole);
-  const shouldScopeToOwnEmployee =
-    !hasGlobalExpenseViewRole &&
-    !userHasPermission(req.user, "employees.view") &&
-    !userHasPermission(req.user, "cash.create");
+  const shouldScopeToOwnEmployee = shouldRestrictToOwnEmployee(req.user);
 
   if (!shouldScopeToOwnEmployee) {
     loadEntries();
     return;
   }
 
-  resolveMongoMasterId(req.user?.id, MongoEmployee, "employees")
+  resolveCurrentSqliteEmployeeId(req.user)
     .then((currentEmployeeId) => {
-      loadEntries(currentEmployeeId || -1);
+      loadEntries(currentEmployeeId || -1, true);
     })
     .catch((err) => {
       res.status(500).json({ error: err.message });
@@ -1116,6 +1180,10 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: resolveErr.message });
   }
 
+  if (shouldRestrictToOwnEmployee(req.user) && !resolvedIds.employee_id) {
+    resolvedIds.employee_id = await resolveCurrentSqliteEmployeeId(req.user).catch(() => null);
+  }
+
   if (!expense_date || !resolvedIds.location_id) {
     return res.status(400).json({ error: "Expense date and location are required" });
   }
@@ -1360,7 +1428,7 @@ router.put("/:id", async (req, res) => {
     }
   }
 
-  db.get("SELECT id, warehouse_id FROM expenses WHERE id = ?", [id], (findErr, row) => {
+  db.get("SELECT id, warehouse_id, employee_id FROM expenses WHERE id = ?", [id], async (findErr, row) => {
     if (findErr) {
       return res.status(500).json({ error: findErr.message });
     }
@@ -1371,6 +1439,12 @@ router.put("/:id", async (req, res) => {
 
     if (!canAccessWarehouse(req.user, row.warehouse_id)) {
       return res.status(403).json({ error: "You cannot edit expenses for this warehouse" });
+    }
+
+    if (shouldRestrictToOwnEmployee(req.user) && !resolvedIds.employee_id) {
+      resolvedIds.employee_id =
+        row.employee_id ||
+        (await resolveCurrentSqliteEmployeeId(req.user).catch(() => null));
     }
 
     const safeItems = Array.isArray(items)
