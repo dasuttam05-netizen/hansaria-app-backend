@@ -861,56 +861,86 @@ router.get("/:id", (req, res) => {
   }
 
   const warehouseFilter = assignedWarehouseFilter(req.user, "e.warehouse_id");
-  const params = [id, ...warehouseFilter.params];
+  const runLookup = (currentEmployeeId = null, bypassWarehouseScope = false) => {
+    const accessClause = [];
+    const accessParams = [];
+    const warehouseClause = bypassWarehouseScope ? "" : warehouseFilter.clause;
 
-  db.get(
-    `
-    SELECT
-      e.*,
-      l.name AS location_name,
-      w.name AS warehouse_name,
-      w.location_id AS warehouse_location_id,
-      emp.name AS employee_name,
-      pr.name AS product_name,
-      c.name AS company_name,
-      ca.account_name AS company_account_name,
-      cn.name AS reg_from_consignee_name,
-      rc.name AS reg_from_company_name,
-      stc.name AS send_to_company_name
-    FROM expenses e
-    LEFT JOIN locations l ON l.id = e.location_id
-    LEFT JOIN warehouses w ON w.id = e.warehouse_id
-    LEFT JOIN employees emp ON emp.id = e.employee_id
-    LEFT JOIN products pr ON pr.id = e.product_id
-    LEFT JOIN companies c ON c.id = e.company_id
-    LEFT JOIN company_accounts ca ON ca.id = e.company_account_id
-    LEFT JOIN consignee_names cn ON cn.id = e.reg_from_consignee_id
-    LEFT JOIN companies rc ON rc.id = e.reg_from_company_id
-    LEFT JOIN companies stc ON stc.id = e.send_to_company_id
-    WHERE e.id = ? ${warehouseFilter.clause}
-    `,
-    params,
-    (err, row) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
+    if (Number.isFinite(Number(currentEmployeeId)) && Number(currentEmployeeId) > 0) {
+      accessClause.push("e.employee_id = ?");
+      accessParams.push(Number(currentEmployeeId));
+    }
 
-      if (!row) {
-        return res.status(404).json({ error: "Expense entry not found" });
-      }
+    const params = [
+      id,
+      ...accessParams,
+      ...(bypassWarehouseScope ? [] : warehouseFilter.params),
+    ];
 
-      loadExpenseItems(id, (itemsErr, items = []) => {
-        if (itemsErr) {
-          return res.status(500).json({ error: itemsErr.message });
+    db.get(
+      `
+      SELECT
+        e.*,
+        l.name AS location_name,
+        w.name AS warehouse_name,
+        w.location_id AS warehouse_location_id,
+        emp.name AS employee_name,
+        pr.name AS product_name,
+        c.name AS company_name,
+        ca.account_name AS company_account_name,
+        cn.name AS reg_from_consignee_name,
+        rc.name AS reg_from_company_name,
+        stc.name AS send_to_company_name
+      FROM expenses e
+      LEFT JOIN locations l ON l.id = e.location_id
+      LEFT JOIN warehouses w ON w.id = e.warehouse_id
+      LEFT JOIN employees emp ON emp.id = e.employee_id
+      LEFT JOIN products pr ON pr.id = e.product_id
+      LEFT JOIN companies c ON c.id = e.company_id
+      LEFT JOIN company_accounts ca ON ca.id = e.company_account_id
+      LEFT JOIN consignee_names cn ON cn.id = e.reg_from_consignee_id
+      LEFT JOIN companies rc ON rc.id = e.reg_from_company_id
+      LEFT JOIN companies stc ON stc.id = e.send_to_company_id
+      WHERE e.id = ?
+        ${accessClause.length ? ` AND ${accessClause.join(" AND ")}` : ""}
+        ${warehouseClause}
+      `,
+      params,
+      (err, row) => {
+        if (err) {
+          return res.status(500).json({ error: err.message });
         }
 
-        return res.json({
-          ...row,
-          items: Array.isArray(items) ? items : [],
+        if (!row) {
+          return res.status(404).json({ error: "Expense entry not found" });
+        }
+
+        loadExpenseItems(id, (itemsErr, items = []) => {
+          if (itemsErr) {
+            return res.status(500).json({ error: itemsErr.message });
+          }
+
+          return res.json({
+            ...row,
+            items: Array.isArray(items) ? items : [],
+          });
         });
-      });
-    }
-  );
+      }
+    );
+  };
+
+  if (!shouldRestrictToOwnEmployee(req.user)) {
+    runLookup();
+    return;
+  }
+
+  resolveCurrentSqliteEmployeeId(req.user)
+    .then((currentEmployeeId) => {
+      runLookup(currentEmployeeId || -1, true);
+    })
+    .catch((err) => {
+      return res.status(500).json({ error: err.message });
+    });
 });
 
 router.post("/:id/approve-cash-book", (req, res) => {
