@@ -1309,6 +1309,17 @@ router.post("/", async (req, res) => {
   const safeItems = Array.isArray(items)
     ? items.filter((item) => item && item.particular_name)
     : [];
+  const hasAnyNonZeroItemInput = safeItems.some(
+    (item) =>
+      (Number(item?.bags) || 0) !== 0 ||
+      (Number(item?.rate) || 0) !== 0 ||
+      (Number(item?.amount) || 0) !== 0
+  );
+  if (safeItems.length > 0 && !hasAnyNonZeroItemInput && (Number(grand_total) || 0) > 0) {
+    return res.status(400).json({
+      error: "Expense Particulars are empty. Please enter Bags/Rate details before saving.",
+    });
+  }
 
   resolveWarehouseForLocation(req.user, resolvedIds.location_id, (warehouseErr, resolvedWarehouseId) => {
     if (warehouseErr) {
@@ -1559,6 +1570,26 @@ router.put("/:id", async (req, res) => {
     const safeItems = hasItemsPayload
       ? items.filter((item) => item && item.particular_name)
       : null;
+    const hasAnyNonZeroItemInput = Array.isArray(safeItems)
+      ? safeItems.some(
+          (item) =>
+            (Number(item?.bags) || 0) !== 0 ||
+            (Number(item?.rate) || 0) !== 0 ||
+            (Number(item?.amount) || 0) !== 0
+        )
+      : false;
+
+    if (
+      hasItemsPayload &&
+      Array.isArray(safeItems) &&
+      safeItems.length > 0 &&
+      !hasAnyNonZeroItemInput &&
+      (Number(grand_total) || 0) > 0
+    ) {
+      return res.status(400).json({
+        error: "Expense Particulars are empty. Please enter Bags/Rate details before saving.",
+      });
+    }
 
     const updateExpenseWithWarehouse = (resolvedWarehouseId) => {
       const computedBalance = calculateExpenseBalance(
