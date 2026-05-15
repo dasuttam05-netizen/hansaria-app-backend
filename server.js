@@ -230,6 +230,8 @@ const localSaleRoutes = require("./routes/localSale");
 const consigneeNamesRoutes = require("./routes/consigneeNames");
 
 const buyerNamesRoutes = require("./routes/buyerNames");
+const farmersRoutes = require("./routes/farmers");
+const whVouchersRoutes = require("./routes/whVouchers");
 
 const cashEntriesRoutes = require("./routes/cashEntries");
 
@@ -406,6 +408,19 @@ app.use(
   authenticate,
   authorizeConsigneeOrExpense,
   buyerNamesRoutes
+);
+
+app.use(
+  "/api/farmers",
+  authenticate,
+  farmersRoutes
+);
+
+app.use(
+  "/api/wh-vouchers",
+  authenticate,
+  authorize("warehouse.trading.view"),
+  whVouchersRoutes
 );
 
 app.use(
