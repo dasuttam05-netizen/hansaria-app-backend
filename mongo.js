@@ -99,6 +99,29 @@ const companySchema =
 
 
 // =========================
+// FARMER
+// =========================
+const farmerSchema =
+  new mongoose.Schema({
+    name: {
+      type: String,
+      required: true,
+    },
+    mobile: String,
+    email: String,
+    address: String,
+    village: String,
+    state: String,
+    gst_no: String,
+    pan_no: String,
+    location: String,
+  },
+  {
+    timestamps: true,
+  });
+
+
+// =========================
 // COMPANY ACCOUNT
 // =========================
 const companyAccountSchema =
@@ -182,6 +205,13 @@ module.exports = {
     mongoose.model(
       "Company",
       companySchema
+    ),
+
+  Farmer:
+    mongoose.models.Farmer ||
+    mongoose.model(
+      "Farmer",
+      farmerSchema
     ),
 
   CompanyAccount:
