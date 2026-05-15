@@ -109,6 +109,131 @@ if (true) {
   `);
 
   db.run(`
+    CREATE TABLE IF NOT EXISTS farmers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      mobile TEXT,
+      email TEXT,
+      address TEXT,
+      village TEXT,
+      gst_no TEXT,
+      pan_no TEXT,
+      state TEXT,
+      location TEXT
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS wh_purchase_vouchers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      voucher_no TEXT UNIQUE,
+      date TEXT NOT NULL,
+      warehouse_id INTEGER,
+      farmer_id TEXT,
+      product_id INTEGER,
+      quantity REAL DEFAULT 0,
+      rate REAL DEFAULT 0,
+      amount REAL DEFAULT 0,
+      employee_id INTEGER,
+      location_id INTEGER,
+      description TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(product_id) REFERENCES products(id),
+      FOREIGN KEY(employee_id) REFERENCES employees(id),
+      FOREIGN KEY(location_id) REFERENCES locations(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS wh_sale_vouchers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      voucher_no TEXT UNIQUE,
+      date TEXT NOT NULL,
+      warehouse_id INTEGER,
+      company_id INTEGER,
+      consignee_id INTEGER,
+      product_id INTEGER,
+      quantity REAL DEFAULT 0,
+      rate REAL DEFAULT 0,
+      amount REAL DEFAULT 0,
+      employee_id INTEGER,
+      location_id INTEGER,
+      description TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(company_id) REFERENCES companies(id),
+      FOREIGN KEY(consignee_id) REFERENCES consignee_names(id),
+      FOREIGN KEY(product_id) REFERENCES products(id),
+      FOREIGN KEY(employee_id) REFERENCES employees(id),
+      FOREIGN KEY(location_id) REFERENCES locations(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS wh_payment_vouchers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      voucher_no TEXT UNIQUE,
+      date TEXT NOT NULL,
+      warehouse_id INTEGER,
+      farmer_id TEXT,
+      amount REAL DEFAULT 0,
+      employee_id INTEGER,
+      location_id INTEGER,
+      description TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(employee_id) REFERENCES employees(id),
+      FOREIGN KEY(location_id) REFERENCES locations(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS wh_receipt_vouchers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      voucher_no TEXT UNIQUE,
+      date TEXT NOT NULL,
+      warehouse_id INTEGER,
+      company_id INTEGER,
+      consignee_id INTEGER,
+      amount REAL DEFAULT 0,
+      employee_id INTEGER,
+      location_id INTEGER,
+      description TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(company_id) REFERENCES companies(id),
+      FOREIGN KEY(consignee_id) REFERENCES consignee_names(id),
+      FOREIGN KEY(employee_id) REFERENCES employees(id),
+      FOREIGN KEY(location_id) REFERENCES locations(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS wh_journal_vouchers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      voucher_no TEXT UNIQUE,
+      date TEXT NOT NULL,
+      warehouse_id INTEGER,
+      debit_account TEXT,
+      credit_account TEXT,
+      amount REAL DEFAULT 0,
+      employee_id INTEGER,
+      location_id INTEGER,
+      description TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(employee_id) REFERENCES employees(id),
+      FOREIGN KEY(location_id) REFERENCES locations(id)
+    )
+  `);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS consignee_names (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       buyer_id INTEGER,
