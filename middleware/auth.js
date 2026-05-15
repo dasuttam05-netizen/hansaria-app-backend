@@ -126,6 +126,12 @@ const LEGACY_PERMISSION_MAP = {
   "cash.create": ["cash.mainBook.create", "cash.partiesBook.create", "cash.employeeBook.create"],
   "cash.edit": ["cash.mainBook.edit", "cash.partiesBook.edit", "cash.employeeBook.edit"],
   "cash.delete": ["cash.mainBook.delete", "cash.partiesBook.delete", "cash.employeeBook.delete"],
+  "farmers.view": ["farmers.manage"],
+  "farmers.create": ["farmers.manage"],
+  "farmers.edit": ["farmers.manage"],
+  "farmers.delete": ["farmers.manage"],
+  "warehouse.trading.view": ["warehouse.trading.manage"],
+  "warehouse.trading.manage": ["warehouse.trading.manage"],
 };
 
 function normalizeRole(
