@@ -944,6 +944,17 @@ if (true) {
     }
   );
 
+  const addCashSettingsCol = (sql, label) => {
+    db.run(sql, (err) => {
+      if (err && !String(err.message).includes("duplicate column")) {
+        console.log(`${label} add error:`, err.message);
+      }
+    });
+  };
+  addCashSettingsCol(`ALTER TABLE cash_book_settings ADD COLUMN opening_locked INTEGER DEFAULT 0`, "cash_book_settings opening_locked");
+  addCashSettingsCol(`ALTER TABLE cash_book_settings ADD COLUMN opening_locked_by INTEGER`, "cash_book_settings opening_locked_by");
+  addCashSettingsCol(`ALTER TABLE cash_book_settings ADD COLUMN opening_locked_at TEXT`, "cash_book_settings opening_locked_at");
+
   db.run(
     `
     UPDATE cash_entries
