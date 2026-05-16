@@ -360,6 +360,16 @@ if (true) {
   `);
 
   db.run(`
+    CREATE TABLE IF NOT EXISTS idempotency_keys (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key TEXT NOT NULL UNIQUE,
+      route TEXT NOT NULL,
+      response_id INTEGER,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS palti_lorry_entries (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       expense_id INTEGER UNIQUE,
