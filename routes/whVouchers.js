@@ -43,15 +43,78 @@ router.post("/purchase", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount, employee_id, location_id, description } = req.body;
+  const {
+    voucher_no,
+    date,
+    warehouse_id,
+    farmer_id,
+    product_id,
+    quantity,
+    rate,
+    amount,
+    packet,
+    gross_weight,
+    tare_weight,
+    dhalta,
+    less_bags_weight,
+    moisture,
+    dunki,
+    fungus,
+    discolour,
+    others,
+    net_weight,
+    bags_claim,
+    labour,
+    total_deduct_amount,
+    total_qty,
+    total_deduction,
+    net_amount_payable,
+    employee_id,
+    location_id,
+    description,
+  } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
   const query = `
-    INSERT INTO wh_purchase_vouchers (voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount, employee_id, location_id, description)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO wh_purchase_vouchers (
+      voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+      packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+      discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+      total_deduction, net_amount_payable, employee_id, location_id, description
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `;
 
-  db.run(query, [voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount, employee_id, location_id, description], function (err) {
+  db.run(query, [
+    voucher_no,
+    date,
+    warehouse_id,
+    farmer_id,
+    product_id,
+    quantity,
+    rate,
+    amount,
+    packet,
+    gross_weight,
+    tare_weight,
+    dhalta,
+    less_bags_weight,
+    moisture,
+    dunki,
+    fungus,
+    discolour,
+    others,
+    net_weight,
+    bags_claim,
+    labour,
+    total_deduct_amount,
+    total_qty,
+    total_deduction,
+    net_amount_payable,
+    employee_id,
+    location_id,
+    description,
+  ], function (err) {
     if (err) {
       if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
       return res.status(500).json({ error: err.message });
@@ -225,8 +288,8 @@ router.get("/report/purchase-summary", (req, res) => {
   const query = `
     SELECT 
       warehouse_id, 
-      SUM(quantity) as total_quantity, 
-      SUM(amount) as total_amount 
+      SUM(COALESCE(NULLIF(total_qty, 0), quantity)) as total_quantity, 
+      SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)) as total_amount 
     FROM wh_purchase_vouchers 
     WHERE 1 = 1 ${filter.clause}
     GROUP BY warehouse_id
@@ -248,9 +311,9 @@ router.get("/report/profit-loss", (req, res) => {
       w.id,
       w.name as warehouse_name,
       (SELECT COALESCE(SUM(amount), 0) FROM wh_sale_vouchers WHERE warehouse_id = w.id) as sale_amount,
-      (SELECT COALESCE(SUM(amount), 0) FROM wh_purchase_vouchers WHERE warehouse_id = w.id) as purchase_amount,
+      (SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) FROM wh_purchase_vouchers WHERE warehouse_id = w.id) as purchase_amount,
       (SELECT COALESCE(SUM(amount), 0) FROM wh_sale_vouchers WHERE warehouse_id = w.id) - 
-      (SELECT COALESCE(SUM(amount), 0) FROM wh_purchase_vouchers WHERE warehouse_id = w.id) as profit_loss
+      (SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) FROM wh_purchase_vouchers WHERE warehouse_id = w.id) as profit_loss
     FROM warehouses w
     WHERE 1 = 1 ${filter.clause}
   `;
