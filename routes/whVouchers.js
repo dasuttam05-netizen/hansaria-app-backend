@@ -109,6 +109,24 @@ function createVoucherNoIfMissing(type, voucherNo, callback) {
   createSequentialVoucherNo(type, callback);
 }
 
+// Idempotency helpers: prevent duplicate resource creation when client retries
+function getIdempotency(key, route, cb) {
+  if (!key) return cb(null, null);
+  db.get(`SELECT response_id FROM idempotency_keys WHERE key = ? AND route = ?`, [key, route], (err, row) => {
+    if (err) return cb(err);
+    cb(null, row ? row.response_id : null);
+  });
+}
+
+function saveIdempotency(key, route, responseId, cb) {
+  if (!key) return cb && cb();
+  db.run(
+    `INSERT OR REPLACE INTO idempotency_keys (key, route, response_id, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`,
+    [key, route, responseId],
+    (err) => cb && cb(err)
+  );
+}
+
 // ===========================
 // PURCHASE VOUCHERS
 // ===========================
@@ -167,6 +185,72 @@ router.post("/purchase", (req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `;
 
+  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+  if (idemKey) {
+    return getIdempotency(idemKey, "purchase", (err, existingId) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (existingId) {
+        return db.get(`SELECT * FROM wh_purchase_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+          if (e2) return res.status(500).json({ error: e2.message });
+          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+        });
+      }
+
+      createVoucherNoIfMissing("purchase", voucher_no, (err, generatedVoucherNo) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const query = `
+          INSERT INTO wh_purchase_vouchers (
+            voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+            packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+            discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+            total_deduction, net_amount_payable, employee_id, location_id, description
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        db.run(query, [
+          generatedVoucherNo,
+          date,
+          warehouse_id,
+          farmer_id,
+          product_id,
+          quantity,
+          rate,
+          amount,
+          packet,
+          gross_weight,
+          tare_weight,
+          dhalta,
+          less_bags_weight,
+          moisture,
+          dunki,
+          fungus,
+          discolour,
+          others,
+          net_weight,
+          bags_claim,
+          labour,
+          total_deduct_amount,
+          total_qty,
+          total_deduction,
+          net_amount_payable,
+          employee_id,
+          location_id,
+          description,
+        ], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+          saveIdempotency(idemKey, "purchase", this.lastID, () => {});
+          res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
+        });
+      });
+    });
+  }
+
+  // no idempotency key, proceed normally
   createVoucherNoIfMissing("purchase", voucher_no, (err, generatedVoucherNo) => {
     if (err) return res.status(500).json({ error: err.message });
 
@@ -307,6 +391,43 @@ router.post("/sale", (req, res) => {
   const { voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, rate, amount, claim_amount, tds_amount, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
+  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+  if (idemKey) {
+    return getIdempotency(idemKey, "sale", (err, existingId) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (existingId) {
+        return db.get(`SELECT * FROM wh_sale_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+          if (e2) return res.status(500).json({ error: e2.message });
+          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+        });
+      }
+
+      createVoucherNoIfMissing("sale", voucher_no, (err, generatedVoucherNo) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const amountValue = Number(amount) || 0;
+        const claimValue = Number(claim_amount) || 0;
+        const tdsValue = Number(tds_amount) || 0;
+        const netAmount = amountValue - claimValue - tdsValue;
+        const outstanding = netAmount;
+
+        const query = `
+          INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, rate, amount, claim_amount, tds_amount, net_amount, outstanding, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, rate, amountValue, claimValue, tdsValue, netAmount, outstanding, employee_id, location_id, description], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+          saveIdempotency(idemKey, "sale", this.lastID, () => {});
+          res.json({ id: this.lastID, voucher_no: generatedVoucherNo, net_amount: netAmount, outstanding });
+        });
+      });
+    });
+  }
+
   createVoucherNoIfMissing("sale", voucher_no, (err, generatedVoucherNo) => {
     if (err) return res.status(500).json({ error: err.message });
 
@@ -350,6 +471,44 @@ router.post("/payment", (req, res) => {
   const { voucher_no, date, warehouse_id, farmer_id, amount, reference_type, reference_id, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
+
+  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+  if (idemKey) {
+    return getIdempotency(idemKey, "payment", (err, existingId) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (existingId) {
+        return db.get(`SELECT * FROM wh_payment_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+          if (e2) return res.status(500).json({ error: e2.message });
+          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+        });
+      }
+
+      createVoucherNoIfMissing("payment", voucher_no, (err, generatedVoucherNo) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const query = `
+          INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, amount, reference_type, reference_id, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+
+          const paymentId = this.lastID;
+          saveIdempotency(idemKey, "payment", paymentId, () => {});
+          computeOutstandingForFarmer(farmer_id, (err2, stats) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+            db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
+              res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats });
+            });
+          });
+        });
+      });
+    });
+  }
 
   createVoucherNoIfMissing("payment", voucher_no, (err, generatedVoucherNo) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -396,6 +555,44 @@ router.post("/receipt", (req, res) => {
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
 
+  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+  if (idemKey) {
+    return getIdempotency(idemKey, "receipt", (err, existingId) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (existingId) {
+        return db.get(`SELECT * FROM wh_receipt_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+          if (e2) return res.status(500).json({ error: e2.message });
+          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+        });
+      }
+
+      createVoucherNoIfMissing("receipt", voucher_no, (err, generatedVoucherNo) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const query = `
+          INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+
+          const receiptId = this.lastID;
+          saveIdempotency(idemKey, "receipt", receiptId, () => {});
+          computeOutstandingForCompany(company_id, (err2, stats) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+            db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
+              res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats });
+            });
+          });
+        });
+      });
+    });
+  }
+
   createVoucherNoIfMissing("receipt", voucher_no, (err, generatedVoucherNo) => {
     if (err) return res.status(500).json({ error: err.message });
 
@@ -439,6 +636,37 @@ router.post("/journal", (req, res) => {
 
   const { voucher_no, date, warehouse_id, debit_account, credit_account, amount, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+
+  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+  if (idemKey) {
+    return getIdempotency(idemKey, "journal", (err, existingId) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (existingId) {
+        return db.get(`SELECT * FROM wh_journal_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+          if (e2) return res.status(500).json({ error: e2.message });
+          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+        });
+      }
+
+      createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const query = `
+          INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, debit_account, credit_account, amount, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        db.run(query, [generatedVoucherNo, date, warehouse_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+          saveIdempotency(idemKey, "journal", this.lastID, () => {});
+          res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
+        });
+      });
+    });
+  }
 
   createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
     if (err) return res.status(500).json({ error: err.message });
