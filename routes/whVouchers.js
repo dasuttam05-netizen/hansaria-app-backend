@@ -795,4 +795,59 @@ router.get("/purchase/:id/pdf", (req, res) => {
   });
 });
 
+// Update purchase voucher
+router.put("/purchase/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const {
+    voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+    packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+    discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+    total_deduction, net_amount_payable, employee_id, location_id, description
+  } = req.body;
+
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+
+  const query = `
+    UPDATE wh_purchase_vouchers SET
+      voucher_no=?, date=?, warehouse_id=?, farmer_id=?, product_id=?, quantity=?, rate=?, amount=?,
+      packet=?, gross_weight=?, tare_weight=?, dhalta=?, less_bags_weight=?, moisture=?, dunki=?, fungus=?,
+      discolour=?, others=?, net_weight=?, bags_claim=?, labour=?, total_deduct_amount=?, total_qty=?,
+      total_deduction=?, net_amount_payable=?, employee_id=?, location_id=?, description=?
+    WHERE id = ?
+  `;
+
+  db.run(query, [
+    voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+    packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+    discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+    total_deduction, net_amount_payable, employee_id, location_id, description, id
+  ], function(err) {
+    if (err) {
+      if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+      return res.status(500).json({ error: err.message });
+    }
+    res.json({ id, message: "Voucher updated successfully" });
+  });
+});
+
+// Delete purchase voucher
+router.delete("/purchase/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const query = "DELETE FROM wh_purchase_vouchers WHERE id = ?";
+
+  db.run(query, [id], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    if (this.changes === 0) return res.status(404).json({ error: "Voucher not found" });
+    res.json({ message: "Voucher deleted successfully" });
+  });
+});
+
 module.exports = router;
