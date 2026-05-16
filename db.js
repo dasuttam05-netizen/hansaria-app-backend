@@ -169,13 +169,19 @@ if (true) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       voucher_no TEXT UNIQUE,
       date TEXT NOT NULL,
+      unloading_date TEXT,
       warehouse_id INTEGER,
       company_id INTEGER,
       consignee_id INTEGER,
       product_id INTEGER,
       quantity REAL DEFAULT 0,
+      shortage_quantity REAL DEFAULT 0,
       rate REAL DEFAULT 0,
       amount REAL DEFAULT 0,
+      claim_amount REAL DEFAULT 0,
+      tds_amount REAL DEFAULT 0,
+      net_amount REAL DEFAULT 0,
+      outstanding REAL DEFAULT 0,
       employee_id INTEGER,
       location_id INTEGER,
       description TEXT,
@@ -198,6 +204,9 @@ if (true) {
       warehouse_id INTEGER,
       farmer_id TEXT,
       amount REAL DEFAULT 0,
+      reference_type TEXT,
+      reference_id INTEGER,
+      outstanding_after REAL DEFAULT 0,
       employee_id INTEGER,
       location_id INTEGER,
       description TEXT,
@@ -218,6 +227,9 @@ if (true) {
       company_id INTEGER,
       consignee_id INTEGER,
       amount REAL DEFAULT 0,
+      reference_type TEXT,
+      reference_id INTEGER,
+      outstanding_after REAL DEFAULT 0,
       employee_id INTEGER,
       location_id INTEGER,
       description TEXT,
@@ -619,6 +631,18 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN total_qty REAL DEFAULT 0`, "wh_purchase_vouchers total_qty");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN total_deduction REAL DEFAULT 0`, "wh_purchase_vouchers total_deduction");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN net_amount_payable REAL DEFAULT 0`, "wh_purchase_vouchers net_amount_payable");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN unloading_date TEXT`, "wh_sale_vouchers unloading_date");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN shortage_quantity REAL DEFAULT 0`, "wh_sale_vouchers shortage_quantity");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN claim_amount REAL DEFAULT 0`, "wh_sale_vouchers claim_amount");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN tds_amount REAL DEFAULT 0`, "wh_sale_vouchers tds_amount");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN net_amount REAL DEFAULT 0`, "wh_sale_vouchers net_amount");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN outstanding REAL DEFAULT 0`, "wh_sale_vouchers outstanding");
+  addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN reference_type TEXT`, "wh_payment_vouchers reference_type");
+  addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN reference_id INTEGER`, "wh_payment_vouchers reference_id");
+  addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN outstanding_after REAL DEFAULT 0`, "wh_payment_vouchers outstanding_after");
+  addColIgnoreDup(`ALTER TABLE wh_receipt_vouchers ADD COLUMN reference_type TEXT`, "wh_receipt_vouchers reference_type");
+  addColIgnoreDup(`ALTER TABLE wh_receipt_vouchers ADD COLUMN reference_id INTEGER`, "wh_receipt_vouchers reference_id");
+  addColIgnoreDup(`ALTER TABLE wh_receipt_vouchers ADD COLUMN outstanding_after REAL DEFAULT 0`, "wh_receipt_vouchers outstanding_after");
 
   db.run(
     `
