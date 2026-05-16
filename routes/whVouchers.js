@@ -31,7 +31,7 @@ function ensureWarehouseAccess(req, res, warehouseId) {
 // PURCHASE VOUCHERS
 // ===========================
 router.get("/purchase", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.view")) {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
   
@@ -39,7 +39,7 @@ router.get("/purchase", (req, res) => {
 });
 
 router.post("/purchase", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.manage")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -64,7 +64,7 @@ router.post("/purchase", (req, res) => {
 // SALE VOUCHERS
 // ===========================
 router.get("/sale", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.view")) {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -72,7 +72,7 @@ router.get("/sale", (req, res) => {
 });
 
 router.post("/sale", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.manage")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -97,7 +97,7 @@ router.post("/sale", (req, res) => {
 // PAYMENT VOUCHERS
 // ===========================
 router.get("/payment", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.view")) {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -105,7 +105,7 @@ router.get("/payment", (req, res) => {
 });
 
 router.post("/payment", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.manage")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -130,7 +130,7 @@ router.post("/payment", (req, res) => {
 // RECEIPT VOUCHERS
 // ===========================
 router.get("/receipt", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.view")) {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -138,7 +138,7 @@ router.get("/receipt", (req, res) => {
 });
 
 router.post("/receipt", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.manage")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -163,7 +163,7 @@ router.post("/receipt", (req, res) => {
 // JOURNAL VOUCHERS
 // ===========================
 router.get("/journal", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.view")) {
+  if (!userHasPermission(req.user, "warehouse.trading.journal.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -171,7 +171,7 @@ router.get("/journal", (req, res) => {
 });
 
 router.post("/journal", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.journal.manage")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -196,7 +196,7 @@ router.post("/journal", (req, res) => {
 // REPORTS
 // ===========================
 router.get("/report/sale-summary", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.view")) {
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -217,7 +217,7 @@ router.get("/report/sale-summary", (req, res) => {
 });
 
 router.get("/report/purchase-summary", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.view")) {
+  if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -238,7 +238,7 @@ router.get("/report/purchase-summary", (req, res) => {
 });
 
 router.get("/report/profit-loss", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.view")) {
+  if (!userHasPermission(req.user, "warehouse.trading.report.profitLoss")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
