@@ -521,11 +521,23 @@ router.get("/activity-logs", (req, res) => {
 });
 
 router.get("/opening/main", (req, res) => {
+  const canViewMainOpening =
+    userHasPermission(req.user, "cash.mainBook.view") ||
+    userHasPermission(req.user, "cash.mainBook.create") ||
+    userHasPermission(req.user, "cash.mainBook.edit") ||
+    userHasPermission(req.user, "cash.mainBook.delete");
+  if (!canViewMainOpening) {
+    return res.status(403).json({ error: "You do not have permission to view main cash opening balance" });
+  }
+
   db.get(
     `
     SELECT
       main_opening_balance,
       main_opening_type,
+      opening_locked,
+      opening_locked_by,
+      opening_locked_at,
       updated_by,
       updated_at
     FROM cash_book_settings
@@ -537,6 +549,9 @@ router.get("/opening/main", (req, res) => {
       return res.json({
         main_opening_balance: Number(row?.main_opening_balance || 0),
         main_opening_type: String(row?.main_opening_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
+        opening_locked: Number(row?.opening_locked || 0) === 1,
+        opening_locked_by: row?.opening_locked_by || null,
+        opening_locked_at: row?.opening_locked_at || null,
         updated_by: row?.updated_by || null,
         updated_at: row?.updated_at || null,
       });
@@ -549,38 +564,196 @@ router.put("/opening/main", (req, res) => {
     return res.status(403).json({ error: "You do not have permission to update main cash opening balance" });
   }
 
-  const openingAmount = Number(req.body?.main_opening_balance || 0);
+  const openingAmount = Math.abs(Number(req.body?.main_opening_balance || 0));
   const openingType = String(req.body?.main_opening_type || "dr").toLowerCase() === "cr" ? "cr" : "dr";
+  const expectedUpdatedAt = req.body?.expected_updated_at ? String(req.body.expected_updated_at) : null;
+
+  if (!Number.isFinite(openingAmount)) {
+    return res.status(400).json({ error: "Invalid opening balance amount" });
+  }
+
+  db.serialize(() => {
+    db.run("BEGIN IMMEDIATE TRANSACTION", (beginErr) => {
+      if (beginErr) {
+        return res.status(500).json({ error: beginErr.message });
+      }
+
+      db.get(
+        `
+        SELECT
+          main_opening_balance,
+          main_opening_type,
+          opening_locked,
+          opening_locked_by,
+          opening_locked_at,
+          updated_at
+        FROM cash_book_settings
+        WHERE id = 1
+        `,
+        [],
+        (readErr, currentRow) => {
+          if (readErr) {
+            return db.run("ROLLBACK", () => res.status(500).json({ error: readErr.message }));
+          }
+          if (!currentRow) {
+            return db.run("ROLLBACK", () => res.status(404).json({ error: "Main cash opening settings not found" }));
+          }
+
+          if (Number(currentRow.opening_locked || 0) === 1 && !isAdminUser(req.user)) {
+            return db.run("ROLLBACK", () =>
+              res.status(423).json({
+                error: "Main opening is locked. Only admin can edit while locked.",
+              })
+            );
+          }
+
+          const dbUpdatedAt = currentRow.updated_at ? String(currentRow.updated_at) : null;
+          if (expectedUpdatedAt && dbUpdatedAt && expectedUpdatedAt !== dbUpdatedAt) {
+            return db.run("ROLLBACK", () =>
+              res.status(409).json({
+                error: "Opening balance was modified by another user. Please refresh and try again.",
+                current: {
+                  main_opening_balance: Number(currentRow.main_opening_balance || 0),
+                  main_opening_type: String(currentRow.main_opening_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
+                  updated_at: currentRow.updated_at || null,
+                  opening_locked: Number(currentRow.opening_locked || 0) === 1,
+                },
+              })
+            );
+          }
+
+          db.run(
+            `
+            UPDATE cash_book_settings
+            SET
+              main_opening_balance = ?,
+              main_opening_type = ?,
+              updated_by = ?,
+              updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            `,
+            [openingAmount, openingType, req.user?.id || null],
+            function (updateErr) {
+              if (updateErr) {
+                return db.run("ROLLBACK", () => res.status(500).json({ error: updateErr.message }));
+              }
+              if (this.changes === 0) {
+                return db.run("ROLLBACK", () => res.status(404).json({ error: "Main cash opening settings not found" }));
+              }
+
+              db.get(
+                `
+                SELECT
+                  main_opening_balance,
+                  main_opening_type,
+                  opening_locked,
+                  opening_locked_by,
+                  opening_locked_at,
+                  updated_by,
+                  updated_at
+                FROM cash_book_settings
+                WHERE id = 1
+                `,
+                [],
+                (afterErr, afterRow) => {
+                  if (afterErr) {
+                    return db.run("ROLLBACK", () => res.status(500).json({ error: afterErr.message }));
+                  }
+
+                  db.run("COMMIT", (commitErr) => {
+                    if (commitErr) {
+                      return db.run("ROLLBACK", () => res.status(500).json({ error: commitErr.message }));
+                    }
+
+                    writeCashAuditLog({
+                      req,
+                      action: "main_opening_update",
+                      details: {
+                        main_opening_balance: openingAmount,
+                        main_opening_type: openingType,
+                      },
+                    });
+
+                    return res.json({
+                      message: "Main cash opening updated successfully",
+                      main_opening_balance: Number(afterRow?.main_opening_balance || 0),
+                      main_opening_type: String(afterRow?.main_opening_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
+                      opening_locked: Number(afterRow?.opening_locked || 0) === 1,
+                      opening_locked_by: afterRow?.opening_locked_by || null,
+                      opening_locked_at: afterRow?.opening_locked_at || null,
+                      updated_by: afterRow?.updated_by || null,
+                      updated_at: afterRow?.updated_at || null,
+                    });
+                  });
+                }
+              );
+            }
+          );
+        }
+      );
+    });
+  });
+});
+
+router.patch("/opening/main/lock", (req, res) => {
+  if (!userHasPermission(req.user, "cash.mainBook.edit")) {
+    return res.status(403).json({ error: "You do not have permission to lock opening settings" });
+  }
+
+  const shouldLock = !!req.body?.locked;
 
   db.run(
     `
     UPDATE cash_book_settings
     SET
-      main_opening_balance = ?,
-      main_opening_type = ?,
+      opening_locked = ?,
+      opening_locked_by = ?,
+      opening_locked_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END,
       updated_by = ?,
       updated_at = CURRENT_TIMESTAMP
     WHERE id = 1
     `,
-    [openingAmount, openingType, req.user?.id || null],
+    [shouldLock ? 1 : 0, req.user?.id || null, shouldLock ? 1 : 0, req.user?.id || null],
     function (err) {
       if (err) return res.status(500).json({ error: err.message });
       if (this.changes === 0) return res.status(404).json({ error: "Main cash opening settings not found" });
 
-      writeCashAuditLog({
-        req,
-        action: "main_opening_update",
-        details: {
-          main_opening_balance: openingAmount,
-          main_opening_type: openingType,
-        },
-      });
+      db.get(
+        `
+        SELECT
+          main_opening_balance,
+          main_opening_type,
+          opening_locked,
+          opening_locked_by,
+          opening_locked_at,
+          updated_by,
+          updated_at
+        FROM cash_book_settings
+        WHERE id = 1
+        `,
+        [],
+        (readErr, row) => {
+          if (readErr) return res.status(500).json({ error: readErr.message });
 
-      return res.json({
-        message: "Main cash opening updated successfully",
-        main_opening_balance: openingAmount,
-        main_opening_type: openingType,
-      });
+          writeCashAuditLog({
+            req,
+            action: shouldLock ? "main_opening_lock" : "main_opening_unlock",
+            details: {
+              opening_locked: shouldLock,
+            },
+          });
+
+          return res.json({
+            main_opening_balance: Number(row?.main_opening_balance || 0),
+            main_opening_type: String(row?.main_opening_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
+            opening_locked: Number(row?.opening_locked || 0) === 1,
+            opening_locked_by: row?.opening_locked_by || null,
+            opening_locked_at: row?.opening_locked_at || null,
+            updated_by: row?.updated_by || null,
+            updated_at: row?.updated_at || null,
+          });
+        }
+      );
     }
   );
 });
