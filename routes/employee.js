@@ -110,6 +110,9 @@ router.get("/", async (req, res) => {
         employee_id:
           row.employee_id || "",
 
+        mobile:
+          row.mobile || "",
+
         location_name:
           row.location_id?.name || "",
 
@@ -167,6 +170,9 @@ router.get("/:id", async (req, res) => {
       employee_id:
         row.employee_id || "",
 
+      mobile:
+        row.mobile || "",
+
       permissions:
         parsePermissions(
           row.permissions,
@@ -202,6 +208,7 @@ router.post("/", async (req, res) => {
 
     const {
       name,
+      mobile,
       address,
       username,
       password,
@@ -360,6 +367,9 @@ router.post("/", async (req, res) => {
 
         name,
 
+        mobile:
+          mobile || "",
+
         address:
           address || "",
 
@@ -404,6 +414,9 @@ router.post("/", async (req, res) => {
         employee.employee_id,
 
       name: employee.name,
+
+      mobile:
+        employee.mobile || "",
 
       address:
         employee.address,
@@ -478,6 +491,7 @@ router.put("/:id", async (req, res) => {
 
     const {
       name,
+      mobile,
       address,
       username,
       password,
@@ -560,6 +574,9 @@ router.put("/:id", async (req, res) => {
     const updateData = {
 
       name,
+
+      mobile:
+        mobile || "",
 
       address:
         address || "",
