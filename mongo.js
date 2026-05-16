@@ -31,6 +31,8 @@ const employeeSchema =
 
     name: String,
 
+    mobile: String,
+
     address: String,
 
     username: {
