@@ -32,6 +32,7 @@ if (true) {
     CREATE TABLE IF NOT EXISTS employees (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
+      mobile TEXT,
       address TEXT,
       location_id INTEGER,
       username TEXT UNIQUE,
@@ -134,6 +135,23 @@ if (true) {
       quantity REAL DEFAULT 0,
       rate REAL DEFAULT 0,
       amount REAL DEFAULT 0,
+      packet REAL DEFAULT 0,
+      gross_weight REAL DEFAULT 0,
+      tare_weight REAL DEFAULT 0,
+      dhalta REAL DEFAULT 0,
+      less_bags_weight REAL DEFAULT 0,
+      moisture REAL DEFAULT 0,
+      dunki REAL DEFAULT 0,
+      fungus REAL DEFAULT 0,
+      discolour REAL DEFAULT 0,
+      others REAL DEFAULT 0,
+      net_weight REAL DEFAULT 0,
+      bags_claim REAL DEFAULT 0,
+      labour REAL DEFAULT 0,
+      total_deduct_amount REAL DEFAULT 0,
+      total_qty REAL DEFAULT 0,
+      total_deduction REAL DEFAULT 0,
+      net_amount_payable REAL DEFAULT 0,
       employee_id INTEGER,
       location_id INTEGER,
       description TEXT,
@@ -584,6 +602,23 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN palti_lorry_id INTEGER`, "adjustment palti_lorry_id");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN source_type TEXT DEFAULT 'inward'`, "adjustment source_type");
   addColIgnoreDup(`ALTER TABLE palti_lorry_entries ADD COLUMN updated_at TEXT`, "palti_lorry_entries updated_at");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN packet REAL DEFAULT 0`, "wh_purchase_vouchers packet");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN gross_weight REAL DEFAULT 0`, "wh_purchase_vouchers gross_weight");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN tare_weight REAL DEFAULT 0`, "wh_purchase_vouchers tare_weight");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN dhalta REAL DEFAULT 0`, "wh_purchase_vouchers dhalta");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN less_bags_weight REAL DEFAULT 0`, "wh_purchase_vouchers less_bags_weight");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN moisture REAL DEFAULT 0`, "wh_purchase_vouchers moisture");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN dunki REAL DEFAULT 0`, "wh_purchase_vouchers dunki");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN fungus REAL DEFAULT 0`, "wh_purchase_vouchers fungus");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN discolour REAL DEFAULT 0`, "wh_purchase_vouchers discolour");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN others REAL DEFAULT 0`, "wh_purchase_vouchers others");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN net_weight REAL DEFAULT 0`, "wh_purchase_vouchers net_weight");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN bags_claim REAL DEFAULT 0`, "wh_purchase_vouchers bags_claim");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN labour REAL DEFAULT 0`, "wh_purchase_vouchers labour");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN total_deduct_amount REAL DEFAULT 0`, "wh_purchase_vouchers total_deduct_amount");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN total_qty REAL DEFAULT 0`, "wh_purchase_vouchers total_qty");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN total_deduction REAL DEFAULT 0`, "wh_purchase_vouchers total_deduction");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN net_amount_payable REAL DEFAULT 0`, "wh_purchase_vouchers net_amount_payable");
 
   db.run(
     `
@@ -940,6 +975,14 @@ if (true) {
     (err) => {
       if (err) {
         console.log("cash_book_settings seed error:", err.message);
+      }
+    }
+  );
+  db.run(
+    `ALTER TABLE employees ADD COLUMN mobile TEXT`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("employees mobile add error:", err.message);
       }
     }
   );
