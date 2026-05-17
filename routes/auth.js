@@ -25,9 +25,22 @@ function getRecordId(value) {
 }
 
 async function attachAssignedWarehousesMongo(user) {
-  const warehouses = await Warehouse.find({
-    employee_id: user.id,
-  })
+  const assignedIds = Array.isArray(user.assigned_warehouse_ids)
+    ? user.assigned_warehouse_ids
+        .map((id) => String(id || "").trim())
+        .filter((id) => id)
+    : [];
+
+  const filter = assignedIds.length
+    ? { _id: { $in: assignedIds } }
+    : {
+        $or: [
+          { employee_id: user.id },
+          { employee_ids: user.id },
+        ],
+      };
+
+  const warehouses = await Warehouse.find(filter)
     .populate("location_id", "name")
     .sort({ name: 1 });
 
@@ -239,6 +252,7 @@ router.post("/login", async (req, res) => {
           role: user.role,
           permissions: user.permissions,
           location_id: user.location_id,
+          assigned_warehouse_ids: user.assigned_warehouse_ids,
         })
       );
 
