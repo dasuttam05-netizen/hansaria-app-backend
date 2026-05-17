@@ -11,6 +11,20 @@ const {
   isAdminUser,
 } = require("../middleware/auth");
 
+function parseEmployeeIds(input) {
+  const raw = Array.isArray(input)
+    ? input
+    : String(input || "").split(",");
+
+  return Array.from(
+    new Set(
+      raw
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
 router.get("/", async (req, res) => {
 
   try {
@@ -64,6 +78,10 @@ router.get("/", async (req, res) => {
           "employee_id",
           "name"
         )
+        .populate(
+          "employee_ids",
+          "name"
+        )
 
         .sort({
           created_at: -1,
@@ -84,6 +102,22 @@ router.get("/", async (req, res) => {
 
         employee_name:
           row.employee_id?.name || "",
+
+        employee_ids:
+          Array.isArray(row.employee_ids)
+            ? row.employee_ids.map((emp) =>
+                emp?._id
+                  ? String(emp._id)
+                  : String(emp)
+              )
+            : [],
+
+        employee_names:
+          Array.isArray(row.employee_ids)
+            ? row.employee_ids
+                .map((emp) => emp?.name)
+                .filter(Boolean)
+            : [],
 
       }));
 
@@ -123,6 +157,7 @@ router.post("/", async (req, res) => {
       address,
       location_id,
       employee_id,
+      employee_ids,
     } = req.body;
 
     if (
@@ -137,6 +172,14 @@ router.post("/", async (req, res) => {
 
     }
 
+    const safeEmployeeIds =
+      parseEmployeeIds(employee_ids);
+
+    const primaryEmployeeId =
+      safeEmployeeIds[0] ||
+      employee_id ||
+      null;
+
     const warehouse =
       await Warehouse.create({
 
@@ -148,7 +191,10 @@ router.post("/", async (req, res) => {
           location_id || null,
 
         employee_id:
-          employee_id || null,
+          primaryEmployeeId,
+
+        employee_ids:
+          safeEmployeeIds,
 
       });
 
@@ -188,7 +234,16 @@ router.put("/:id", async (req, res) => {
       address,
       location_id,
       employee_id,
+      employee_ids,
     } = req.body;
+
+    const safeEmployeeIds =
+      parseEmployeeIds(employee_ids);
+
+    const primaryEmployeeId =
+      safeEmployeeIds[0] ||
+      employee_id ||
+      null;
 
     const updated =
       await Warehouse.findByIdAndUpdate(
@@ -203,7 +258,10 @@ router.put("/:id", async (req, res) => {
             location_id || null,
 
           employee_id:
-            employee_id || null,
+            primaryEmployeeId,
+
+          employee_ids:
+            safeEmployeeIds,
         },
 
         {
