@@ -26,6 +26,49 @@ function parseEmployeeIds(input) {
   );
 }
 
+function normalizeId(value) {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  if (value._id) return String(value._id);
+  if (value.id) return String(value.id);
+  return String(value);
+}
+
+function normalizeIdArray(input) {
+  if (!Array.isArray(input)) return [];
+  return Array.from(
+    new Set(
+      input
+        .map((item) => normalizeId(item))
+        .filter(Boolean)
+    )
+  );
+}
+
+async function syncWarehouseEmployeeAssignments(warehouseId, employeeIds = []) {
+  const warehouseIdStr = String(warehouseId || "");
+  const safeEmployeeIds = Array.from(
+    new Set(
+      (Array.isArray(employeeIds) ? employeeIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  // Remove this warehouse from all employees first, then add to selected employees.
+  await Employee.updateMany(
+    {},
+    { $pull: { assigned_warehouse_ids: warehouseIdStr } }
+  );
+
+  if (!safeEmployeeIds.length) return;
+
+  await Employee.updateMany(
+    { _id: { $in: safeEmployeeIds } },
+    { $addToSet: { assigned_warehouse_ids: warehouseIdStr } }
+  );
+}
+
 router.get("/", async (req, res) => {
 
   try {
@@ -88,9 +131,7 @@ router.get("/", async (req, res) => {
       Array.from(
         new Set(
           rows.flatMap((row) =>
-            Array.isArray(row.employee_ids)
-              ? row.employee_ids.map((id) => String(id))
-              : []
+            normalizeIdArray(row.employee_ids)
           )
         )
       );
@@ -119,27 +160,24 @@ router.get("/", async (req, res) => {
         short_id:
           String(row._id).slice(-6),
 
+        location_id:
+          normalizeId(row.location_id),
+
         location_name:
           row.location_id?.name || "",
+
+        employee_id:
+          normalizeId(row.employee_id),
 
         employee_name:
           row.employee_id?.name || "",
 
-        employee_ids:
-          Array.isArray(row.employee_ids)
-            ? row.employee_ids.map((emp) =>
-                emp?._id
-                  ? String(emp._id)
-                  : String(emp)
-              )
-            : [],
+        employee_ids: normalizeIdArray(row.employee_ids),
 
         employee_names:
-          Array.isArray(row.employee_ids)
-            ? row.employee_ids
-                .map((emp) => employeeNameMap.get(String(emp)) || "")
-                .filter(Boolean)
-            : [],
+          normalizeIdArray(row.employee_ids)
+            .map((empId) => employeeNameMap.get(empId) || "")
+            .filter(Boolean),
 
       }));
 
@@ -219,6 +257,11 @@ router.post("/", async (req, res) => {
           safeEmployeeIds,
 
       });
+
+    await syncWarehouseEmployeeAssignments(
+      warehouse._id,
+      safeEmployeeIds
+    );
 
     return res.json(
       warehouse
@@ -300,6 +343,11 @@ router.put("/:id", async (req, res) => {
 
     }
 
+    await syncWarehouseEmployeeAssignments(
+      req.params.id,
+      safeEmployeeIds
+    );
+
     return res.json({
       updated: 1,
     });
@@ -344,6 +392,11 @@ router.delete("/:id", async (req, res) => {
       });
 
     }
+
+    await Employee.updateMany(
+      {},
+      { $pull: { assigned_warehouse_ids: String(req.params.id) } }
+    );
 
     return res.json({
       deleted: 1,
