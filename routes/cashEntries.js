@@ -335,7 +335,8 @@ function getCashEntryBasicById(entryId, cb) {
   db.get(
     `
     SELECT id, voucher_no, entry_date, entry_type, warehouse_id, company_id, company_account_id,
-           description, amount, payment_method, reference_no, narration, employee_id, status, fund_source, journal_group_no
+           description, amount, payment_method, reference_no, narration, employee_id, status, fund_source,
+           journal_group_no, source_expense_id
     FROM cash_entries
     WHERE id = ?
     `,
@@ -1755,13 +1756,29 @@ router.patch("/:id(\\d+)", (req, res) => {
     if (oldErr) return res.status(500).json({ error: oldErr.message });
     if (!oldRow) return res.status(404).json({ error: "Entry not found" });
 
-    db.run(
+    const isExpenseSplitEntry =
+      oldRow.source_expense_id &&
+      String(oldRow.entry_type || "").toLowerCase() === "expense";
+    const updateSql = isExpenseSplitEntry
+      ? `
+        UPDATE cash_entries
+        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE source_expense_id = ?
+          AND entry_type = 'expense'
+          AND COALESCE(status, 'pending') != 'cancelled'
       `
-      UPDATE cash_entries
-      SET status = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-      `,
-      [status, req.params.id],
+      : `
+        UPDATE cash_entries
+        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `;
+    const updateParams = isExpenseSplitEntry
+      ? [status, oldRow.source_expense_id]
+      : [status, req.params.id];
+
+    db.run(
+      updateSql,
+      updateParams,
       function (err) {
         if (err) return res.status(500).json({ error: err.message });
         if (this.changes === 0) return res.status(404).json({ error: "Entry not found" });
@@ -1777,14 +1794,28 @@ router.patch("/:id(\\d+)", (req, res) => {
           },
         });
 
-        updateMongoCashEntryFields(Number(req.params.id), {
-          status,
-          updated_at: new Date(),
-        }).catch((err) => {
-          console.error("Mongo mirror error:", err.message);
-        });
+        if (isExpenseSplitEntry) {
+          runMongoMirror(() =>
+            CashEntry.updateMany(
+              { source_expense_id: Number(oldRow.source_expense_id), entry_type: "expense", status: { $ne: "cancelled" } },
+              { $set: { status, updated_at: new Date() } }
+            ).exec()
+          ).catch((err) => {
+            console.error("Mongo mirror error:", err.message);
+          });
+        } else {
+          updateMongoCashEntryFields(Number(req.params.id), {
+            status,
+            updated_at: new Date(),
+          }).catch((err) => {
+            console.error("Mongo mirror error:", err.message);
+          });
+        }
 
-        return res.json({ message: "Cash entry status updated successfully" });
+        return res.json({
+          message: "Cash entry status updated successfully",
+          changes: this.changes || 0,
+        });
       }
     );
   });
