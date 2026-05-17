@@ -40,46 +40,6 @@ function getRecordId(value) {
   return String(value);
 }
 
-async function syncEmployeeWarehouses(
-  employeeId,
-  assignedWarehouseIds
-) {
-
-  const safeWarehouseIds =
-    parseWarehouseIds(
-      assignedWarehouseIds
-    );
-
-  await Warehouse.updateMany(
-    {
-      employee_id: employeeId,
-    },
-    {
-      $set: {
-        employee_id: null,
-      },
-    }
-  );
-
-  if (safeWarehouseIds.length === 0) {
-    return;
-  }
-
-  await Warehouse.updateMany(
-    {
-      _id: {
-        $in: safeWarehouseIds,
-      },
-    },
-    {
-      $set: {
-        employee_id: employeeId,
-      },
-    }
-  );
-}
-
-
 // =========================
 // GET ALL EMPLOYEES
 // =========================
@@ -120,6 +80,11 @@ router.get("/", async (req, res) => {
           parsePermissions(
             row.permissions,
             row.role
+          ),
+
+        assigned_warehouse_ids:
+          parseWarehouseIds(
+            row.assigned_warehouse_ids
           ),
       }));
 
@@ -177,6 +142,11 @@ router.get("/:id", async (req, res) => {
         parsePermissions(
           row.permissions,
           row.role
+        ),
+
+      assigned_warehouse_ids:
+        parseWarehouseIds(
+          row.assigned_warehouse_ids
         ),
     });
 
@@ -399,12 +369,12 @@ router.post("/", async (req, res) => {
           ).toLowerCase() === "cr"
             ? "cr"
             : "dr",
-      });
 
-    await syncEmployeeWarehouses(
-      employee._id,
-      assigned_warehouse_ids
-    );
+        assigned_warehouse_ids:
+          parseWarehouseIds(
+            assigned_warehouse_ids
+          ),
+      });
 
     return res.json({
 
@@ -444,7 +414,7 @@ router.post("/", async (req, res) => {
 
       assigned_warehouse_ids:
         parseWarehouseIds(
-          assigned_warehouse_ids
+          employee.assigned_warehouse_ids
         ),
     });
 
@@ -606,6 +576,11 @@ router.put("/:id", async (req, res) => {
         ).toLowerCase() === "cr"
           ? "cr"
           : "dr",
+
+      assigned_warehouse_ids:
+        parseWarehouseIds(
+          assigned_warehouse_ids
+        ),
     };
 
     if (password) {
@@ -620,11 +595,6 @@ router.put("/:id", async (req, res) => {
     await Employee.findByIdAndUpdate(
       targetEmployeeId,
       updateData
-    );
-
-    await syncEmployeeWarehouses(
-      targetEmployeeId,
-      assigned_warehouse_ids
     );
 
     return res.json({
