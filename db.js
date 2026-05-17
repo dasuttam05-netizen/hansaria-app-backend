@@ -176,11 +176,17 @@ if (true) {
       product_id INTEGER,
       quantity REAL DEFAULT 0,
       shortage_quantity REAL DEFAULT 0,
+      unloading_qty REAL DEFAULT 0,
       rate REAL DEFAULT 0,
       amount REAL DEFAULT 0,
       claim_amount REAL DEFAULT 0,
+      other_deduction REAL DEFAULT 0,
+      adjustment_amount REAL DEFAULT 0,
       tds_amount REAL DEFAULT 0,
       net_amount REAL DEFAULT 0,
+      net_receivable_amount REAL DEFAULT 0,
+      fifo_rate REAL DEFAULT 0,
+      fifo_amount REAL DEFAULT 0,
       outstanding REAL DEFAULT 0,
       employee_id INTEGER,
       location_id INTEGER,
@@ -644,8 +650,14 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN unloading_date TEXT`, "wh_sale_vouchers unloading_date");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN shortage_quantity REAL DEFAULT 0`, "wh_sale_vouchers shortage_quantity");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN claim_amount REAL DEFAULT 0`, "wh_sale_vouchers claim_amount");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN other_deduction REAL DEFAULT 0`, "wh_sale_vouchers other_deduction");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN adjustment_amount REAL DEFAULT 0`, "wh_sale_vouchers adjustment_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN tds_amount REAL DEFAULT 0`, "wh_sale_vouchers tds_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN net_amount REAL DEFAULT 0`, "wh_sale_vouchers net_amount");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN unloading_qty REAL DEFAULT 0`, "wh_sale_vouchers unloading_qty");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN net_receivable_amount REAL DEFAULT 0`, "wh_sale_vouchers net_receivable_amount");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN fifo_rate REAL DEFAULT 0`, "wh_sale_vouchers fifo_rate");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN fifo_amount REAL DEFAULT 0`, "wh_sale_vouchers fifo_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN outstanding REAL DEFAULT 0`, "wh_sale_vouchers outstanding");
   addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN reference_type TEXT`, "wh_payment_vouchers reference_type");
   addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN reference_id INTEGER`, "wh_payment_vouchers reference_id");
