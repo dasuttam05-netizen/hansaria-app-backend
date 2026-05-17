@@ -244,24 +244,24 @@ function parsePermissions(
   return [];
 }
 
-async function loadAssignedWarehouseIds(userId) {
-  if (!userId) return [];
-
-  const warehouses = await Warehouse.find(
-    { employee_id: userId },
-    { _id: 1 }
-  );
-
-  return (warehouses || [])
-    .map((row) =>
-      row?._id
-        ? String(row._id)
-        : ""
+function normalizeObjectIdArray(input) {
+  if (!Array.isArray(input)) return [];
+  return Array.from(
+    new Set(
+      input
+        .map((item) => {
+          if (!item) return "";
+          if (item._id) return String(item._id);
+          return String(item);
+        })
+        .filter((item) => item)
     )
-    .filter((item) => item);
+  );
 }
 
-async function loadAssignedWarehouseAccess(userId) {
+async function loadAssignedWarehouseAccess(user) {
+  const userId = user?._id ? String(user._id) : String(user?.id || "");
+
   if (!userId) {
     return {
       assigned_warehouse_ids: [],
@@ -270,12 +270,41 @@ async function loadAssignedWarehouseAccess(userId) {
     };
   }
 
+  let assignedWarehouseIds =
+    normalizeObjectIdArray(
+      user?.assigned_warehouse_ids
+    );
+
+  if (!assignedWarehouseIds.length) {
+    const legacyRows = await Warehouse.find(
+      {
+        $or: [
+          { employee_id: userId },
+          { employee_ids: userId },
+        ],
+      },
+      { _id: 1 }
+    ).lean();
+
+    assignedWarehouseIds = (legacyRows || [])
+      .map((row) => (row?._id ? String(row._id) : ""))
+      .filter((item) => item);
+  }
+
+  if (!assignedWarehouseIds.length) {
+    return {
+      assigned_warehouse_ids: [],
+      assigned_sqlite_warehouse_ids: [],
+      location_ids: [],
+    };
+  }
+
   const warehouses = await Warehouse.find(
-    { employee_id: userId },
+    { _id: { $in: assignedWarehouseIds } },
     { _id: 1, name: 1, location_id: 1 }
   ).lean();
 
-  const assignedWarehouseIds = (warehouses || [])
+  assignedWarehouseIds = (warehouses || [])
     .map((row) => (row?._id ? String(row._id) : ""))
     .filter((item) => item);
 
@@ -347,6 +376,11 @@ function buildUserPayload(
         : user.location_id
         ? String(user.location_id)
         : null,
+
+    assigned_warehouse_ids:
+      normalizeObjectIdArray(
+        user.assigned_warehouse_ids
+      ),
   };
 }
 
@@ -388,7 +422,7 @@ function userHasPermission(
 async function buildAuthenticatedUserPayload(user) {
   const payload = buildUserPayload(user);
   const access =
-    await loadAssignedWarehouseAccess(payload.id);
+    await loadAssignedWarehouseAccess(user);
 
   // Merge warehouse location IDs with employee's own location_ids
   const employeeLocationIds = Array.isArray(user.location_ids)
