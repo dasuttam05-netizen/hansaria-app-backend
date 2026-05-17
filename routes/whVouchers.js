@@ -4,6 +4,21 @@ const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
 const PDFDocument = require('pdfkit');
+function fmtDate(value) {
+  if (!value) return "-";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+
+function fmtNum(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0.00";
+  return n.toFixed(2);
+}
 
 function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
   const filter = assignedWarehouseFilter(req.user, "warehouse_id");
@@ -87,7 +102,7 @@ function computeOutstandingForFarmer(farmerId, callback) {
 }
 
 function computeOutstandingForCompany(companyId, callback) {
-  const saleSql = `SELECT COALESCE(SUM(amount), 0) AS total_sale FROM wh_sale_vouchers WHERE company_id = ?`;
+  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE company_id = ?`;
   const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE company_id = ?`;
   db.get(saleSql, [companyId], (err, sale) => {
     if (err) return callback(err);
@@ -354,7 +369,7 @@ router.get("/outstanding", (req, res) => {
       filters.push("location_id = ?");
       params.push(location_id);
     }
-    detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_sale_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+    detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     computeOutstandingForCompany(id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
@@ -388,7 +403,7 @@ router.post("/sale", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, rate, amount, claim_amount, tds_amount, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
   const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
@@ -407,16 +422,22 @@ router.post("/sale", (req, res) => {
 
         const amountValue = Number(amount) || 0;
         const claimValue = Number(claim_amount) || 0;
+        const otherDeductionValue = Number(other_deduction) || 0;
+        const adjustmentValue = Number(adjustment_amount) || 0;
         const tdsValue = Number(tds_amount) || 0;
-        const netAmount = amountValue - claimValue - tdsValue;
+        const netAmount = amountValue - claimValue - otherDeductionValue - adjustmentValue - tdsValue;
+        const unloadingQtyValue = Number(unloading_qty) || Number(quantity) || 0;
+        const fifoAmountValue = amountValue;
+        const fifoRateValue = unloadingQtyValue > 0 ? amountValue / unloadingQtyValue : 0;
+        const netReceivableValue = netAmount;
         const outstanding = netAmount;
 
         const query = `
-          INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, rate, amount, claim_amount, tds_amount, net_amount, outstanding, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, net_amount, net_receivable_amount, fifo_rate, fifo_amount, outstanding, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, rate, amountValue, claimValue, tdsValue, netAmount, outstanding, employee_id, location_id, description], function (err) {
+        db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue, outstanding, employee_id, location_id, description], function (err) {
           if (err) {
             if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
             return res.status(500).json({ error: err.message });
@@ -433,21 +454,88 @@ router.post("/sale", (req, res) => {
 
     const amountValue = Number(amount) || 0;
     const claimValue = Number(claim_amount) || 0;
+    const otherDeductionValue = Number(other_deduction) || 0;
+    const adjustmentValue = Number(adjustment_amount) || 0;
     const tdsValue = Number(tds_amount) || 0;
-    const netAmount = amountValue - claimValue - tdsValue;
+    const netAmount = amountValue - claimValue - otherDeductionValue - adjustmentValue - tdsValue;
+    const unloadingQtyValue = Number(unloading_qty) || Number(quantity) || 0;
+    const fifoAmountValue = amountValue;
+    const fifoRateValue = unloadingQtyValue > 0 ? amountValue / unloadingQtyValue : 0;
+    const netReceivableValue = netAmount;
     const outstanding = netAmount;
 
     const query = `
-      INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, rate, amount, claim_amount, tds_amount, net_amount, outstanding, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, net_amount, net_receivable_amount, fifo_rate, fifo_amount, outstanding, employee_id, location_id, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, rate, amountValue, claimValue, tdsValue, netAmount, outstanding, employee_id, location_id, description], function (err) {
+    db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue, outstanding, employee_id, location_id, description], function (err) {
       if (err) {
         if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
         return res.status(500).json({ error: err.message });
       }
       res.json({ id: this.lastID, voucher_no: generatedVoucherNo, net_amount: netAmount, outstanding });
+    });
+  });
+});
+
+router.put("/sale/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const { voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, employee_id, location_id, description } = req.body;
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+
+  const amountValue = Number(amount) || 0;
+  const claimValue = Number(claim_amount) || 0;
+  const otherDeductionValue = Number(other_deduction) || 0;
+  const adjustmentValue = Number(adjustment_amount) || 0;
+  const tdsValue = Number(tds_amount) || 0;
+  const netAmount = amountValue - claimValue - otherDeductionValue - adjustmentValue - tdsValue;
+  const unloadingQtyValue = Number(unloading_qty) || Number(quantity) || 0;
+  const fifoAmountValue = amountValue;
+  const fifoRateValue = unloadingQtyValue > 0 ? amountValue / unloadingQtyValue : 0;
+  const netReceivableValue = netAmount;
+
+  const query = `
+    UPDATE wh_sale_vouchers SET
+      voucher_no=?, date=?, unloading_date=?, warehouse_id=?, company_id=?, consignee_id=?, product_id=?,
+      quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?,
+      adjustment_amount=?, tds_amount=?, net_amount=?, net_receivable_amount=?, fifo_rate=?, fifo_amount=?,
+      outstanding=?, employee_id=?, location_id=?, description=?
+    WHERE id = ?
+  `;
+
+  db.run(query, [
+    voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id,
+    quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue,
+    adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue,
+    netAmount, employee_id, location_id, description, id
+  ], function (err) {
+    if (err) {
+      if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+      return res.status(500).json({ error: err.message });
+    }
+    res.json({ id, updated: 1, net_amount: netAmount, net_receivable_amount: netReceivableValue, outstanding: netAmount });
+  });
+});
+
+router.delete("/sale/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  db.get("SELECT warehouse_id FROM wh_sale_vouchers WHERE id = ?", [id], (findErr, row) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!row) return res.status(404).json({ error: "Voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    db.run("DELETE FROM wh_sale_vouchers WHERE id = ?", [id], function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ deleted: 1 });
     });
   });
 });
@@ -698,8 +786,8 @@ router.get("/report/sale-summary", (req, res) => {
   const query = `
     SELECT 
       warehouse_id, 
-      SUM(quantity) as total_quantity, 
-      SUM(amount) as total_amount 
+      SUM(COALESCE(NULLIF(unloading_qty, 0), quantity)) as total_quantity, 
+      SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)) as total_amount 
     FROM wh_sale_vouchers 
     WHERE 1 = 1 ${filter.clause}
     GROUP BY warehouse_id
@@ -741,9 +829,9 @@ router.get("/report/profit-loss", (req, res) => {
     SELECT 
       w.id,
       w.name as warehouse_name,
-      (SELECT COALESCE(SUM(amount), 0) FROM wh_sale_vouchers WHERE warehouse_id = w.id) as sale_amount,
+      (SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) FROM wh_sale_vouchers WHERE warehouse_id = w.id) as sale_amount,
       (SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) FROM wh_purchase_vouchers WHERE warehouse_id = w.id) as purchase_amount,
-      (SELECT COALESCE(SUM(amount), 0) FROM wh_sale_vouchers WHERE warehouse_id = w.id) - 
+      (SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) FROM wh_sale_vouchers WHERE warehouse_id = w.id) - 
       (SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) FROM wh_purchase_vouchers WHERE warehouse_id = w.id) as profit_loss
     FROM warehouses w
     WHERE 1 = 1 ${filter.clause}
@@ -757,39 +845,178 @@ router.get("/report/profit-loss", (req, res) => {
 // PDF download for purchase voucher - available to authenticated users
 router.get("/purchase/:id/pdf", (req, res) => {
   const id = req.params.id;
-  const q = "SELECT * FROM wh_purchase_vouchers WHERE id = ?";
+  const q = `
+    SELECT
+      p.*,
+      w.name AS warehouse_name,
+      w.address AS warehouse_address,
+      f.name AS farmer_name,
+      f.mobile AS farmer_mobile,
+      f.village AS farmer_village
+    FROM wh_purchase_vouchers p
+    LEFT JOIN warehouses w ON w.id = p.warehouse_id
+    LEFT JOIN farmers f ON f.id = p.farmer_id
+    WHERE p.id = ?
+  `;
   db.get(q, [id], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ error: "Not found" });
     if (!req.user) return res.status(403).json({ error: "Authentication required" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
 
-    const doc = new PDFDocument({ margin: 40 });
+    const doc = new PDFDocument({ size: "A4", margin: 28 });
     res.setHeader('Content-Type', 'application/pdf');
     const filename = `purchase_${row.voucher_no || id}.pdf`;
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     doc.pipe(res);
 
-    doc.fontSize(18).text('Agri Rise Pvt Ltd', { align: 'center' });
-    doc.moveDown(0.5);
-    doc.fontSize(14).text(`Purchase Voucher`, { align: 'center' });
-    doc.moveDown();
+    const pageW = doc.page.width;
+    const contentW = pageW - 56;
+    const blue = "#0b2a66";
+    const orange = "#e67e22";
+    const light = "#f7f8fb";
+    const x = 28;
+    let y = 28;
 
-    const fields = [
-      ['Voucher No', row.voucher_no || id],
-      ['Date', row.date],
-      ['Warehouse ID', row.warehouse_id],
-      ['Farmer ID', row.farmer_id],
-      ['Product ID', row.product_id],
-      ['Quantity', row.quantity],
-      ['Rate', row.rate],
-      ['Amount', row.amount],
-      ['Net Payable', row.net_amount_payable],
-      ['Description', row.description || '']
+    doc.rect(x, y, contentW, 82).fill(light);
+    doc.fillColor(blue).fontSize(30).text("SHIVANSH", x + 16, y + 12, { continued: true });
+    doc.fillColor("#1b1b1b").fontSize(30).text(" TRADING CO.");
+    doc.fillColor(orange).fontSize(11).text("GRAIN MERCHANT & COMMISSION AGENT", x + 18, y + 50);
+    doc.fillColor(blue).fontSize(26).text("PURCHASE MEMO", x + contentW - 250, y + 24, { width: 230, align: "right" });
+    y += 92;
+
+    doc.strokeColor("#d7d7d7").lineWidth(1).moveTo(x, y).lineTo(x + contentW, y).stroke();
+    y += 12;
+
+    doc.fillColor("#222").fontSize(12).text(`Serial No.: ${row.voucher_no || id}`, x + 2, y);
+    doc.text(`Date: ${fmtDate(row.date)}`, x + contentW - 180, y, { width: 178, align: "right" });
+    y += 26;
+
+    const leftW = (contentW - 16) / 2;
+    const rightX = x + leftW + 16;
+    doc.roundedRect(x, y, leftW, 132, 6).stroke("#c9c9c9");
+    doc.roundedRect(rightX, y, leftW, 132, 6).stroke("#c9c9c9");
+    doc.rect(x, y, leftW, 22).fill(blue);
+    doc.rect(rightX, y, leftW, 22).fill(orange);
+    doc.fillColor("#fff").fontSize(12).text("PARTY INFORMATION", x + 10, y + 5);
+    doc.text("DOCUMENT INFORMATION", rightX + 10, y + 5);
+
+    doc.fillColor("#222").fontSize(11);
+    const pStart = y + 32;
+    doc.text(`Name: ${row.farmer_name || "-"}`, x + 10, pStart);
+    doc.text(`Phone: ${row.farmer_mobile || "-"}`, x + 10, pStart + 20);
+    doc.text(`Village: ${row.farmer_village || "-"}`, x + 10, pStart + 40);
+    doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`, x + 10, pStart + 60);
+    doc.text(`Address: ${row.warehouse_address || "-"}`, x + 10, pStart + 80, { width: leftW - 20 });
+
+    doc.text(`R.S.T. No.: -`, rightX + 10, pStart);
+    doc.text(`Transport No.: -`, rightX + 10, pStart + 20);
+    doc.text(`Product ID: ${row.product_id || "-"}`, rightX + 10, pStart + 40);
+    doc.text(`Farmer ID: ${row.farmer_id || "-"}`, rightX + 10, pStart + 60);
+    doc.text(`Location ID: ${row.location_id || "-"}`, rightX + 10, pStart + 80);
+    y += 146;
+
+    const tableX = x;
+    const tableW = contentW;
+    const col1 = 42;
+    const col2 = tableW - 180 - col1;
+    const col3 = 180;
+    doc.rect(tableX, y, tableW, 26).fill(blue);
+    doc.fillColor("#fff").fontSize(12).text("#", tableX + 14, y + 7);
+    doc.text("PARTICULARS", tableX + col1 + 10, y + 7);
+    doc.text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, y + 7);
+    y += 26;
+
+    const lines = [
+      ["1", "Brokerage", fmtNum(row.total_deduct_amount)],
+      ["2", "Labour", fmtNum(row.labour)],
+      ["3", "Packet", fmtNum(row.packet)],
+      ["4", "Gross Weight", fmtNum(row.gross_weight)],
+      ["5", "Tare Weight", fmtNum(row.tare_weight)],
+      ["6", "Net Weight", fmtNum(row.net_weight)],
+      ["7", "Moisture", fmtNum(row.moisture)],
+      ["8", "Dunki", fmtNum(row.dunki)],
+      ["9", "Others", fmtNum(row.others)],
+      ["10", "Net Amount Payable", fmtNum(row.net_amount_payable || row.amount)],
     ];
 
-    fields.forEach(f => {
-      doc.fontSize(12).text(`${f[0]}: ${f[1]}`);
+    lines.forEach((ln) => {
+      doc.rect(tableX, y, tableW, 24).stroke("#d8d8d8");
+      doc.text(ln[0], tableX + 14, y + 6);
+      doc.text(ln[1], tableX + col1 + 10, y + 6);
+      doc.text(ln[2], tableX + col1 + col2 + 10, y + 6);
+      y += 24;
     });
+
+    y += 10;
+    doc.roundedRect(x, y, contentW, 78, 6).stroke("#cfcfcf");
+    doc.fontSize(12).fillColor("#222").text(`Total Qty: ${fmtNum(row.total_qty || row.quantity)}`, x + 12, y + 12);
+    doc.text(`Total Deductions: ${fmtNum(row.total_deduction || row.total_deduct_amount)}`, x + 220, y + 12);
+    doc.fillColor(blue).fontSize(14).text(`Net Amount Payable: Rs. ${fmtNum(row.net_amount_payable || row.amount)}`, x + 12, y + 42);
+
+    if (row.description) {
+      y += 88;
+      doc.fillColor("#222").fontSize(11).text(`Remarks: ${row.description}`, x, y, { width: contentW });
+    }
+
+    doc.end();
+  });
+});
+
+router.get("/sale/:id/pdf", (req, res) => {
+  const id = req.params.id;
+  const q = `
+    SELECT
+      s.*,
+      w.name AS warehouse_name,
+      c.name AS company_name,
+      co.name AS consignee_name,
+      p.name AS product_name
+    FROM wh_sale_vouchers s
+    LEFT JOIN warehouses w ON w.id = s.warehouse_id
+    LEFT JOIN companies c ON c.id = s.company_id
+    LEFT JOIN consignee_names co ON co.id = s.consignee_id
+    LEFT JOIN products p ON p.id = s.product_id
+    WHERE s.id = ?
+  `;
+
+  db.get(q, [id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: "Not found" });
+    if (!req.user) return res.status(403).json({ error: "Authentication required" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    const doc = new PDFDocument({ size: "A4", margin: 36 });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="sale_${row.voucher_no || id}.pdf"`);
+    doc.pipe(res);
+
+    doc.fontSize(18).text("SALE VOUCHER", { align: "center" });
+    doc.moveDown(0.6);
+    doc.fontSize(11).text(`Voucher No: ${row.voucher_no || "-"}`);
+    doc.text(`Sale Date: ${fmtDate(row.date)}`);
+    doc.text(`Unloading Date: ${fmtDate(row.unloading_date)}`);
+    doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`);
+    doc.text(`Company: ${row.company_name || "-"}`);
+    doc.text(`Consignee: ${row.consignee_name || "-"}`);
+    doc.text(`Product: ${row.product_name || "-"}`);
+    doc.moveDown(0.4);
+    doc.text(`Qty: ${fmtNum(row.quantity)}`);
+    doc.text(`Unloading Qty: ${fmtNum(row.unloading_qty || row.quantity)}`);
+    doc.text(`Shortage Qty: ${fmtNum(row.shortage_quantity)}`);
+    doc.text(`Rate: ${fmtNum(row.rate)}`);
+    doc.text(`Amount: ${fmtNum(row.amount)}`);
+    doc.text(`Claim: ${fmtNum(row.claim_amount)}`);
+    doc.text(`Other Deduction: ${fmtNum(row.other_deduction)}`);
+    doc.text(`Adjustment: ${fmtNum(row.adjustment_amount)}`);
+    doc.text(`TDS: ${fmtNum(row.tds_amount)}`);
+    doc.text(`Net Receivable: ${fmtNum(row.net_receivable_amount || row.net_amount || row.amount)}`);
+    doc.text(`Outstanding: ${fmtNum(row.outstanding)}`);
+
+    if (row.description) {
+      doc.moveDown(0.4);
+      doc.text(`Remarks: ${row.description}`);
+    }
 
     doc.end();
   });
