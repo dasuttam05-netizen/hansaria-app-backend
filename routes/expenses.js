@@ -1098,307 +1098,167 @@ router.post("/:id/approve-cash-book", (req, res) => {
                 return res.status(500).json({ error: statusErr.message });
               }
 
-              db.run(
-                `
+              let employeeCashEntryId = null;
+              let partyCashEntryId = null;
+              const cashEntrySql = `
                 INSERT INTO cash_entries (
-                  voucher_no,
-                  entry_date,
-                  entry_type,
-                  warehouse_id,
-                  company_id,
-                  company_account_id,
-                  description,
-                  amount,
-                  payment_method,
-                  reference_no,
-                  narration,
-                  created_by,
-                  employee_id,
-                  fund_source,
-                  status,
-                  source_expense_id
+                  voucher_no, entry_date, entry_type, warehouse_id, company_id, company_account_id,
+                  description, amount, payment_method, reference_no, narration, created_by,
+                  employee_id, fund_source, status, source_expense_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `,
-                [
-                  expense.voucher_no || null,
-                  expense.expense_date,
-                  "expense",
-                  expense.warehouse_id || null,
-                  expense.company_id || null,
-                  expense.company_account_id || null,
-                  `Expense ${expense.voucher_no || ""}${expense.work_description ? ` - ${expense.work_description}` : ""}`.trim(),
-                  Number(expense.total_expense_amount) || 0,
-                  "Cash",
-                  expense.voucher_no || null,
-                  expense.narration || null,
-                  req.user?.id || null,
-                  expense.employee_id || null,
-                  "main_cash",
-                  "pending",
-                  expense.id,
-                ],
-                function insertCashEntry(insertErr) {
-                  if (insertErr) {
+              `;
+              const baseDescription = `${expense.work_description || ""}, ${expense.lorry_no || ""}`.trim();
+              const cashEntryInserts = [];
+
+              if (expense.employee_id) {
+                cashEntryInserts.push(
+                  new Promise((resolve, reject) => {
                     db.run(
-                      "UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                      [expense.status || "PENDING", id],
-                      () => {}
+                      cashEntrySql,
+                      [
+                        expense.voucher_no ? `${expense.voucher_no}-EMP` : null,
+                        expense.expense_date,
+                        "expense",
+                        expense.warehouse_id || null,
+                        expense.company_id || null,
+                        expense.company_account_id || null,
+                        baseDescription,
+                        Number(expense.total_expense_amount) || 0,
+                        "Cash",
+                        expense.voucher_no || null,
+                        expense.narration || null,
+                        req.user?.id || null,
+                        expense.employee_id || null,
+                        "employee_cash",
+                        "pending",
+                        expense.id,
+                      ],
+                      function (err) {
+                        if (err) return reject(err);
+                        employeeCashEntryId = this.lastID;
+                        return resolve();
+                      }
                     );
-                    return res.status(500).json({ error: insertErr.message });
+                  })
+                );
+              }
+
+              if (expense.company_id) {
+                cashEntryInserts.push(
+                  new Promise((resolve, reject) => {
+                    db.run(
+                      cashEntrySql,
+                      [
+                        expense.voucher_no ? `${expense.voucher_no}-PARTY` : null,
+                        expense.expense_date,
+                        "expense",
+                        expense.warehouse_id || null,
+                        expense.company_id || null,
+                        expense.company_account_id || null,
+                        baseDescription,
+                        Number(expense.total_expense_amount) || 0,
+                        "Cash",
+                        expense.voucher_no || null,
+                        expense.narration || null,
+                        req.user?.id || null,
+                        expense.employee_id || null,
+                        "party_cash",
+                        "pending",
+                        expense.id,
+                      ],
+                      function (err) {
+                        if (err) return reject(err);
+                        partyCashEntryId = this.lastID;
+                        return resolve();
+                      }
+                    );
+                  })
+                );
+              }
+
+              if (!cashEntryInserts.length) {
+                db.run(
+                  "UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                  [expense.status || "PENDING", id],
+                  () => {}
+                );
+                return res.status(400).json({ error: "Employee or party is required to move expense to Cash Book" });
+              }
+
+              const sendSuccessResponse = (inwardInfo, outwardInfo, paltiInfo) => {
+                const inwardPosted = !!inwardInfo?.posted || !!inwardInfo?.already_posted;
+                const outwardPosted = !!outwardInfo?.posted || !!outwardInfo?.already_posted;
+                const paltiPosted = !!paltiInfo?.posted || !!paltiInfo?.already_posted;
+                let message = "Expense approved and moved to Employee/Party Cash Book pending list";
+
+                if (inwardPosted) message += ", and posted to Inward";
+                if (outwardPosted) message += ", and posted to Outward";
+                if (paltiPosted) message += ", and posted to Palti Lorry";
+
+                return res.json({
+                  approved: true,
+                  expense_id: expense.id,
+                  cash_entry_id: employeeCashEntryId || partyCashEntryId,
+                  employee_cash_entry_id: employeeCashEntryId,
+                  party_cash_entry_id: partyCashEntryId,
+                  inward_posted: inwardPosted,
+                  inward_id: inwardInfo?.inward_id || null,
+                  inward_voucher_no: inwardInfo?.inward_voucher_no || null,
+                  outward_posted: outwardPosted,
+                  outward_id: outwardInfo?.outward_id || null,
+                  outward_voucher_no: outwardInfo?.outward_voucher_no || null,
+                  palti_posted: paltiPosted,
+                  message,
+                });
+              };
+
+              const continueAfterCashEntries = () => {
+                const inwardNeeded = shouldPostExpenseToInward(expense);
+                const outwardNeeded = shouldPostExpenseToOutward(expense);
+                const paltiNeeded = shouldPostExpenseToPaltiLorry(expense);
+
+                const continueWithPalti = (inwardInfo, outwardInfo) => {
+                  if (!paltiNeeded) {
+                    return sendSuccessResponse(inwardInfo, outwardInfo, { posted: false, already_posted: false });
                   }
 
-                  const cashEntryId = this.lastID;
-                  let employeeCashEntryId = null;
-                  let partyCashEntryId = null;
-
-                  const insertAdditionalEntries = async () => {
-                    const additionalInserts = [];
-
-                    // Insert for employee cash book if employee_id exists
-                    if (expense.employee_id) {
-                      const empDescription = `${expense.work_description || ""}, ${expense.lorry_no || ""}`.trim();
-                      additionalInserts.push(
-                        new Promise((resolve, reject) => {
-                          db.run(
-                            `
-                            INSERT INTO cash_entries (
-                              voucher_no, entry_date, entry_type, warehouse_id, company_id, company_account_id,
-                              description, amount, payment_method, reference_no, narration, created_by, employee_id, fund_source, status, source_expense_id
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            `,
-                            [
-                              expense.voucher_no ? `${expense.voucher_no}-EMP` : null,
-                              expense.expense_date,
-                              "expense",
-                              expense.warehouse_id || null,
-                              expense.company_id || null,
-                              expense.company_account_id || null,
-                              empDescription,
-                              Number(expense.total_expense_amount) || 0,
-                              "Cash",
-                              expense.voucher_no || null,
-                              expense.narration || null,
-                              req.user?.id || null,
-                              expense.employee_id || null,
-                              "employee_cash",
-                              "pending",
-                              expense.id,
-                            ],
-                            function (err) {
-                              if (err) reject(err);
-                              else {
-                                employeeCashEntryId = this.lastID;
-                                resolve();
-                              }
-                            }
-                          );
-                        })
-                      );
-                    }
-
-                    // Insert for party cash book if company_id exists
-                    if (expense.company_id) {
-                      const partyDescription = `${expense.work_description || ""}, ${expense.lorry_no || ""}`.trim();
-                      additionalInserts.push(
-                        new Promise((resolve, reject) => {
-                          db.run(
-                            `
-                            INSERT INTO cash_entries (
-                              voucher_no, entry_date, entry_type, warehouse_id, company_id, company_account_id,
-                              description, amount, payment_method, reference_no, narration, created_by, employee_id, fund_source, status, source_expense_id
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            `,
-                            [
-                              expense.voucher_no ? `${expense.voucher_no}-PARTY` : null,
-                              expense.expense_date,
-                              "expense",
-                              expense.warehouse_id || null,
-                              expense.company_id || null,
-                              expense.company_account_id || null,
-                              partyDescription,
-                              Number(expense.total_expense_amount) || 0,
-                              "Cash",
-                              expense.voucher_no || null,
-                              expense.narration || null,
-                              req.user?.id || null,
-                              expense.employee_id || null,
-                              "party_cash",
-                              "pending",
-                              expense.id,
-                            ],
-                            function (err) {
-                              if (err) reject(err);
-                              else {
-                                partyCashEntryId = this.lastID;
-                                resolve();
-                              }
-                            }
-                          );
-                        })
-                      );
-                    }
-
-                    try {
-                      await Promise.all(additionalInserts);
-                    } catch (addErr) {
-                      console.error("Error inserting additional cash entries:", addErr);
-                      // Continue anyway, as main entry is inserted
-                    }
-                  };
-
-                  insertAdditionalEntries().then(() => {
-                    const handleAfterPosting = (inwardInfo, outwardInfo) => {
-                      const sendSuccessResponse = (paltiInfo) => {
-                        const inwardPosted = !!inwardInfo?.posted || !!inwardInfo?.already_posted;
-                        const outwardPosted = !!outwardInfo?.posted || !!outwardInfo?.already_posted;
-                        const paltiPosted = !!paltiInfo?.posted || !!paltiInfo?.already_posted;
-                        let message = "Expense approved and moved to Cash Book pending list";
-
-                        if (inwardPosted) {
-                          message += ", and posted to Inward";
-                        }
-                        if (outwardPosted) {
-                          message += ", and posted to Outward";
-                        }
-                        if (paltiPosted) {
-                          message += ", and posted to Palti Lorry";
-                        }
-
-                        return res.json({
-                          approved: true,
-                          expense_id: expense.id,
-                          cash_entry_id: cashEntryId,
-                          employee_cash_entry_id: employeeCashEntryId,
-                          party_cash_entry_id: partyCashEntryId,
-                          inward_posted: inwardPosted,
-                          inward_id: inwardInfo?.inward_id || null,
-                          inward_voucher_no: inwardInfo?.inward_voucher_no || null,
-                          outward_posted: outwardPosted,
-                          outward_id: outwardInfo?.outward_id || null,
-                          outward_voucher_no: outwardInfo?.outward_voucher_no || null,
-                          palti_posted: paltiPosted,
-                          message,
-                        });
-                      };
-
-                      if (shouldPostExpenseToPaltiLorry(expense)) {
-                        postExpenseToPaltiLorry(expense, req.user?.id, (paltiErr, paltiInfo) => {
-                          if (paltiErr) {
-                            return res.status(500).json({ error: paltiErr.message });
-                          }
-                          return sendSuccessResponse(paltiInfo);
-                        });
-                        return;
-                      }
-
-                      return sendSuccessResponse({ posted: false, already_posted: false });
-                    };
-
-                    const inwardNeeded = shouldPostExpenseToInward(expense);
-                    const outwardNeeded = shouldPostExpenseToOutward(expense);
-
-                    const continueWithOutward = (inwardInfo) => {
-                      if (!outwardNeeded) {
-                        return handleAfterPosting(inwardInfo, { posted: false, already_posted: false });
-                      }
-
-                      postExpenseToOutward(expense, (outwardErr, outwardInfo) => {
-                        if (outwardErr) {
-                          return res.status(500).json({ error: outwardErr.message });
-                        }
-                        return handleAfterPosting(inwardInfo, outwardInfo);
-                      });
-                    };
-
-                    if (!inwardNeeded) {
-                      return continueWithOutward({ posted: false, already_posted: false });
-                    }
-
-                    postExpenseToInward(expense, (inwardErr, inwardInfo) => {
-                      if (inwardErr) {
-                        return res.status(500).json({ error: inwardErr.message });
-                      }
-                      return continueWithOutward(inwardInfo);
-                    });
-                  }).catch((addErr) => {
-                    console.error("Error in additional inserts:", addErr);
-                    // Still proceed with the main flow
-                    const handleAfterPosting = (inwardInfo, outwardInfo) => {
-                      const sendSuccessResponse = (paltiInfo) => {
-                        const inwardPosted = !!inwardInfo?.posted || !!inwardInfo?.already_posted;
-                        const outwardPosted = !!outwardInfo?.posted || !!outwardInfo?.already_posted;
-                        const paltiPosted = !!paltiInfo?.posted || !!paltiInfo?.already_posted;
-                        let message = "Expense approved and moved to Cash Book pending list";
-
-                        if (inwardPosted) {
-                          message += ", and posted to Inward";
-                        }
-                        if (outwardPosted) {
-                          message += ", and posted to Outward";
-                        }
-                        if (paltiPosted) {
-                          message += ", and posted to Palti Lorry";
-                        }
-
-                        return res.json({
-                          approved: true,
-                          expense_id: expense.id,
-                          cash_entry_id: cashEntryId,
-                          employee_cash_entry_id: employeeCashEntryId,
-                          party_cash_entry_id: partyCashEntryId,
-                          inward_posted: inwardPosted,
-                          inward_id: inwardInfo?.inward_id || null,
-                          inward_voucher_no: inwardInfo?.inward_voucher_no || null,
-                          outward_posted: outwardPosted,
-                          outward_id: outwardInfo?.outward_id || null,
-                          outward_voucher_no: outwardInfo?.outward_voucher_no || null,
-                          palti_posted: paltiPosted,
-                          message,
-                        });
-                      };
-
-                      if (shouldPostExpenseToPaltiLorry(expense)) {
-                        postExpenseToPaltiLorry(expense, req.user?.id, (paltiErr, paltiInfo) => {
-                          if (paltiErr) {
-                            return res.status(500).json({ error: paltiErr.message });
-                          }
-                          return sendSuccessResponse(paltiInfo);
-                        });
-                        return;
-                      }
-
-                      return sendSuccessResponse({ posted: false, already_posted: false });
-                    };
-
-                    const inwardNeeded = shouldPostExpenseToInward(expense);
-                    const outwardNeeded = shouldPostExpenseToOutward(expense);
-
-                    const continueWithOutward = (inwardInfo) => {
-                      if (!outwardNeeded) {
-                        return handleAfterPosting(inwardInfo, { posted: false, already_posted: false });
-                      }
-
-                      postExpenseToOutward(expense, (outwardErr, outwardInfo) => {
-                        if (outwardErr) {
-                          return res.status(500).json({ error: outwardErr.message });
-                        }
-                        return handleAfterPosting(inwardInfo, outwardInfo);
-                      });
-                    };
-
-                    if (!inwardNeeded) {
-                      return continueWithOutward({ posted: false, already_posted: false });
-                    }
-
-                    postExpenseToInward(expense, (inwardErr, inwardInfo) => {
-                      if (inwardErr) {
-                        return res.status(500).json({ error: inwardErr.message });
-                      }
-                      return continueWithOutward(inwardInfo);
-                    });
+                  return postExpenseToPaltiLorry(expense, req.user?.id, (paltiErr, paltiInfo) => {
+                    if (paltiErr) return res.status(500).json({ error: paltiErr.message });
+                    return sendSuccessResponse(inwardInfo, outwardInfo, paltiInfo);
                   });
+                };
+
+                const continueWithOutward = (inwardInfo) => {
+                  if (!outwardNeeded) {
+                    return continueWithPalti(inwardInfo, { posted: false, already_posted: false });
+                  }
+
+                  return postExpenseToOutward(expense, (outwardErr, outwardInfo) => {
+                    if (outwardErr) return res.status(500).json({ error: outwardErr.message });
+                    return continueWithPalti(inwardInfo, outwardInfo);
+                  });
+                };
+
+                if (!inwardNeeded) {
+                  return continueWithOutward({ posted: false, already_posted: false });
                 }
-              );
+
+                return postExpenseToInward(expense, (inwardErr, inwardInfo) => {
+                  if (inwardErr) return res.status(500).json({ error: inwardErr.message });
+                  return continueWithOutward(inwardInfo);
+                });
+              };
+
+              Promise.all(cashEntryInserts)
+                .then(continueAfterCashEntries)
+                .catch((insertErr) => {
+                  db.run(
+                    "UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    [expense.status || "PENDING", id],
+                    () => {}
+                  );
+                  return res.status(500).json({ error: insertErr.message });
+                });
             }
           );
         }
