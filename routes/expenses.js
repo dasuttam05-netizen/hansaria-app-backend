@@ -377,6 +377,26 @@ async function resolveAssignedWarehouseIds(user) {
   return Array.from(new Set(resolvedIds));
 }
 
+async function canAccessExpenseWarehouse(user, warehouseId, locationId = null) {
+  if (canAccessWarehouse(user, warehouseId)) {
+    return true;
+  }
+
+  const resolvedWarehouseIds = await resolveAssignedWarehouseIds(user).catch(() => []);
+  if (isPositiveNumber(warehouseId) && resolvedWarehouseIds.includes(Number(warehouseId))) {
+    return true;
+  }
+
+  if (locationId) {
+    const accessibleLocationIds = await resolveUserAccessibleLocationIds(user).catch(() => []);
+    if (isPositiveNumber(locationId) && accessibleLocationIds.includes(Number(locationId))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 async function resolveUserAccessibleLocationIds(user) {
   const rawLocationIds = [
     user?.location_id,
@@ -1045,7 +1065,7 @@ router.post("/:id/approve-cash-book", (req, res) => {
     WHERE x.id = ?
     `,
     [id],
-    (findErr, expense) => {
+    async (findErr, expense) => {
       if (findErr) {
         return res.status(500).json({ error: findErr.message });
       }
@@ -1054,7 +1074,7 @@ router.post("/:id/approve-cash-book", (req, res) => {
         return res.status(404).json({ error: "Expense not found" });
       }
 
-      if (!canAccessWarehouse(req.user, expense.warehouse_id)) {
+      if (!(await canAccessExpenseWarehouse(req.user, expense.warehouse_id, expense.location_id || expense.warehouse_location_id))) {
         return res.status(403).json({ error: "You cannot approve expenses for this warehouse" });
       }
 
@@ -1725,7 +1745,7 @@ router.put("/:id", async (req, res) => {
     }
   }
 
-  db.get("SELECT id, warehouse_id, employee_id FROM expenses WHERE id = ?", [id], async (findErr, row) => {
+  db.get("SELECT id, warehouse_id, location_id, employee_id FROM expenses WHERE id = ?", [id], async (findErr, row) => {
     if (findErr) {
       return res.status(500).json({ error: findErr.message });
     }
@@ -1734,7 +1754,7 @@ router.put("/:id", async (req, res) => {
       return res.status(404).json({ error: "Expense not found" });
     }
 
-    if (!canAccessWarehouse(req.user, row.warehouse_id)) {
+    if (!(await canAccessExpenseWarehouse(req.user, row.warehouse_id, row.location_id))) {
       return res.status(403).json({ error: "You cannot edit expenses for this warehouse" });
     }
 
@@ -1902,7 +1922,7 @@ router.delete("/:id", (req, res) => {
   }
   const { id } = req.params;
 
-  db.get("SELECT id, warehouse_id FROM expenses WHERE id = ?", [id], (findErr, row) => {
+  db.get("SELECT id, warehouse_id, location_id FROM expenses WHERE id = ?", [id], async (findErr, row) => {
     if (findErr) {
       return res.status(500).json({ error: findErr.message });
     }
@@ -1911,7 +1931,7 @@ router.delete("/:id", (req, res) => {
       return res.status(404).json({ error: "Expense not found" });
     }
 
-    if (!canAccessWarehouse(req.user, row.warehouse_id)) {
+    if (!(await canAccessExpenseWarehouse(req.user, row.warehouse_id, row.location_id))) {
       return res.status(403).json({ error: "You cannot delete expenses for this warehouse" });
     }
 
@@ -1937,14 +1957,14 @@ router.post("/:id/post-palti-lorry", (req, res) => {
   }
 
   const { id } = req.params;
-  db.get("SELECT * FROM expenses WHERE id = ?", [id], (findErr, expense) => {
+  db.get("SELECT * FROM expenses WHERE id = ?", [id], async (findErr, expense) => {
     if (findErr) {
       return res.status(500).json({ error: findErr.message });
     }
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
-    if (!canAccessWarehouse(req.user, expense.warehouse_id)) {
+    if (!(await canAccessExpenseWarehouse(req.user, expense.warehouse_id, expense.location_id))) {
       return res.status(403).json({ error: "You cannot post this warehouse expense" });
     }
     postExpenseToPaltiLorry(expense, req.user?.id, (paltiErr, paltiInfo) => {
