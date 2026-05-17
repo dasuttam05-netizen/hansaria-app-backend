@@ -4,6 +4,7 @@ const router = express.Router();
 
 const {
   Warehouse,
+  Employee,
 } = require("../mongo");
 
 const {
@@ -78,14 +79,35 @@ router.get("/", async (req, res) => {
           "employee_id",
           "name"
         )
-        .populate(
-          "employee_ids",
-          "name"
-        )
 
         .sort({
           created_at: -1,
         });
+
+    const allEmployeeIds =
+      Array.from(
+        new Set(
+          rows.flatMap((row) =>
+            Array.isArray(row.employee_ids)
+              ? row.employee_ids.map((id) => String(id))
+              : []
+          )
+        )
+      );
+
+    const employeeNameMap =
+      new Map();
+
+    if (allEmployeeIds.length) {
+      const employeeRows =
+        await Employee.find(
+          { _id: { $in: allEmployeeIds } },
+          { name: 1 }
+        );
+      employeeRows.forEach((emp) => {
+        employeeNameMap.set(String(emp._id), emp.name || "");
+      });
+    }
 
     const formatted =
       rows.map((row) => ({
@@ -115,7 +137,7 @@ router.get("/", async (req, res) => {
         employee_names:
           Array.isArray(row.employee_ids)
             ? row.employee_ids
-                .map((emp) => emp?.name)
+                .map((emp) => employeeNameMap.get(String(emp)) || "")
                 .filter(Boolean)
             : [],
 
