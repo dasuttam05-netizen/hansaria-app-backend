@@ -1,4 +1,5 @@
 const express = require("express");
+const mongoose = require("mongoose");
 
 const router = express.Router();
 
@@ -67,15 +68,21 @@ async function syncWarehouseEmployeeAssignments(warehouseId, employeeIds = []) {
   );
 
   // Remove this warehouse from all employees first, then add to selected employees.
-  await Employee.updateMany(
+  await Employee.collection.updateMany(
     {},
     { $pull: { assigned_warehouse_ids: warehouseIdStr } }
   );
 
   if (!safeEmployeeIds.length) return;
 
-  await Employee.updateMany(
-    { _id: { $in: safeEmployeeIds } },
+  const safeObjectIds = safeEmployeeIds
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+
+  if (!safeObjectIds.length) return;
+
+  await Employee.collection.updateMany(
+    { _id: { $in: safeObjectIds } },
     { $addToSet: { assigned_warehouse_ids: warehouseIdStr } }
   );
 }
@@ -141,10 +148,12 @@ router.get("/", async (req, res) => {
     const warehouseIds = rows.map((row) => String(row._id));
     const employeeRowsByAssignment =
       warehouseIds.length
-        ? await Employee.find(
-            { assigned_warehouse_ids: { $in: warehouseIds } },
-            { _id: 1, name: 1, assigned_warehouse_ids: 1 }
-          ).lean()
+        ? await Employee.collection
+            .find(
+              { assigned_warehouse_ids: { $in: warehouseIds } },
+              { projection: { _id: 1, name: 1, assigned_warehouse_ids: 1 } }
+            )
+            .toArray()
         : [];
 
     const employeeIdsFromRows = Array.from(
