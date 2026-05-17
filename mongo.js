@@ -166,6 +166,12 @@ const warehouseSchema =
         mongoose.Schema.Types.ObjectId,
       ref: "Employee",
     },
+
+    employee_ids: [{
+      type:
+        mongoose.Schema.Types.ObjectId,
+      ref: "Employee",
+    }],
   });
 
 
