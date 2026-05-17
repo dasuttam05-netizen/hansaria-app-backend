@@ -12,7 +12,8 @@
     "start": "node server.js",
     "start:lan": "node server.js",
     "benchmark:capacity": "node scripts/benchmark-capacity.js",
-    "access:normalize": "node scripts/normalizeEmployeeAccess.js"
+    "access:normalize": "node scripts/normalizeEmployeeAccess.js",
+    "migrate:employee-warehouse-assignments": "node scripts/migrateEmployeeWarehouseAssignments.js"
   },
 
   "dependencies": {
