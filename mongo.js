@@ -67,6 +67,12 @@ const employeeSchema =
       type: String,
       default: "dr",
     },
+
+    assigned_warehouse_ids: [{
+      type:
+        mongoose.Schema.Types.ObjectId,
+      ref: "Warehouse",
+    }],
   },
   {
     timestamps: true,
