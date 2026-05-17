@@ -13,7 +13,8 @@
     "start:lan": "node server.js",
     "benchmark:capacity": "node scripts/benchmark-capacity.js",
     "access:normalize": "node scripts/normalizeEmployeeAccess.js",
-    "migrate:employee-warehouse-assignments": "node scripts/migrateEmployeeWarehouseAssignments.js"
+    "migrate:employee-warehouse-assignments": "node scripts/migrateEmployeeWarehouseAssignments.js",
+    "sync:warehouse-employee-links": "node scripts/syncWarehouseEmployeeLinks.js"
   },
 
   "dependencies": {
