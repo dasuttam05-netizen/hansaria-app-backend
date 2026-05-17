@@ -133,6 +133,10 @@ router.get("/", async (req, res) => {
           "employee_id",
           "name"
         )
+        .populate(
+          "employee_ids",
+          "name"
+        )
 
         .sort({
           created_at: -1,
@@ -231,9 +235,18 @@ router.get("/", async (req, res) => {
 
         employee_names:
           Array.from(
-            warehouseToEmployeeSet.get(String(row._id)) || []
+            new Set([
+              ...((Array.isArray(row.employee_ids)
+                ? row.employee_ids
+                    .map((emp) => (emp?.name ? String(emp.name) : ""))
+                    .filter(Boolean)
+                : [])),
+              ...Array.from(
+                warehouseToEmployeeSet.get(String(row._id)) || []
+              ).map((empId) => employeeNameMap.get(empId) || ""),
+              row.employee_name || "",
+            ])
           )
-            .map((empId) => employeeNameMap.get(empId) || "")
             .filter(Boolean),
 
       }));
