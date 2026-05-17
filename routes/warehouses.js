@@ -26,6 +26,17 @@ function parseEmployeeIds(input) {
   );
 }
 
+function mergeUniqueIds(...groups) {
+  return Array.from(
+    new Set(
+      groups
+        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
 function normalizeId(value) {
   if (!value) return null;
   if (typeof value === "string") return value;
@@ -127,13 +138,32 @@ router.get("/", async (req, res) => {
           created_at: -1,
         });
 
-    const allEmployeeIds =
-      Array.from(
-        new Set(
-          rows.flatMap((row) =>
-            normalizeIdArray(row.employee_ids)
+    const warehouseIds = rows.map((row) => String(row._id));
+    const employeeRowsByAssignment =
+      warehouseIds.length
+        ? await Employee.find(
+            { assigned_warehouse_ids: { $in: warehouseIds } },
+            { _id: 1, name: 1, assigned_warehouse_ids: 1 }
+          ).lean()
+        : [];
+
+    const employeeIdsFromRows = Array.from(
+      new Set(
+        rows.flatMap((row) =>
+          mergeUniqueIds(
+            normalizeIdArray(row.employee_ids),
+            normalizeId(row.employee_id) ? [normalizeId(row.employee_id)] : []
           )
         )
+      )
+    );
+
+    const allEmployeeIds =
+      Array.from(
+        new Set([
+          ...employeeIdsFromRows,
+          ...(employeeRowsByAssignment || []).map((emp) => String(emp._id)),
+        ])
       );
 
     const employeeNameMap =
@@ -147,6 +177,29 @@ router.get("/", async (req, res) => {
         );
       employeeRows.forEach((emp) => {
         employeeNameMap.set(String(emp._id), emp.name || "");
+      });
+    }
+
+    const warehouseToEmployeeSet = new Map();
+    for (const row of rows) {
+      const key = String(row._id);
+      warehouseToEmployeeSet.set(
+        key,
+        new Set(
+          mergeUniqueIds(
+            normalizeIdArray(row.employee_ids),
+            normalizeId(row.employee_id) ? [normalizeId(row.employee_id)] : []
+          )
+        )
+      );
+    }
+
+    for (const emp of employeeRowsByAssignment || []) {
+      const empId = String(emp._id);
+      const assignedWarehouseIds = normalizeIdArray(emp.assigned_warehouse_ids);
+      assignedWarehouseIds.forEach((whId) => {
+        if (!warehouseToEmployeeSet.has(String(whId))) return;
+        warehouseToEmployeeSet.get(String(whId)).add(empId);
       });
     }
 
@@ -172,10 +225,14 @@ router.get("/", async (req, res) => {
         employee_name:
           row.employee_id?.name || "",
 
-        employee_ids: normalizeIdArray(row.employee_ids),
+        employee_ids: Array.from(
+          warehouseToEmployeeSet.get(String(row._id)) || []
+        ),
 
         employee_names:
-          normalizeIdArray(row.employee_ids)
+          Array.from(
+            warehouseToEmployeeSet.get(String(row._id)) || []
+          )
             .map((empId) => employeeNameMap.get(empId) || "")
             .filter(Boolean),
 
