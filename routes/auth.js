@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const {
   Employee,
   Warehouse,
+  Location,
 } = require("../mongo");
 
 const {
@@ -31,7 +32,9 @@ async function attachAssignedWarehousesMongo(user) {
         .filter((id) => id)
     : [];
 
-  const filter = assignedIds.length
+  const filter = user.all_warehouse_access
+    ? {}
+    : assignedIds.length
     ? { _id: { $in: assignedIds } }
     : {
         $or: [
@@ -62,14 +65,27 @@ async function attachAssignedWarehousesMongo(user) {
     )
   );
 
+  if (user.all_location_access) {
+    const locations = await Location.find({}, { _id: 1 }).lean();
+    locationIds.push(
+      ...(locations || [])
+        .map((row) => getRecordId(row))
+        .filter((item) => item)
+    );
+  }
+
+  const normalizedLocationIds = Array.from(new Set(locationIds));
+
   return {
     ...user,
-    location_id: getRecordId(user.location_id) || locationIds[0] || null,
-    location_ids: locationIds,
+    location_id: getRecordId(user.location_id) || normalizedLocationIds[0] || null,
+    location_ids: normalizedLocationIds,
+    all_location_access: !!user.all_location_access,
     assigned_warehouses: normalizedWarehouses,
     assigned_warehouse_ids: normalizedWarehouses.map(
       (row) => row.id
     ),
+    all_warehouse_access: !!user.all_warehouse_access,
   };
 }
 
@@ -253,6 +269,8 @@ router.post("/login", async (req, res) => {
           permissions: user.permissions,
           location_id: user.location_id,
           assigned_warehouse_ids: user.assigned_warehouse_ids,
+          all_location_access: user.all_location_access,
+          all_warehouse_access: user.all_warehouse_access,
         })
       );
 
