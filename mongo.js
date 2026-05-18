@@ -54,6 +54,11 @@ const employeeSchema =
       ref: "Location",
     }],
 
+    all_location_access: {
+      type: Boolean,
+      default: false,
+    },
+
     role: String,
 
     permissions: [String],
@@ -73,6 +78,11 @@ const employeeSchema =
         mongoose.Schema.Types.ObjectId,
       ref: "Warehouse",
     }],
+
+    all_warehouse_access: {
+      type: Boolean,
+      default: false,
+    },
   },
   {
     timestamps: true,
