@@ -67,6 +67,9 @@ router.get("/", async (req, res) => {
             ? row.location_ids.map(getRecordId)
             : [],
 
+        all_location_access:
+          !!row.all_location_access,
+
         employee_id:
           row.employee_id || "",
 
@@ -86,6 +89,9 @@ router.get("/", async (req, res) => {
           parseWarehouseIds(
             row.assigned_warehouse_ids
           ),
+
+        all_warehouse_access:
+          !!row.all_warehouse_access,
       }));
 
     return res.json(formatted);
@@ -132,6 +138,9 @@ router.get("/:id", async (req, res) => {
           ? row.location_ids.map(getRecordId)
           : [],
 
+      all_location_access:
+        !!row.all_location_access,
+
       employee_id:
         row.employee_id || "",
 
@@ -148,6 +157,9 @@ router.get("/:id", async (req, res) => {
         parseWarehouseIds(
           row.assigned_warehouse_ids
         ),
+
+      all_warehouse_access:
+        !!row.all_warehouse_access,
     });
 
   } catch (err) {
@@ -184,11 +196,13 @@ router.post("/", async (req, res) => {
       password,
       location_id,
       location_ids,
+      all_location_access,
       role,
       permissions,
       opening_balance,
       opening_balance_type,
       assigned_warehouse_ids,
+      all_warehouse_access,
     } = req.body;
 
     if (
@@ -353,6 +367,9 @@ router.post("/", async (req, res) => {
         location_ids:
           safeLocationIds,
 
+        all_location_access:
+          !!all_location_access,
+
         role: safeRole,
 
         permissions:
@@ -374,6 +391,9 @@ router.post("/", async (req, res) => {
           parseWarehouseIds(
             assigned_warehouse_ids
           ),
+
+        all_warehouse_access:
+          !!all_warehouse_access,
       });
 
     return res.json({
@@ -400,6 +420,9 @@ router.post("/", async (req, res) => {
       location_ids:
         employee.location_ids,
 
+      all_location_access:
+        !!employee.all_location_access,
+
       role:
         employee.role,
 
@@ -416,6 +439,9 @@ router.post("/", async (req, res) => {
         parseWarehouseIds(
           employee.assigned_warehouse_ids
         ),
+
+      all_warehouse_access:
+        !!employee.all_warehouse_access,
     });
 
   } catch (err) {
@@ -467,11 +493,13 @@ router.put("/:id", async (req, res) => {
       password,
       location_id,
       location_ids,
+      all_location_access,
       role,
       permissions,
       opening_balance,
       opening_balance_type,
       assigned_warehouse_ids,
+      all_warehouse_access,
     } = req.body;
 
     const target =
@@ -559,6 +587,9 @@ router.put("/:id", async (req, res) => {
       location_ids:
         safeLocationIds,
 
+      all_location_access:
+        !!all_location_access,
+
       role:
         safeRole,
 
@@ -581,6 +612,9 @@ router.put("/:id", async (req, res) => {
         parseWarehouseIds(
           assigned_warehouse_ids
         ),
+
+      all_warehouse_access:
+        !!all_warehouse_access,
     };
 
     if (password) {
