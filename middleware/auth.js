@@ -2,7 +2,7 @@ const jwt = require("jsonwebtoken");
 
 const db = require("../db");
 
-const { Employee, Warehouse } = require("../mongo");
+const { Employee, Warehouse, Location } = require("../mongo");
 
 const SECRET =
   process.env.JWT_SECRET ||
@@ -139,6 +139,18 @@ const LEGACY_PERMISSION_MAP = {
   "cash.create": ["cash.mainBook.create", "cash.partiesBook.create", "cash.employeeBook.create"],
   "cash.edit": ["cash.mainBook.edit", "cash.partiesBook.edit", "cash.employeeBook.edit"],
   "cash.delete": ["cash.mainBook.delete", "cash.partiesBook.delete", "cash.employeeBook.delete"],
+  "cash.mainBook.view": ["cash.view"],
+  "cash.mainBook.create": ["cash.create"],
+  "cash.mainBook.edit": ["cash.edit"],
+  "cash.mainBook.delete": ["cash.delete"],
+  "cash.partiesBook.view": ["cash.view"],
+  "cash.partiesBook.create": ["cash.create"],
+  "cash.partiesBook.edit": ["cash.edit"],
+  "cash.partiesBook.delete": ["cash.delete"],
+  "cash.employeeBook.view": ["cash.view"],
+  "cash.employeeBook.create": ["cash.create"],
+  "cash.employeeBook.edit": ["cash.edit"],
+  "cash.employeeBook.delete": ["cash.delete"],
   "farmers.view": ["farmers.manage"],
   "farmers.create": ["farmers.manage"],
   "farmers.edit": ["farmers.manage"],
@@ -275,7 +287,18 @@ async function loadAssignedWarehouseAccess(user) {
       user?.assigned_warehouse_ids
     );
 
-  if (!assignedWarehouseIds.length) {
+  let warehouses = [];
+
+  if (user?.all_warehouse_access) {
+    warehouses = await Warehouse.find(
+      {},
+      { _id: 1, name: 1, location_id: 1 }
+    ).lean();
+
+    assignedWarehouseIds = (warehouses || [])
+      .map((row) => (row?._id ? String(row._id) : ""))
+      .filter((item) => item);
+  } else if (!assignedWarehouseIds.length) {
     const legacyRows = await Warehouse.find(
       {
         $or: [
@@ -291,7 +314,7 @@ async function loadAssignedWarehouseAccess(user) {
       .filter((item) => item);
   }
 
-  if (!assignedWarehouseIds.length) {
+  if (!assignedWarehouseIds.length && !user?.all_location_access) {
     return {
       assigned_warehouse_ids: [],
       assigned_sqlite_warehouse_ids: [],
@@ -299,10 +322,12 @@ async function loadAssignedWarehouseAccess(user) {
     };
   }
 
-  const warehouses = await Warehouse.find(
-    { _id: { $in: assignedWarehouseIds } },
-    { _id: 1, name: 1, location_id: 1 }
-  ).lean();
+  if (!warehouses.length && assignedWarehouseIds.length) {
+    warehouses = await Warehouse.find(
+      { _id: { $in: assignedWarehouseIds } },
+      { _id: 1, name: 1, location_id: 1 }
+    ).lean();
+  }
 
   assignedWarehouseIds = (warehouses || [])
     .map((row) => (row?._id ? String(row._id) : ""))
@@ -326,7 +351,7 @@ async function loadAssignedWarehouseAccess(user) {
     }
   }
 
-  const locationIds = Array.from(
+  let locationIds = Array.from(
     new Set(
       (warehouses || [])
         .map((row) => {
@@ -337,6 +362,18 @@ async function loadAssignedWarehouseAccess(user) {
         .filter((item) => item)
     )
   );
+
+  if (user?.all_location_access) {
+    const allLocations = await Location.find({}, { _id: 1 }).lean();
+    locationIds = Array.from(
+      new Set([
+        ...locationIds,
+        ...(allLocations || [])
+          .map((row) => (row?._id ? String(row._id) : ""))
+          .filter((item) => item),
+      ])
+    );
+  }
 
   return {
     assigned_warehouse_ids: assignedWarehouseIds,
@@ -381,6 +418,12 @@ function buildUserPayload(
       normalizeObjectIdArray(
         user.assigned_warehouse_ids
       ),
+
+    all_location_access:
+      !!user.all_location_access,
+
+    all_warehouse_access:
+      !!user.all_warehouse_access,
   };
 }
 
