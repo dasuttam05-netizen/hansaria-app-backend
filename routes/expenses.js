@@ -55,6 +55,49 @@ function buildDefaultExpenseItems() {
   }));
 }
 
+function isEffectivelyEmptyExpenseItem(item) {
+  return (
+    (Number(item?.bags) || 0) === 0 &&
+    (Number(item?.rate) || 0) === 0 &&
+    (Number(item?.amount) || 0) === 0
+  );
+}
+
+function isDefaultEmptyExpenseItemsPayload(items) {
+  if (!Array.isArray(items) || items.length === 0) return false;
+
+  return items.every((item, index) => {
+    const name = String(item?.particular_name || "").trim().toUpperCase();
+    const defaultName = EXPENSE_PARTICULAR_DEFAULTS[index] || "";
+    return name === defaultName && isEffectivelyEmptyExpenseItem(item);
+  });
+}
+
+function hasSavedNonZeroExpenseItems(expenseId, callback) {
+  db.get(
+    `
+    SELECT 1 AS has_items
+    FROM expense_items
+    WHERE expense_id = ?
+      AND (
+        COALESCE(bags, 0) <> 0 OR
+        COALESCE(rate, 0) <> 0 OR
+        COALESCE(amount, 0) <> 0
+      )
+    LIMIT 1
+    `,
+    [expenseId],
+    (err, row) => {
+      if (err) {
+        callback(err);
+        return;
+      }
+
+      callback(null, !!row);
+    }
+  );
+}
+
 function nextVoucher(callback) {
   db.get(
     "SELECT id FROM expenses ORDER BY id DESC LIMIT 1",
@@ -1605,7 +1648,7 @@ router.put("/:id", async (req, res) => {
     }
   }
 
-  db.get("SELECT id, warehouse_id, location_id, employee_id FROM expenses WHERE id = ?", [id], async (findErr, row) => {
+  db.get("SELECT id, warehouse_id, location_id, employee_id, grand_total, total_expense_amount FROM expenses WHERE id = ?", [id], async (findErr, row) => {
     if (findErr) {
       return res.status(500).json({ error: findErr.message });
     }
@@ -1625,9 +1668,12 @@ router.put("/:id", async (req, res) => {
     }
 
     const hasItemsPayload = Array.isArray(items);
-    const safeItems = hasItemsPayload
+    let safeItems = hasItemsPayload
       ? items.filter((item) => item && item.particular_name)
       : null;
+    let preservedDefaultItems = false;
+    let grandTotalForUpdate = Number(grand_total) || 0;
+    let totalExpenseAmountForUpdate = Number(total_expense_amount) || 0;
     const hasAnyNonZeroItemInput = Array.isArray(safeItems)
       ? safeItems.some(
           (item) =>
@@ -1642,6 +1688,7 @@ router.put("/:id", async (req, res) => {
       Array.isArray(safeItems) &&
       safeItems.length > 0 &&
       !hasAnyNonZeroItemInput &&
+      !isDefaultEmptyExpenseItemsPayload(safeItems) &&
       (Number(grand_total) || 0) > 0
     ) {
       return res.status(400).json({
@@ -1649,6 +1696,7 @@ router.put("/:id", async (req, res) => {
       });
     }
 
+    const proceedWithUpdate = () => {
     const updateExpenseWithWarehouse = (resolvedWarehouseId) => {
       const computedBalance = calculateExpenseBalance(
         loading,
@@ -1700,8 +1748,8 @@ router.put("/:id", async (req, res) => {
         status || "PENDING",
         Number(receive_cash_from_party) || 0,
         Number(receive_cash_from_driver) || 0,
-        Number(grand_total) || 0,
-        Number(total_expense_amount) || 0,
+        grandTotalForUpdate,
+        totalExpenseAmountForUpdate,
         narration || "",
         id,
       ],
@@ -1715,40 +1763,47 @@ router.put("/:id", async (req, res) => {
         }
 
         if (!safeItems || safeItems.length === 0) {
-          return res.json({ updated: true });
+          return res.json({
+            updated: true,
+            ...(preservedDefaultItems ? { items_preserved: true } : {}),
+          });
         }
 
-        db.run("DELETE FROM expense_items WHERE expense_id = ?", [id], (deleteErr) => {
-          if (deleteErr) {
-            return res.status(500).json({ error: deleteErr.message });
-          }
-
-          const stmt = db.prepare(
-            `
-            INSERT INTO expense_items (expense_id, line_no, particular_name, bags, rate, amount)
-            VALUES (?, ?, ?, ?, ?, ?)
-            `
-          );
-
-          safeItems.forEach((item, index) => {
-            stmt.run([
-              id,
-              index + 1,
-              item.particular_name,
-              Number(item.bags) || 0,
-              Number(item.rate) || 0,
-              Number(item.amount) || 0,
-            ]);
-          });
-
-          stmt.finalize((finalizeErr) => {
-            if (finalizeErr) {
-              return res.status(500).json({ error: finalizeErr.message });
+        const replaceExpenseItems = () => {
+          db.run("DELETE FROM expense_items WHERE expense_id = ?", [id], (deleteErr) => {
+            if (deleteErr) {
+              return res.status(500).json({ error: deleteErr.message });
             }
 
-            return res.json({ updated: true });
+            const stmt = db.prepare(
+              `
+              INSERT INTO expense_items (expense_id, line_no, particular_name, bags, rate, amount)
+              VALUES (?, ?, ?, ?, ?, ?)
+              `
+            );
+
+            safeItems.forEach((item, index) => {
+              stmt.run([
+                id,
+                index + 1,
+                item.particular_name,
+                Number(item.bags) || 0,
+                Number(item.rate) || 0,
+                Number(item.amount) || 0,
+              ]);
+            });
+
+            stmt.finalize((finalizeErr) => {
+              if (finalizeErr) {
+                return res.status(500).json({ error: finalizeErr.message });
+              }
+
+              return res.json({ updated: true });
+            });
           });
-        });
+        };
+
+        return replaceExpenseItems();
       }
       );
     };
@@ -1773,6 +1828,26 @@ router.put("/:id", async (req, res) => {
 
       return updateExpenseWithWarehouse(resolvedWarehouseId);
     });
+    };
+
+    if (isDefaultEmptyExpenseItemsPayload(safeItems)) {
+      return hasSavedNonZeroExpenseItems(id, (itemsErr, hasSavedItems) => {
+        if (itemsErr) {
+          return res.status(500).json({ error: itemsErr.message });
+        }
+
+        if (hasSavedItems) {
+          safeItems = null;
+          preservedDefaultItems = true;
+          grandTotalForUpdate = Number(row.grand_total) || 0;
+          totalExpenseAmountForUpdate = Number(row.total_expense_amount) || 0;
+        }
+
+        return proceedWithUpdate();
+      });
+    }
+
+    return proceedWithUpdate();
   });
 });
 
