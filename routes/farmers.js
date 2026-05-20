@@ -34,6 +34,64 @@ function canManageFarmers(user, action) {
   return userHasPermission(user, "farmers.manage") || userHasPermission(user, `farmers.${action}`);
 }
 
+const cleanText = (value) => {
+  const text = String(value || "").trim();
+  return text ? text : null;
+};
+
+const compactUpper = (value) => String(value || "").replace(/\s/g, "").toUpperCase();
+const compactDigits = (value) => String(value || "").replace(/\D/g, "");
+const isValidPan = (value) => !value || /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(value);
+const isValidAadhar = (value) => !value || /^[0-9]{12}$/.test(value);
+const isValidGst = (value) =>
+  !value || /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(value);
+
+function buildFarmerPayload(body) {
+  const panNo = compactUpper(body.pan_no);
+  const gstNo = compactUpper(body.gst_no);
+  const aadharNo = compactDigits(body.aadhar_no);
+  const ifscCode = compactUpper(body.ifsc_code);
+
+  if (!isValidPan(panNo)) {
+    return { error: "Invalid PAN No. format" };
+  }
+  if (!isValidAadhar(aadharNo)) {
+    return { error: "Invalid Aadhaar No. format" };
+  }
+  if (!isValidGst(gstNo)) {
+    return { error: "Invalid GST No. format" };
+  }
+  if (gstNo && panNo && gstNo.slice(2, 12) !== panNo) {
+    return { error: "GST No. PAN part does not match PAN No." };
+  }
+  if (ifscCode && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifscCode)) {
+    return { error: "Invalid IFSC Code format" };
+  }
+
+  return {
+    payload: {
+      name: String(body.name || "").trim(),
+      mobile: String(body.mobile || "").trim(),
+      email: cleanText(body.email),
+      address: cleanText(body.address),
+      village: cleanText(body.village),
+      state: cleanText(body.state),
+      gst_no: gstNo || null,
+      pan_no: panNo || null,
+      aadhar_no: aadharNo || null,
+      aadhaar_pan_link_status: ["linked", "not_linked", "unknown"].includes(body.aadhaar_pan_link_status)
+        ? body.aadhaar_pan_link_status
+        : "unknown",
+      bank_name: cleanText(body.bank_name),
+      bank_account_no: compactDigits(body.bank_account_no) || null,
+      ifsc_code: ifscCode || null,
+      branch_name: cleanText(body.branch_name),
+      account_holder_name: cleanText(body.account_holder_name),
+      location: cleanText(body.location),
+    },
+  };
+}
+
 router.get("/", async (req, res) => {
   try {
     if (!canReadFarmers(req.user)) {
@@ -58,17 +116,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const {
-      name,
-      mobile,
-      email,
-      address,
-      village,
-      state,
-      gst_no,
-      pan_no,
-      location,
-    } = req.body;
+    const { name, mobile } = req.body;
 
     if (!name || !mobile) {
       return res.status(400).json({
@@ -76,17 +124,10 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const farmer = await Farmer.create({
-      name: String(name).trim(),
-      mobile: String(mobile).trim(),
-      email: email ? String(email).trim() : null,
-      address: address ? String(address).trim() : null,
-      village: village ? String(village).trim() : null,
-      state: state ? String(state).trim() : null,
-      gst_no: gst_no ? String(gst_no).trim() : null,
-      pan_no: pan_no ? String(pan_no).trim() : null,
-      location: location ? String(location).trim() : null,
-    });
+    const built = buildFarmerPayload(req.body);
+    if (built.error) return res.status(400).json({ error: built.error });
+
+    const farmer = await Farmer.create(built.payload);
 
     res.json(farmer);
   } catch (err) {
@@ -103,17 +144,7 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    const {
-      name,
-      mobile,
-      email,
-      address,
-      village,
-      state,
-      gst_no,
-      pan_no,
-      location,
-    } = req.body;
+    const { name, mobile } = req.body;
 
     if (!name || !mobile) {
       return res.status(400).json({
@@ -121,21 +152,10 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    const updated = await Farmer.findByIdAndUpdate(
-      req.params.id,
-      {
-        name: String(name).trim(),
-        mobile: String(mobile).trim(),
-        email: email ? String(email).trim() : null,
-        address: address ? String(address).trim() : null,
-        village: village ? String(village).trim() : null,
-        state: state ? String(state).trim() : null,
-        gst_no: gst_no ? String(gst_no).trim() : null,
-        pan_no: pan_no ? String(pan_no).trim() : null,
-        location: location ? String(location).trim() : null,
-      },
-      { new: true }
-    );
+    const built = buildFarmerPayload(req.body);
+    if (built.error) return res.status(400).json({ error: built.error });
+
+    const updated = await Farmer.findByIdAndUpdate(req.params.id, built.payload, { new: true });
 
     if (!updated) {
       return res.status(404).json({ error: "Farmer not found" });
