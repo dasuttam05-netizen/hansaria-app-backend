@@ -1,4 +1,5 @@
 const express = require("express");
+const https = require("https");
 const router = express.Router();
 
 const { Farmer } = require("../mongo");
@@ -45,6 +46,33 @@ const isValidPan = (value) => !value || /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(value);
 const isValidAadhar = (value) => !value || /^[0-9]{12}$/.test(value);
 const isValidGst = (value) =>
   !value || /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(value);
+
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, { timeout: 10000 }, (response) => {
+      let raw = "";
+      response.on("data", (chunk) => {
+        raw += chunk;
+      });
+      response.on("end", () => {
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`Lookup failed with status ${response.statusCode}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(raw));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    request.on("timeout", () => {
+      request.destroy(new Error("Lookup timed out"));
+    });
+    request.on("error", reject);
+  });
+}
 
 function buildFarmerPayload(body) {
   const panNo = compactUpper(body.pan_no);
@@ -110,6 +138,49 @@ router.get("/", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/lookup/pincode/:pincode", async (req, res) => {
+  try {
+    const pincode = compactDigits(req.params.pincode);
+    if (!/^[0-9]{6}$/.test(pincode)) {
+      return res.status(400).json({ error: "PIN No. must be 6 digits" });
+    }
+
+    const result = await fetchJson(`https://api.postalpincode.in/pincode/${pincode}`);
+    const item = Array.isArray(result) ? result[0] : null;
+    const postOffice = item?.PostOffice?.[0];
+    if (!postOffice) {
+      return res.status(404).json({ error: "PIN not found" });
+    }
+
+    res.json({
+      location: postOffice.District || postOffice.Block || "",
+      state: postOffice.State || "",
+      village: postOffice.Name || "",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "PIN lookup failed" });
+  }
+});
+
+router.get("/lookup/ifsc/:ifsc", async (req, res) => {
+  try {
+    const ifsc = compactUpper(req.params.ifsc);
+    if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) {
+      return res.status(400).json({ error: "Invalid IFSC Code format" });
+    }
+
+    const data = await fetchJson(`https://ifsc.razorpay.com/${ifsc}`);
+    res.json({
+      bank_name: data?.BANK || "",
+      branch_name: data?.BRANCH || "",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "IFSC lookup failed" });
   }
 });
 
