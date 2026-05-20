@@ -129,6 +129,7 @@ const farmerSchema =
     email: String,
     address: String,
     village: String,
+    pincode: String,
     state: String,
     gst_no: String,
     pan_no: String,
