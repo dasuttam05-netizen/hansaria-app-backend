@@ -132,6 +132,16 @@ const farmerSchema =
     state: String,
     gst_no: String,
     pan_no: String,
+    aadhar_no: String,
+    aadhaar_pan_link_status: {
+      type: String,
+      default: "unknown",
+    },
+    bank_name: String,
+    bank_account_no: String,
+    ifsc_code: String,
+    branch_name: String,
+    account_holder_name: String,
     location: String,
   },
   {
