@@ -50,6 +50,7 @@ function buildFarmerPayload(body) {
   const panNo = compactUpper(body.pan_no);
   const gstNo = compactUpper(body.gst_no);
   const aadharNo = compactDigits(body.aadhar_no);
+  const pincode = compactDigits(body.pincode);
   const ifscCode = compactUpper(body.ifsc_code);
 
   if (!isValidPan(panNo)) {
@@ -57,6 +58,9 @@ function buildFarmerPayload(body) {
   }
   if (!isValidAadhar(aadharNo)) {
     return { error: "Invalid Aadhaar No. format" };
+  }
+  if (!/^[0-9]{6}$/.test(pincode)) {
+    return { error: "PIN No. is required and must be 6 digits" };
   }
   if (!isValidGst(gstNo)) {
     return { error: "Invalid GST No. format" };
@@ -75,6 +79,7 @@ function buildFarmerPayload(body) {
       email: cleanText(body.email),
       address: cleanText(body.address),
       village: cleanText(body.village),
+      pincode,
       state: cleanText(body.state),
       gst_no: gstNo || null,
       pan_no: panNo || null,
@@ -116,11 +121,11 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const { name, mobile } = req.body;
+    const { name, mobile, pincode } = req.body;
 
-    if (!name || !mobile) {
+    if (!name || !mobile || !pincode) {
       return res.status(400).json({
-        error: "Farmer name and mobile are required",
+        error: "Farmer name, mobile and PIN No. are required",
       });
     }
 
@@ -144,11 +149,11 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    const { name, mobile } = req.body;
+    const { name, mobile, pincode } = req.body;
 
-    if (!name || !mobile) {
+    if (!name || !mobile || !pincode) {
       return res.status(400).json({
-        error: "Farmer name and mobile are required",
+        error: "Farmer name, mobile and PIN No. are required",
       });
     }
 
