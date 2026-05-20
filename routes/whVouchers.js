@@ -149,8 +149,26 @@ router.get("/purchase", (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
-  
-  getWarehouseScopedRows(req, res, "wh_purchase_vouchers");
+
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const query = `
+    SELECT
+      v.*,
+      p.name AS product_name,
+      w.name AS warehouse_name,
+      f.name AS farmer_name
+    FROM wh_purchase_vouchers v
+    LEFT JOIN products p ON p.id = v.product_id
+    LEFT JOIN warehouses w ON w.id = v.warehouse_id
+    LEFT JOIN farmers f ON f.id = v.farmer_id
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.date DESC, v.id DESC
+  `;
+
+  db.all(query, filter.params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows || []);
+  });
 });
 
 router.post("/purchase", (req, res) => {
