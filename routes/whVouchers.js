@@ -2027,32 +2027,57 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
         )
       : [];
     const purchaseMap = new Map(purchases.map((row) => [String(row.id || row._id), row]));
+    const paymentMap = new Map(payments.map((row) => [String(row.id), row]));
     const adjustmentsByPayment = new Map();
+    const adjustmentsByPurchase = new Map();
     sqliteAdjustments.forEach((item) => {
       const paymentId = String(item.payment_id);
+      const purchaseId = String(item.purchase_id);
       const purchase = purchaseMap.get(String(item.purchase_id));
+      const payment = paymentMap.get(paymentId);
       const voucherNo = item.purchase_voucher_no || purchase?.voucher_no || item.purchase_id;
-      if (!adjustmentsByPayment.has(paymentId)) adjustmentsByPayment.set(paymentId, []);
-      adjustmentsByPayment.get(paymentId).push({
+      const detail = {
         ...item,
         purchase_voucher_no: voucherNo,
-      });
+        payment_date: payment?.date || "",
+        payment_voucher_no: payment?.voucher_no || "",
+        payment_amount: Number(payment?.amount || 0),
+      };
+      if (!adjustmentsByPayment.has(paymentId)) adjustmentsByPayment.set(paymentId, []);
+      adjustmentsByPayment.get(paymentId).push(detail);
+      if (!adjustmentsByPurchase.has(purchaseId)) adjustmentsByPurchase.set(purchaseId, []);
+      adjustmentsByPurchase.get(purchaseId).push(detail);
     });
 
     const rows = [
-      ...purchases.map((row) => ({
-        date: row.date,
-        voucher_no: row.voucher_no,
-        voucher_type: "Purchase",
-        particulars: `Purchase Bill ${row.voucher_no || ""}`.trim(),
-        adjustment_details: "",
-        warehouse_id: row.warehouse_id,
-        warehouse_name: row.warehouse_name,
-        farmer_id: row.farmer_id,
-        farmer_name: row.farmer_name,
-        debit: 0,
-        credit: Number(row.total_amount || row.net_amount_payable || row.amount || 0),
-      })),
+      ...purchases.map((row) => {
+        const purchaseId = String(row.id || row._id);
+        const paymentDetails = adjustmentsByPurchase.get(purchaseId) || [];
+        const purchaseAmount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+        const paymentAmount = paymentDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
+        return {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Purchase",
+          particulars: `Purchase Bill ${row.voucher_no || ""}`.trim(),
+          adjustment_details: paymentDetails
+            .map((item) => `${item.payment_date || "-"} ${item.payment_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`)
+            .join("; "),
+          payment_details: paymentDetails,
+          purchase_id: purchaseId,
+          purchase_amount: Number(purchaseAmount.toFixed(2)),
+          payment_amount: Number(paymentAmount.toFixed(2)),
+          journal_amount: 0,
+          receipt_amount: 0,
+          bill_balance: Number((purchaseAmount - paymentAmount).toFixed(2)),
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name,
+          farmer_id: row.farmer_id,
+          farmer_name: row.farmer_name,
+          debit: 0,
+          credit: purchaseAmount,
+        };
+      }),
       ...payments.map((row) => {
         const paymentAdjustments = adjustmentsByPayment.get(String(row.id)) || [];
         const adjustmentDetails = paymentAdjustments
