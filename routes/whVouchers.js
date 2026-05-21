@@ -29,6 +29,39 @@ function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
   });
 }
 
+function getPurchaseVoucherRows(req, res) {
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const fallbackFilter = assignedWarehouseFilter(req.user, "warehouse_id");
+  const query = `
+    SELECT
+      v.*,
+      (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
+      (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
+      (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name
+    FROM wh_purchase_vouchers v
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.date DESC, v.id DESC
+  `;
+
+  db.all(query, filter.params, (err, rows) => {
+    if (!err) {
+      return res.json(rows || []);
+    }
+
+    console.error("Purchase voucher mapped query failed, falling back to base rows:", err.message);
+    const fallbackQuery = `
+      SELECT *
+      FROM wh_purchase_vouchers
+      WHERE 1 = 1 ${fallbackFilter.clause}
+      ORDER BY date DESC, id DESC
+    `;
+    db.all(fallbackQuery, fallbackFilter.params, (fallbackErr, fallbackRows) => {
+      if (fallbackErr) return res.status(500).json({ error: fallbackErr.message });
+      res.json(fallbackRows || []);
+    });
+  });
+}
+
 function ensureWarehouseAccess(req, res, warehouseId) {
   if (!warehouseId) {
     res.status(400).json({ error: "Warehouse is required" });
@@ -68,10 +101,11 @@ function getVoucherTable(type) {
 function createSequentialVoucherNo(type, callback) {
   const table = getVoucherTable(type);
   if (!table) return callback(new Error("Invalid voucher type"));
+  const shortPrefix = getVoucherPrefix(type);
   const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-  const prefix = `${getVoucherPrefix(type)}-${datePart}-`;
-  const query = `SELECT voucher_no FROM ${table} WHERE voucher_no LIKE ? ORDER BY voucher_no DESC LIMIT 1`;
-  db.get(query, [`${prefix}%`], (err, row) => {
+  const prefix = `${shortPrefix}-${datePart}-`;
+  const query = `SELECT voucher_no FROM ${table} WHERE voucher_no LIKE ? ORDER BY id DESC LIMIT 1`;
+  db.get(query, [`${shortPrefix}-%`], (err, row) => {
     if (err) return callback(err);
     let next = 1;
     if (row && row.voucher_no) {
@@ -149,26 +183,7 @@ router.get("/purchase", (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
-
-  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
-  const query = `
-    SELECT
-      v.*,
-      p.name AS product_name,
-      w.name AS warehouse_name,
-      f.name AS farmer_name
-    FROM wh_purchase_vouchers v
-    LEFT JOIN products p ON p.id = v.product_id
-    LEFT JOIN warehouses w ON w.id = v.warehouse_id
-    LEFT JOIN farmers f ON f.id = v.farmer_id
-    WHERE 1 = 1 ${filter.clause}
-    ORDER BY v.date DESC, v.id DESC
-  `;
-
-  db.all(query, filter.params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows || []);
-  });
+  getPurchaseVoucherRows(req, res);
 });
 
 router.post("/purchase", (req, res) => {
@@ -821,15 +836,22 @@ router.get("/report/purchase-summary", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const filter = assignedWarehouseFilter(req.user, "warehouse_id");
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
   const query = `
-    SELECT 
-      warehouse_id, 
-      SUM(COALESCE(NULLIF(total_qty, 0), quantity)) as total_quantity, 
-      SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)) as total_amount 
-    FROM wh_purchase_vouchers 
+    SELECT
+      v.*,
+      w.name AS warehouse_name,
+      f.name AS farmer_name,
+      p.name AS product_name,
+      (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
+      COALESCE(NULLIF(v.total_qty, 0), v.quantity) AS total_quantity,
+      COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+    FROM wh_purchase_vouchers v
+    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+    LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(v.farmer_id AS TEXT)
+    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
     WHERE 1 = 1 ${filter.clause}
-    GROUP BY warehouse_id
+    ORDER BY v.date DESC, v.id DESC
   `;
   db.all(query, filter.params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
