@@ -1,6 +1,52 @@
 const mongoose = require("mongoose");
+const dns = require("node:dns");
 
 require("dotenv").config();
+
+mongoose.set("bufferCommands", false);
+
+const rawMongoUri = process.env.MONGODB_URI?.trim() || "";
+const mongoDnsServers = String(process.env.MONGODB_DNS_SERVERS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+
+if (mongoDnsServers.length > 0) {
+  dns.setServers(mongoDnsServers);
+  console.log(`Using custom DNS servers for MongoDB: ${mongoDnsServers.join(", ")}`);
+}
+
+function normalizeAtlasUri(uri) {
+  if (!uri || !uri.startsWith("mongodb+srv://")) return uri;
+  return uri.replace(
+    /\/([^/?#=]+)=([^/?#]+)$/,
+    "/$1?retryWrites=true&w=majority&appName=$2"
+  );
+}
+
+const mongodbUri = normalizeAtlasUri(rawMongoUri);
+const hasMongoUri = mongodbUri && !mongodbUri.includes("username:password");
+
+if (!hasMongoUri) {
+  console.log("MongoDB URI is not configured or contains placeholder credentials.");
+} else if (mongoose.connection.readyState === 0) {
+  if (mongodbUri !== rawMongoUri) {
+    console.log("Normalized MongoDB URI format from legacy value in .env.");
+  }
+
+  mongoose
+    .connect(mongodbUri, {
+      serverSelectionTimeoutMS: 8000,
+      socketTimeoutMS: 45000,
+    })
+    .then(() => console.log("Connected to MongoDB"))
+    .catch((err) => {
+      if (err?.syscall === "querySrv") {
+        console.error("MongoDB SRV DNS lookup failed. Switch DNS server or use Atlas non-SRV URI.");
+      }
+      console.error("MongoDB Connection Error:", err.message);
+    });
+}
 
 
 // =========================
@@ -215,6 +261,50 @@ const productSchema =
 
 
 // =========================
+// WAREHOUSE PURCHASE VOUCHER
+// =========================
+const purchaseVoucherSchema =
+  new mongoose.Schema({
+    voucher_no: {
+      type: String,
+      index: true,
+    },
+    date: String,
+    warehouse_id: String,
+    farmer_id: String,
+    company_account_id: String,
+    product_id: String,
+    quantity: { type: Number, default: 0 },
+    rate: { type: Number, default: 0 },
+    amount: { type: Number, default: 0 },
+    packet: { type: Number, default: 0 },
+    gross_weight: { type: Number, default: 0 },
+    tare_weight: { type: Number, default: 0 },
+    dhalta: { type: Number, default: 0 },
+    less_bags_weight: { type: Number, default: 0 },
+    moisture: { type: Number, default: 0 },
+    dunki: { type: Number, default: 0 },
+    fungus: { type: Number, default: 0 },
+    discolour: { type: Number, default: 0 },
+    others: { type: Number, default: 0 },
+    net_weight: { type: Number, default: 0 },
+    bags_claim: { type: Number, default: 0 },
+    labour: { type: Number, default: 0 },
+    total_deduct_amount: { type: Number, default: 0 },
+    total_qty: { type: Number, default: 0 },
+    total_deduction: { type: Number, default: 0 },
+    round_off: { type: Number, default: 0 },
+    net_amount_payable: { type: Number, default: 0 },
+    employee_id: String,
+    location_id: String,
+    description: String,
+  },
+  {
+    timestamps: true,
+  });
+
+
+// =========================
 // EXPORTS
 // =========================
 module.exports = {
@@ -268,5 +358,12 @@ module.exports = {
     mongoose.model(
       "Product",
       productSchema
+    ),
+
+  PurchaseVoucher:
+    mongoose.models.PurchaseVoucher ||
+    mongoose.model(
+      "PurchaseVoucher",
+      purchaseVoucherSchema
     ),
 };
