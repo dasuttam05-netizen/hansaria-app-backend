@@ -512,13 +512,26 @@ function createSequentialVoucherNo(type, callback) {
   });
 }
 
-function computeOutstandingForFarmer(farmerId, callback) {
+function computeOutstandingForFarmer(farmerId, warehouseId = null, locationId = null, callback) {
+  const params = [farmerId];
+  let warehouseClause = "";
+  let locationClause = "";
+
+  if (warehouseId) {
+    warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
+    params.push(warehouseId);
+  }
+  if (locationId) {
+    locationClause = " AND CAST(location_id AS TEXT) = CAST(? AS TEXT)";
+    params.push(locationId);
+  }
+
   const purchaseSql = mongoReady()
     ? null
-    : `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE farmer_id = ?`;
-  const paymentSql = `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE farmer_id = ?`;
+    : `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE CAST(farmer_id AS TEXT) = CAST(?)${warehouseClause}${locationClause}`;
+  const paymentSql = `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE CAST(farmer_id AS TEXT) = CAST(?)${warehouseClause}${locationClause}`;
   const finish = (totalPurchase) => {
-    db.get(paymentSql, [farmerId], (err2, payment) => {
+    db.get(paymentSql, params, (err2, payment) => {
       if (err2) return callback(err2);
       const totalPayment = payment?.total_payment || 0;
       callback(null, {
@@ -530,7 +543,10 @@ function computeOutstandingForFarmer(farmerId, callback) {
   };
 
   if (mongoReady()) {
-    PurchaseVoucher.find({ farmer_id: String(farmerId || "") })
+    const filter = { farmer_id: String(farmerId || "") };
+    if (warehouseId) filter.warehouse_id = String(warehouseId);
+    if (locationId) filter.location_id = String(locationId);
+    PurchaseVoucher.find(filter)
       .lean()
       .then((rows) => {
         const totalPurchase = (rows || []).reduce(
@@ -543,18 +559,32 @@ function computeOutstandingForFarmer(farmerId, callback) {
     return;
   }
 
-  db.get(purchaseSql, [farmerId], (err, purchase) => {
+  db.get(purchaseSql, params, (err, purchase) => {
     if (err) return callback(err);
     finish(purchase?.total_purchase || 0);
   });
 }
 
-function computeOutstandingForCompany(companyId, callback) {
-  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE company_id = ?`;
-  const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE company_id = ?`;
-  db.get(saleSql, [companyId], (err, sale) => {
+function computeOutstandingForCompany(companyId, warehouseId = null, locationId = null, callback) {
+  const params = [companyId];
+  let warehouseClause = "";
+  let locationClause = "";
+
+  if (warehouseId) {
+    warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
+    params.push(warehouseId);
+  }
+  if (locationId) {
+    locationClause = " AND CAST(location_id AS TEXT) = CAST(? AS TEXT)";
+    params.push(locationId);
+  }
+
+  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE CAST(company_id AS TEXT) = CAST(?)${warehouseClause}${locationClause}`;
+  const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE CAST(company_id AS TEXT) = CAST(?)${warehouseClause}${locationClause}`;
+
+  db.get(saleSql, params, (err, sale) => {
     if (err) return callback(err);
-    db.get(receiptSql, [companyId], (err2, receipt) => {
+    db.get(receiptSql, params, (err2, receipt) => {
       if (err2) return callback(err2);
       const totalSale = sale?.total_sale || 0;
       const totalReceipt = receipt?.total_receipt || 0;
@@ -1029,7 +1059,7 @@ router.get("/outstanding", (req, res) => {
       paymentParams.push(exclude_payment_id);
     }
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_payment_vouchers WHERE farmer_id = ? ${paymentFilters.length ? `AND ${paymentFilters.join(" AND ")}` : ""} ORDER BY date ASC`;
-    computeOutstandingForFarmer(id, (err, stats) => {
+    computeOutstandingForFarmer(id, warehouse_id, location_id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
       getPaymentAdjustmentsByPurchase((adjustErr, adjustedMap) => {
         if (adjustErr) return res.status(500).json({ error: adjustErr.message });
@@ -1097,7 +1127,7 @@ router.get("/outstanding", (req, res) => {
     }
     detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
-    computeOutstandingForCompany(id, (err, stats) => {
+    computeOutstandingForCompany(id, warehouse_id, location_id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
       db.all(detailsQuery, params, (err2, sales) => {
         if (err2) return res.status(500).json({ error: err2.message });
@@ -1320,7 +1350,7 @@ router.post("/payment", (req, res) => {
             insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => {
               if (adjErr) return res.status(500).json({ error: adjErr.message });
               saveIdempotency(idemKey, "payment", paymentId, () => {});
-              computeOutstandingForFarmer(farmer_id, (err2, stats) => {
+              computeOutstandingForFarmer(farmer_id, warehouse_id, location_id, (err2, stats) => {
                 if (err2) return res.status(500).json({ error: err2.message });
                 db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
                   res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
@@ -1351,7 +1381,7 @@ router.post("/payment", (req, res) => {
         const paymentId = this.lastID;
         insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => {
           if (adjErr) return res.status(500).json({ error: adjErr.message });
-          computeOutstandingForFarmer(farmer_id, (err2, stats) => {
+          computeOutstandingForFarmer(farmer_id, warehouse_id, location_id, (err2, stats) => {
             if (err2) return res.status(500).json({ error: err2.message });
             db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
               res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
@@ -1410,7 +1440,7 @@ router.put("/payment/:id", (req, res) => {
                 db.run("ROLLBACK");
                 return res.status(500).json({ error: adjErr.message });
               }
-              computeOutstandingForFarmer(farmer_id, (statsErr, stats) => {
+              computeOutstandingForFarmer(farmer_id, warehouse_id, location_id, (statsErr, stats) => {
                 if (statsErr) {
                   db.run("ROLLBACK");
                   return res.status(500).json({ error: statsErr.message });
@@ -1457,7 +1487,7 @@ router.delete("/payment/:id", (req, res) => {
             db.run("ROLLBACK");
             return res.status(500).json({ error: deleteErr.message });
           }
-          computeOutstandingForFarmer(row.farmer_id, (statsErr, stats) => {
+          computeOutstandingForFarmer(row.farmer_id, row.warehouse_id, row.location_id, (statsErr, stats) => {
             if (statsErr) {
               db.run("ROLLBACK");
               return res.status(500).json({ error: statsErr.message });
@@ -1520,7 +1550,7 @@ router.post("/receipt", (req, res) => {
 
           const receiptId = this.lastID;
           saveIdempotency(idemKey, "receipt", receiptId, () => {});
-          computeOutstandingForCompany(company_id, (err2, stats) => {
+          computeOutstandingForCompany(company_id, warehouse_id, location_id, (err2, stats) => {
             if (err2) return res.status(500).json({ error: err2.message });
             db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
               res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats });
@@ -1546,7 +1576,7 @@ router.post("/receipt", (req, res) => {
       }
 
       const receiptId = this.lastID;
-      computeOutstandingForCompany(company_id, (err2, stats) => {
+      computeOutstandingForCompany(company_id, warehouse_id, location_id, (err2, stats) => {
         if (err2) return res.status(500).json({ error: err2.message });
         db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
           res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats });
