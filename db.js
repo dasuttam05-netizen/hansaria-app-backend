@@ -232,6 +232,17 @@ if (true) {
   `);
 
   db.run(`
+    CREATE TABLE IF NOT EXISTS wh_payment_adjustments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      payment_id INTEGER NOT NULL,
+      purchase_id TEXT NOT NULL,
+      adjusted_amount REAL NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(payment_id) REFERENCES wh_payment_vouchers(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS wh_receipt_vouchers (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       voucher_no TEXT UNIQUE,
