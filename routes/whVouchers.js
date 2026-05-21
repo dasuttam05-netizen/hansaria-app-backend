@@ -596,14 +596,21 @@ function saveIdempotency(key, route, responseId, cb) {
   );
 }
 
-function getPaymentAdjustmentsByPurchase(callback) {
+function getPaymentAdjustmentsByPurchase(callback, excludePaymentId = null) {
+  const params = [];
+  let excludeClause = "";
+  if (excludePaymentId) {
+    excludeClause = "WHERE CAST(payment_id AS TEXT) <> CAST(? AS TEXT)";
+    params.push(excludePaymentId);
+  }
   db.all(
     `
       SELECT purchase_id, COALESCE(SUM(adjusted_amount), 0) AS adjusted_amount
       FROM wh_payment_adjustments
+      ${excludeClause}
       GROUP BY purchase_id
     `,
-    [],
+    params,
     (err, rows) => {
       if (err) return callback(err);
       const map = new Map();
@@ -621,11 +628,12 @@ function normalizePaymentAdjustments(input) {
     .map((item) => ({
       purchase_id: String(item?.purchase_id || item?.id || "").trim(),
       adjusted_amount: Number(item?.adjusted_amount),
+      voucher_no: item?.voucher_no || item?.purchase_voucher_no || "",
     }))
     .filter((item) => item.purchase_id && Number.isFinite(item.adjusted_amount) && item.adjusted_amount > 0);
 }
 
-function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments }, callback) {
+function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments, excludePaymentId = null }, callback) {
   const cleanAdjustments = normalizePaymentAdjustments(adjustments);
   const paymentAmount = Number(amount || 0);
   const adjustedTotal = cleanAdjustments.reduce((sum, item) => sum + item.adjusted_amount, 0);
@@ -693,7 +701,7 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
       params,
       (rowsErr, rows) => (rowsErr ? callback(rowsErr) : finish(rows || []))
     );
-  });
+  }, excludePaymentId);
 }
 
 function insertPaymentAdjustments(paymentId, adjustments, callback) {
@@ -707,6 +715,79 @@ function insertPaymentAdjustments(paymentId, adjustments, callback) {
     db.run(stmt, [paymentId, item.purchase_id, item.adjusted_amount], (err) => (err ? callback(err) : next()));
   };
   next();
+}
+
+function buildPaymentReferenceId(adjustments, purchaseRows = []) {
+  const purchaseMap = new Map((purchaseRows || []).map((row) => [String(row.id || row._id), row]));
+  return normalizePaymentAdjustments(adjustments)
+    .map((item) => item.voucher_no || purchaseMap.get(String(item.purchase_id))?.voucher_no || item.purchase_id)
+    .filter(Boolean)
+    .join(", ");
+}
+
+function getPaymentRowsForUser(req, res) {
+  const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
+  const query = `
+    SELECT p.*, ca.account_name AS company_account_name, f.name AS farmer_name
+    FROM wh_payment_vouchers p
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+    LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY p.date DESC, p.id DESC
+  `;
+  db.all(query, filter.params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    const paymentRows = rows || [];
+    if (!paymentRows.length) return res.json([]);
+    const ids = paymentRows.map((row) => row.id);
+    db.all(
+      `
+        SELECT a.*, pv.voucher_no AS purchase_voucher_no
+        FROM wh_payment_adjustments a
+        LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
+        WHERE a.payment_id IN (${ids.map(() => "?").join(",")})
+        ORDER BY a.id ASC
+      `,
+      ids,
+      async (adjErr, adjustmentRows) => {
+        if (adjErr) return res.status(500).json({ error: adjErr.message });
+        let mongoPurchaseMap = new Map();
+        if (mongoReady()) {
+          const mongoPurchaseIds = [...new Set((adjustmentRows || [])
+            .map((row) => String(row.purchase_id || ""))
+            .filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+          if (mongoPurchaseIds.length) {
+            try {
+              const mongoPurchases = await PurchaseVoucher.find({ _id: { $in: mongoPurchaseIds } }).lean();
+              mongoPurchaseMap = new Map((mongoPurchases || []).map((row) => [String(row._id), row]));
+            } catch (mongoErr) {
+              console.error("Payment adjustment purchase lookup failed:", mongoErr.message);
+            }
+          }
+        }
+        const byPayment = new Map();
+        (adjustmentRows || []).forEach((row) => {
+          const paymentId = String(row.payment_id);
+          const mongoPurchase = mongoPurchaseMap.get(String(row.purchase_id));
+          if (!byPayment.has(paymentId)) byPayment.set(paymentId, []);
+          byPayment.get(paymentId).push({
+            ...row,
+            voucher_no: row.purchase_voucher_no || mongoPurchase?.voucher_no || row.purchase_id,
+            purchase_voucher_no: row.purchase_voucher_no || mongoPurchase?.voucher_no || row.purchase_id,
+          });
+        });
+        res.json(paymentRows.map((row) => {
+          const adjustments = byPayment.get(String(row.id)) || [];
+          return {
+            ...row,
+            adjustments,
+            reference_type: row.reference_type || "purchase",
+            reference_id: row.reference_id || adjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", "),
+          };
+        }));
+      }
+    );
+  });
 }
 
 // ===========================
@@ -924,7 +1005,7 @@ router.get("/next-voucher-no", (req, res) => {
 });
 
 router.get("/outstanding", (req, res) => {
-  const { party_type, id, warehouse_id, location_id } = req.query;
+  const { party_type, id, warehouse_id, location_id, exclude_payment_id } = req.query;
   if (!party_type || !id) return res.status(400).json({ error: "party_type and id are required" });
 
   const filters = ["1=1"];
@@ -941,7 +1022,13 @@ router.get("/outstanding", (req, res) => {
       filters.push("location_id = ?");
       params.push(location_id);
     }
-    paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_payment_vouchers WHERE farmer_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+    const paymentFilters = filters.slice(1);
+    const paymentParams = [...params];
+    if (exclude_payment_id) {
+      paymentFilters.push("CAST(id AS TEXT) <> CAST(? AS TEXT)");
+      paymentParams.push(exclude_payment_id);
+    }
+    paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_payment_vouchers WHERE farmer_id = ? ${paymentFilters.length ? `AND ${paymentFilters.join(" AND ")}` : ""} ORDER BY date ASC`;
     computeOutstandingForFarmer(id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
       getPaymentAdjustmentsByPurchase((adjustErr, adjustedMap) => {
@@ -961,7 +1048,7 @@ router.get("/outstanding", (req, res) => {
             };
           });
 
-          db.all(paymentsQuery, params, (err3, payments) => {
+          db.all(paymentsQuery, paymentParams, (err3, payments) => {
             if (err3) return res.status(500).json({ error: err3.message });
             const totalPurchase = purchases.reduce((sum, row) => sum + Number(row.amount || 0), 0);
             const totalPayment = (payments || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
@@ -994,7 +1081,7 @@ router.get("/outstanding", (req, res) => {
           if (err2) return res.status(500).json({ error: err2.message });
           send(purchases || []);
         });
-      });
+      }, exclude_payment_id);
     });
     return;
   }
@@ -1187,7 +1274,7 @@ router.get("/payment", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  getWarehouseScopedRows(req, res, "wh_payment_vouchers");
+  getPaymentRowsForUser(req, res);
 });
 
 router.post("/payment", (req, res) => {
@@ -1221,7 +1308,9 @@ router.post("/payment", (req, res) => {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+        const finalReferenceType = reference_type || "purchase";
+        const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
+        db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
           if (err) {
             if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
             return res.status(500).json({ error: err.message });
@@ -1251,7 +1340,9 @@ router.post("/payment", (req, res) => {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `;
 
-      db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+      const finalReferenceType = reference_type || "purchase";
+      const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
+      db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
         if (err) {
           if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
           return res.status(500).json({ error: err.message });
@@ -1264,6 +1355,116 @@ router.post("/payment", (req, res) => {
             if (err2) return res.status(500).json({ error: err2.message });
             db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
               res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+router.put("/payment/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+  if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
+
+  db.get("SELECT * FROM wh_payment_vouchers WHERE id = ?", [id], (findErr, oldRow) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!oldRow) return res.status(404).json({ error: "Payment voucher not found" });
+    if (!ensureWarehouseAccess(req, res, oldRow.warehouse_id)) return;
+
+    validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, excludePaymentId: id }, (validationErr, cleanAdjustments) => {
+      if (validationErr) return res.status(400).json({ error: validationErr.message });
+
+      const finalReferenceType = reference_type || "purchase";
+      const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
+      const query = `
+        UPDATE wh_payment_vouchers SET
+          voucher_no=?, date=?, warehouse_id=?, farmer_id=?, company_account_id=?, amount=?,
+          reference_type=?, reference_id=?, employee_id=?, location_id=?, description=?, updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+      `;
+
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION");
+        db.run(query, [voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description, id], function (err) {
+          if (err) {
+            db.run("ROLLBACK");
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+
+          db.run("DELETE FROM wh_payment_adjustments WHERE payment_id = ?", [id], (deleteErr) => {
+            if (deleteErr) {
+              db.run("ROLLBACK");
+              return res.status(500).json({ error: deleteErr.message });
+            }
+
+            insertPaymentAdjustments(id, cleanAdjustments, (adjErr) => {
+              if (adjErr) {
+                db.run("ROLLBACK");
+                return res.status(500).json({ error: adjErr.message });
+              }
+              computeOutstandingForFarmer(farmer_id, (statsErr, stats) => {
+                if (statsErr) {
+                  db.run("ROLLBACK");
+                  return res.status(500).json({ error: statsErr.message });
+                }
+                db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, id], (outErr) => {
+                  if (outErr) {
+                    db.run("ROLLBACK");
+                    return res.status(500).json({ error: outErr.message });
+                  }
+                  db.run("COMMIT", (commitErr) => {
+                    if (commitErr) return res.status(500).json({ error: commitErr.message });
+                    res.json({ id, updated: 1, voucher_no, stats, adjustments: cleanAdjustments, reference_id: finalReferenceId });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+router.delete("/payment/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  db.get("SELECT * FROM wh_payment_vouchers WHERE id = ?", [id], (findErr, row) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!row) return res.status(404).json({ error: "Payment voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION");
+      db.run("DELETE FROM wh_payment_adjustments WHERE payment_id = ?", [id], (adjErr) => {
+        if (adjErr) {
+          db.run("ROLLBACK");
+          return res.status(500).json({ error: adjErr.message });
+        }
+        db.run("DELETE FROM wh_payment_vouchers WHERE id = ?", [id], function (deleteErr) {
+          if (deleteErr) {
+            db.run("ROLLBACK");
+            return res.status(500).json({ error: deleteErr.message });
+          }
+          computeOutstandingForFarmer(row.farmer_id, (statsErr, stats) => {
+            if (statsErr) {
+              db.run("ROLLBACK");
+              return res.status(500).json({ error: statsErr.message });
+            }
+            db.run("COMMIT", (commitErr) => {
+              if (commitErr) return res.status(500).json({ error: commitErr.message });
+              res.json({ deleted: 1, stats });
             });
           });
         });
@@ -1789,24 +1990,62 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
   }
 
   try {
-    const purchases = await getPurchaseReportRowsForUser(req.user);
+    const farmerId = String(req.query.farmer_id || "").trim();
+    const allPurchases = await getPurchaseReportRowsForUser(req.user);
+    const purchases = farmerId
+      ? allPurchases.filter((row) => String(row.farmer_id || "") === farmerId)
+      : allPurchases;
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
+    const paymentParams = [...filter.params];
+    let farmerClause = "";
+    if (farmerId) {
+      farmerClause = " AND CAST(p.farmer_id AS TEXT) = CAST(? AS TEXT)";
+      paymentParams.push(farmerId);
+    }
     const payments = await dbAll(
       `
         SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name
         FROM wh_payment_vouchers p
         LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
         LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
-        WHERE 1 = 1 ${filter.clause}
+        WHERE 1 = 1 ${filter.clause} ${farmerClause}
       `,
-      filter.params
+      paymentParams
     );
+
+    const paymentIds = payments.map((row) => row.id);
+    const sqliteAdjustments = paymentIds.length
+      ? await dbAll(
+          `
+            SELECT a.*, pv.voucher_no AS purchase_voucher_no
+            FROM wh_payment_adjustments a
+            LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
+            WHERE a.payment_id IN (${paymentIds.map(() => "?").join(",")})
+            ORDER BY a.id ASC
+          `,
+          paymentIds
+        )
+      : [];
+    const purchaseMap = new Map(purchases.map((row) => [String(row.id || row._id), row]));
+    const adjustmentsByPayment = new Map();
+    sqliteAdjustments.forEach((item) => {
+      const paymentId = String(item.payment_id);
+      const purchase = purchaseMap.get(String(item.purchase_id));
+      const voucherNo = item.purchase_voucher_no || purchase?.voucher_no || item.purchase_id;
+      if (!adjustmentsByPayment.has(paymentId)) adjustmentsByPayment.set(paymentId, []);
+      adjustmentsByPayment.get(paymentId).push({
+        ...item,
+        purchase_voucher_no: voucherNo,
+      });
+    });
 
     const rows = [
       ...purchases.map((row) => ({
         date: row.date,
         voucher_no: row.voucher_no,
         voucher_type: "Purchase",
+        particulars: `Purchase Bill ${row.voucher_no || ""}`.trim(),
+        adjustment_details: "",
         warehouse_id: row.warehouse_id,
         warehouse_name: row.warehouse_name,
         farmer_id: row.farmer_id,
@@ -1814,17 +2053,26 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
         debit: 0,
         credit: Number(row.total_amount || row.net_amount_payable || row.amount || 0),
       })),
-      ...payments.map((row) => ({
-        date: row.date,
-        voucher_no: row.voucher_no,
-        voucher_type: "Payment",
-        warehouse_id: row.warehouse_id,
-        warehouse_name: row.warehouse_name,
-        farmer_id: row.farmer_id,
-        farmer_name: row.farmer_name,
-        debit: Number(row.amount || 0),
-        credit: 0,
-      })),
+      ...payments.map((row) => {
+        const paymentAdjustments = adjustmentsByPayment.get(String(row.id)) || [];
+        const adjustmentDetails = paymentAdjustments
+          .map((item) => `${item.purchase_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`)
+          .join("; ");
+        return {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Payment",
+          particulars: `Payment adjusted against ${paymentAdjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", ") || row.reference_id || "purchase bill"}`,
+          adjustment_details: adjustmentDetails,
+          reference_id: row.reference_id || paymentAdjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", "),
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name,
+          farmer_id: row.farmer_id,
+          farmer_name: row.farmer_name,
+          debit: Number(row.amount || 0),
+          credit: 0,
+        };
+      }),
     ];
 
     res.json(buildLedgerRows(rows, (row) => row.farmer_id, (row) => row.farmer_name || "Unknown Farmer"));
