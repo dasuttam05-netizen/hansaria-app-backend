@@ -21,8 +21,14 @@ function fmtNum(value) {
 }
 
 function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
-  const filter = assignedWarehouseFilter(req.user, "warehouse_id");
-  const query = `SELECT * FROM ${tableName} WHERE 1 = 1 ${filter.clause} ORDER BY ${orderBy}`;
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const query = `
+    SELECT v.*, ca.account_name AS company_account_name
+    FROM ${tableName} v
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.${orderBy}
+  `;
   db.all(query, filter.params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows || []);
@@ -37,8 +43,10 @@ function getPurchaseVoucherRows(req, res) {
       v.*,
       (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
       (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
-      (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name
+      (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
+      ca.account_name AS company_account_name
     FROM wh_purchase_vouchers v
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
     WHERE 1 = 1 ${filter.clause}
     ORDER BY v.date DESC, v.id DESC
   `;
@@ -196,6 +204,7 @@ router.post("/purchase", (req, res) => {
     date,
     warehouse_id,
     farmer_id,
+    company_account_id,
     product_id,
     quantity,
     rate,
@@ -216,6 +225,7 @@ router.post("/purchase", (req, res) => {
     total_deduct_amount,
     total_qty,
     total_deduction,
+    round_off,
     net_amount_payable,
     employee_id,
     location_id,
@@ -225,12 +235,12 @@ router.post("/purchase", (req, res) => {
 
   const query = `
     INSERT INTO wh_purchase_vouchers (
-      voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+      voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
       packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
       discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
-      total_deduction, net_amount_payable, employee_id, location_id, description
+      total_deduction, round_off, net_amount_payable, employee_id, location_id, description
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `;
 
   const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
@@ -249,12 +259,12 @@ router.post("/purchase", (req, res) => {
 
         const query = `
           INSERT INTO wh_purchase_vouchers (
-            voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+            voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
             packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
             discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
-            total_deduction, net_amount_payable, employee_id, location_id, description
+            total_deduction, round_off, net_amount_payable, employee_id, location_id, description
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
         db.run(query, [
@@ -262,6 +272,7 @@ router.post("/purchase", (req, res) => {
           date,
           warehouse_id,
           farmer_id,
+          company_account_id,
           product_id,
           quantity,
           rate,
@@ -282,6 +293,7 @@ router.post("/purchase", (req, res) => {
           total_deduct_amount,
           total_qty,
           total_deduction,
+          round_off,
           net_amount_payable,
           employee_id,
           location_id,
@@ -304,12 +316,12 @@ router.post("/purchase", (req, res) => {
 
     const query = `
       INSERT INTO wh_purchase_vouchers (
-        voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+        voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
         packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
         discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
-        total_deduction, net_amount_payable, employee_id, location_id, description
+        total_deduction, round_off, net_amount_payable, employee_id, location_id, description
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     db.run(query, [
@@ -317,6 +329,7 @@ router.post("/purchase", (req, res) => {
       date,
       warehouse_id,
       farmer_id,
+      company_account_id,
       product_id,
       quantity,
       rate,
@@ -337,6 +350,7 @@ router.post("/purchase", (req, res) => {
       total_deduct_amount,
       total_qty,
       total_deduction,
+      round_off,
       net_amount_payable,
       employee_id,
       location_id,
@@ -436,7 +450,7 @@ router.post("/sale", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
   const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
@@ -466,11 +480,11 @@ router.post("/sale", (req, res) => {
         const outstanding = netAmount;
 
         const query = `
-          INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, net_amount, net_receivable_amount, fifo_rate, fifo_amount, outstanding, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, net_amount, net_receivable_amount, fifo_rate, fifo_amount, outstanding, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue, outstanding, employee_id, location_id, description], function (err) {
+        db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue, outstanding, employee_id, location_id, description], function (err) {
           if (err) {
             if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
             return res.status(500).json({ error: err.message });
@@ -498,11 +512,11 @@ router.post("/sale", (req, res) => {
     const outstanding = netAmount;
 
     const query = `
-      INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, net_amount, net_receivable_amount, fifo_rate, fifo_amount, outstanding, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO wh_sale_vouchers (voucher_no, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, net_amount, net_receivable_amount, fifo_rate, fifo_amount, outstanding, employee_id, location_id, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue, outstanding, employee_id, location_id, description], function (err) {
+    db.run(query, [generatedVoucherNo, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue, outstanding, employee_id, location_id, description], function (err) {
       if (err) {
         if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
         return res.status(500).json({ error: err.message });
@@ -518,7 +532,7 @@ router.put("/sale/:id", (req, res) => {
   }
 
   const id = req.params.id;
-  const { voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
   const amountValue = Number(amount) || 0;
@@ -534,7 +548,7 @@ router.put("/sale/:id", (req, res) => {
 
   const query = `
     UPDATE wh_sale_vouchers SET
-      voucher_no=?, date=?, unloading_date=?, warehouse_id=?, company_id=?, consignee_id=?, product_id=?,
+      voucher_no=?, date=?, unloading_date=?, warehouse_id=?, company_id=?, company_account_id=?, consignee_id=?, product_id=?,
       quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?,
       adjustment_amount=?, tds_amount=?, net_amount=?, net_receivable_amount=?, fifo_rate=?, fifo_amount=?,
       outstanding=?, employee_id=?, location_id=?, description=?
@@ -542,7 +556,7 @@ router.put("/sale/:id", (req, res) => {
   `;
 
   db.run(query, [
-    voucher_no, date, unloading_date, warehouse_id, company_id, consignee_id, product_id,
+    voucher_no, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id,
     quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue,
     adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue,
     netAmount, employee_id, location_id, description, id
@@ -589,7 +603,7 @@ router.post("/payment", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, warehouse_id, farmer_id, amount, reference_type, reference_id, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
 
@@ -608,11 +622,11 @@ router.post("/payment", (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
 
         const query = `
-          INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, amount, reference_type, reference_id, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+        db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
           if (err) {
             if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
             return res.status(500).json({ error: err.message });
@@ -635,11 +649,11 @@ router.post("/payment", (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
 
     const query = `
-      INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, amount, reference_type, reference_id, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+    db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
       if (err) {
         if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
         return res.status(500).json({ error: err.message });
@@ -672,7 +686,7 @@ router.post("/receipt", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, warehouse_id, company_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
 
@@ -691,11 +705,11 @@ router.post("/receipt", (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
 
         const query = `
-          INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+        db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
           if (err) {
             if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
             return res.status(500).json({ error: err.message });
@@ -718,11 +732,11 @@ router.post("/receipt", (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
 
     const query = `
-      INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+    db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
       if (err) {
         if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
         return res.status(500).json({ error: err.message });
@@ -755,7 +769,7 @@ router.post("/journal", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, warehouse_id, debit_account, credit_account, amount, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
   const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
@@ -773,11 +787,11 @@ router.post("/journal", (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
 
         const query = `
-          INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, debit_account, credit_account, amount, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        db.run(query, [generatedVoucherNo, date, warehouse_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
+        db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
           if (err) {
             if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
             return res.status(500).json({ error: err.message });
@@ -793,11 +807,11 @@ router.post("/journal", (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
 
     const query = `
-      INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, debit_account, credit_account, amount, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    db.run(query, [generatedVoucherNo, date, warehouse_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
+    db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
       if (err) {
         if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
         return res.status(500).json({ error: err.message });
@@ -841,6 +855,7 @@ router.get("/report/purchase-summary", (req, res) => {
     SELECT
       v.*,
       w.name AS warehouse_name,
+      ca.account_name AS company_account_name,
       f.name AS farmer_name,
       p.name AS product_name,
       (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
@@ -848,6 +863,7 @@ router.get("/report/purchase-summary", (req, res) => {
       COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
     FROM wh_purchase_vouchers v
     LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
     LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(v.farmer_id AS TEXT)
     LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
     WHERE 1 = 1 ${filter.clause}
@@ -890,12 +906,19 @@ router.get("/purchase/:id/pdf", (req, res) => {
       p.*,
       w.name AS warehouse_name,
       w.address AS warehouse_address,
+      ca.account_name AS company_account_name,
+      ca.mobile AS company_account_mobile,
+      ca.pan_no AS company_account_pan,
+      ca.address AS company_account_address,
       f.name AS farmer_name,
       f.mobile AS farmer_mobile,
-      f.village AS farmer_village
+      f.village AS farmer_village,
+      pr.name AS product_name
     FROM wh_purchase_vouchers p
     LEFT JOIN warehouses w ON w.id = p.warehouse_id
+    LEFT JOIN company_accounts ca ON ca.id = p.company_account_id
     LEFT JOIN farmers f ON f.id = p.farmer_id
+    LEFT JOIN products pr ON pr.id = p.product_id
     WHERE p.id = ?
   `;
   db.get(q, [id], (err, row) => {
@@ -919,10 +942,13 @@ router.get("/purchase/:id/pdf", (req, res) => {
     let y = 28;
 
     doc.rect(x, y, contentW, 82).fill(light);
+    doc.rect(x + contentW - 255, y, 255, 82).fill(blue);
+    doc.polygon([x + contentW - 295, y + 82], [x + contentW - 255, y], [x + contentW - 255, y + 82]).fill(blue);
     doc.fillColor(blue).fontSize(30).text("SHIVANSH", x + 16, y + 12, { continued: true });
     doc.fillColor("#1b1b1b").fontSize(30).text(" TRADING CO.");
     doc.fillColor(orange).fontSize(11).text("GRAIN MERCHANT & COMMISSION AGENT", x + 18, y + 50);
-    doc.fillColor(blue).fontSize(26).text("PURCHASE MEMO", x + contentW - 250, y + 24, { width: 230, align: "right" });
+    doc.fillColor("#333").fontSize(10).text("Sanjat Bajar, Ward No.-01, Bairasray, Pin - 851120, Bihar", x + 18, y + 66, { width: contentW - 310 });
+    doc.fillColor("#fff").fontSize(24).text("PURCHASE MEMO", x + contentW - 245, y + 28, { width: 225, align: "center" });
     y += 92;
 
     doc.strokeColor("#d7d7d7").lineWidth(1).moveTo(x, y).lineTo(x + contentW, y).stroke();
@@ -946,14 +972,14 @@ router.get("/purchase/:id/pdf", (req, res) => {
     doc.text(`Name: ${row.farmer_name || "-"}`, x + 10, pStart);
     doc.text(`Phone: ${row.farmer_mobile || "-"}`, x + 10, pStart + 20);
     doc.text(`Village: ${row.farmer_village || "-"}`, x + 10, pStart + 40);
-    doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`, x + 10, pStart + 60);
-    doc.text(`Address: ${row.warehouse_address || "-"}`, x + 10, pStart + 80, { width: leftW - 20 });
+    doc.text(`Account: ${row.company_account_name || "-"}`, x + 10, pStart + 60);
+    doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`, x + 10, pStart + 80);
 
     doc.text(`R.S.T. No.: -`, rightX + 10, pStart);
     doc.text(`Transport No.: -`, rightX + 10, pStart + 20);
-    doc.text(`Product ID: ${row.product_id || "-"}`, rightX + 10, pStart + 40);
-    doc.text(`Farmer ID: ${row.farmer_id || "-"}`, rightX + 10, pStart + 60);
-    doc.text(`Location ID: ${row.location_id || "-"}`, rightX + 10, pStart + 80);
+    doc.text(`Product: ${row.product_name || row.product_id || "-"}`, rightX + 10, pStart + 40);
+    doc.text(`Account Mobile: ${row.company_account_mobile || "-"}`, rightX + 10, pStart + 60);
+    doc.text(`Account PAN: ${row.company_account_pan || "-"}`, rightX + 10, pStart + 80);
     y += 146;
 
     const tableX = x;
@@ -969,14 +995,14 @@ router.get("/purchase/:id/pdf", (req, res) => {
 
     const lines = [
       ["1", "Brokerage", fmtNum(row.total_deduct_amount)],
-      ["2", "Labour", fmtNum(row.labour)],
-      ["3", "Packet", fmtNum(row.packet)],
-      ["4", "Gross Weight", fmtNum(row.gross_weight)],
-      ["5", "Tare Weight", fmtNum(row.tare_weight)],
-      ["6", "Net Weight", fmtNum(row.net_weight)],
-      ["7", "Moisture", fmtNum(row.moisture)],
-      ["8", "Dunki", fmtNum(row.dunki)],
-      ["9", "Others", fmtNum(row.others)],
+      ["2", "Packet", fmtNum(row.packet)],
+      ["3", "Gross Weight", fmtNum(row.gross_weight)],
+      ["4", "Tare Weight", fmtNum(row.tare_weight)],
+      ["5", "Dhalta", fmtNum(row.dhalta)],
+      ["6", "Less Bags Weight", fmtNum(row.less_bags_weight)],
+      ["7", "Moisture / Dunki / Fungas", fmtNum(Number(row.moisture || 0) + Number(row.dunki || 0) + Number(row.fungus || 0))],
+      ["8", "Disclour / Others", fmtNum(Number(row.discolour || 0) + Number(row.others || 0))],
+      ["9", "Lorry Claim", fmtNum(row.bags_claim)],
       ["10", "Net Amount Payable", fmtNum(row.net_amount_payable || row.amount)],
     ];
 
@@ -989,13 +1015,24 @@ router.get("/purchase/:id/pdf", (req, res) => {
     });
 
     y += 10;
-    doc.roundedRect(x, y, contentW, 78, 6).stroke("#cfcfcf");
-    doc.fontSize(12).fillColor("#222").text(`Total Qty: ${fmtNum(row.total_qty || row.quantity)}`, x + 12, y + 12);
-    doc.text(`Total Deductions: ${fmtNum(row.total_deduction || row.total_deduct_amount)}`, x + 220, y + 12);
-    doc.fillColor(blue).fontSize(14).text(`Net Amount Payable: Rs. ${fmtNum(row.net_amount_payable || row.amount)}`, x + 12, y + 42);
+    doc.roundedRect(x, y, contentW, 86, 6).stroke("#cfcfcf");
+    doc.fontSize(11).fillColor("#222").text(`Purchased Kg.: ${fmtNum(row.gross_weight)}`, x + 12, y + 12);
+    doc.text(`Net Qty.: ${fmtNum(row.total_qty || row.net_weight || row.quantity)}`, x + 142, y + 12);
+    doc.text(`Labour Charges: ${fmtNum(row.labour)}`, x + 268, y + 12);
+    doc.text(`Total Deductions: ${fmtNum(row.total_deduction || row.total_deduct_amount)}`, x + 410, y + 12);
+    doc.rect(x + contentW - 220, y + 40, 220, 34).fill(blue);
+    doc.fillColor("#fff").fontSize(13).text("Net Amount Payable", x + contentW - 210, y + 50);
+    doc.fillColor(orange).fontSize(15).text(`Rs. ${fmtNum(row.net_amount_payable || row.amount)}`, x + contentW - 105, y + 49, { width: 95, align: "right" });
+
+    y += 98;
+    doc.roundedRect(x, y, contentW, 58, 6).stroke("#cfcfcf");
+    doc.fillColor(blue).fontSize(11).text("ADDITIONAL DETAILS", x + 12, y + 10);
+    doc.fillColor("#222").fontSize(10).text(`Bank / Account: ${row.company_account_name || "-"}`, x + 12, y + 31, { width: 170 });
+    doc.text(`Account Address: ${row.company_account_address || "-"}`, x + 205, y + 31, { width: 170 });
+    doc.text(`Transport No.: -`, x + 405, y + 31, { width: 120 });
 
     if (row.description) {
-      y += 88;
+      y += 70;
       doc.fillColor("#222").fontSize(11).text(`Remarks: ${row.description}`, x, y, { width: contentW });
     }
 
@@ -1070,28 +1107,28 @@ router.put("/purchase/:id", (req, res) => {
 
   const id = req.params.id;
   const {
-    voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+    voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
     packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
     discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
-    total_deduction, net_amount_payable, employee_id, location_id, description
+    total_deduction, round_off, net_amount_payable, employee_id, location_id, description
   } = req.body;
 
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
   const query = `
     UPDATE wh_purchase_vouchers SET
-      voucher_no=?, date=?, warehouse_id=?, farmer_id=?, product_id=?, quantity=?, rate=?, amount=?,
+      voucher_no=?, date=?, warehouse_id=?, farmer_id=?, company_account_id=?, product_id=?, quantity=?, rate=?, amount=?,
       packet=?, gross_weight=?, tare_weight=?, dhalta=?, less_bags_weight=?, moisture=?, dunki=?, fungus=?,
       discolour=?, others=?, net_weight=?, bags_claim=?, labour=?, total_deduct_amount=?, total_qty=?,
-      total_deduction=?, net_amount_payable=?, employee_id=?, location_id=?, description=?
+      total_deduction=?, round_off=?, net_amount_payable=?, employee_id=?, location_id=?, description=?
     WHERE id = ?
   `;
 
   db.run(query, [
-    voucher_no, date, warehouse_id, farmer_id, product_id, quantity, rate, amount,
+    voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
     packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
     discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
-    total_deduction, net_amount_payable, employee_id, location_id, description, id
+    total_deduction, round_off, net_amount_payable, employee_id, location_id, description, id
   ], function(err) {
     if (err) {
       if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
