@@ -851,6 +851,7 @@ router.get("/report/purchase-summary", (req, res) => {
   }
 
   const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const legacyFilter = assignedWarehouseFilter(req.user, "t.warehouse_id");
   const query = `
     SELECT
       v.*,
@@ -870,6 +871,42 @@ router.get("/report/purchase-summary", (req, res) => {
     ORDER BY v.date DESC, v.id DESC
   `;
   db.all(query, filter.params, (err, rows) => {
+    const sendRowsWithLegacy = (purchaseRows) => {
+      const legacyQuery = `
+        SELECT
+          t.id,
+          t.date,
+          t.warehouse_id,
+          t.farmer_id,
+          t.product_id,
+          t.quantity,
+          t.amount,
+          t.description,
+          t.created_at,
+          w.name AS warehouse_name,
+          f.name AS farmer_name,
+          p.name AS product_name,
+          t.quantity AS total_quantity,
+          t.amount AS total_amount,
+          t.amount AS net_amount_payable,
+          1 AS legacy_purchase_entry
+        FROM warehouse_trading_entries t
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(t.warehouse_id AS TEXT)
+        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(t.farmer_id AS TEXT)
+        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(t.product_id AS TEXT)
+        WHERE LOWER(COALESCE(t.transaction_type, '')) = 'purchase' ${legacyFilter.clause}
+        ORDER BY t.date DESC, t.id DESC
+      `;
+
+      db.all(legacyQuery, legacyFilter.params, (legacyErr, legacyRows) => {
+        if (legacyErr) {
+          console.error("Legacy purchase report query failed:", legacyErr.message);
+          return res.json(purchaseRows || []);
+        }
+        res.json([...(purchaseRows || []), ...(legacyRows || [])]);
+      });
+    };
+
     if (err) {
       console.error("Purchase report mapped query failed, falling back to base rows:", err.message);
       const fallbackQuery = `
@@ -887,10 +924,10 @@ router.get("/report/purchase-summary", (req, res) => {
       `;
       return db.all(fallbackQuery, filter.params, (fallbackErr, fallbackRows) => {
         if (fallbackErr) return res.status(500).json({ error: fallbackErr.message });
-        res.json(fallbackRows || []);
+        sendRowsWithLegacy(fallbackRows || []);
       });
     }
-    res.json(rows || []);
+    sendRowsWithLegacy(rows || []);
   });
 });
 
