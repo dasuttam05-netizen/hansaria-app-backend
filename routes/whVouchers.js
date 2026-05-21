@@ -4,6 +4,15 @@ const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
 const PDFDocument = require('pdfkit');
+const {
+  mongoose,
+  PurchaseVoucher,
+  Warehouse,
+  Farmer,
+  Product,
+  CompanyAccount,
+} = require("../mongo");
+
 function fmtDate(value) {
   if (!value) return "-";
   const d = new Date(value);
@@ -35,7 +44,147 @@ function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
   });
 }
 
+const mongoReady = () => mongoose.connection.readyState === 1;
+
+const numberFields = [
+  "quantity",
+  "rate",
+  "amount",
+  "packet",
+  "gross_weight",
+  "tare_weight",
+  "dhalta",
+  "less_bags_weight",
+  "moisture",
+  "dunki",
+  "fungus",
+  "discolour",
+  "others",
+  "net_weight",
+  "bags_claim",
+  "labour",
+  "total_deduct_amount",
+  "total_qty",
+  "total_deduction",
+  "round_off",
+  "net_amount_payable",
+];
+
+function buildPurchasePayload(body, voucherNo) {
+  const payload = {
+    voucher_no: voucherNo || body.voucher_no,
+    date: body.date,
+    warehouse_id: body.warehouse_id ? String(body.warehouse_id) : "",
+    farmer_id: body.farmer_id ? String(body.farmer_id) : "",
+    company_account_id: body.company_account_id ? String(body.company_account_id) : "",
+    product_id: body.product_id ? String(body.product_id) : "",
+    employee_id: body.employee_id ? String(body.employee_id) : "",
+    location_id: body.location_id ? String(body.location_id) : "",
+    description: body.description || "",
+  };
+
+  numberFields.forEach((field) => {
+    const value = Number(body[field]);
+    payload[field] = Number.isFinite(value) ? value : 0;
+  });
+
+  return payload;
+}
+
+function assignedWarehouseIdsForMongo(user) {
+  const ids = user?.assigned_warehouse_ids || user?.assigned_sqlite_warehouse_ids || [];
+  return ids.map((id) => String(id));
+}
+
+function mongoPurchaseScope(user) {
+  if (!user || user.role === "admin" || userHasPermission(user, "warehouses.manage")) {
+    return {};
+  }
+
+  const ids = assignedWarehouseIdsForMongo(user);
+  if (ids.length === 0) return { _id: null };
+  return { warehouse_id: { $in: ids } };
+}
+
+async function nextMongoVoucherNo(type) {
+  const shortPrefix = getVoucherPrefix(type);
+  const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const prefix = `${shortPrefix}-${datePart}-`;
+  const latest = await PurchaseVoucher.findOne({ voucher_no: new RegExp(`^${shortPrefix}-`) })
+    .sort({ createdAt: -1, _id: -1 })
+    .lean();
+  let next = 1;
+  if (latest?.voucher_no) {
+    const pieces = String(latest.voucher_no).split("-");
+    const last = Number(pieces[pieces.length - 1]);
+    if (Number.isFinite(last) && last >= 1) next = last + 1;
+  }
+  return `${prefix}${String(next).padStart(4, "0")}`;
+}
+
+function mongoIdFilter(id) {
+  const value = String(id || "");
+  return mongoose.Types.ObjectId.isValid(value) ? { _id: value } : null;
+}
+
+async function decoratePurchaseRows(rows) {
+  const warehouseIds = [...new Set(rows.map((r) => r.warehouse_id).filter(mongoose.Types.ObjectId.isValid))];
+  const farmerIds = [...new Set(rows.map((r) => r.farmer_id).filter(mongoose.Types.ObjectId.isValid))];
+  const productIds = [...new Set(rows.map((r) => r.product_id).filter(mongoose.Types.ObjectId.isValid))];
+  const accountIds = [...new Set(rows.map((r) => r.company_account_id).filter(mongoose.Types.ObjectId.isValid))];
+
+  const [warehouses, farmers, products, accounts] = await Promise.all([
+    warehouseIds.length ? Warehouse.find({ _id: { $in: warehouseIds } }).lean() : [],
+    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }).lean() : [],
+    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
+  ]);
+
+  const byId = (items) => new Map(items.map((item) => [String(item._id), item]));
+  const warehouseMap = byId(warehouses);
+  const farmerMap = byId(farmers);
+  const productMap = byId(products);
+  const accountMap = byId(accounts);
+
+  return rows.map((row) => {
+    const plain = row.toObject ? row.toObject() : row;
+    const warehouse = warehouseMap.get(String(plain.warehouse_id));
+    const farmer = farmerMap.get(String(plain.farmer_id));
+    const product = productMap.get(String(plain.product_id));
+    const account = accountMap.get(String(plain.company_account_id));
+    return {
+      ...plain,
+      id: String(plain._id),
+      _id: String(plain._id),
+      warehouse_name: warehouse?.name || plain.warehouse_name,
+      farmer_name: farmer?.name || plain.farmer_name,
+      product_name: product?.name || plain.product_name,
+      company_account_name: account?.account_name || plain.company_account_name,
+      total_quantity: plain.total_qty || plain.net_weight || plain.quantity || 0,
+      total_amount: plain.net_amount_payable || plain.amount || 0,
+      gross_amount: (plain.total_qty || plain.net_weight || plain.quantity || 0) * (plain.rate || 0),
+    };
+  });
+}
+
 function getPurchaseVoucherRows(req, res) {
+  if (mongoReady()) {
+    PurchaseVoucher.find(mongoPurchaseScope(req.user))
+      .sort({ date: -1, createdAt: -1, _id: -1 })
+      .lean()
+      .then((rows) => decoratePurchaseRows(rows))
+      .then((rows) => res.json(rows || []))
+      .catch((err) => {
+        console.error("Mongo purchase voucher query failed, falling back to SQLite:", err.message);
+        getPurchaseVoucherRowsSqlite(req, res);
+      });
+    return;
+  }
+
+  getPurchaseVoucherRowsSqlite(req, res);
+}
+
+function getPurchaseVoucherRowsSqlite(req, res) {
   const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
   const fallbackFilter = assignedWarehouseFilter(req.user, "warehouse_id");
   const query = `
@@ -163,6 +312,12 @@ function computeOutstandingForCompany(companyId, callback) {
 
 function createVoucherNoIfMissing(type, voucherNo, callback) {
   if (voucherNo && String(voucherNo).trim()) return callback(null, voucherNo);
+  if (type === "purchase" && mongoReady()) {
+    nextMongoVoucherNo(type)
+      .then((nextNo) => callback(null, nextNo))
+      .catch((err) => callback(err));
+    return;
+  }
   createSequentialVoucherNo(type, callback);
 }
 
@@ -232,6 +387,24 @@ router.post("/purchase", (req, res) => {
     description,
   } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is not connected. Purchase data must be saved in MongoDB." });
+  }
+
+  if (mongoReady()) {
+    return createVoucherNoIfMissing("purchase", voucher_no, async (err, generatedVoucherNo) => {
+      if (err) return res.status(500).json({ error: err.message });
+      try {
+        const payload = buildPurchasePayload(req.body, generatedVoucherNo);
+        const doc = await PurchaseVoucher.create(payload);
+        return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: doc.voucher_no, saved_to: "mongodb" });
+      } catch (mongoErr) {
+        if (mongoErr?.code === 11000) return res.status(400).json({ error: "Voucher number already exists" });
+        return res.status(500).json({ error: mongoErr.message });
+      }
+    });
+  }
 
   const query = `
     INSERT INTO wh_purchase_vouchers (
@@ -368,6 +541,12 @@ router.post("/purchase", (req, res) => {
 router.get("/next-voucher-no", (req, res) => {
   const { type } = req.query;
   if (!type) return res.status(400).json({ error: "type query param is required" });
+  if (type === "purchase" && mongoReady()) {
+    nextMongoVoucherNo(type)
+      .then((voucher_no) => res.json({ voucher_no }))
+      .catch((err) => res.status(500).json({ error: err.message }));
+    return;
+  }
   createSequentialVoucherNo(type, (err, voucher_no) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ voucher_no });
@@ -850,6 +1029,18 @@ router.get("/report/purchase-summary", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
+  if (mongoReady()) {
+    return PurchaseVoucher.find(mongoPurchaseScope(req.user))
+      .sort({ date: -1, createdAt: -1, _id: -1 })
+      .lean()
+      .then((rows) => decoratePurchaseRows(rows))
+      .then((rows) => res.json(rows || []))
+      .catch((err) => {
+        console.error("Mongo purchase report query failed, falling back to SQLite:", err.message);
+        res.status(500).json({ error: err.message });
+      });
+  }
+
   const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
   const legacyFilter = assignedWarehouseFilter(req.user, "t.warehouse_id");
   const query = `
@@ -1171,6 +1362,19 @@ router.put("/purchase/:id", (req, res) => {
 
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
+  if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+    const payload = buildPurchasePayload(req.body, voucher_no);
+    return PurchaseVoucher.findByIdAndUpdate(id, payload, { new: true })
+      .then((doc) => {
+        if (!doc) return res.status(404).json({ error: "Voucher not found" });
+        res.json({ id: String(doc._id), _id: String(doc._id), message: "Voucher updated successfully", saved_to: "mongodb" });
+      })
+      .catch((err) => {
+        if (err?.code === 11000) return res.status(400).json({ error: "Voucher number already exists" });
+        res.status(500).json({ error: err.message });
+      });
+  }
+
   const query = `
     UPDATE wh_purchase_vouchers SET
       voucher_no=?, date=?, warehouse_id=?, farmer_id=?, company_account_id=?, product_id=?, quantity=?, rate=?, amount=?,
@@ -1201,6 +1405,16 @@ router.delete("/purchase/:id", (req, res) => {
   }
 
   const id = req.params.id;
+  if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+    return PurchaseVoucher.findById(id)
+      .then((doc) => {
+        if (!doc) return res.status(404).json({ error: "Voucher not found" });
+        if (!ensureWarehouseAccess(req, res, doc.warehouse_id)) return null;
+        return PurchaseVoucher.deleteOne({ _id: id }).then(() => res.json({ message: "Voucher deleted successfully" }));
+      })
+      .catch((err) => res.status(500).json({ error: err.message }));
+  }
+
   const query = "DELETE FROM wh_purchase_vouchers WHERE id = ?";
 
   db.run(query, [id], function(err) {
