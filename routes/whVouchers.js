@@ -513,13 +513,13 @@ function createSequentialVoucherNo(type, callback) {
 }
 
 function computeOutstandingForFarmer(farmerId, callback) {
-  const purchaseSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE farmer_id = ?`;
+  const purchaseSql = mongoReady()
+    ? null
+    : `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE farmer_id = ?`;
   const paymentSql = `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE farmer_id = ?`;
-  db.get(purchaseSql, [farmerId], (err, purchase) => {
-    if (err) return callback(err);
+  const finish = (totalPurchase) => {
     db.get(paymentSql, [farmerId], (err2, payment) => {
       if (err2) return callback(err2);
-      const totalPurchase = purchase?.total_purchase || 0;
       const totalPayment = payment?.total_payment || 0;
       callback(null, {
         total_purchase: totalPurchase,
@@ -527,6 +527,25 @@ function computeOutstandingForFarmer(farmerId, callback) {
         outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
       });
     });
+  };
+
+  if (mongoReady()) {
+    PurchaseVoucher.find({ farmer_id: String(farmerId || "") })
+      .lean()
+      .then((rows) => {
+        const totalPurchase = (rows || []).reduce(
+          (sum, row) => sum + Number(row.net_amount_payable || row.amount || 0),
+          0
+        );
+        finish(totalPurchase);
+      })
+      .catch(callback);
+    return;
+  }
+
+  db.get(purchaseSql, [farmerId], (err, purchase) => {
+    if (err) return callback(err);
+    finish(purchase?.total_purchase || 0);
   });
 }
 
@@ -575,6 +594,119 @@ function saveIdempotency(key, route, responseId, cb) {
     [key, route, responseId],
     (err) => cb && cb(err)
   );
+}
+
+function getPaymentAdjustmentsByPurchase(callback) {
+  db.all(
+    `
+      SELECT purchase_id, COALESCE(SUM(adjusted_amount), 0) AS adjusted_amount
+      FROM wh_payment_adjustments
+      GROUP BY purchase_id
+    `,
+    [],
+    (err, rows) => {
+      if (err) return callback(err);
+      const map = new Map();
+      (rows || []).forEach((row) => {
+        map.set(String(row.purchase_id), Number(row.adjusted_amount || 0));
+      });
+      callback(null, map);
+    }
+  );
+}
+
+function normalizePaymentAdjustments(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => ({
+      purchase_id: String(item?.purchase_id || item?.id || "").trim(),
+      adjusted_amount: Number(item?.adjusted_amount),
+    }))
+    .filter((item) => item.purchase_id && Number.isFinite(item.adjusted_amount) && item.adjusted_amount > 0);
+}
+
+function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments }, callback) {
+  const cleanAdjustments = normalizePaymentAdjustments(adjustments);
+  const paymentAmount = Number(amount || 0);
+  const adjustedTotal = cleanAdjustments.reduce((sum, item) => sum + item.adjusted_amount, 0);
+
+  if (paymentAmount <= 0) {
+    return callback(new Error("Payment amount is required"));
+  }
+
+  if (!cleanAdjustments.length) {
+    return callback(new Error("Please adjust this payment against purchase bills"));
+  }
+
+  if (Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
+    return callback(new Error("Payment amount and adjustment amount must be equal"));
+  }
+
+  getPaymentAdjustmentsByPurchase((err, adjustedMap) => {
+    if (err) return callback(err);
+
+    const finish = (purchaseRows) => {
+      const purchaseMap = new Map((purchaseRows || []).map((row) => [String(row.id || row._id), row]));
+      for (const item of cleanAdjustments) {
+        const purchase = purchaseMap.get(String(item.purchase_id));
+        if (!purchase) {
+          return callback(new Error("Invalid purchase adjustment target"));
+        }
+
+        const billAmount = Number(purchase.amount || purchase.net_amount_payable || purchase.total_amount || 0);
+        const alreadyAdjusted = adjustedMap.get(String(item.purchase_id)) || 0;
+        const pending = Math.max(0, billAmount - alreadyAdjusted);
+        if (item.adjusted_amount - pending > 0.0001) {
+          return callback(new Error(`Adjustment cannot exceed pending amount for ${purchase.voucher_no || item.purchase_id}`));
+        }
+      }
+
+      callback(null, cleanAdjustments);
+    };
+
+    if (mongoReady()) {
+      const filter = { farmer_id: String(farmerId || "") };
+      if (warehouseId) filter.warehouse_id = String(warehouseId);
+      PurchaseVoucher.find(filter)
+        .lean()
+        .then((rows) => finish((rows || []).map((row) => ({
+          ...row,
+          id: String(row._id),
+          amount: Number(row.net_amount_payable || row.amount || 0),
+        }))))
+        .catch(callback);
+      return;
+    }
+
+    const params = [farmerId];
+    let warehouseClause = "";
+    if (warehouseId) {
+      warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
+      params.push(warehouseId);
+    }
+    db.all(
+      `
+        SELECT id, voucher_no, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
+        FROM wh_purchase_vouchers
+        WHERE CAST(farmer_id AS TEXT) = CAST(? AS TEXT) ${warehouseClause}
+      `,
+      params,
+      (rowsErr, rows) => (rowsErr ? callback(rowsErr) : finish(rows || []))
+    );
+  });
+}
+
+function insertPaymentAdjustments(paymentId, adjustments, callback) {
+  if (!adjustments.length) return callback();
+  const stmt = "INSERT INTO wh_payment_adjustments (payment_id, purchase_id, adjusted_amount) VALUES (?, ?, ?)";
+  let index = 0;
+  const next = () => {
+    if (index >= adjustments.length) return callback();
+    const item = adjustments[index];
+    index += 1;
+    db.run(stmt, [paymentId, item.purchase_id, item.adjusted_amount], (err) => (err ? callback(err) : next()));
+  };
+  next();
 }
 
 // ===========================
@@ -809,15 +941,58 @@ router.get("/outstanding", (req, res) => {
       filters.push("location_id = ?");
       params.push(location_id);
     }
-    detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount FROM wh_purchase_vouchers WHERE farmer_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_payment_vouchers WHERE farmer_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     computeOutstandingForFarmer(id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
-      db.all(detailsQuery, params, (err2, purchases) => {
-        if (err2) return res.status(500).json({ error: err2.message });
-        db.all(paymentsQuery, params, (err3, payments) => {
-          if (err3) return res.status(500).json({ error: err3.message });
-          res.json({ party_type: "farmer", id, stats, purchases, payments });
+      getPaymentAdjustmentsByPurchase((adjustErr, adjustedMap) => {
+        if (adjustErr) return res.status(500).json({ error: adjustErr.message });
+
+        const send = (purchaseRows) => {
+          const purchases = (purchaseRows || []).map((row) => {
+            const purchaseId = String(row.id || row._id);
+            const amount = Number(row.amount || row.net_amount_payable || row.total_amount || 0);
+            const adjusted_amount = adjustedMap.get(purchaseId) || 0;
+            return {
+              ...row,
+              id: purchaseId,
+              amount,
+              adjusted_amount,
+              pending_amount: Number(Math.max(0, amount - adjusted_amount).toFixed(2)),
+            };
+          });
+
+          db.all(paymentsQuery, params, (err3, payments) => {
+            if (err3) return res.status(500).json({ error: err3.message });
+            const totalPurchase = purchases.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+            const totalPayment = (payments || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
+            const scopedStats = {
+              total_purchase: Number(totalPurchase.toFixed(2)),
+              total_payment: Number(totalPayment.toFixed(2)),
+              outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
+            };
+            res.json({ party_type: "farmer", id, stats: scopedStats, purchases, payments });
+          });
+        };
+
+        if (mongoReady()) {
+          const filter = { farmer_id: String(id || "") };
+          if (warehouse_id) filter.warehouse_id = String(warehouse_id);
+          PurchaseVoucher.find(filter)
+            .sort({ date: 1, createdAt: 1, _id: 1 })
+            .lean()
+            .then((rows) => decoratePurchaseRows(rows || []))
+            .then((rows) => send(rows.map((row) => ({
+              ...row,
+              amount: Number(row.total_amount || row.net_amount_payable || row.amount || 0),
+            }))))
+            .catch((mongoErr) => res.status(500).json({ error: mongoErr.message }));
+          return;
+        }
+
+        detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount FROM wh_purchase_vouchers WHERE farmer_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+        db.all(detailsQuery, params, (err2, purchases) => {
+          if (err2) return res.status(500).json({ error: err2.message });
+          send(purchases || []);
         });
       });
     });
@@ -1020,14 +1195,17 @@ router.post("/payment", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
 
-  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
-  if (idemKey) {
-    return getIdempotency(idemKey, "payment", (err, existingId) => {
-      if (err) return res.status(500).json({ error: err.message });
+  validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments }, (validationErr, cleanAdjustments) => {
+    if (validationErr) return res.status(400).json({ error: validationErr.message });
+
+    const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+    if (idemKey) {
+      return getIdempotency(idemKey, "payment", (err, existingId) => {
+        if (err) return res.status(500).json({ error: err.message });
       if (existingId) {
         return db.get(`SELECT * FROM wh_payment_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
           if (e2) return res.status(500).json({ error: e2.message });
@@ -1049,38 +1227,45 @@ router.post("/payment", (req, res) => {
             return res.status(500).json({ error: err.message });
           }
 
-          const paymentId = this.lastID;
-          saveIdempotency(idemKey, "payment", paymentId, () => {});
-          computeOutstandingForFarmer(farmer_id, (err2, stats) => {
-            if (err2) return res.status(500).json({ error: err2.message });
-            db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
-              res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats });
+            const paymentId = this.lastID;
+            insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => {
+              if (adjErr) return res.status(500).json({ error: adjErr.message });
+              saveIdempotency(idemKey, "payment", paymentId, () => {});
+              computeOutstandingForFarmer(farmer_id, (err2, stats) => {
+                if (err2) return res.status(500).json({ error: err2.message });
+                db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
+                  res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+                });
+              });
             });
-          });
         });
       });
     });
-  }
+    }
 
-  createVoucherNoIfMissing("payment", voucher_no, (err, generatedVoucherNo) => {
-    if (err) return res.status(500).json({ error: err.message });
+    createVoucherNoIfMissing("payment", voucher_no, (err, generatedVoucherNo) => {
+      if (err) return res.status(500).json({ error: err.message });
 
-    const query = `
-      INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
+      const query = `
+        INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
 
-    db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
-      if (err) {
-        if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-        return res.status(500).json({ error: err.message });
-      }
+      db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
+        if (err) {
+          if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+          return res.status(500).json({ error: err.message });
+        }
 
-      const paymentId = this.lastID;
-      computeOutstandingForFarmer(farmer_id, (err2, stats) => {
-        if (err2) return res.status(500).json({ error: err2.message });
-        db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
-          res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats });
+        const paymentId = this.lastID;
+        insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => {
+          if (adjErr) return res.status(500).json({ error: adjErr.message });
+          computeOutstandingForFarmer(farmer_id, (err2, stats) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+            db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
+              res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+            });
+          });
         });
       });
     });
