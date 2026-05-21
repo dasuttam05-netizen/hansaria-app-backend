@@ -2,6 +2,7 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 
 const {
+  mongoose,
   Employee,
   Warehouse,
   Location,
@@ -23,6 +24,55 @@ function getRecordId(value) {
   if (value._id) return String(value._id);
   if (value.id) return String(value.id);
   return String(value);
+}
+
+function waitForMongoConnection(timeoutMs = 9000) {
+  if (mongoose.connection.readyState === 1) {
+    return Promise.resolve();
+  }
+
+  if (mongoose.connection.readyState === 0) {
+    return Promise.reject(
+      new Error("MongoDB is not connected. Please check MONGODB_URI.")
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(
+        new Error("MongoDB connection timed out. Please check MONGODB_URI / network access.")
+      );
+    }, timeoutMs);
+
+    function cleanup() {
+      clearTimeout(timer);
+      mongoose.connection.off("connected", handleConnected);
+      mongoose.connection.off("error", handleError);
+      mongoose.connection.off("disconnected", handleDisconnected);
+    }
+
+    function handleConnected() {
+      cleanup();
+      resolve();
+    }
+
+    function handleError(err) {
+      cleanup();
+      reject(err);
+    }
+
+    function handleDisconnected() {
+      cleanup();
+      reject(
+        new Error("MongoDB disconnected. Please check MONGODB_URI / network access.")
+      );
+    }
+
+    mongoose.connection.once("connected", handleConnected);
+    mongoose.connection.once("error", handleError);
+    mongoose.connection.once("disconnected", handleDisconnected);
+  });
 }
 
 async function attachAssignedWarehousesMongo(user) {
@@ -112,6 +162,8 @@ router.post(
         });
       }
 
+      await waitForMongoConnection();
+
       const existingUser = await Employee.findOne({
         username,
       });
@@ -176,6 +228,8 @@ router.post("/login", async (req, res) => {
           "Username and password are required",
       });
     }
+
+    await waitForMongoConnection();
 
     const user = await Employee.findOne({
       username,
