@@ -870,7 +870,26 @@ router.get("/report/purchase-summary", (req, res) => {
     ORDER BY v.date DESC, v.id DESC
   `;
   db.all(query, filter.params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) {
+      console.error("Purchase report mapped query failed, falling back to base rows:", err.message);
+      const fallbackQuery = `
+        SELECT
+          v.*,
+          (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
+          (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
+          (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
+          (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
+          COALESCE(NULLIF(v.total_qty, 0), v.quantity) AS total_quantity,
+          COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+        FROM wh_purchase_vouchers v
+        WHERE 1 = 1 ${filter.clause}
+        ORDER BY v.date DESC, v.id DESC
+      `;
+      return db.all(fallbackQuery, filter.params, (fallbackErr, fallbackRows) => {
+        if (fallbackErr) return res.status(500).json({ error: fallbackErr.message });
+        res.json(fallbackRows || []);
+      });
+    }
     res.json(rows || []);
   });
 });
