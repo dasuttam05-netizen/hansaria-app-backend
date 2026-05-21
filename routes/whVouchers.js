@@ -233,6 +233,154 @@ function ensureWarehouseAccess(req, res, warehouseId) {
   return true;
 }
 
+async function getMongoPurchaseVoucherForPdf(id) {
+  const filter = mongoIdFilter(id);
+  if (!filter || !mongoReady()) return null;
+
+  const row = await PurchaseVoucher.findOne(filter).lean();
+  if (!row) return null;
+
+  const [warehouse, farmer, product, account] = await Promise.all([
+    row.warehouse_id && mongoose.Types.ObjectId.isValid(row.warehouse_id)
+      ? Warehouse.findById(row.warehouse_id).lean()
+      : null,
+    row.farmer_id && mongoose.Types.ObjectId.isValid(row.farmer_id)
+      ? Farmer.findById(row.farmer_id).lean()
+      : null,
+    row.product_id && mongoose.Types.ObjectId.isValid(row.product_id)
+      ? Product.findById(row.product_id).lean()
+      : null,
+    row.company_account_id && mongoose.Types.ObjectId.isValid(row.company_account_id)
+      ? CompanyAccount.findById(row.company_account_id).lean()
+      : null,
+  ]);
+
+  return {
+    ...row,
+    id: String(row._id),
+    warehouse_name: warehouse?.name || row.warehouse_name,
+    warehouse_address: warehouse?.address || row.warehouse_address,
+    farmer_name: farmer?.name || row.farmer_name,
+    farmer_mobile: farmer?.mobile || row.farmer_mobile,
+    farmer_village: farmer?.village || row.farmer_village,
+    product_name: product?.name || row.product_name,
+    company_account_name: account?.account_name || row.company_account_name,
+    company_account_mobile: account?.mobile || row.company_account_mobile,
+    company_account_pan: account?.pan_no || row.company_account_pan,
+    company_account_address: account?.address || row.company_account_address,
+  };
+}
+
+function sendPurchaseVoucherPdf(res, row, id) {
+  const doc = new PDFDocument({ size: "A4", margin: 28 });
+  res.setHeader("Content-Type", "application/pdf");
+  const safeName = String(row.voucher_no || id).replace(/[/\\?%*:|"<>]/g, "-");
+  res.setHeader("Content-Disposition", `attachment; filename="purchase_${safeName}.pdf"`);
+  doc.pipe(res);
+
+  const pageW = doc.page.width;
+  const contentW = pageW - 56;
+  const blue = "#0b2a66";
+  const orange = "#e67e22";
+  const light = "#f7f8fb";
+  const x = 28;
+  let y = 28;
+
+  doc.rect(x, y, contentW, 82).fill(light);
+  doc.rect(x + contentW - 255, y, 255, 82).fill(blue);
+  doc.polygon([x + contentW - 295, y + 82], [x + contentW - 255, y], [x + contentW - 255, y + 82]).fill(blue);
+  doc.fillColor(blue).fontSize(30).text("SHIVANSH", x + 16, y + 12, { continued: true });
+  doc.fillColor("#1b1b1b").fontSize(30).text(" TRADING CO.");
+  doc.fillColor(orange).fontSize(11).text("GRAIN MERCHANT & COMMISSION AGENT", x + 18, y + 50);
+  doc.fillColor("#333").fontSize(10).text("Sanjat Bajar, Ward No.-01, Bairasray, Pin - 851120, Bihar", x + 18, y + 66, { width: contentW - 310 });
+  doc.fillColor("#fff").fontSize(24).text("PURCHASE MEMO", x + contentW - 245, y + 28, { width: 225, align: "center" });
+  y += 92;
+
+  doc.strokeColor("#d7d7d7").lineWidth(1).moveTo(x, y).lineTo(x + contentW, y).stroke();
+  y += 12;
+
+  doc.fillColor("#222").fontSize(12).text(`Serial No.: ${row.voucher_no || id}`, x + 2, y);
+  doc.text(`Date: ${fmtDate(row.date)}`, x + contentW - 180, y, { width: 178, align: "right" });
+  y += 26;
+
+  const leftW = (contentW - 16) / 2;
+  const rightX = x + leftW + 16;
+  doc.roundedRect(x, y, leftW, 132, 6).stroke("#c9c9c9");
+  doc.roundedRect(rightX, y, leftW, 132, 6).stroke("#c9c9c9");
+  doc.rect(x, y, leftW, 22).fill(blue);
+  doc.rect(rightX, y, leftW, 22).fill(orange);
+  doc.fillColor("#fff").fontSize(12).text("PARTY INFORMATION", x + 10, y + 5);
+  doc.text("DOCUMENT INFORMATION", rightX + 10, y + 5);
+
+  doc.fillColor("#222").fontSize(11);
+  const pStart = y + 32;
+  doc.text(`Name: ${row.farmer_name || "-"}`, x + 10, pStart);
+  doc.text(`Phone: ${row.farmer_mobile || "-"}`, x + 10, pStart + 20);
+  doc.text(`Village: ${row.farmer_village || "-"}`, x + 10, pStart + 40);
+  doc.text(`Account: ${row.company_account_name || "-"}`, x + 10, pStart + 60);
+  doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`, x + 10, pStart + 80);
+
+  doc.text("R.S.T. No.: -", rightX + 10, pStart);
+  doc.text("Transport No.: -", rightX + 10, pStart + 20);
+  doc.text(`Product: ${row.product_name || row.product_id || "-"}`, rightX + 10, pStart + 40);
+  doc.text(`Account Mobile: ${row.company_account_mobile || "-"}`, rightX + 10, pStart + 60);
+  doc.text(`Account PAN: ${row.company_account_pan || "-"}`, rightX + 10, pStart + 80);
+  y += 146;
+
+  const tableX = x;
+  const tableW = contentW;
+  const col1 = 42;
+  const col2 = tableW - 180 - col1;
+  doc.rect(tableX, y, tableW, 26).fill(blue);
+  doc.fillColor("#fff").fontSize(12).text("#", tableX + 14, y + 7);
+  doc.text("PARTICULARS", tableX + col1 + 10, y + 7);
+  doc.text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, y + 7);
+  y += 26;
+
+  [
+    ["1", "Brokerage", fmtNum(row.total_deduct_amount)],
+    ["2", "Packet", fmtNum(row.packet)],
+    ["3", "Gross Weight", fmtNum(row.gross_weight)],
+    ["4", "Tare Weight", fmtNum(row.tare_weight)],
+    ["5", "Dhalta", fmtNum(row.dhalta)],
+    ["6", "Less Bags Weight", fmtNum(row.less_bags_weight)],
+    ["7", "Moisture / Dunki / Fungas", fmtNum(Number(row.moisture || 0) + Number(row.dunki || 0) + Number(row.fungus || 0))],
+    ["8", "Disclour / Others", fmtNum(Number(row.discolour || 0) + Number(row.others || 0))],
+    ["9", "Lorry Claim", fmtNum(row.bags_claim)],
+    ["10", "Net Amount Payable", fmtNum(row.net_amount_payable || row.amount)],
+  ].forEach((ln) => {
+    doc.rect(tableX, y, tableW, 24).stroke("#d8d8d8");
+    doc.fillColor("#222").fontSize(11).text(ln[0], tableX + 14, y + 6);
+    doc.text(ln[1], tableX + col1 + 10, y + 6);
+    doc.text(ln[2], tableX + col1 + col2 + 10, y + 6);
+    y += 24;
+  });
+
+  y += 10;
+  doc.roundedRect(x, y, contentW, 86, 6).stroke("#cfcfcf");
+  doc.fontSize(11).fillColor("#222").text(`Purchased Kg.: ${fmtNum(row.gross_weight)}`, x + 12, y + 12);
+  doc.text(`Net Qty.: ${fmtNum(row.total_qty || row.net_weight || row.quantity)}`, x + 142, y + 12);
+  doc.text(`Labour Charges: ${fmtNum(row.labour)}`, x + 268, y + 12);
+  doc.text(`Total Deductions: ${fmtNum(row.total_deduction || row.total_deduct_amount)}`, x + 410, y + 12);
+  doc.rect(x + contentW - 220, y + 40, 220, 34).fill(blue);
+  doc.fillColor("#fff").fontSize(13).text("Net Amount Payable", x + contentW - 210, y + 50);
+  doc.fillColor(orange).fontSize(15).text(`Rs. ${fmtNum(row.net_amount_payable || row.amount)}`, x + contentW - 105, y + 49, { width: 95, align: "right" });
+
+  y += 98;
+  doc.roundedRect(x, y, contentW, 58, 6).stroke("#cfcfcf");
+  doc.fillColor(blue).fontSize(11).text("ADDITIONAL DETAILS", x + 12, y + 10);
+  doc.fillColor("#222").fontSize(10).text(`Bank / Account: ${row.company_account_name || "-"}`, x + 12, y + 31, { width: 170 });
+  doc.text(`Account Address: ${row.company_account_address || "-"}`, x + 205, y + 31, { width: 170 });
+  doc.text("Transport No.: -", x + 405, y + 31, { width: 120 });
+
+  if (row.description) {
+    y += 70;
+    doc.fillColor("#222").fontSize(11).text(`Remarks: ${row.description}`, x, y, { width: contentW });
+  }
+
+  doc.end();
+}
+
 function getVoucherPrefix(type) {
   const prefixMap = {
     purchase: "PUR",
@@ -1000,6 +1148,194 @@ router.post("/journal", (req, res) => {
   });
 });
 
+function dbAll(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => (err ? reject(err) : resolve(rows || [])));
+  });
+}
+
+async function getPurchaseReportRowsForUser(user) {
+  if (mongoReady()) {
+    const rows = await PurchaseVoucher.find(mongoPurchaseScope(user))
+      .sort({ date: -1, createdAt: -1, _id: -1 })
+      .lean();
+    return decoratePurchaseRows(rows);
+  }
+
+  const filter = assignedWarehouseFilter(user, "v.warehouse_id");
+  return dbAll(
+    `
+      SELECT
+        v.*,
+        w.name AS warehouse_name,
+        ca.account_name AS company_account_name,
+        f.name AS farmer_name,
+        p.name AS product_name,
+        (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
+        COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
+        COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+      FROM wh_purchase_vouchers v
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+      LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(v.farmer_id AS TEXT)
+      LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
+      WHERE 1 = 1 ${filter.clause}
+      ORDER BY v.date DESC, v.id DESC
+    `,
+    filter.params
+  );
+}
+
+async function getSaleReportRowsForUser(user) {
+  const filter = assignedWarehouseFilter(user, "s.warehouse_id");
+  return dbAll(
+    `
+      SELECT
+        s.*,
+        w.name AS warehouse_name,
+        c.name AS company_name,
+        ca.account_name AS company_account_name,
+        p.name AS product_name,
+        COALESCE(NULLIF(s.unloading_qty, 0), s.quantity) AS total_quantity,
+        COALESCE(NULLIF(s.net_receivable_amount, 0), s.amount) AS total_amount
+      FROM wh_sale_vouchers s
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
+      LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
+      WHERE 1 = 1 ${filter.clause}
+      ORDER BY s.date DESC, s.id DESC
+    `,
+    filter.params
+  );
+}
+
+function buildLedgerRows(rows, getPartyId, getPartyName) {
+  const balances = new Map();
+  return rows
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+    .map((row) => {
+      const key = getPartyId(row) || "unknown";
+      const previous = balances.get(key) || 0;
+      const debit = Number(row.debit || 0);
+      const credit = Number(row.credit || 0);
+      const balance = previous + debit - credit;
+      balances.set(key, balance);
+      return {
+        ...row,
+        party_id: key,
+        party_name: getPartyName(row),
+        debit,
+        credit,
+        balance: Number(balance.toFixed(2)),
+      };
+    })
+    .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+}
+
+function groupStock(purchases, sales) {
+  const groups = new Map();
+  const keyOf = (row) => `${row.warehouse_id || ""}::${row.product_id || ""}`;
+  const ensure = (row) => {
+    const key = keyOf(row);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        warehouse_id: row.warehouse_id,
+        warehouse_name: row.warehouse_name || "",
+        product_id: row.product_id,
+        product_name: row.product_name || "",
+        purchase_qty: 0,
+        sale_qty: 0,
+        gross_weight: 0,
+        purchase_amount: 0,
+        sale_amount: 0,
+      });
+    }
+    const item = groups.get(key);
+    item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
+    item.product_name = item.product_name || row.product_name || "";
+    return item;
+  };
+
+  purchases.forEach((row) => {
+    const item = ensure(row);
+    const qty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+    item.purchase_qty += qty;
+    item.gross_weight += Number(row.gross_weight || qty || 0);
+    item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+  });
+
+  sales.forEach((row) => {
+    const item = ensure(row);
+    const qty = Number(row.total_quantity || row.unloading_qty || row.quantity || 0);
+    item.sale_qty += qty;
+    item.sale_amount += Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+  });
+
+  return Array.from(groups.values()).map((item) => {
+    const stockQty = item.purchase_qty - item.sale_qty;
+    const avgRate = item.purchase_qty > 0 ? item.purchase_amount / item.purchase_qty : 0;
+    return {
+      ...item,
+      stock_qty: Number(stockQty.toFixed(2)),
+      avg_rate: Number(avgRate.toFixed(2)),
+      stock_amount: Number((stockQty * avgRate).toFixed(2)),
+    };
+  });
+}
+
+function buildFifoStock(purchases, sales) {
+  const lotsByKey = new Map();
+  const keyOf = (row) => `${row.warehouse_id || ""}::${row.product_id || ""}`;
+
+  purchases
+    .slice()
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+    .forEach((row) => {
+      const key = keyOf(row);
+      const qty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+      const amount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+      if (!lotsByKey.has(key)) lotsByKey.set(key, []);
+      lotsByKey.get(key).push({
+        ...row,
+        purchase_qty: qty,
+        remaining_qty: qty,
+        fifo_rate: qty > 0 ? amount / qty : Number(row.rate || 0),
+      });
+    });
+
+  sales
+    .slice()
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+    .forEach((row) => {
+      const lots = lotsByKey.get(keyOf(row)) || [];
+      let saleQty = Number(row.total_quantity || row.unloading_qty || row.quantity || 0);
+      for (const lot of lots) {
+        if (saleQty <= 0) break;
+        const used = Math.min(lot.remaining_qty, saleQty);
+        lot.remaining_qty -= used;
+        saleQty -= used;
+      }
+    });
+
+  return Array.from(lotsByKey.values())
+    .flat()
+    .filter((lot) => lot.remaining_qty > 0.0001)
+    .map((lot) => ({
+      date: lot.date,
+      voucher_no: lot.voucher_no,
+      warehouse_id: lot.warehouse_id,
+      warehouse_name: lot.warehouse_name,
+      product_id: lot.product_id,
+      product_name: lot.product_name,
+      purchase_qty: Number(lot.purchase_qty.toFixed(2)),
+      remaining_qty: Number(lot.remaining_qty.toFixed(2)),
+      rate: Number(lot.fifo_rate.toFixed(2)),
+      amount: Number((lot.remaining_qty * lot.fifo_rate).toFixed(2)),
+      gross_weight: Number(lot.gross_weight || lot.purchase_qty || 0),
+    }));
+}
+
 // ===========================
 // REPORTS
 // ===========================
@@ -1122,27 +1458,186 @@ router.get("/report/purchase-summary", (req, res) => {
   });
 });
 
-router.get("/report/profit-loss", (req, res) => {
+router.get("/report/profit-loss", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.profitLoss")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const filter = assignedWarehouseFilter(req.user, "w.id");
-  const query = `
-    SELECT 
-      w.id,
-      w.name as warehouse_name,
-      (SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) FROM wh_sale_vouchers WHERE warehouse_id = w.id) as sale_amount,
-      (SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) FROM wh_purchase_vouchers WHERE warehouse_id = w.id) as purchase_amount,
-      (SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) FROM wh_sale_vouchers WHERE warehouse_id = w.id) - 
-      (SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) FROM wh_purchase_vouchers WHERE warehouse_id = w.id) as profit_loss
-    FROM warehouses w
-    WHERE 1 = 1 ${filter.clause}
-  `;
-  db.all(query, filter.params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows || []);
-  });
+  try {
+    const [purchases, sales] = await Promise.all([
+      getPurchaseReportRowsForUser(req.user),
+      getSaleReportRowsForUser(req.user),
+    ]);
+    const rows = new Map();
+    const ensure = (row) => {
+      const key = String(row.warehouse_id || "");
+      if (!rows.has(key)) {
+        rows.set(key, {
+          id: row.warehouse_id,
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name || "",
+          sale_amount: 0,
+          purchase_amount: 0,
+          profit_loss: 0,
+        });
+      }
+      const item = rows.get(key);
+      item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
+      return item;
+    };
+
+    purchases.forEach((row) => {
+      const item = ensure(row);
+      item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+    });
+    sales.forEach((row) => {
+      const item = ensure(row);
+      item.sale_amount += Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+    });
+
+    res.json(
+      Array.from(rows.values()).map((row) => ({
+        ...row,
+        sale_amount: Number(row.sale_amount.toFixed(2)),
+        purchase_amount: Number(row.purchase_amount.toFixed(2)),
+        profit_loss: Number((row.sale_amount - row.purchase_amount).toFixed(2)),
+      }))
+    );
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/purchase-party-ledger", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const purchases = await getPurchaseReportRowsForUser(req.user);
+    const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
+    const payments = await dbAll(
+      `
+        SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name
+        FROM wh_payment_vouchers p
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
+        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
+        WHERE 1 = 1 ${filter.clause}
+      `,
+      filter.params
+    );
+
+    const rows = [
+      ...purchases.map((row) => ({
+        date: row.date,
+        voucher_no: row.voucher_no,
+        voucher_type: "Purchase",
+        warehouse_id: row.warehouse_id,
+        warehouse_name: row.warehouse_name,
+        farmer_id: row.farmer_id,
+        farmer_name: row.farmer_name,
+        debit: 0,
+        credit: Number(row.total_amount || row.net_amount_payable || row.amount || 0),
+      })),
+      ...payments.map((row) => ({
+        date: row.date,
+        voucher_no: row.voucher_no,
+        voucher_type: "Payment",
+        warehouse_id: row.warehouse_id,
+        warehouse_name: row.warehouse_name,
+        farmer_id: row.farmer_id,
+        farmer_name: row.farmer_name,
+        debit: Number(row.amount || 0),
+        credit: 0,
+      })),
+    ];
+
+    res.json(buildLedgerRows(rows, (row) => row.farmer_id, (row) => row.farmer_name || "Unknown Farmer"));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/sale-party-ledger", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const sales = await getSaleReportRowsForUser(req.user);
+    const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
+    const receipts = await dbAll(
+      `
+        SELECT r.*, w.name AS warehouse_name, c.name AS company_name
+        FROM wh_receipt_vouchers r
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(r.warehouse_id AS TEXT)
+        LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(r.company_id AS TEXT)
+        WHERE 1 = 1 ${filter.clause}
+      `,
+      filter.params
+    );
+
+    const rows = [
+      ...sales.map((row) => ({
+        date: row.date,
+        voucher_no: row.voucher_no,
+        voucher_type: "Sale",
+        warehouse_id: row.warehouse_id,
+        warehouse_name: row.warehouse_name,
+        company_id: row.company_id,
+        company_name: row.company_name,
+        debit: Number(row.total_amount || row.net_receivable_amount || row.amount || 0),
+        credit: 0,
+      })),
+      ...receipts.map((row) => ({
+        date: row.date,
+        voucher_no: row.voucher_no,
+        voucher_type: "Receipt",
+        warehouse_id: row.warehouse_id,
+        warehouse_name: row.warehouse_name,
+        company_id: row.company_id,
+        company_name: row.company_name,
+        debit: 0,
+        credit: Number(row.amount || 0),
+      })),
+    ];
+
+    res.json(buildLedgerRows(rows, (row) => row.company_id, (row) => row.company_name || "Unknown Company"));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/warehouse-stock", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.purchase") && !userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const [purchases, sales] = await Promise.all([
+      getPurchaseReportRowsForUser(req.user),
+      getSaleReportRowsForUser(req.user),
+    ]);
+    res.json(groupStock(purchases, sales));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/fifo-stock", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.purchase") && !userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const [purchases, sales] = await Promise.all([
+      getPurchaseReportRowsForUser(req.user),
+      getSaleReportRowsForUser(req.user),
+    ]);
+    res.json(buildFifoStock(purchases, sales));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // PDF download for purchase voucher - available to authenticated users
@@ -1168,122 +1663,22 @@ router.get("/purchase/:id/pdf", (req, res) => {
     LEFT JOIN products pr ON pr.id = p.product_id
     WHERE p.id = ?
   `;
-  db.get(q, [id], (err, row) => {
+  db.get(q, [id], async (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
+    if (!row) {
+      try {
+        row = await getMongoPurchaseVoucherForPdf(id);
+      } catch (mongoErr) {
+        console.error("Mongo purchase PDF lookup failed:", mongoErr.message);
+        return res.status(500).json({ error: mongoErr.message });
+      }
+    }
+
     if (!row) return res.status(404).json({ error: "Not found" });
     if (!req.user) return res.status(403).json({ error: "Authentication required" });
     if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
 
-    const doc = new PDFDocument({ size: "A4", margin: 28 });
-    res.setHeader('Content-Type', 'application/pdf');
-    const filename = `purchase_${row.voucher_no || id}.pdf`;
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    doc.pipe(res);
-
-    const pageW = doc.page.width;
-    const contentW = pageW - 56;
-    const blue = "#0b2a66";
-    const orange = "#e67e22";
-    const light = "#f7f8fb";
-    const x = 28;
-    let y = 28;
-
-    doc.rect(x, y, contentW, 82).fill(light);
-    doc.rect(x + contentW - 255, y, 255, 82).fill(blue);
-    doc.polygon([x + contentW - 295, y + 82], [x + contentW - 255, y], [x + contentW - 255, y + 82]).fill(blue);
-    doc.fillColor(blue).fontSize(30).text("SHIVANSH", x + 16, y + 12, { continued: true });
-    doc.fillColor("#1b1b1b").fontSize(30).text(" TRADING CO.");
-    doc.fillColor(orange).fontSize(11).text("GRAIN MERCHANT & COMMISSION AGENT", x + 18, y + 50);
-    doc.fillColor("#333").fontSize(10).text("Sanjat Bajar, Ward No.-01, Bairasray, Pin - 851120, Bihar", x + 18, y + 66, { width: contentW - 310 });
-    doc.fillColor("#fff").fontSize(24).text("PURCHASE MEMO", x + contentW - 245, y + 28, { width: 225, align: "center" });
-    y += 92;
-
-    doc.strokeColor("#d7d7d7").lineWidth(1).moveTo(x, y).lineTo(x + contentW, y).stroke();
-    y += 12;
-
-    doc.fillColor("#222").fontSize(12).text(`Serial No.: ${row.voucher_no || id}`, x + 2, y);
-    doc.text(`Date: ${fmtDate(row.date)}`, x + contentW - 180, y, { width: 178, align: "right" });
-    y += 26;
-
-    const leftW = (contentW - 16) / 2;
-    const rightX = x + leftW + 16;
-    doc.roundedRect(x, y, leftW, 132, 6).stroke("#c9c9c9");
-    doc.roundedRect(rightX, y, leftW, 132, 6).stroke("#c9c9c9");
-    doc.rect(x, y, leftW, 22).fill(blue);
-    doc.rect(rightX, y, leftW, 22).fill(orange);
-    doc.fillColor("#fff").fontSize(12).text("PARTY INFORMATION", x + 10, y + 5);
-    doc.text("DOCUMENT INFORMATION", rightX + 10, y + 5);
-
-    doc.fillColor("#222").fontSize(11);
-    const pStart = y + 32;
-    doc.text(`Name: ${row.farmer_name || "-"}`, x + 10, pStart);
-    doc.text(`Phone: ${row.farmer_mobile || "-"}`, x + 10, pStart + 20);
-    doc.text(`Village: ${row.farmer_village || "-"}`, x + 10, pStart + 40);
-    doc.text(`Account: ${row.company_account_name || "-"}`, x + 10, pStart + 60);
-    doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`, x + 10, pStart + 80);
-
-    doc.text(`R.S.T. No.: -`, rightX + 10, pStart);
-    doc.text(`Transport No.: -`, rightX + 10, pStart + 20);
-    doc.text(`Product: ${row.product_name || row.product_id || "-"}`, rightX + 10, pStart + 40);
-    doc.text(`Account Mobile: ${row.company_account_mobile || "-"}`, rightX + 10, pStart + 60);
-    doc.text(`Account PAN: ${row.company_account_pan || "-"}`, rightX + 10, pStart + 80);
-    y += 146;
-
-    const tableX = x;
-    const tableW = contentW;
-    const col1 = 42;
-    const col2 = tableW - 180 - col1;
-    const col3 = 180;
-    doc.rect(tableX, y, tableW, 26).fill(blue);
-    doc.fillColor("#fff").fontSize(12).text("#", tableX + 14, y + 7);
-    doc.text("PARTICULARS", tableX + col1 + 10, y + 7);
-    doc.text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, y + 7);
-    y += 26;
-
-    const lines = [
-      ["1", "Brokerage", fmtNum(row.total_deduct_amount)],
-      ["2", "Packet", fmtNum(row.packet)],
-      ["3", "Gross Weight", fmtNum(row.gross_weight)],
-      ["4", "Tare Weight", fmtNum(row.tare_weight)],
-      ["5", "Dhalta", fmtNum(row.dhalta)],
-      ["6", "Less Bags Weight", fmtNum(row.less_bags_weight)],
-      ["7", "Moisture / Dunki / Fungas", fmtNum(Number(row.moisture || 0) + Number(row.dunki || 0) + Number(row.fungus || 0))],
-      ["8", "Disclour / Others", fmtNum(Number(row.discolour || 0) + Number(row.others || 0))],
-      ["9", "Lorry Claim", fmtNum(row.bags_claim)],
-      ["10", "Net Amount Payable", fmtNum(row.net_amount_payable || row.amount)],
-    ];
-
-    lines.forEach((ln) => {
-      doc.rect(tableX, y, tableW, 24).stroke("#d8d8d8");
-      doc.text(ln[0], tableX + 14, y + 6);
-      doc.text(ln[1], tableX + col1 + 10, y + 6);
-      doc.text(ln[2], tableX + col1 + col2 + 10, y + 6);
-      y += 24;
-    });
-
-    y += 10;
-    doc.roundedRect(x, y, contentW, 86, 6).stroke("#cfcfcf");
-    doc.fontSize(11).fillColor("#222").text(`Purchased Kg.: ${fmtNum(row.gross_weight)}`, x + 12, y + 12);
-    doc.text(`Net Qty.: ${fmtNum(row.total_qty || row.net_weight || row.quantity)}`, x + 142, y + 12);
-    doc.text(`Labour Charges: ${fmtNum(row.labour)}`, x + 268, y + 12);
-    doc.text(`Total Deductions: ${fmtNum(row.total_deduction || row.total_deduct_amount)}`, x + 410, y + 12);
-    doc.rect(x + contentW - 220, y + 40, 220, 34).fill(blue);
-    doc.fillColor("#fff").fontSize(13).text("Net Amount Payable", x + contentW - 210, y + 50);
-    doc.fillColor(orange).fontSize(15).text(`Rs. ${fmtNum(row.net_amount_payable || row.amount)}`, x + contentW - 105, y + 49, { width: 95, align: "right" });
-
-    y += 98;
-    doc.roundedRect(x, y, contentW, 58, 6).stroke("#cfcfcf");
-    doc.fillColor(blue).fontSize(11).text("ADDITIONAL DETAILS", x + 12, y + 10);
-    doc.fillColor("#222").fontSize(10).text(`Bank / Account: ${row.company_account_name || "-"}`, x + 12, y + 31, { width: 170 });
-    doc.text(`Account Address: ${row.company_account_address || "-"}`, x + 205, y + 31, { width: 170 });
-    doc.text(`Transport No.: -`, x + 405, y + 31, { width: 120 });
-
-    if (row.description) {
-      y += 70;
-      doc.fillColor("#222").fontSize(11).text(`Remarks: ${row.description}`, x, y, { width: contentW });
-    }
-
-    doc.end();
+    sendPurchaseVoucherPdf(res, row, id);
   });
 });
 
