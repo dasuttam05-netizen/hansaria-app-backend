@@ -268,11 +268,41 @@ async function getMongoPurchaseVoucherForPdf(id) {
     farmer_gst: farmer?.gst_no || row.farmer_gst,
     farmer_pan: farmer?.pan_no || row.farmer_pan,
     farmer_state: farmer?.state || row.farmer_state,
+    farmer_bank_name: farmer?.bank_name || row.farmer_bank_name,
+    farmer_bank_account_no: farmer?.bank_account_no || row.farmer_bank_account_no,
+    farmer_ifsc_code: farmer?.ifsc_code || row.farmer_ifsc_code,
+    farmer_branch_name: farmer?.branch_name || row.farmer_branch_name,
+    farmer_account_holder_name: farmer?.account_holder_name || row.farmer_account_holder_name,
     product_name: product?.name || row.product_name,
     company_account_name: account?.account_name || row.company_account_name,
     company_account_mobile: account?.mobile || row.company_account_mobile,
     company_account_pan: account?.pan_no || row.company_account_pan,
     company_account_address: account?.address || row.company_account_address,
+  };
+}
+
+async function enrichPurchaseVoucherPdfRow(row) {
+  if (!row || !mongoReady()) return row;
+  const farmerId = String(row.farmer_id || "");
+  if (!mongoose.Types.ObjectId.isValid(farmerId)) return row;
+
+  const farmer = await Farmer.findById(farmerId).lean();
+  if (!farmer) return row;
+
+  return {
+    ...row,
+    farmer_name: row.farmer_name || farmer.name,
+    farmer_mobile: row.farmer_mobile || farmer.mobile,
+    farmer_address: row.farmer_address || farmer.address,
+    farmer_village: row.farmer_village || farmer.village,
+    farmer_gst: row.farmer_gst || farmer.gst_no,
+    farmer_pan: row.farmer_pan || farmer.pan_no,
+    farmer_state: row.farmer_state || farmer.state,
+    farmer_bank_name: row.farmer_bank_name || farmer.bank_name,
+    farmer_bank_account_no: row.farmer_bank_account_no || farmer.bank_account_no,
+    farmer_ifsc_code: row.farmer_ifsc_code || farmer.ifsc_code,
+    farmer_branch_name: row.farmer_branch_name || farmer.branch_name,
+    farmer_account_holder_name: row.farmer_account_holder_name || farmer.account_holder_name,
   };
 }
 
@@ -292,15 +322,19 @@ function sendPurchaseVoucherPdf(res, row, id) {
   const light = "#f8fafc";
   const x = 28;
   let y = 28;
-  const accountName = row.company_account_name || "SHIVANSH TRADING CO.";
+  const accountName = row.company_account_name || "SHIVANSH";
   const accountAddress = row.company_account_address || row.warehouse_address || "-";
   const warehouseLine = [row.warehouse_name, row.warehouse_location].filter(Boolean).join(" - ");
   const netQty = row.total_qty || row.net_weight || row.quantity || 0;
   const grossAmount = Number(netQty || 0) * Number(row.rate || 0);
   const netPayable = row.net_amount_payable || row.amount || 0;
+  const fmt4 = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(4) : "0.0000";
+  };
 
   const labelValue = (label, value, tx, ty, width = 120) => {
-    doc.fillColor("#111827").fontSize(8.8).text(label, tx, ty, { width: width * 0.45 });
+    doc.fillColor("#111827").fontSize(8.4).text(label, tx, ty, { width: width * 0.45 });
     doc.fillColor(muted).text(":", tx + width * 0.45, ty);
     doc.fillColor("#111827").text(value || "-", tx + width * 0.52, ty, { width: width * 0.48 });
   };
@@ -308,15 +342,14 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.rect(x - 10, y - 10, contentW + 20, 760).lineWidth(2).stroke(primary);
 
   doc.circle(x + 28, y + 28, 24).lineWidth(2).stroke(accent);
-  doc.fillColor(primary).fontSize(26).text(accountName, x + 66, y + 10, { width: 260 });
-  doc.fillColor(primary).fontSize(15).text("TRADING CO.", x + 68, y + 42, { characterSpacing: 4 });
-  doc.fillColor(accent).fontSize(7.8).text("GRAIN MERCHANT & COMMISSION AGENT", x + 70, y + 62);
+  doc.fillColor(primary).fontSize(25).text(accountName, x + 66, y + 13, { width: 285 });
+  doc.fillColor(accent).fontSize(7.8).text("GRAIN MERCHANT & COMMISSION AGENT", x + 70, y + 50);
   doc.fillColor(primary).fontSize(8.5).text("Phone", x + 340, y + 15);
   doc.fillColor("#111827").text(row.company_account_mobile || "9064348416 / 9304251749", x + 370, y + 15);
   doc.fillColor(primary).text("Mobile", x + 448, y + 15);
   doc.fillColor("#111827").text(row.farmer_mobile || "7004862400", x + 485, y + 15);
   doc.polygon([x + 382, y + 46], [x + contentW, y + 46], [x + contentW, y + 86], [x + 348, y + 86]).fill(primary);
-  doc.fillColor("#fff").fontSize(16).text("PURCHASE MEMO", x + 405, y + 58, { width: 150, align: "center" });
+  doc.fillColor("#fff").fontSize(14).text("PURCHASE MEMO", x + 388, y + 58, { width: 178, align: "center" });
   doc.fillColor("#111827").fontSize(9).text(`Location: ${warehouseLine || "-"}`, x, y + 94, { width: contentW });
   doc.moveTo(x, y + 116).lineTo(x + contentW, y + 116).stroke(border);
   y += 132;
@@ -370,17 +403,17 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   [
     ["1", "Product", row.product_name || row.product_id || "-"],
-    ["2", "Packet", fmtNum(row.packet)],
-    ["3", "Gross Weight", fmtNum(row.gross_weight)],
-    ["4", "Tare Weight", fmtNum(row.tare_weight)],
-    ["5", "Dhalta", fmtNum(row.dhalta)],
-    ["6", "Less Bags Weight", fmtNum(row.less_bags_weight)],
-    ["7", "Moisture", fmtNum(row.moisture)],
-    ["8", "Dunki / Fungus", fmtNum(Number(row.dunki || 0) + Number(row.fungus || 0))],
-    ["9", "Discolour / Others", fmtNum(Number(row.discolour || 0) + Number(row.others || 0))],
-    ["10", "Bags Claim", fmtNum(row.bags_claim)],
-    ["11", "Labour", fmtNum(row.labour)],
-    ["12", "Round Off", fmtNum(row.round_off)],
+    ["2", "Packet", fmt4(row.packet)],
+    ["3", "Gross Weight", fmt4(row.gross_weight)],
+    ["4", "Tare Weight", fmt4(row.tare_weight)],
+    ["5", "Dhalta", fmt4(row.dhalta)],
+    ["6", "Less Bags Weight", fmt4(row.less_bags_weight)],
+    ["7", "Moisture", fmt4(row.moisture)],
+    ["8", "Dunki / Fungus", fmt4(Number(row.dunki || 0) + Number(row.fungus || 0))],
+    ["9", "Discolour / Others", fmt4(Number(row.discolour || 0) + Number(row.others || 0))],
+    ["10", "Bags Claim", fmt4(row.bags_claim)],
+    ["11", "Labour", fmt4(row.labour)],
+    ["12", "Round Off", fmt4(row.round_off)],
   ].forEach((ln) => {
     doc.rect(tableX, y, tableW, 18).stroke(border);
     doc.fillColor("#111827").fontSize(8.8).text(ln[0], tableX + 14, y + 5);
@@ -394,11 +427,11 @@ function sendPurchaseVoucherPdf(res, row, id) {
   const totalX = x + summaryW + 10;
   const boxW = summaryW / 5;
   [
-    ["PURCHASED KG.", fmtNum(row.gross_weight)],
-    ["MAKKA QTY.", fmtNum(netQty)],
-    ["BORA QTY.", fmtNum(row.packet)],
-    ["LABOUR CHARGES", fmtNum(row.labour)],
-    ["TOTAL", fmtNum(grossAmount || netPayable)],
+    ["PURCHASED KG.", fmt4(row.gross_weight)],
+    ["MAKKA QTY.", fmt4(netQty)],
+    ["BORA QTY.", fmt4(row.packet)],
+    ["LABOUR CHARGES", fmt4(row.labour)],
+    ["TOTAL", fmt4(grossAmount || netPayable)],
   ].forEach((item, index) => {
     const bx = x + index * boxW;
     doc.rect(bx, y, boxW, 52).stroke(border);
@@ -407,22 +440,22 @@ function sendPurchaseVoucherPdf(res, row, id) {
   });
 
   doc.roundedRect(totalX, y, contentW - summaryW - 10, 52, 4).stroke(border);
-  labelValue("Total Qty.", fmtNum(netQty), totalX + 12, y + 8, contentW - summaryW - 34);
-  labelValue("Total Deductions", fmtNum(row.total_deduction || row.total_deduct_amount), totalX + 12, y + 25, contentW - summaryW - 34);
+  labelValue("Total Qty.", fmt4(netQty), totalX + 12, y + 8, contentW - summaryW - 34);
+  labelValue("Total Deductions", fmt4(row.total_deduction || row.total_deduct_amount), totalX + 12, y + 25, contentW - summaryW - 34);
   doc.rect(totalX, y + 36, contentW - summaryW - 10, 16).fill(primary);
   doc.fillColor("#fff").fontSize(8.5).text("Net Amount Payable", totalX + 12, y + 41);
-  doc.fillColor(accent).fontSize(10).text(fmtNum(netPayable), totalX + 110, y + 40, { width: 100, align: "right" });
+  doc.fillColor("#fff").fontSize(8.5).text(fmt4(netPayable), totalX + 100, y + 41, { width: contentW - summaryW - 124, align: "right" });
 
   y += 68;
   doc.roundedRect(x, y, contentW, 76, 4).stroke(border);
   doc.rect(x + 58, y, 190, 22).fill(primary);
   doc.polygon([x + 248, y], [x + 270, y], [x + 252, y + 22], [x + 248, y + 22]).fill(primary);
   doc.fillColor("#fff").fontSize(10).text("ADDITIONAL DETAILS", x + 80, y + 7);
-  labelValue("Bank", accountName, x + 12, y + 38, 160);
-  labelValue("IFSC Code", "-", x + 12, y + 58, 160);
-  labelValue("Name of Party", row.farmer_name, x + 205, y + 38, 160);
-  labelValue("Branch", row.warehouse_location || "-", x + 205, y + 58, 160);
-  labelValue("Account Number", "-", x + 395, y + 38, 150);
+  labelValue("Bank", row.farmer_bank_name || "-", x + 12, y + 38, 160);
+  labelValue("IFSC Code", row.farmer_ifsc_code || "-", x + 12, y + 58, 160);
+  labelValue("Name of Party", row.farmer_account_holder_name || row.farmer_name, x + 205, y + 38, 160);
+  labelValue("Branch", row.farmer_branch_name || "-", x + 205, y + 58, 160);
+  labelValue("Account Number", row.farmer_bank_account_no || "-", x + 395, y + 38, 150);
   labelValue("Transport No.", "-", x + 395, y + 58, 150);
 
   y += 94;
@@ -1717,6 +1750,11 @@ router.get("/purchase/:id/pdf", (req, res) => {
       f.gst_no AS farmer_gst,
       f.pan_no AS farmer_pan,
       f.state AS farmer_state,
+      NULL AS farmer_bank_name,
+      NULL AS farmer_bank_account_no,
+      NULL AS farmer_ifsc_code,
+      NULL AS farmer_branch_name,
+      NULL AS farmer_account_holder_name,
       pr.name AS product_name
     FROM wh_purchase_vouchers p
     LEFT JOIN warehouses w ON w.id = p.warehouse_id
@@ -1740,6 +1778,12 @@ router.get("/purchase/:id/pdf", (req, res) => {
     if (!row) return res.status(404).json({ error: "Not found" });
     if (!req.user) return res.status(403).json({ error: "Authentication required" });
     if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    try {
+      row = await enrichPurchaseVoucherPdfRow(row);
+    } catch (enrichErr) {
+      console.error("Purchase PDF enrichment failed:", enrichErr.message);
+    }
 
     sendPurchaseVoucherPdf(res, row, id);
   });
