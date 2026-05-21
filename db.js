@@ -131,6 +131,7 @@ if (true) {
       date TEXT NOT NULL,
       warehouse_id INTEGER,
       farmer_id TEXT,
+      company_account_id INTEGER,
       product_id INTEGER,
       quantity REAL DEFAULT 0,
       rate REAL DEFAULT 0,
@@ -151,6 +152,7 @@ if (true) {
       total_deduct_amount REAL DEFAULT 0,
       total_qty REAL DEFAULT 0,
       total_deduction REAL DEFAULT 0,
+      round_off REAL DEFAULT 0,
       net_amount_payable REAL DEFAULT 0,
       employee_id INTEGER,
       location_id INTEGER,
@@ -158,6 +160,7 @@ if (true) {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(company_account_id) REFERENCES company_accounts(id),
       FOREIGN KEY(product_id) REFERENCES products(id),
       FOREIGN KEY(employee_id) REFERENCES employees(id),
       FOREIGN KEY(location_id) REFERENCES locations(id)
@@ -172,6 +175,7 @@ if (true) {
       unloading_date TEXT,
       warehouse_id INTEGER,
       company_id INTEGER,
+      company_account_id INTEGER,
       consignee_id INTEGER,
       product_id INTEGER,
       quantity REAL DEFAULT 0,
@@ -195,6 +199,7 @@ if (true) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
       FOREIGN KEY(company_id) REFERENCES companies(id),
+      FOREIGN KEY(company_account_id) REFERENCES company_accounts(id),
       FOREIGN KEY(consignee_id) REFERENCES consignee_names(id),
       FOREIGN KEY(product_id) REFERENCES products(id),
       FOREIGN KEY(employee_id) REFERENCES employees(id),
@@ -209,6 +214,7 @@ if (true) {
       date TEXT NOT NULL,
       warehouse_id INTEGER,
       farmer_id TEXT,
+      company_account_id INTEGER,
       amount REAL DEFAULT 0,
       reference_type TEXT,
       reference_id INTEGER,
@@ -219,6 +225,7 @@ if (true) {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(company_account_id) REFERENCES company_accounts(id),
       FOREIGN KEY(employee_id) REFERENCES employees(id),
       FOREIGN KEY(location_id) REFERENCES locations(id)
     )
@@ -231,6 +238,7 @@ if (true) {
       date TEXT NOT NULL,
       warehouse_id INTEGER,
       company_id INTEGER,
+      company_account_id INTEGER,
       consignee_id INTEGER,
       amount REAL DEFAULT 0,
       reference_type TEXT,
@@ -243,6 +251,7 @@ if (true) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
       FOREIGN KEY(company_id) REFERENCES companies(id),
+      FOREIGN KEY(company_account_id) REFERENCES company_accounts(id),
       FOREIGN KEY(consignee_id) REFERENCES consignee_names(id),
       FOREIGN KEY(employee_id) REFERENCES employees(id),
       FOREIGN KEY(location_id) REFERENCES locations(id)
@@ -255,6 +264,7 @@ if (true) {
       voucher_no TEXT UNIQUE,
       date TEXT NOT NULL,
       warehouse_id INTEGER,
+      company_account_id INTEGER,
       debit_account TEXT,
       credit_account TEXT,
       amount REAL DEFAULT 0,
@@ -264,6 +274,7 @@ if (true) {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
+      FOREIGN KEY(company_account_id) REFERENCES company_accounts(id),
       FOREIGN KEY(employee_id) REFERENCES employees(id),
       FOREIGN KEY(location_id) REFERENCES locations(id)
     )
@@ -631,6 +642,7 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN source_type TEXT DEFAULT 'inward'`, "adjustment source_type");
   addColIgnoreDup(`ALTER TABLE palti_lorry_entries ADD COLUMN updated_at TEXT`, "palti_lorry_entries updated_at");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN packet REAL DEFAULT 0`, "wh_purchase_vouchers packet");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN company_account_id INTEGER`, "wh_purchase_vouchers company_account_id");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN gross_weight REAL DEFAULT 0`, "wh_purchase_vouchers gross_weight");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN tare_weight REAL DEFAULT 0`, "wh_purchase_vouchers tare_weight");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN dhalta REAL DEFAULT 0`, "wh_purchase_vouchers dhalta");
@@ -646,8 +658,10 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN total_deduct_amount REAL DEFAULT 0`, "wh_purchase_vouchers total_deduct_amount");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN total_qty REAL DEFAULT 0`, "wh_purchase_vouchers total_qty");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN total_deduction REAL DEFAULT 0`, "wh_purchase_vouchers total_deduction");
+  addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN round_off REAL DEFAULT 0`, "wh_purchase_vouchers round_off");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN net_amount_payable REAL DEFAULT 0`, "wh_purchase_vouchers net_amount_payable");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN unloading_date TEXT`, "wh_sale_vouchers unloading_date");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN company_account_id INTEGER`, "wh_sale_vouchers company_account_id");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN shortage_quantity REAL DEFAULT 0`, "wh_sale_vouchers shortage_quantity");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN claim_amount REAL DEFAULT 0`, "wh_sale_vouchers claim_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN other_deduction REAL DEFAULT 0`, "wh_sale_vouchers other_deduction");
@@ -660,11 +674,14 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN fifo_amount REAL DEFAULT 0`, "wh_sale_vouchers fifo_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN outstanding REAL DEFAULT 0`, "wh_sale_vouchers outstanding");
   addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN reference_type TEXT`, "wh_payment_vouchers reference_type");
+  addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN company_account_id INTEGER`, "wh_payment_vouchers company_account_id");
   addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN reference_id INTEGER`, "wh_payment_vouchers reference_id");
   addColIgnoreDup(`ALTER TABLE wh_payment_vouchers ADD COLUMN outstanding_after REAL DEFAULT 0`, "wh_payment_vouchers outstanding_after");
   addColIgnoreDup(`ALTER TABLE wh_receipt_vouchers ADD COLUMN reference_type TEXT`, "wh_receipt_vouchers reference_type");
+  addColIgnoreDup(`ALTER TABLE wh_receipt_vouchers ADD COLUMN company_account_id INTEGER`, "wh_receipt_vouchers company_account_id");
   addColIgnoreDup(`ALTER TABLE wh_receipt_vouchers ADD COLUMN reference_id INTEGER`, "wh_receipt_vouchers reference_id");
   addColIgnoreDup(`ALTER TABLE wh_receipt_vouchers ADD COLUMN outstanding_after REAL DEFAULT 0`, "wh_receipt_vouchers outstanding_after");
+  addColIgnoreDup(`ALTER TABLE wh_journal_vouchers ADD COLUMN company_account_id INTEGER`, "wh_journal_vouchers company_account_id");
 
   db.run(
     `
