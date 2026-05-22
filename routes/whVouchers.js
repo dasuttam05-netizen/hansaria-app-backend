@@ -852,11 +852,16 @@ function getPaymentRowsForUser(req, res) {
         });
         res.json(paymentRows.map((row) => {
           const adjustments = byPayment.get(String(row.id)) || [];
+          const adjustmentDetails = adjustments
+            .filter((item) => item.purchase_voucher_no && item.adjusted_amount)
+            .map((item) => `${item.purchase_voucher_no}: ${fmtNum(item.adjusted_amount)}`)
+            .join(", ");
           return {
             ...row,
+            party_name: row.company_account_name || row.farmer_name || "-",
             adjustments,
             reference_type: row.reference_type || "purchase",
-            reference_id: row.reference_id || adjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", "),
+            reference_id: row.reference_id || adjustmentDetails || adjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", "),
           };
         }));
       }
@@ -1185,6 +1190,79 @@ router.get("/outstanding", (req, res) => {
   }
 
   res.status(400).json({ error: "Unsupported party_type" });
+});
+
+// ===========================
+// FARMERS BY ACCOUNT WITH OUTSTANDING
+// ===========================
+router.get("/farmers-by-account/:accountId", (req, res) => {
+  const { accountId } = req.params;
+  const { warehouse_id } = req.query;
+  if (!accountId) return res.status(400).json({ error: "Account ID is required" });
+
+  const filter = assignedWarehouseFilter(req.user, "pv.warehouse_id");
+  const filters = ["1=1"];
+  const params = [];
+  
+  if (warehouse_id) {
+    filters.push("pv.warehouse_id = ?");
+    params.push(warehouse_id);
+  }
+
+  const query = `
+    SELECT DISTINCT f.id, f.name, f.mobile, f.address, f.village
+    FROM wh_purchase_vouchers pv
+    INNER JOIN farmers f ON CAST(f.id AS TEXT) = CAST(pv.farmer_id AS TEXT)
+    WHERE pv.company_account_id = ? ${filter.clause} ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""}
+    ORDER BY f.name ASC
+  `;
+
+  db.all(query, [accountId, ...filter.params, ...params], (err, farmers) => {
+    if (err) return res.status(500).json({ error: err.message });
+    
+    if (!farmers || !farmers.length) return res.json([]);
+
+    const farmerIds = farmers.map((f) => f.id);
+    const adjustSql = `
+      SELECT pv.farmer_id, SUM(COALESCE(pa.adjusted_amount, 0)) as total_adjusted
+      FROM wh_payment_adjustments pa
+      INNER JOIN wh_payment_vouchers pv ON pa.payment_id = pv.id
+      WHERE pv.company_account_id = ? AND pv.farmer_id IN (${farmerIds.map(() => "?").join(",")})
+      GROUP BY pv.farmer_id
+    `;
+
+    const purchaseSql = `
+      SELECT farmer_id, SUM(COALESCE(NULLIF(net_amount_payable, 0), amount, 0)) as total_purchase
+      FROM wh_purchase_vouchers
+      WHERE company_account_id = ? AND farmer_id IN (${farmerIds.map(() => "?").join(",")})
+      GROUP BY farmer_id
+    `;
+
+    db.all(adjustSql, [accountId, ...farmerIds], (adjErr, adjRows) => {
+      if (adjErr) console.error("Adjustment query error:", adjErr);
+      db.all(purchaseSql, [accountId, ...farmerIds], (purErr, purRows) => {
+        if (purErr) console.error("Purchase query error:", purErr);
+        
+        const adjustMap = new Map((adjRows || []).map((r) => [String(r.farmer_id), Number(r.total_adjusted || 0)]));
+        const purchaseMap = new Map((purRows || []).map((r) => [String(r.farmer_id), Number(r.total_purchase || 0)]));
+        
+        const result = farmers.map((f) => {
+          const totalPurchase = purchaseMap.get(String(f.id)) || 0;
+          const totalAdjusted = adjustMap.get(String(f.id)) || 0;
+          const outstanding = Math.max(0, totalPurchase - totalAdjusted);
+          
+          return {
+            ...f,
+            total_purchase: Number(totalPurchase.toFixed(2)),
+            total_adjusted: Number(totalAdjusted.toFixed(2)),
+            outstanding: Number(outstanding.toFixed(2)),
+          };
+        });
+        
+        res.json(result.filter((f) => f.outstanding > 0));
+      });
+    });
+  });
 });
 
 // ===========================
