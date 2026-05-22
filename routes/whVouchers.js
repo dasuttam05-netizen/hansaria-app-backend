@@ -586,13 +586,15 @@ function createSequentialVoucherNo(type, callback) {
   });
 }
 
-function computeOutstandingForFarmer(farmerId, callback) {
+function computeOutstandingForFarmer(farmerId, callback, companyAccountId = null) {
   const purchaseSql = mongoReady()
     ? null
-    : `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE farmer_id = ?`;
-  const paymentSql = `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE farmer_id = ?`;
+    : `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE farmer_id = ?${companyAccountId ? " AND company_account_id = ?" : ""}`;
+  const paymentSql = `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE farmer_id = ?${companyAccountId ? " AND company_account_id = ?" : ""}`;
   const finish = (totalPurchase) => {
-    db.get(paymentSql, [farmerId], (err2, payment) => {
+    const paymentParams = [farmerId];
+    if (companyAccountId) paymentParams.push(companyAccountId);
+    db.get(paymentSql, paymentParams, (err2, payment) => {
       if (err2) return callback(err2);
       const totalPayment = payment?.total_payment || 0;
       callback(null, {
@@ -604,7 +606,9 @@ function computeOutstandingForFarmer(farmerId, callback) {
   };
 
   if (mongoReady()) {
-    PurchaseVoucher.find({ farmer_id: String(farmerId || "") })
+    const filter = { farmer_id: String(farmerId || "") };
+    if (companyAccountId) filter.company_account_id = String(companyAccountId);
+    PurchaseVoucher.find(filter)
       .lean()
       .then((rows) => {
         const totalPurchase = (rows || []).reduce(
@@ -617,7 +621,9 @@ function computeOutstandingForFarmer(farmerId, callback) {
     return;
   }
 
-  db.get(purchaseSql, [farmerId], (err, purchase) => {
+  const purchaseParams = [farmerId];
+  if (companyAccountId) purchaseParams.push(companyAccountId);
+  db.get(purchaseSql, purchaseParams, (err, purchase) => {
     if (err) return callback(err);
     finish(purchase?.total_purchase || 0);
   });
@@ -1084,7 +1090,7 @@ router.get("/next-voucher-no", (req, res) => {
 });
 
 router.get("/outstanding", (req, res) => {
-  const { party_type, id, warehouse_id, location_id, exclude_payment_id } = req.query;
+  const { party_type, id, warehouse_id, location_id, exclude_payment_id, company_account_id } = req.query;
   if (!party_type || !id) return res.status(400).json({ error: "party_type and id are required" });
 
   const filters = ["1=1"];
@@ -1100,6 +1106,10 @@ router.get("/outstanding", (req, res) => {
     if (location_id) {
       filters.push("location_id = ?");
       params.push(location_id);
+    }
+    if (company_account_id) {
+      filters.push("company_account_id = ?");
+      params.push(company_account_id);
     }
     const paymentFilters = filters.slice(1);
     const paymentParams = [...params];
@@ -1143,6 +1153,7 @@ router.get("/outstanding", (req, res) => {
         if (mongoReady()) {
           const filter = { farmer_id: String(id || "") };
           if (warehouse_id) filter.warehouse_id = String(warehouse_id);
+          if (company_account_id) filter.company_account_id = String(company_account_id);
           PurchaseVoucher.find(filter)
             .sort({ date: 1, createdAt: 1, _id: 1 })
             .lean()
@@ -1161,7 +1172,7 @@ router.get("/outstanding", (req, res) => {
           send(purchases || []);
         });
       }, exclude_payment_id);
-    });
+    }, company_account_id);
     return;
   }
 
@@ -1200,6 +1211,57 @@ router.get("/farmers-by-account/:accountId", (req, res) => {
   const { warehouse_id } = req.query;
   if (!accountId) return res.status(400).json({ error: "Account ID is required" });
 
+  if (mongoReady()) {
+    const filter = { company_account_id: String(accountId) };
+    const selectedWarehouseId = String(warehouse_id || "").trim();
+    const assignedWarehouses = req.user && Array.isArray(req.user.assigned_warehouses)
+      ? req.user.assigned_warehouses.map((id) => String(id))
+      : [];
+    if (selectedWarehouseId) {
+      if (assignedWarehouses.length) {
+        if (!assignedWarehouses.includes(selectedWarehouseId)) return res.json([]);
+      }
+      filter.warehouse_id = selectedWarehouseId;
+    } else if (assignedWarehouses.length) {
+      filter.warehouse_id = { $in: assignedWarehouses };
+    }
+
+    return PurchaseVoucher.find(filter)
+      .lean()
+      .then(async (rows) => {
+        const farmerIds = [...new Set((rows || []).map((r) => String(r.farmer_id || "")).filter(Boolean))];
+        if (!farmerIds.length) return res.json([]);
+
+        const farmers = await Farmer.find({ _id: { $in: farmerIds } })
+          .select("_id name mobile address village")
+          .lean();
+
+        const result = await Promise.all(
+          (farmers || []).map(
+            (f) =>
+              new Promise((resolve) => {
+                computeOutstandingForFarmer(String(f._id), (_err, stats = {}) => {
+                  const outstanding = Number(stats.outstanding || 0);
+                  resolve({
+                    id: String(f._id),
+                    name: f.name,
+                    mobile: f.mobile,
+                    address: f.address,
+                    village: f.village,
+                    total_purchase: Number(stats.total_purchase || 0),
+                    total_adjusted: Number(stats.total_payment || 0),
+                    outstanding: Number(outstanding.toFixed(2)),
+                  });
+                }, accountId);
+              })
+          )
+        );
+
+        return res.json(result.filter((f) => f.outstanding > 0));
+      })
+      .catch((err) => res.status(500).json({ error: err.message }));
+  }
+
   const filter = assignedWarehouseFilter(req.user, "pv.warehouse_id");
   const filters = ["1=1"];
   const params = [];
@@ -1213,7 +1275,7 @@ router.get("/farmers-by-account/:accountId", (req, res) => {
     SELECT DISTINCT f.id, f.name, f.mobile, f.address, f.village
     FROM wh_purchase_vouchers pv
     INNER JOIN farmers f ON CAST(f.id AS TEXT) = CAST(pv.farmer_id AS TEXT)
-    WHERE pv.company_account_id = ? ${filter.clause} ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""}
+    WHERE CAST(pv.company_account_id AS TEXT) = CAST(? AS TEXT) ${filter.clause} ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""}
     ORDER BY f.name ASC
   `;
 
@@ -1227,14 +1289,14 @@ router.get("/farmers-by-account/:accountId", (req, res) => {
       SELECT pv.farmer_id, SUM(COALESCE(pa.adjusted_amount, 0)) as total_adjusted
       FROM wh_payment_adjustments pa
       INNER JOIN wh_payment_vouchers pv ON pa.payment_id = pv.id
-      WHERE pv.company_account_id = ? AND pv.farmer_id IN (${farmerIds.map(() => "?").join(",")})
+      WHERE CAST(pv.company_account_id AS TEXT) = CAST(? AS TEXT) AND pv.farmer_id IN (${farmerIds.map(() => "?").join(",")})
       GROUP BY pv.farmer_id
     `;
 
     const purchaseSql = `
       SELECT farmer_id, SUM(COALESCE(NULLIF(net_amount_payable, 0), amount, 0)) as total_purchase
       FROM wh_purchase_vouchers
-      WHERE company_account_id = ? AND farmer_id IN (${farmerIds.map(() => "?").join(",")})
+      WHERE CAST(company_account_id AS TEXT) = CAST(? AS TEXT) AND farmer_id IN (${farmerIds.map(() => "?").join(",")})
       GROUP BY farmer_id
     `;
 
