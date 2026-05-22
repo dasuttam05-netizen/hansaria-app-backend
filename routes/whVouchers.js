@@ -167,12 +167,86 @@ async function decoratePurchaseRows(rows) {
   });
 }
 
+function getSqlitePurchaseRows(req) {
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const fallbackFilter = assignedWarehouseFilter(req.user, "warehouse_id");
+  const query = `
+    SELECT
+      v.*,
+      (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
+      (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
+      (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
+      ca.account_name AS company_account_name
+    FROM wh_purchase_vouchers v
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.date DESC, v.id DESC
+  `;
+
+  return new Promise((resolve, reject) => {
+    db.all(query, filter.params, (err, rows) => {
+      if (!err) {
+        resolve(rows || []);
+        return;
+      }
+
+      console.error("Purchase voucher mapped query failed, falling back to base rows:", err.message);
+      const fallbackQuery = `
+        SELECT *
+        FROM wh_purchase_vouchers
+        WHERE 1 = 1 ${fallbackFilter.clause}
+        ORDER BY date DESC, id DESC
+      `;
+      db.all(fallbackQuery, fallbackFilter.params, (fallbackErr, fallbackRows) => {
+        if (fallbackErr) {
+          reject(fallbackErr);
+          return;
+        }
+        resolve(fallbackRows || []);
+      });
+    });
+  });
+}
+
+function mergePurchaseRows(mongoRows, sqliteRows) {
+  const mongoByVoucherNo = new Map();
+  const merged = [];
+
+  for (const row of mongoRows) {
+    const key = String(row.voucher_no || row._id || "");
+    if (key) mongoByVoucherNo.set(key, row);
+    merged.push(row);
+  }
+
+  for (const row of sqliteRows) {
+    const key = String(row.voucher_no || row.id || "");
+    if (!key || !mongoByVoucherNo.has(key)) {
+      merged.push(row);
+    }
+  }
+
+  return merged.sort((a, b) => {
+    const dateA = new Date(a.date || a.created_at || 0).getTime();
+    const dateB = new Date(b.date || b.created_at || 0).getTime();
+    if (dateA !== dateB) return dateB - dateA;
+    const voucherA = String(a.voucher_no || a.id || a._id || "");
+    const voucherB = String(b.voucher_no || b.id || b._id || "");
+    return voucherB.localeCompare(voucherA, undefined, { numeric: true, sensitivity: "base" });
+  });
+}
+
+async function getAllPurchaseVoucherRows(req) {
+  const mongoRows = await PurchaseVoucher.find(mongoPurchaseScope(req.user)).lean();
+  const sqliteRows = await getSqlitePurchaseRows(req);
+  return mergePurchaseRows(
+    await decoratePurchaseRows(mongoRows),
+    sqliteRows
+  );
+}
+
 function getPurchaseVoucherRows(req, res) {
   if (mongoReady()) {
-    PurchaseVoucher.find(mongoPurchaseScope(req.user))
-      .sort({ date: -1, createdAt: -1, _id: -1 })
-      .lean()
-      .then((rows) => decoratePurchaseRows(rows))
+    getAllPurchaseVoucherRows(req)
       .then((rows) => res.json(rows || []))
       .catch((err) => {
         console.error("Mongo purchase voucher query failed, falling back to SQLite:", err.message);
@@ -512,26 +586,13 @@ function createSequentialVoucherNo(type, callback) {
   });
 }
 
-function computeOutstandingForFarmer(farmerId, warehouseId = null, locationId = null, callback) {
-  const params = [farmerId];
-  let warehouseClause = "";
-  let locationClause = "";
-
-  if (warehouseId) {
-    warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
-    params.push(warehouseId);
-  }
-  if (locationId) {
-    locationClause = " AND CAST(location_id AS TEXT) = CAST(? AS TEXT)";
-    params.push(locationId);
-  }
-
+function computeOutstandingForFarmer(farmerId, callback) {
   const purchaseSql = mongoReady()
     ? null
-    : `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE CAST(farmer_id AS TEXT) = CAST(?)${warehouseClause}${locationClause}`;
-  const paymentSql = `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE CAST(farmer_id AS TEXT) = CAST(?)${warehouseClause}${locationClause}`;
+    : `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE farmer_id = ?`;
+  const paymentSql = `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE farmer_id = ?`;
   const finish = (totalPurchase) => {
-    db.get(paymentSql, params, (err2, payment) => {
+    db.get(paymentSql, [farmerId], (err2, payment) => {
       if (err2) return callback(err2);
       const totalPayment = payment?.total_payment || 0;
       callback(null, {
@@ -543,10 +604,7 @@ function computeOutstandingForFarmer(farmerId, warehouseId = null, locationId = 
   };
 
   if (mongoReady()) {
-    const filter = { farmer_id: String(farmerId || "") };
-    if (warehouseId) filter.warehouse_id = String(warehouseId);
-    if (locationId) filter.location_id = String(locationId);
-    PurchaseVoucher.find(filter)
+    PurchaseVoucher.find({ farmer_id: String(farmerId || "") })
       .lean()
       .then((rows) => {
         const totalPurchase = (rows || []).reduce(
@@ -559,32 +617,18 @@ function computeOutstandingForFarmer(farmerId, warehouseId = null, locationId = 
     return;
   }
 
-  db.get(purchaseSql, params, (err, purchase) => {
+  db.get(purchaseSql, [farmerId], (err, purchase) => {
     if (err) return callback(err);
     finish(purchase?.total_purchase || 0);
   });
 }
 
-function computeOutstandingForCompany(companyId, warehouseId = null, locationId = null, callback) {
-  const params = [companyId];
-  let warehouseClause = "";
-  let locationClause = "";
-
-  if (warehouseId) {
-    warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
-    params.push(warehouseId);
-  }
-  if (locationId) {
-    locationClause = " AND CAST(location_id AS TEXT) = CAST(? AS TEXT)";
-    params.push(locationId);
-  }
-
-  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE CAST(company_id AS TEXT) = CAST(?)${warehouseClause}${locationClause}`;
-  const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE CAST(company_id AS TEXT) = CAST(?)${warehouseClause}${locationClause}`;
-
-  db.get(saleSql, params, (err, sale) => {
+function computeOutstandingForCompany(companyId, callback) {
+  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE company_id = ?`;
+  const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE company_id = ?`;
+  db.get(saleSql, [companyId], (err, sale) => {
     if (err) return callback(err);
-    db.get(receiptSql, params, (err2, receipt) => {
+    db.get(receiptSql, [companyId], (err2, receipt) => {
       if (err2) return callback(err2);
       const totalSale = sale?.total_sale || 0;
       const totalReceipt = receipt?.total_receipt || 0;
@@ -1059,7 +1103,7 @@ router.get("/outstanding", (req, res) => {
       paymentParams.push(exclude_payment_id);
     }
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_payment_vouchers WHERE farmer_id = ? ${paymentFilters.length ? `AND ${paymentFilters.join(" AND ")}` : ""} ORDER BY date ASC`;
-    computeOutstandingForFarmer(id, warehouse_id, location_id, (err, stats) => {
+    computeOutstandingForFarmer(id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
       getPaymentAdjustmentsByPurchase((adjustErr, adjustedMap) => {
         if (adjustErr) return res.status(500).json({ error: adjustErr.message });
@@ -1127,7 +1171,7 @@ router.get("/outstanding", (req, res) => {
     }
     detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
-    computeOutstandingForCompany(id, warehouse_id, location_id, (err, stats) => {
+    computeOutstandingForCompany(id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
       db.all(detailsQuery, params, (err2, sales) => {
         if (err2) return res.status(500).json({ error: err2.message });
@@ -1350,7 +1394,7 @@ router.post("/payment", (req, res) => {
             insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => {
               if (adjErr) return res.status(500).json({ error: adjErr.message });
               saveIdempotency(idemKey, "payment", paymentId, () => {});
-              computeOutstandingForFarmer(farmer_id, warehouse_id, location_id, (err2, stats) => {
+              computeOutstandingForFarmer(farmer_id, (err2, stats) => {
                 if (err2) return res.status(500).json({ error: err2.message });
                 db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
                   res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
@@ -1381,7 +1425,7 @@ router.post("/payment", (req, res) => {
         const paymentId = this.lastID;
         insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => {
           if (adjErr) return res.status(500).json({ error: adjErr.message });
-          computeOutstandingForFarmer(farmer_id, warehouse_id, location_id, (err2, stats) => {
+          computeOutstandingForFarmer(farmer_id, (err2, stats) => {
             if (err2) return res.status(500).json({ error: err2.message });
             db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
               res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
@@ -1440,7 +1484,7 @@ router.put("/payment/:id", (req, res) => {
                 db.run("ROLLBACK");
                 return res.status(500).json({ error: adjErr.message });
               }
-              computeOutstandingForFarmer(farmer_id, warehouse_id, location_id, (statsErr, stats) => {
+              computeOutstandingForFarmer(farmer_id, (statsErr, stats) => {
                 if (statsErr) {
                   db.run("ROLLBACK");
                   return res.status(500).json({ error: statsErr.message });
@@ -1487,7 +1531,7 @@ router.delete("/payment/:id", (req, res) => {
             db.run("ROLLBACK");
             return res.status(500).json({ error: deleteErr.message });
           }
-          computeOutstandingForFarmer(row.farmer_id, row.warehouse_id, row.location_id, (statsErr, stats) => {
+          computeOutstandingForFarmer(row.farmer_id, (statsErr, stats) => {
             if (statsErr) {
               db.run("ROLLBACK");
               return res.status(500).json({ error: statsErr.message });
@@ -1550,7 +1594,7 @@ router.post("/receipt", (req, res) => {
 
           const receiptId = this.lastID;
           saveIdempotency(idemKey, "receipt", receiptId, () => {});
-          computeOutstandingForCompany(company_id, warehouse_id, location_id, (err2, stats) => {
+          computeOutstandingForCompany(company_id, (err2, stats) => {
             if (err2) return res.status(500).json({ error: err2.message });
             db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
               res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats });
@@ -1576,7 +1620,7 @@ router.post("/receipt", (req, res) => {
       }
 
       const receiptId = this.lastID;
-      computeOutstandingForCompany(company_id, warehouse_id, location_id, (err2, stats) => {
+      computeOutstandingForCompany(company_id, (err2, stats) => {
         if (err2) return res.status(500).json({ error: err2.message });
         db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
           res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats });
