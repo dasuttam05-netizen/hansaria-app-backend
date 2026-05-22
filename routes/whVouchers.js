@@ -1,9 +1,3 @@
-const express = require("express");
-const router = express.Router();
-const db = require("../db");
-const { userHasPermission } = require("../middleware/auth");
-const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
-const PDFDocument = require('pdfkit');
 const {const express = require("express");
 const router = express.Router();
 const db = require("../db");
