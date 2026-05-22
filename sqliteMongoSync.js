@@ -26,6 +26,12 @@ const TRACKED_TABLES = new Set([
   "expense_items",
   "cash_entries",
   "cash_entry_adjustments",
+  "wh_payment_vouchers",
+  "wh_payment_adjustments",
+  "wh_purchase_vouchers",
+  "wh_receipt_vouchers",
+  "wh_journal_vouchers",
+  "wh_sale_vouchers",
 ]);
 
 const TABLE_NAME_REGEX = /^[a-z_][a-z0-9_]*$/i;
