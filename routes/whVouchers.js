@@ -2205,24 +2205,33 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
 
   try {
     const farmerId = String(req.query.farmer_id || "").trim();
+    const companyAccountId = String(req.query.company_account_id || "").trim();
     const allPurchases = await getPurchaseReportRowsForUser(req.user);
-    const purchases = farmerId
-      ? allPurchases.filter((row) => String(row.farmer_id || "") === farmerId)
-      : allPurchases;
+    const purchases = allPurchases.filter((row) => {
+      if (farmerId && String(row.farmer_id || "") !== farmerId) return false;
+      if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
+      return true;
+    });
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
     const paymentParams = [...filter.params];
     let farmerClause = "";
+    let accountClause = "";
     if (farmerId) {
       farmerClause = " AND CAST(p.farmer_id AS TEXT) = CAST(? AS TEXT)";
       paymentParams.push(farmerId);
     }
+    if (companyAccountId) {
+      accountClause = " AND CAST(p.company_account_id AS TEXT) = CAST(? AS TEXT)";
+      paymentParams.push(companyAccountId);
+    }
     const payments = await dbAll(
       `
-        SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name
+        SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name, ca.account_name AS company_account_name
         FROM wh_payment_vouchers p
         LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
         LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
-        WHERE 1 = 1 ${filter.clause} ${farmerClause}
+        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+        WHERE 1 = 1 ${filter.clause} ${farmerClause} ${accountClause}
       `,
       paymentParams
     );
@@ -2308,6 +2317,8 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
           warehouse_name: row.warehouse_name,
           farmer_id: row.farmer_id,
           farmer_name: row.farmer_name,
+          company_account_id: row.company_account_id,
+          company_account_name: row.company_account_name,
           debit: Number(row.amount || 0),
           credit: 0,
         };
