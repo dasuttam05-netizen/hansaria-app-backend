@@ -106,7 +106,6 @@ function buildFarmerPayload(body) {
       mobile: String(body.mobile || "").trim(),
       email: cleanText(body.email),
       address: cleanText(body.address),
-      village: cleanText(body.village),
       pincode,
       state: cleanText(body.state),
       district: cleanText(body.district),
@@ -124,7 +123,6 @@ function buildFarmerPayload(body) {
       ifsc_code: ifscCode || null,
       branch_name: cleanText(body.branch_name),
       account_holder_name: cleanText(body.account_holder_name),
-      location: cleanText(body.location),
     },
   };
 }
@@ -160,9 +158,9 @@ router.get("/lookup/pincode/:pincode", async (req, res) => {
     }
 
     res.json({
-      location: postOffice.District || postOffice.Block || "",
+      district: postOffice.District || postOffice.Block || "",
+      city: postOffice.Name || "",
       state: postOffice.State || "",
-      village: postOffice.Name || "",
     });
   } catch (err) {
     console.error(err);
