@@ -1885,6 +1885,7 @@ async function getSaleReportRowsForUser(user) {
         s.*,
         w.name AS warehouse_name,
         c.name AS company_name,
+        co.name AS consignee_name,
         ca.account_name AS company_account_name,
         p.name AS product_name,
         COALESCE(NULLIF(s.unloading_qty, 0), s.quantity) AS total_quantity,
@@ -1892,6 +1893,7 @@ async function getSaleReportRowsForUser(user) {
       FROM wh_sale_vouchers s
       LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
       LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+      LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
       LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
       LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
       WHERE 1 = 1 ${filter.clause}
@@ -1926,43 +1928,64 @@ function buildLedgerRows(rows, getPartyId, getPartyName) {
 
 function groupStock(purchases, sales) {
   const groups = new Map();
-  const keyOf = (row) => `${row.warehouse_id || ""}::${row.product_id || ""}`;
+  const keyOf = (row) => `${row.warehouse_id || ""}::${row.company_account_id || ""}::${row.product_id || ""}`;
   const ensure = (row) => {
     const key = keyOf(row);
     if (!groups.has(key)) {
       groups.set(key, {
         warehouse_id: row.warehouse_id,
         warehouse_name: row.warehouse_name || "",
+        company_account_id: row.company_account_id || "",
+        company_account_name: row.company_account_name || "",
         product_id: row.product_id,
         product_name: row.product_name || "",
         purchase_qty: 0,
         sale_qty: 0,
-        gross_weight: 0,
         purchase_amount: 0,
         sale_amount: 0,
+        purchase_details: [],
+        sale_details: [],
       });
     }
     const item = groups.get(key);
     item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
+    item.company_account_name = item.company_account_name || row.company_account_name || "";
     item.product_name = item.product_name || row.product_name || "";
     return item;
   };
 
   purchases.forEach((row) => {
     const item = ensure(row);
-    const netQty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
-    const grossQty = Number(row.gross_weight || 0);
-    const qty = grossQty > 0 ? grossQty : netQty;
+    const grossLessTare = Number(row.gross_weight || 0) - Number(row.tare_weight || 0);
+    const fallbackQty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+    const qty = grossLessTare > 0 ? grossLessTare : fallbackQty;
+    const amount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
     item.purchase_qty += qty;
-    item.gross_weight += qty;
-    item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+    item.purchase_amount += amount;
+    item.purchase_details.push({
+      date: row.date || "",
+      voucher_no: row.voucher_no || "",
+      party_name: row.farmer_name || row.party_name || "",
+      qty: Number(qty.toFixed(4)),
+      rate: Number(row.rate || 0),
+      amount,
+    });
   });
 
   sales.forEach((row) => {
     const item = ensure(row);
     const qty = Number(row.total_quantity || row.unloading_qty || row.quantity || 0);
+    const amount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
     item.sale_qty += qty;
-    item.sale_amount += Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+    item.sale_amount += amount;
+    item.sale_details.push({
+      date: row.date || "",
+      voucher_no: row.voucher_no || "",
+      party_name: row.company_name || row.consignee_name || row.party_name || "",
+      qty: Number(qty.toFixed(4)),
+      rate: Number(row.rate || 0),
+      amount,
+    });
   });
 
   return Array.from(groups.values()).map((item) => {
@@ -1972,10 +1995,13 @@ function groupStock(purchases, sales) {
       ...item,
       purchase_qty: Number(item.purchase_qty.toFixed(4)),
       sale_qty: Number(item.sale_qty.toFixed(4)),
-      gross_weight: Number(item.gross_weight.toFixed(4)),
       stock_qty: Number(stockQty.toFixed(4)),
-      avg_rate: Number(avgRate.toFixed(4)),
-      stock_amount: Number((stockQty * avgRate).toFixed(4)),
+      avg_rate: Number(avgRate.toFixed(2)),
+      stock_amount: Number((stockQty * avgRate).toFixed(2)),
+      purchase_amount: Number(item.purchase_amount.toFixed(2)),
+      sale_amount: Number(item.sale_amount.toFixed(2)),
+      purchase_details: item.purchase_details.sort((a, b) => String(a.date || "").localeCompare(String(b.date || ""))),
+      sale_details: item.sale_details.sort((a, b) => String(a.date || "").localeCompare(String(b.date || ""))),
     };
   });
 }
