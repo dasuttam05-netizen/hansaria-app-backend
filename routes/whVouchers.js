@@ -480,14 +480,15 @@ function sendPurchaseVoucherPdf(res, row, id) {
     ["2", "Packet", fmt4(row.packet)],
     ["3", "Gross Weight", fmt4(row.gross_weight)],
     ["4", "Tare Weight", fmt4(row.tare_weight)],
-    ["5", "Dhalta", fmt4(row.dhalta)],
-    ["6", "Less Bags Weight", fmt4(row.less_bags_weight)],
-    ["7", "Moisture", fmt4(row.moisture)],
-    ["8", "Dunki / Fungus", fmt4(Number(row.dunki || 0) + Number(row.fungus || 0))],
-    ["9", "Discolour / Others", fmt4(Number(row.discolour || 0) + Number(row.others || 0))],
-    ["10", "Bags Claim", fmt4(row.bags_claim)],
-    ["11", "Labour", fmt4(row.labour)],
-    ["12", "Round Off", fmt4(row.round_off)],
+    ["5", "New Weight", fmt4(Math.max(Number(row.gross_weight || 0) - Number(row.tare_weight || 0), 0))],
+    ["6", "Dhalta", fmt4(row.dhalta)],
+    ["7", "Less Bags Weight", fmt4(row.less_bags_weight)],
+    ["8", "Moisture", fmt4(row.moisture)],
+    ["9", "Dunki / Fungus", fmt4(Number(row.dunki || 0) + Number(row.fungus || 0))],
+    ["10", "Discolour / Others", fmt4(Number(row.discolour || 0) + Number(row.others || 0))],
+    ["11", "Bags Claim", fmt4(row.bags_claim)],
+    ["12", "Labour", fmt4(row.labour)],
+    ["13", "Round Off", fmt4(row.round_off)],
   ].forEach((ln) => {
     doc.rect(tableX, y, tableW, 18).stroke(border);
     doc.fillColor("#111827").fontSize(8.8).text(ln[0], tableX + 14, y + 5);
@@ -1949,9 +1950,11 @@ function groupStock(purchases, sales) {
 
   purchases.forEach((row) => {
     const item = ensure(row);
-    const qty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+    const netQty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+    const grossQty = Number(row.gross_weight || 0);
+    const qty = grossQty > 0 ? grossQty : netQty;
     item.purchase_qty += qty;
-    item.gross_weight += Number(row.gross_weight || qty || 0);
+    item.gross_weight += qty;
     item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
   });
 
@@ -1967,9 +1970,12 @@ function groupStock(purchases, sales) {
     const avgRate = item.purchase_qty > 0 ? item.purchase_amount / item.purchase_qty : 0;
     return {
       ...item,
-      stock_qty: Number(stockQty.toFixed(2)),
-      avg_rate: Number(avgRate.toFixed(2)),
-      stock_amount: Number((stockQty * avgRate).toFixed(2)),
+      purchase_qty: Number(item.purchase_qty.toFixed(4)),
+      sale_qty: Number(item.sale_qty.toFixed(4)),
+      gross_weight: Number(item.gross_weight.toFixed(4)),
+      stock_qty: Number(stockQty.toFixed(4)),
+      avg_rate: Number(avgRate.toFixed(4)),
+      stock_amount: Number((stockQty * avgRate).toFixed(4)),
     };
   });
 }
@@ -1983,7 +1989,9 @@ function buildFifoStock(purchases, sales) {
     .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
     .forEach((row) => {
       const key = keyOf(row);
-      const qty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+      const netQty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+      const grossQty = Number(row.gross_weight || 0);
+      const qty = grossQty > 0 ? grossQty : netQty;
       const amount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
       if (!lotsByKey.has(key)) lotsByKey.set(key, []);
       lotsByKey.get(key).push({
@@ -2018,11 +2026,11 @@ function buildFifoStock(purchases, sales) {
       warehouse_name: lot.warehouse_name,
       product_id: lot.product_id,
       product_name: lot.product_name,
-      purchase_qty: Number(lot.purchase_qty.toFixed(2)),
-      remaining_qty: Number(lot.remaining_qty.toFixed(2)),
-      rate: Number(lot.fifo_rate.toFixed(2)),
-      amount: Number((lot.remaining_qty * lot.fifo_rate).toFixed(2)),
-      gross_weight: Number(lot.gross_weight || lot.purchase_qty || 0),
+      purchase_qty: Number(lot.purchase_qty.toFixed(4)),
+      remaining_qty: Number(lot.remaining_qty.toFixed(4)),
+      rate: Number(lot.fifo_rate.toFixed(4)),
+      amount: Number((lot.remaining_qty * lot.fifo_rate).toFixed(4)),
+      gross_weight: Number((Number(lot.gross_weight || lot.purchase_qty || 0)).toFixed(4)),
     }));
 }
 
@@ -2077,7 +2085,7 @@ router.get("/report/purchase-summary", (req, res) => {
       f.name AS farmer_name,
       p.name AS product_name,
       (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
-      COALESCE(NULLIF(v.total_qty, 0), v.quantity) AS total_quantity,
+      COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
       COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
     FROM wh_purchase_vouchers v
     LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
@@ -2133,7 +2141,7 @@ router.get("/report/purchase-summary", (req, res) => {
           (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
           (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
           (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
-          COALESCE(NULLIF(v.total_qty, 0), v.quantity) AS total_quantity,
+          COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
           COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
         FROM wh_purchase_vouchers v
         WHERE 1 = 1 ${filter.clause}
