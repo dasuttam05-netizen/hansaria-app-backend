@@ -4,6 +4,8 @@ const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
 const PDFDocument = require('pdfkit');
+const multer = require("multer");
+const XLSX = require("xlsx");
 const {
   mongoose,
   PurchaseVoucher,
@@ -11,7 +13,11 @@ const {
   Farmer,
   Product,
   CompanyAccount,
+  Employee,
+  Location,
 } = require("../mongo");
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 function fmtDate(value) {
   if (!value) return "-";
@@ -659,6 +665,128 @@ function createVoucherNoIfMissing(type, voucherNo, callback) {
   createSequentialVoucherNo(type, callback);
 }
 
+const normalizeImportKey = (value) => String(value || "").trim().toLowerCase();
+
+function firstValue(row, keys) {
+  for (const key of keys) {
+    if (row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== "") {
+      return row[key];
+    }
+  }
+  return "";
+}
+
+function excelDateToIso(value) {
+  if (!value) return "";
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  if (typeof value === "number") {
+    const parsed = XLSX.SSF.parse_date_code(value);
+    if (parsed) {
+      return `${parsed.y}-${String(parsed.m).padStart(2, "0")}-${String(parsed.d).padStart(2, "0")}`;
+    }
+  }
+  const raw = String(value).trim();
+  const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return `${iso[1]}-${String(iso[2]).padStart(2, "0")}-${String(iso[3]).padStart(2, "0")}`;
+  const dmy = raw.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})$/);
+  if (dmy) {
+    const yyyy = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+    return `${yyyy}-${String(dmy[2]).padStart(2, "0")}-${String(dmy[1]).padStart(2, "0")}`;
+  }
+  const date = new Date(raw);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
+}
+
+function importNumber(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  const parsed = Number(String(value).replace(/,/g, "").trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function resolveByNameOrId(map, value) {
+  const key = normalizeImportKey(value);
+  return key ? map.get(key) : null;
+}
+
+function buildImportMap(rows, nameFields = ["name"]) {
+  const map = new Map();
+  rows.forEach((row) => {
+    if (row?._id) map.set(normalizeImportKey(row._id), row);
+    if (row?.id) map.set(normalizeImportKey(row.id), row);
+    nameFields.forEach((field) => {
+      if (row?.[field]) map.set(normalizeImportKey(row[field]), row);
+    });
+  });
+  return map;
+}
+
+function purchaseImportRowsFromSheet(buffer) {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) return [];
+  return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
+}
+
+function purchaseImportTemplateBuffer() {
+  const headers = [
+    "Date",
+    "Voucher No",
+    "Warehouse",
+    "Account",
+    "Farmer",
+    "Product",
+    "Employee",
+    "Location",
+    "Packet",
+    "Gross Wt",
+    "Tare Wt",
+    "Dhalta",
+    "Less Bags Weight",
+    "Moistur",
+    "Dunki",
+    "Fungas",
+    "Disclour",
+    "Others",
+    "Rate",
+    "Bags Claim",
+    "Labour",
+    "Round Off",
+    "Narration",
+  ];
+  const sample = [
+    new Date().toISOString().slice(0, 10),
+    "",
+    "Hemtobat Warehouse",
+    "Agri Rise Pvt Ltd",
+    "Manikul Islam",
+    "Maize",
+    "Subrajyoti Mondal",
+    "Hemtobat Hub",
+    30,
+    1.8,
+    0,
+    0.18,
+    0.0069,
+    0,
+    0,
+    0,
+    0,
+    0,
+    19900,
+    245,
+    180,
+    -0.69,
+    "",
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+  ws["!cols"] = headers.map(() => ({ wch: 18 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Purchase Import");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
 // Idempotency helpers: prevent duplicate resource creation when client retries
 function getIdempotency(key, route, cb) {
   if (!key) return cb(null, null);
@@ -884,6 +1012,150 @@ router.get("/purchase", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
   getPurchaseVoucherRows(req, res);
+});
+
+router.get("/purchase/import-template", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const buffer = purchaseImportTemplateBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", 'attachment; filename="purchase_voucher_import_format.xlsx"');
+  res.send(buffer);
+});
+
+router.post("/purchase/import-xlsx", upload.single("file"), async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is not connected. Purchase import saves data in MongoDB." });
+  }
+  if (!req.file?.buffer) {
+    return res.status(400).json({ error: "Please upload an Excel file" });
+  }
+
+  try {
+    const rows = purchaseImportRowsFromSheet(req.file.buffer);
+    if (!rows.length) return res.status(400).json({ error: "No rows found in Excel file" });
+
+    const [warehouses, farmers, products, accounts, employees, locations] = await Promise.all([
+      Warehouse.find({}).lean(),
+      Farmer.find({}).lean(),
+      Product.find({}).lean(),
+      CompanyAccount.find({}).lean(),
+      Employee.find({}).lean(),
+      Location.find({}).lean(),
+    ]);
+
+    const warehouseMap = buildImportMap(warehouses, ["name"]);
+    const farmerMap = buildImportMap(farmers, ["name", "mobile", "phone"]);
+    const productMap = buildImportMap(products, ["name"]);
+    const accountMap = buildImportMap(accounts, ["account_name", "name"]);
+    const employeeMap = buildImportMap(employees, ["name", "mobile", "phone"]);
+    const locationMap = buildImportMap(locations, ["name"]);
+    const imported = [];
+    const errors = [];
+
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const rowNo = index + 2;
+      const date = excelDateToIso(firstValue(row, ["Date", "date"]));
+      const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse", "Warehouse Name", "warehouse", "warehouse_id"]));
+      const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Party", "Name", "farmer", "farmer_id"]));
+      const product = resolveByNameOrId(productMap, firstValue(row, ["Product", "Product Name", "product", "product_id"]));
+      const account = resolveByNameOrId(accountMap, firstValue(row, ["Account", "Account Name", "company_account", "company_account_id"]));
+      const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee", "Employee Name", "employee", "employee_id"]));
+      const location = resolveByNameOrId(locationMap, firstValue(row, ["Location", "location", "location_id"]));
+
+      const missing = [];
+      if (!date) missing.push("Date");
+      if (!warehouse) missing.push("Warehouse");
+      if (!farmer) missing.push("Farmer");
+      if (!product) missing.push("Product");
+      if (!account) missing.push("Account");
+      if (missing.length) {
+        errors.push({ row: rowNo, error: `Missing/invalid: ${missing.join(", ")}` });
+        continue;
+      }
+      if (!canAccessWarehouse(req.user, warehouse._id)) {
+        errors.push({ row: rowNo, error: `No access to warehouse: ${warehouse.name || warehouse._id}` });
+        continue;
+      }
+
+      const packet = importNumber(firstValue(row, ["Packet", "packet"]));
+      const grossWeight = importNumber(firstValue(row, ["Gross Wt", "Gross Weight", "gross_weight"]));
+      const tareWeight = importNumber(firstValue(row, ["Tare Wt", "Tare Weight", "Tear Weight", "tare_weight"]));
+      const dhalta = importNumber(firstValue(row, ["Dhalta", "dhalta"]));
+      const lessBagsWeight = importNumber(firstValue(row, ["Less Bags Weight", "less_bags_weight"]));
+      const moisture = importNumber(firstValue(row, ["Moistur", "Moisture", "moisture"]));
+      const dunki = importNumber(firstValue(row, ["Dunki", "dunki"]));
+      const fungus = importNumber(firstValue(row, ["Fungas", "Fungus", "fungus"]));
+      const discolour = importNumber(firstValue(row, ["Disclour", "Discolour", "discolour"]));
+      const others = importNumber(firstValue(row, ["Others", "others"]));
+      const rate = importNumber(firstValue(row, ["Rate", "rate"]));
+      const bagsClaim = importNumber(firstValue(row, ["Bags Claim", "bags_claim"]));
+      const labour = importNumber(firstValue(row, ["Labour", "labour"]));
+      const roundOff = importNumber(firstValue(row, ["Round Off", "round_off"]));
+      const newWeight = Math.max(grossWeight - tareWeight, 0);
+      const netWeight = Math.max(newWeight - dhalta - lessBagsWeight - moisture - dunki - fungus - discolour - others, 0);
+      const grossAmount = netWeight * rate;
+      const totalDeduction = bagsClaim + labour;
+      const netPayable = Math.max(grossAmount - totalDeduction + roundOff, 0);
+
+      try {
+        const requestedVoucherNo = String(firstValue(row, ["Voucher No", "voucher_no"])).trim();
+        const voucherNo = await new Promise((resolve, reject) => {
+          createVoucherNoIfMissing("purchase", requestedVoucherNo, (err, value) => (err ? reject(err) : resolve(value)));
+        });
+        const doc = await PurchaseVoucher.create({
+          voucher_no: voucherNo,
+          date,
+          warehouse_id: String(warehouse._id),
+          farmer_id: String(farmer._id),
+          company_account_id: String(account._id),
+          product_id: String(product._id),
+          employee_id: employee ? String(employee._id) : String(warehouse.employee_id || ""),
+          location_id: location ? String(location._id) : String(warehouse.location_id || ""),
+          quantity: netWeight,
+          rate,
+          amount: netPayable,
+          packet,
+          gross_weight: grossWeight,
+          tare_weight: tareWeight,
+          dhalta,
+          less_bags_weight: lessBagsWeight,
+          moisture,
+          dunki,
+          fungus,
+          discolour,
+          others,
+          net_weight: netWeight,
+          bags_claim: bagsClaim,
+          labour,
+          total_deduct_amount: 0,
+          total_qty: netWeight,
+          total_deduction: totalDeduction,
+          round_off: roundOff,
+          net_amount_payable: netPayable,
+          description: String(firstValue(row, ["Narration", "Description", "description"])).trim(),
+        });
+        imported.push({ row: rowNo, id: String(doc._id), voucher_no: doc.voucher_no });
+      } catch (err) {
+        const message = err?.code === 11000 ? "Voucher number already exists" : err.message;
+        errors.push({ row: rowNo, error: message });
+      }
+    }
+
+    res.json({
+      imported: imported.length,
+      failed: errors.length,
+      rows: imported,
+      errors,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 router.post("/purchase", (req, res) => {
