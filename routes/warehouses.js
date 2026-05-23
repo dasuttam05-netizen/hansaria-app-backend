@@ -285,6 +285,12 @@ router.post("/", async (req, res) => {
     const {
       name,
       address,
+      pincode,
+      state,
+      district,
+      city,
+      room_floor_building,
+      street_locality_landmark,
       location_id,
       employee_id,
       employee_ids,
@@ -316,6 +322,13 @@ router.post("/", async (req, res) => {
         name,
 
         address,
+
+        pincode: pincode || null,
+        state: state || null,
+        district: district || null,
+        city: city || null,
+        room_floor_building: room_floor_building || null,
+        street_locality_landmark: street_locality_landmark || null,
 
         location_id:
           location_id || null,
@@ -367,6 +380,12 @@ router.put("/:id", async (req, res) => {
     const {
       name,
       address,
+      pincode,
+      state,
+      district,
+      city,
+      room_floor_building,
+      street_locality_landmark,
       location_id,
       employee_id,
       employee_ids,
@@ -388,6 +407,13 @@ router.put("/:id", async (req, res) => {
           name,
 
           address,
+
+          pincode: pincode || null,
+          state: state || null,
+          district: district || null,
+          city: city || null,
+          room_floor_building: room_floor_building || null,
+          street_locality_landmark: street_locality_landmark || null,
 
           location_id:
             location_id || null,
