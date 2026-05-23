@@ -177,6 +177,10 @@ const farmerSchema =
     village: String,
     pincode: String,
     state: String,
+    district: String,
+    city: String,
+    room_floor_building: String,
+    street_locality_landmark: String,
     gst_no: String,
     pan_no: String,
     aadhar_no: String,
@@ -227,6 +231,12 @@ const warehouseSchema =
     name: String,
 
     address: String,
+    pincode: String,
+    state: String,
+    district: String,
+    city: String,
+    room_floor_building: String,
+    street_locality_landmark: String,
 
     location_id: {
       type:
