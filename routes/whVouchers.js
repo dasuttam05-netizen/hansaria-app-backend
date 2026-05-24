@@ -1076,6 +1076,32 @@ function getPaymentAdjustmentsByPurchase(callback, excludePaymentId = null) {
   );
 }
 
+function getReceiptAdjustmentsBySale(callback, excludeReceiptId = null) {
+  const params = [];
+  let excludeClause = "";
+  if (excludeReceiptId) {
+    excludeClause = "WHERE CAST(receipt_id AS TEXT) <> CAST(? AS TEXT)";
+    params.push(excludeReceiptId);
+  }
+  db.all(
+    `
+      SELECT sale_id, COALESCE(SUM(adjusted_amount), 0) AS adjusted_amount
+      FROM wh_receipt_adjustments
+      ${excludeClause}
+      GROUP BY sale_id
+    `,
+    params,
+    (err, rows) => {
+      if (err) return callback(err);
+      const map = new Map();
+      (rows || []).forEach((row) => {
+        map.set(String(row.sale_id), Number(row.adjusted_amount || 0));
+      });
+      callback(null, map);
+    }
+  );
+}
+
 function normalizePaymentAdjustments(input) {
   if (!Array.isArray(input)) return [];
   return input
@@ -1175,6 +1201,90 @@ function buildPaymentReferenceId(adjustments, purchaseRows = []) {
   const purchaseMap = new Map((purchaseRows || []).map((row) => [String(row.id || row._id), row]));
   return normalizePaymentAdjustments(adjustments)
     .map((item) => item.voucher_no || purchaseMap.get(String(item.purchase_id))?.voucher_no || item.purchase_id)
+    .filter(Boolean)
+    .join(", ");
+}
+
+function normalizeReceiptAdjustments(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => ({
+      sale_id: String(item?.sale_id || item?.id || "").trim(),
+      adjusted_amount: Number(item?.adjusted_amount),
+      voucher_no: item?.voucher_no || item?.sale_voucher_no || "",
+    }))
+    .filter((item) => item.sale_id && Number.isFinite(item.adjusted_amount) && item.adjusted_amount > 0);
+}
+
+function validateReceiptAdjustments({ companyId, amount, adjustments, excludeReceiptId = null }, callback) {
+  const cleanAdjustments = normalizeReceiptAdjustments(adjustments);
+  const receiptAmount = Number(amount || 0);
+  const adjustedTotal = cleanAdjustments.reduce((sum, item) => sum + item.adjusted_amount, 0);
+
+  if (receiptAmount <= 0) {
+    return callback(new Error("Receipt amount is required"));
+  }
+
+  if (!cleanAdjustments.length) {
+    return callback(new Error("Please adjust this receipt against sale bills"));
+  }
+
+  if (Math.abs(adjustedTotal - receiptAmount) > 0.0001) {
+    return callback(new Error("Receipt amount and adjustment amount must be equal"));
+  }
+
+  getReceiptAdjustmentsBySale((err, adjustedMap) => {
+    if (err) return callback(err);
+
+    const params = [companyId];
+    db.all(
+      `
+        SELECT id, voucher_no, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount
+        FROM wh_sale_vouchers
+        WHERE CAST(company_id AS TEXT) = CAST(? AS TEXT)
+      `,
+      params,
+      (rowsErr, sales) => {
+        if (rowsErr) return callback(rowsErr);
+        
+        const saleMap = new Map((sales || []).map((row) => [String(row.id), row]));
+        for (const item of cleanAdjustments) {
+          const sale = saleMap.get(String(item.sale_id));
+          if (!sale) {
+            return callback(new Error("Invalid sale adjustment target"));
+          }
+
+          const billAmount = Number(sale.amount || sale.net_receivable_amount || 0);
+          const alreadyAdjusted = adjustedMap.get(String(item.sale_id)) || 0;
+          const pending = Math.max(0, billAmount - alreadyAdjusted);
+          if (item.adjusted_amount - pending > 0.0001) {
+            return callback(new Error(`Adjustment cannot exceed pending amount for ${sale.voucher_no || item.sale_id}`));
+          }
+        }
+
+        callback(null, cleanAdjustments);
+      }
+    );
+  }, excludeReceiptId);
+}
+
+function insertReceiptAdjustments(receiptId, adjustments, callback) {
+  if (!adjustments.length) return callback();
+  const stmt = "INSERT INTO wh_receipt_adjustments (receipt_id, sale_id, adjusted_amount) VALUES (?, ?, ?)";
+  let index = 0;
+  const next = () => {
+    if (index >= adjustments.length) return callback();
+    const item = adjustments[index];
+    index += 1;
+    db.run(stmt, [receiptId, item.sale_id, item.adjusted_amount], (err) => (err ? callback(err) : next()));
+  };
+  next();
+}
+
+function buildReceiptReferenceId(adjustments, saleRows = []) {
+  const saleMap = new Map((saleRows || []).map((row) => [String(row.id), row]));
+  return normalizeReceiptAdjustments(adjustments)
+    .map((item) => item.voucher_no || saleMap.get(String(item.sale_id))?.voucher_no || item.sale_id)
     .filter(Boolean)
     .join(", ");
 }
@@ -1707,13 +1817,37 @@ router.get("/outstanding", (req, res) => {
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     computeOutstandingForCompany(id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
-      db.all(detailsQuery, params, (err2, sales) => {
-        if (err2) return res.status(500).json({ error: err2.message });
-        db.all(paymentsQuery, params, (err3, receipts) => {
-          if (err3) return res.status(500).json({ error: err3.message });
-          res.json({ party_type: "company", id, stats, sales, receipts });
+      getReceiptAdjustmentsBySale((adjustErr, adjustedMap) => {
+        if (adjustErr) return res.status(500).json({ error: adjustErr.message });
+        
+        db.all(detailsQuery, params, (err2, sales) => {
+          if (err2) return res.status(500).json({ error: err2.message });
+          
+          const receiptsFilter = filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : "";
+          const receiptExcludeClause = exclude_payment_id ? `AND CAST(id AS TEXT) <> CAST(? AS TEXT)` : "";
+          const receiptParams = [...params];
+          if (exclude_payment_id) receiptParams.push(exclude_payment_id);
+          
+          db.all(paymentsQuery, params, (err3, receipts) => {
+            if (err3) return res.status(500).json({ error: err3.message });
+            
+            const decoratedSales = (sales || []).map((row) => {
+              const saleId = String(row.id || row._id);
+              const amount = Number(row.amount || 0);
+              const adjusted_amount = adjustedMap.get(saleId) || 0;
+              return {
+                ...row,
+                id: saleId,
+                amount,
+                adjusted_amount,
+                pending_amount: Number(Math.max(0, amount - adjusted_amount).toFixed(2)),
+              };
+            });
+            
+            res.json({ party_type: "company", id, stats, sales: decoratedSales, receipts });
+          });
         });
-      });
+      }, exclude_payment_id);
     });
     return;
   }
@@ -2195,67 +2329,81 @@ router.post("/receipt", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
 
-  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
-  if (idemKey) {
-    return getIdempotency(idemKey, "receipt", (err, existingId) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (existingId) {
-        return db.get(`SELECT * FROM wh_receipt_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
-          if (e2) return res.status(500).json({ error: e2.message });
-          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
-        });
-      }
+  validateReceiptAdjustments({ companyId: company_id, amount, adjustments }, (validationErr, cleanAdjustments) => {
+    if (validationErr) return res.status(400).json({ error: validationErr.message });
 
-      createVoucherNoIfMissing("receipt", voucher_no, (err, generatedVoucherNo) => {
+    const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+    if (idemKey) {
+      return getIdempotency(idemKey, "receipt", (err, existingId) => {
         if (err) return res.status(500).json({ error: err.message });
+        if (existingId) {
+          return db.get(`SELECT * FROM wh_receipt_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+            if (e2) return res.status(500).json({ error: e2.message });
+            return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+          });
+        }
 
-        const query = `
-          INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `;
+        createVoucherNoIfMissing("receipt", voucher_no, (err, generatedVoucherNo) => {
+          if (err) return res.status(500).json({ error: err.message });
 
-        db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
-          if (err) {
-            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-            return res.status(500).json({ error: err.message });
-          }
+          const query = `
+            INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `;
 
-          const receiptId = this.lastID;
-          saveIdempotency(idemKey, "receipt", receiptId, () => {});
-          computeOutstandingForCompany(company_id, (err2, stats) => {
-            if (err2) return res.status(500).json({ error: err2.message });
-            db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
-              res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats });
+          const finalReferenceType = reference_type || "sale";
+          const finalReferenceId = reference_id || buildReceiptReferenceId(cleanAdjustments);
+          db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, company_account_id, consignee_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
+            if (err) {
+              if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+              return res.status(500).json({ error: err.message });
+            }
+
+            const receiptId = this.lastID;
+            insertReceiptAdjustments(receiptId, cleanAdjustments, (adjErr) => {
+              if (adjErr) return res.status(500).json({ error: adjErr.message });
+              saveIdempotency(idemKey, "receipt", receiptId, () => {});
+              computeOutstandingForCompany(company_id, (err2, stats) => {
+                if (err2) return res.status(500).json({ error: err2.message });
+                db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
+                  res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+                });
+              });
             });
           });
         });
       });
-    });
-  }
+    }
 
-  createVoucherNoIfMissing("receipt", voucher_no, (err, generatedVoucherNo) => {
-    if (err) return res.status(500).json({ error: err.message });
+    createVoucherNoIfMissing("receipt", voucher_no, (err, generatedVoucherNo) => {
+      if (err) return res.status(500).json({ error: err.message });
 
-    const query = `
-      INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
+      const query = `
+        INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
 
-    db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description], function (err) {
-      if (err) {
-        if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-        return res.status(500).json({ error: err.message });
-      }
+      const finalReferenceType = reference_type || "sale";
+      const finalReferenceId = reference_id || buildReceiptReferenceId(cleanAdjustments);
+      db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, company_account_id, consignee_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
+        if (err) {
+          if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+          return res.status(500).json({ error: err.message });
+        }
 
-      const receiptId = this.lastID;
-      computeOutstandingForCompany(company_id, (err2, stats) => {
-        if (err2) return res.status(500).json({ error: err2.message });
-        db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
-          res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats });
+        const receiptId = this.lastID;
+        insertReceiptAdjustments(receiptId, cleanAdjustments, (adjErr) => {
+          if (adjErr) return res.status(500).json({ error: adjErr.message });
+          computeOutstandingForCompany(company_id, (err2, stats) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+            db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
+              res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+            });
+          });
         });
       });
     });
