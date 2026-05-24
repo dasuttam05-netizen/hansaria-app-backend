@@ -191,6 +191,7 @@ if (true) {
       round_off REAL DEFAULT 0,
       net_amount REAL DEFAULT 0,
       net_receivable_amount REAL DEFAULT 0,
+      net_amount_payable REAL DEFAULT 0,
       fifo_rate REAL DEFAULT 0,
       fifo_amount REAL DEFAULT 0,
       outstanding REAL DEFAULT 0,
@@ -686,6 +687,7 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN net_amount REAL DEFAULT 0`, "wh_sale_vouchers net_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN unloading_qty REAL DEFAULT 0`, "wh_sale_vouchers unloading_qty");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN net_receivable_amount REAL DEFAULT 0`, "wh_sale_vouchers net_receivable_amount");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN net_amount_payable REAL DEFAULT 0`, "wh_sale_vouchers net_amount_payable");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN fifo_rate REAL DEFAULT 0`, "wh_sale_vouchers fifo_rate");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN fifo_amount REAL DEFAULT 0`, "wh_sale_vouchers fifo_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN outstanding REAL DEFAULT 0`, "wh_sale_vouchers outstanding");
