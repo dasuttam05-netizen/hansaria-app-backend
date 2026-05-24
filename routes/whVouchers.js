@@ -51,6 +51,28 @@ function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
   });
 }
 
+function getSaleVoucherRows(req, res) {
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const query = `
+    SELECT
+      v.*,
+      COALESCE(v.buyer_id, v.company_id) AS buyer_id,
+      b.name AS buyer_name,
+      co.name AS consignee_name,
+      ca.account_name AS company_account_name
+    FROM wh_sale_vouchers v
+    LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(v.buyer_id, v.company_id) AS TEXT)
+    LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(v.consignee_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.date DESC
+  `;
+  db.all(query, filter.params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows || []);
+  });
+}
+
 const mongoReady = () => mongoose.connection.readyState === 1;
 
 const numberFields = [
@@ -104,7 +126,10 @@ function buildSalePayload(body, voucherNo) {
     date: body.date,
     unloading_date: body.unloading_date || "",
     warehouse_id: body.warehouse_id ? String(body.warehouse_id) : "",
+    buyer_id: body.buyer_id || body.company_id ? String(body.buyer_id || body.company_id) : "",
+    company_id: body.company_id || body.buyer_id ? String(body.company_id || body.buyer_id) : "",
     company_account_id: body.company_account_id ? String(body.company_account_id) : "",
+    consignee_id: body.consignee_id ? String(body.consignee_id) : "",
     product_id: body.product_id ? String(body.product_id) : "",
     employee_id: body.employee_id ? String(body.employee_id) : "",
     location_id: body.location_id ? String(body.location_id) : "",
@@ -113,6 +138,7 @@ function buildSalePayload(body, voucherNo) {
 
   const saleFields = [
     "quantity",
+    "shortage_quantity",
     "rate",
     "amount",
     "packet",
@@ -131,6 +157,11 @@ function buildSalePayload(body, voucherNo) {
     "claim_amount",
     "adjustment_amount",
     "tds_amount",
+    "net_amount",
+    "net_receivable_amount",
+    "fifo_rate",
+    "fifo_amount",
+    "outstanding",
     "round_off",
     "net_amount_payable",
   ];
@@ -139,6 +170,22 @@ function buildSalePayload(body, voucherNo) {
     const value = Number(body[field]);
     payload[field] = Number.isFinite(value) ? value : 0;
   });
+
+  const grossAmount = payload.amount;
+  const netAmount =
+    grossAmount -
+    payload.claim_amount -
+    payload.other_deduction -
+    payload.adjustment_amount -
+    payload.tds_amount +
+    payload.round_off;
+  const qtyForFifo = payload.unloading_qty || payload.quantity;
+  payload.net_amount = netAmount;
+  payload.net_amount_payable = netAmount;
+  payload.net_receivable_amount = netAmount;
+  payload.outstanding = netAmount;
+  payload.fifo_amount = grossAmount;
+  payload.fifo_rate = qtyForFifo > 0 ? grossAmount / qtyForFifo : 0;
 
   return payload;
 }
@@ -1654,7 +1701,7 @@ router.get("/sale", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  getWarehouseScopedRows(req, res, "wh_sale_vouchers");
+  getSaleVoucherRows(req, res);
 });
 
 router.post("/sale", (req, res) => {
@@ -1705,14 +1752,15 @@ router.put("/sale/:id", (req, res) => {
     })();
   }
 
-  const { voucher_no, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
 
   const amountValue = Number(amount) || 0;
   const claimValue = Number(claim_amount) || 0;
   const otherDeductionValue = Number(other_deduction) || 0;
   const adjustmentValue = Number(adjustment_amount) || 0;
   const tdsValue = Number(tds_amount) || 0;
-  const netAmount = amountValue - claimValue - otherDeductionValue - adjustmentValue - tdsValue;
+  const roundOffValue = Number(round_off) || 0;
+  const netAmount = amountValue - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
   const unloadingQtyValue = Number(unloading_qty) || Number(quantity) || 0;
   const fifoAmountValue = amountValue;
   const fifoRateValue = unloadingQtyValue > 0 ? amountValue / unloadingQtyValue : 0;
@@ -1720,17 +1768,17 @@ router.put("/sale/:id", (req, res) => {
 
   const query = `
     UPDATE wh_sale_vouchers SET
-      voucher_no=?, date=?, unloading_date=?, warehouse_id=?, company_id=?, company_account_id=?, consignee_id=?, product_id=?,
+      voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?, product_id=?,
       quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?,
-      adjustment_amount=?, tds_amount=?, net_amount=?, net_receivable_amount=?, fifo_rate=?, fifo_amount=?,
+      adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, fifo_rate=?, fifo_amount=?,
       outstanding=?, employee_id=?, location_id=?, description=?
     WHERE id = ?
   `;
 
   db.run(query, [
-    voucher_no, date, unloading_date, warehouse_id, company_id, company_account_id, consignee_id, product_id,
+    voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id, product_id,
     quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue,
-    adjustmentValue, tdsValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue,
+    adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue,
     netAmount, employee_id, location_id, description, id
   ], function (err) {
     if (err) {
@@ -2174,8 +2222,10 @@ async function getSaleReportRowsForUser(user) {
     `
       SELECT
         s.*,
+        COALESCE(s.buyer_id, s.company_id) AS buyer_id,
         w.name AS warehouse_name,
         c.name AS company_name,
+        b.name AS buyer_name,
         co.name AS consignee_name,
         ca.account_name AS company_account_name,
         p.name AS product_name,
@@ -2184,6 +2234,7 @@ async function getSaleReportRowsForUser(user) {
       FROM wh_sale_vouchers s
       LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
       LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+      LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(s.buyer_id, s.company_id) AS TEXT)
       LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
       LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
       LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
@@ -2684,8 +2735,10 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         voucher_type: "Sale",
         warehouse_id: row.warehouse_id,
         warehouse_name: row.warehouse_name,
-        company_id: row.company_id,
-        company_name: row.company_name,
+        company_id: row.buyer_id || row.company_id,
+        company_name: row.buyer_name || row.company_name,
+        buyer_id: row.buyer_id,
+        buyer_name: row.buyer_name,
         debit: Number(row.total_amount || row.net_receivable_amount || row.amount || 0),
         credit: 0,
       })),
@@ -2702,7 +2755,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       })),
     ];
 
-    res.json(buildLedgerRows(rows, (row) => row.company_id, (row) => row.company_name || "Unknown Company"));
+    res.json(buildLedgerRows(rows, (row) => row.buyer_id || row.company_id, (row) => row.buyer_name || row.company_name || "Unknown Buyer"));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2804,13 +2857,16 @@ router.get("/sale/:id/pdf", (req, res) => {
   const q = `
     SELECT
       s.*,
+      COALESCE(s.buyer_id, s.company_id) AS buyer_id,
       w.name AS warehouse_name,
       c.name AS company_name,
+      b.name AS buyer_name,
       co.name AS consignee_name,
       p.name AS product_name
     FROM wh_sale_vouchers s
     LEFT JOIN warehouses w ON w.id = s.warehouse_id
     LEFT JOIN companies c ON c.id = s.company_id
+    LEFT JOIN buyer_names b ON b.id = COALESCE(s.buyer_id, s.company_id)
     LEFT JOIN consignee_names co ON co.id = s.consignee_id
     LEFT JOIN products p ON p.id = s.product_id
     WHERE s.id = ?
@@ -2833,7 +2889,7 @@ router.get("/sale/:id/pdf", (req, res) => {
     doc.text(`Sale Date: ${fmtDate(row.date)}`);
     doc.text(`Unloading Date: ${fmtDate(row.unloading_date)}`);
     doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`);
-    doc.text(`Company: ${row.company_name || "-"}`);
+    doc.text(`Buyer: ${row.buyer_name || row.company_name || "-"}`);
     doc.text(`Consignee: ${row.consignee_name || "-"}`);
     doc.text(`Product: ${row.product_name || "-"}`);
     doc.moveDown(0.4);
