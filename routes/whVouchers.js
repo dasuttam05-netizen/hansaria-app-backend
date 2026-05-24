@@ -51,7 +51,55 @@ function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
   });
 }
 
+function getSqliteSaleRowsForUser(user) {
+  const filter = assignedWarehouseFilter(user, "v.warehouse_id");
+  return dbAll(
+    `
+      SELECT
+        v.*,
+        COALESCE(v.buyer_id, v.company_id) AS buyer_id,
+        b.name AS buyer_name,
+        co.name AS consignee_name,
+        ca.account_name AS company_account_name,
+        w.name AS warehouse_name,
+        p.name AS product_name,
+        COALESCE(NULLIF(v.unloading_qty, 0), v.quantity) AS total_quantity,
+        COALESCE(NULLIF(v.net_receivable_amount, 0), NULLIF(v.net_amount, 0), NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+      FROM wh_sale_vouchers v
+      LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(v.buyer_id, v.company_id) AS TEXT)
+      LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(v.consignee_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+      LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
+      WHERE 1 = 1 ${filter.clause}
+      ORDER BY v.date DESC, v.id DESC
+    `,
+    filter.params
+  );
+}
+
+async function getAllSaleVoucherRowsForUser(user) {
+  const sqliteRows = await getSqliteSaleRowsForUser(user);
+  if (!mongoReady()) return sqliteRows;
+  const mongoRows = await SaleVoucher.find(mongoPurchaseScope(user)).lean();
+  return mergeSaleRows(await decorateSaleRows(mongoRows), sqliteRows);
+}
+
 function getSaleVoucherRows(req, res) {
+  if (mongoReady()) {
+    getAllSaleVoucherRowsForUser(req.user)
+      .then((rows) => res.json(rows || []))
+      .catch((err) => {
+        console.error("Mongo sale voucher query failed, falling back to SQLite:", err.message);
+        getSaleVoucherRowsSqlite(req, res);
+      });
+    return;
+  }
+
+  getSaleVoucherRowsSqlite(req, res);
+}
+
+function getSaleVoucherRowsSqlite(req, res) {
   const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
   const query = `
     SELECT
@@ -59,13 +107,19 @@ function getSaleVoucherRows(req, res) {
       COALESCE(v.buyer_id, v.company_id) AS buyer_id,
       b.name AS buyer_name,
       co.name AS consignee_name,
-      ca.account_name AS company_account_name
+      ca.account_name AS company_account_name,
+      w.name AS warehouse_name,
+      p.name AS product_name,
+      COALESCE(NULLIF(v.unloading_qty, 0), v.quantity) AS total_quantity,
+      COALESCE(NULLIF(v.net_receivable_amount, 0), NULLIF(v.net_amount, 0), NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
     FROM wh_sale_vouchers v
     LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(v.buyer_id, v.company_id) AS TEXT)
     LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(v.consignee_id AS TEXT)
     LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
     WHERE 1 = 1 ${filter.clause}
-    ORDER BY v.date DESC
+    ORDER BY v.date DESC, v.id DESC
   `;
   db.all(query, filter.params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -263,6 +317,104 @@ async function decoratePurchaseRows(rows) {
       total_amount: plain.net_amount_payable || plain.amount || 0,
       gross_amount: (plain.total_qty || plain.net_weight || plain.quantity || 0) * (plain.rate || 0),
     };
+  });
+}
+
+async function sqliteRowsByIds(tableName, ids) {
+  const cleanIds = [...new Set((ids || []).map((id) => String(id || "")).filter(Boolean))];
+  if (!cleanIds.length) return new Map();
+  const placeholders = cleanIds.map(() => "?").join(",");
+  const rows = await dbAll(`SELECT * FROM ${tableName} WHERE CAST(id AS TEXT) IN (${placeholders})`, cleanIds);
+  return new Map((rows || []).map((row) => [String(row.id), row]));
+}
+
+async function decorateSaleRows(rows) {
+  const plainRows = rows.map((row) => (row.toObject ? row.toObject() : row));
+  const warehouseIds = [...new Set(plainRows.map((r) => r.warehouse_id).filter(Boolean))];
+  const productIds = [...new Set(plainRows.map((r) => r.product_id).filter(Boolean))];
+  const accountIds = [...new Set(plainRows.map((r) => r.company_account_id).filter(Boolean))];
+  const buyerIds = [...new Set(plainRows.map((r) => r.buyer_id || r.company_id).filter(Boolean))];
+  const consigneeIds = [...new Set(plainRows.map((r) => r.consignee_id).filter(Boolean))];
+
+  const mongoWarehouseIds = warehouseIds.filter(mongoose.Types.ObjectId.isValid);
+  const mongoProductIds = productIds.filter(mongoose.Types.ObjectId.isValid);
+  const mongoAccountIds = accountIds.filter(mongoose.Types.ObjectId.isValid);
+
+  const [
+    mongoWarehouses,
+    mongoProducts,
+    mongoAccounts,
+    sqliteWarehouses,
+    sqliteProducts,
+    sqliteAccounts,
+    sqliteBuyers,
+    sqliteConsignees,
+  ] = await Promise.all([
+    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : [],
+    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : [],
+    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : [],
+    sqliteRowsByIds("warehouses", warehouseIds),
+    sqliteRowsByIds("products", productIds),
+    sqliteRowsByIds("company_accounts", accountIds),
+    sqliteRowsByIds("buyer_names", buyerIds),
+    sqliteRowsByIds("consignee_names", consigneeIds),
+  ]);
+
+  const byMongoId = (items) => new Map(items.map((item) => [String(item._id), item]));
+  const mongoWarehouseMap = byMongoId(mongoWarehouses);
+  const mongoProductMap = byMongoId(mongoProducts);
+  const mongoAccountMap = byMongoId(mongoAccounts);
+
+  return plainRows.map((plain) => {
+    const buyerId = plain.buyer_id || plain.company_id || "";
+    const warehouse = mongoWarehouseMap.get(String(plain.warehouse_id)) || sqliteWarehouses.get(String(plain.warehouse_id));
+    const product = mongoProductMap.get(String(plain.product_id)) || sqliteProducts.get(String(plain.product_id));
+    const account = mongoAccountMap.get(String(plain.company_account_id)) || sqliteAccounts.get(String(plain.company_account_id));
+    const buyer = sqliteBuyers.get(String(buyerId));
+    const consignee = sqliteConsignees.get(String(plain.consignee_id));
+    const totalQuantity = plain.unloading_qty || plain.quantity || Math.max(Number(plain.gross_weight || 0) - Number(plain.tare_weight || 0), 0);
+    const totalAmount = plain.net_receivable_amount || plain.net_amount || plain.net_amount_payable || plain.amount || 0;
+    return {
+      ...plain,
+      id: String(plain._id || plain.id),
+      _id: String(plain._id || plain.id),
+      buyer_id: buyerId,
+      warehouse_name: warehouse?.name || plain.warehouse_name,
+      product_name: product?.name || plain.product_name,
+      company_account_name: account?.account_name || account?.name || plain.company_account_name,
+      buyer_name: buyer?.name || plain.buyer_name || plain.company_name,
+      consignee_name: consignee?.name || plain.consignee_name,
+      total_quantity: totalQuantity,
+      total_amount: totalAmount,
+    };
+  });
+}
+
+function mergeSaleRows(mongoRows, sqliteRows) {
+  const mongoByVoucherNo = new Map();
+  const merged = [];
+
+  for (const row of mongoRows) {
+    const key = String(row.voucher_no || row._id || "");
+    if (key) mongoByVoucherNo.set(key, row);
+    merged.push(row);
+  }
+
+  for (const row of sqliteRows) {
+    const key = String(row.voucher_no || row.id || "");
+    if (!key || !mongoByVoucherNo.has(key)) {
+      merged.push(row);
+    }
+  }
+
+  return merged.sort((a, b) => {
+    const dateA = new Date(a.date || a.created_at || 0).getTime();
+    const dateB = new Date(b.date || b.created_at || 0).getTime();
+    if (dateA !== dateB) return dateB - dateA;
+    return String(b.voucher_no || b.id || b._id || "").localeCompare(String(a.voucher_no || a.id || a._id || ""), undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
   });
 }
 
@@ -1770,7 +1922,7 @@ router.put("/sale/:id", (req, res) => {
     UPDATE wh_sale_vouchers SET
       voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?, product_id=?,
       quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?,
-      adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, fifo_rate=?, fifo_amount=?,
+      adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, fifo_rate=?, fifo_amount=?,
       outstanding=?, employee_id=?, location_id=?, description=?
     WHERE id = ?
   `;
@@ -1778,7 +1930,7 @@ router.put("/sale/:id", (req, res) => {
   db.run(query, [
     voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id, product_id,
     quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue,
-    adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, fifoRateValue, fifoAmountValue,
+    adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, netAmount, fifoRateValue, fifoAmountValue,
     netAmount, employee_id, location_id, description, id
   ], function (err) {
     if (err) {
@@ -2217,32 +2369,7 @@ async function getPurchaseReportRowsForUser(user) {
 }
 
 async function getSaleReportRowsForUser(user) {
-  const filter = assignedWarehouseFilter(user, "s.warehouse_id");
-  return dbAll(
-    `
-      SELECT
-        s.*,
-        COALESCE(s.buyer_id, s.company_id) AS buyer_id,
-        w.name AS warehouse_name,
-        c.name AS company_name,
-        b.name AS buyer_name,
-        co.name AS consignee_name,
-        ca.account_name AS company_account_name,
-        p.name AS product_name,
-        COALESCE(NULLIF(s.unloading_qty, 0), s.quantity) AS total_quantity,
-        COALESCE(NULLIF(s.net_receivable_amount, 0), s.amount) AS total_amount
-      FROM wh_sale_vouchers s
-      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
-      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
-      LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(s.buyer_id, s.company_id) AS TEXT)
-      LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
-      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
-      LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
-      WHERE 1 = 1 ${filter.clause}
-      ORDER BY s.date DESC, s.id DESC
-    `,
-    filter.params
-  );
+  return getAllSaleVoucherRowsForUser(user);
 }
 
 function buildLedgerRows(rows, getPartyId, getPartyName) {
@@ -2410,20 +2537,33 @@ router.get("/report/sale-summary", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const filter = assignedWarehouseFilter(req.user, "warehouse_id");
-  const query = `
-    SELECT 
-      warehouse_id, 
-      SUM(COALESCE(NULLIF(unloading_qty, 0), quantity)) as total_quantity, 
-      SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)) as total_amount 
-    FROM wh_sale_vouchers 
-    WHERE 1 = 1 ${filter.clause}
-    GROUP BY warehouse_id
-  `;
-  db.all(query, filter.params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows || []);
-  });
+  getSaleReportRowsForUser(req.user)
+    .then((rows) => {
+      const grouped = new Map();
+      (rows || []).forEach((row) => {
+        const key = String(row.warehouse_id || "");
+        if (!grouped.has(key)) {
+          grouped.set(key, {
+            warehouse_id: row.warehouse_id,
+            warehouse_name: row.warehouse_name || "",
+            total_quantity: 0,
+            total_amount: 0,
+          });
+        }
+        const item = grouped.get(key);
+        item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
+        item.total_quantity += Number(row.total_quantity || row.unloading_qty || row.quantity || 0);
+        item.total_amount += Number(row.total_amount || row.net_receivable_amount || row.net_amount || row.amount || 0);
+      });
+      res.json(
+        [...grouped.values()].map((row) => ({
+          ...row,
+          total_quantity: Number(row.total_quantity.toFixed(4)),
+          total_amount: Number(row.total_amount.toFixed(2)),
+        }))
+      );
+    })
+    .catch((err) => res.status(500).json({ error: err.message }));
 });
 
 router.get("/report/purchase-summary", (req, res) => {
