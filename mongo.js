@@ -315,6 +315,50 @@ const purchaseVoucherSchema =
 
 
 // =========================
+// WAREHOUSE SALE VOUCHER
+// =========================
+const saleVoucherSchema =
+  new mongoose.Schema({
+    voucher_no: {
+      type: String,
+      index: true,
+    },
+    date: String,
+    unloading_date: String,
+    warehouse_id: String,
+    company_account_id: String,
+    product_id: String,
+    quantity: { type: Number, default: 0 },
+    rate: { type: Number, default: 0 },
+    amount: { type: Number, default: 0 },
+    packet: { type: Number, default: 0 },
+    gross_weight: { type: Number, default: 0 },
+    tare_weight: { type: Number, default: 0 },
+    net_weight: { type: Number, default: 0 },
+    unloading_qty: { type: Number, default: 0 },
+    moisture: { type: Number, default: 0 },
+    dunki: { type: Number, default: 0 },
+    fungus: { type: Number, default: 0 },
+    discolour: { type: Number, default: 0 },
+    others: { type: Number, default: 0 },
+    total_deduction: { type: Number, default: 0 },
+    bags_claim: { type: Number, default: 0 },
+    other_deduction: { type: Number, default: 0 },
+    claim_amount: { type: Number, default: 0 },
+    adjustment_amount: { type: Number, default: 0 },
+    tds_amount: { type: Number, default: 0 },
+    round_off: { type: Number, default: 0 },
+    net_amount_payable: { type: Number, default: 0 },
+    employee_id: String,
+    location_id: String,
+    description: String,
+  },
+  {
+    timestamps: true,
+  });
+
+
+// =========================
 // EXPORTS
 // =========================
 module.exports = {
@@ -375,5 +419,12 @@ module.exports = {
     mongoose.model(
       "PurchaseVoucher",
       purchaseVoucherSchema
+    ),
+
+  SaleVoucher:
+    mongoose.models.SaleVoucher ||
+    mongoose.model(
+      "SaleVoucher",
+      saleVoucherSchema
     ),
 };
