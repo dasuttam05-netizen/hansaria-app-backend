@@ -933,7 +933,7 @@ function computeOutstandingForFarmer(farmerId, callback, companyAccountId = null
 }
 
 function computeOutstandingForCompany(companyId, callback) {
-  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE company_id = ?`;
+  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT)`;
   const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE company_id = ?`;
   db.get(saleSql, [companyId], (err, sale) => {
     if (err) return callback(err);
@@ -1292,7 +1292,7 @@ function validateReceiptAdjustments({ companyId, amount, adjustments, excludeRec
       `
         SELECT id, voucher_no, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount
         FROM wh_sale_vouchers
-        WHERE CAST(company_id AS TEXT) = CAST(? AS TEXT)
+        WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT)
       `,
       params,
       (rowsErr, sales) => {
@@ -1864,7 +1864,7 @@ router.get("/outstanding", (req, res) => {
       filters.push("location_id = ?");
       params.push(location_id);
     }
-    detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+    detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT) ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     computeOutstandingForCompany(id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
