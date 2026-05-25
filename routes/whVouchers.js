@@ -1888,8 +1888,9 @@ router.get("/outstanding", (req, res) => {
           const receiptExcludeClause = exclude_payment_id ? `AND CAST(id AS TEXT) <> CAST(? AS TEXT)` : "";
           const receiptParams = [...params];
           if (exclude_payment_id) receiptParams.push(exclude_payment_id);
-          
-          db.all(paymentsQuery, params, (err3, receipts) => {
+          const receiptsQuery = `${paymentsQuery} ${receiptExcludeClause}`.trim();
+
+          db.all(receiptsQuery, receiptParams, (err3, receipts) => {
             if (err3) return res.status(500).json({ error: err3.message });
             
             const decoratedSales = (sales || []).map((row) => {
