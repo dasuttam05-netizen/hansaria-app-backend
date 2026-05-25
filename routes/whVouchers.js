@@ -933,19 +933,15 @@ function computeOutstandingForFarmer(farmerId, callback, companyAccountId = null
 }
 
 function computeOutstandingForCompany(companyId, callback, companyAccountId = null) {
-  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT)${companyAccountId ? " AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}`;
   const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE company_id = ?${companyAccountId ? " AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}`;
-  const saleParams = [companyId];
   const receiptParams = [companyId];
   if (companyAccountId) {
-    saleParams.push(companyAccountId);
     receiptParams.push(companyAccountId);
   }
-  db.get(saleSql, saleParams, (err, sale) => {
-    if (err) return callback(err);
+
+  const finish = (totalSale) => {
     db.get(receiptSql, receiptParams, (err2, receipt) => {
       if (err2) return callback(err2);
-      const totalSale = sale?.total_sale || 0;
       const totalReceipt = receipt?.total_receipt || 0;
       callback(null, {
         total_sale: totalSale,
@@ -953,6 +949,36 @@ function computeOutstandingForCompany(companyId, callback, companyAccountId = nu
         outstanding: Number((totalSale - totalReceipt).toFixed(2)),
       });
     });
+  };
+
+  if (mongoReady()) {
+    const filter = {
+      $or: [
+        { buyer_id: String(companyId) },
+        { company_id: String(companyId) },
+      ],
+    };
+    if (companyAccountId) filter.company_account_id = String(companyAccountId);
+    return SaleVoucher.find(filter)
+      .lean()
+      .then((rows) => {
+        const totalSale = (rows || []).reduce(
+          (sum, row) => sum + Number(row.net_receivable_amount || row.amount || 0),
+          0
+        );
+        finish(totalSale);
+      })
+      .catch(callback);
+  }
+
+  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT)${companyAccountId ? " AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}`;
+  const saleParams = [companyId];
+  if (companyAccountId) {
+    saleParams.push(companyAccountId);
+  }
+  db.get(saleSql, saleParams, (err, sale) => {
+    if (err) return callback(err);
+    finish(sale?.total_sale || 0);
   });
 }
 
@@ -1293,6 +1319,42 @@ function validateReceiptAdjustments({ companyId, amount, adjustments, excludeRec
   getReceiptAdjustmentsBySale((err, adjustedMap) => {
     if (err) return callback(err);
 
+    const finish = (sales) => {
+      const saleMap = new Map((sales || []).map((row) => [String(row.id), row]));
+      for (const item of cleanAdjustments) {
+        const sale = saleMap.get(String(item.sale_id));
+        if (!sale) {
+          return callback(new Error("Invalid sale adjustment target"));
+        }
+
+        const billAmount = Number(sale.amount || sale.net_receivable_amount || 0);
+        const alreadyAdjusted = adjustedMap.get(String(item.sale_id)) || 0;
+        const pending = Math.max(0, billAmount - alreadyAdjusted);
+        if (item.adjusted_amount - pending > 0.0001) {
+          return callback(new Error(`Adjustment cannot exceed pending amount for ${sale.voucher_no || item.sale_id}`));
+        }
+      }
+
+      callback(null, cleanAdjustments);
+    };
+
+    if (mongoReady()) {
+      const filter = {
+        $or: [
+          { buyer_id: String(companyId) },
+          { company_id: String(companyId) },
+        ],
+      };
+      return SaleVoucher.find(filter)
+        .lean()
+        .then((rows) => finish((rows || []).map((row) => ({
+          ...row,
+          id: String(row._id),
+          amount: Number(row.net_receivable_amount || row.amount || 0),
+        })) ))
+        .catch((mongoErr) => callback(mongoErr));
+    }
+
     const params = [companyId];
     db.all(
       `
@@ -1303,23 +1365,7 @@ function validateReceiptAdjustments({ companyId, amount, adjustments, excludeRec
       params,
       (rowsErr, sales) => {
         if (rowsErr) return callback(rowsErr);
-        
-        const saleMap = new Map((sales || []).map((row) => [String(row.id), row]));
-        for (const item of cleanAdjustments) {
-          const sale = saleMap.get(String(item.sale_id));
-          if (!sale) {
-            return callback(new Error("Invalid sale adjustment target"));
-          }
-
-          const billAmount = Number(sale.amount || sale.net_receivable_amount || 0);
-          const alreadyAdjusted = adjustedMap.get(String(item.sale_id)) || 0;
-          const pending = Math.max(0, billAmount - alreadyAdjusted);
-          if (item.adjusted_amount - pending > 0.0001) {
-            return callback(new Error(`Adjustment cannot exceed pending amount for ${sale.voucher_no || item.sale_id}`));
-          }
-        }
-
-        callback(null, cleanAdjustments);
+        finish(sales || []);
       }
     );
   }, excludeReceiptId);
@@ -1874,16 +1920,40 @@ router.get("/outstanding", (req, res) => {
       filters.push("CAST(company_account_id AS TEXT) = CAST(? AS TEXT)");
       params.push(company_account_id);
     }
-    detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT) ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+
+    const getSaleRows = (callback) => {
+      if (mongoReady()) {
+        const filter = {
+          $or: [
+            { buyer_id: String(id || "") },
+            { company_id: String(id || "") },
+          ],
+        };
+        if (warehouse_id) filter.warehouse_id = String(warehouse_id);
+        if (company_account_id) filter.company_account_id = String(company_account_id);
+        return SaleVoucher.find(filter)
+          .sort({ date: 1, createdAt: 1, _id: 1 })
+          .lean()
+          .then((rows) => callback(null, (rows || []).map((row) => ({
+            ...row,
+            id: String(row._id),
+            amount: Number(row.net_receivable_amount || row.amount || 0),
+          })))).catch(callback);
+      }
+
+      detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT) ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+      db.all(detailsQuery, params, (err2, sales) => (err2 ? callback(err2) : callback(null, sales || [])));
+    };
+
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     computeOutstandingForCompany(id, (err, stats) => {
       if (err) return res.status(500).json({ error: err.message });
       getReceiptAdjustmentsBySale((adjustErr, adjustedMap) => {
         if (adjustErr) return res.status(500).json({ error: adjustErr.message });
-        
-        db.all(detailsQuery, params, (err2, sales) => {
+
+        getSaleRows((err2, sales) => {
           if (err2) return res.status(500).json({ error: err2.message });
-          
+
           const receiptsFilter = filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : "";
           const receiptExcludeClause = exclude_payment_id ? `AND CAST(id AS TEXT) <> CAST(? AS TEXT)` : "";
           const receiptParams = [...params];
@@ -1892,7 +1962,7 @@ router.get("/outstanding", (req, res) => {
 
           db.all(receiptsQuery, receiptParams, (err3, receipts) => {
             if (err3) return res.status(500).json({ error: err3.message });
-            
+
             const decoratedSales = (sales || []).map((row) => {
               const saleId = String(row.id || row._id);
               const amount = Number(row.amount || 0);
@@ -1905,7 +1975,7 @@ router.get("/outstanding", (req, res) => {
                 pending_amount: Number(Math.max(0, amount - adjusted_amount).toFixed(2)),
               };
             });
-            
+
             res.json({ party_type: "company", id, stats, sales: decoratedSales, receipts });
           });
         });
