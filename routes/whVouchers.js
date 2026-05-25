@@ -2929,31 +2929,15 @@ router.get("/report/sale-summary", (req, res) => {
   }
 
   getSaleReportRowsForUser(req.user)
-    .then((rows) => {
-      const grouped = new Map();
-      (rows || []).forEach((row) => {
-        const key = String(row.warehouse_id || "");
-        if (!grouped.has(key)) {
-          grouped.set(key, {
-            warehouse_id: row.warehouse_id,
-            warehouse_name: row.warehouse_name || "",
-            total_quantity: 0,
-            total_amount: 0,
-          });
-        }
-        const item = grouped.get(key);
-        item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
-        item.total_quantity += Number(row.total_quantity || row.unloading_qty || row.quantity || 0);
-        item.total_amount += Number(row.total_amount || row.net_receivable_amount || row.net_amount || row.amount || 0);
-      });
+    .then((rows) =>
       res.json(
-        [...grouped.values()].map((row) => ({
+        (rows || []).map((row) => ({
           ...row,
-          total_quantity: Number(row.total_quantity.toFixed(4)),
-          total_amount: Number(row.total_amount.toFixed(2)),
+          total_quantity: Number(Number(row.total_quantity || row.unloading_qty || row.quantity || 0).toFixed(4)),
+          total_amount: Number(Number(row.total_amount || row.net_receivable_amount || row.net_amount || row.amount || 0).toFixed(2)),
         }))
-      );
-    })
+      )
+    )
     .catch((err) => res.status(500).json({ error: err.message }));
 });
 
@@ -3246,18 +3230,35 @@ router.get("/report/sale-party-ledger", async (req, res) => {
   }
 
   try {
-    const sales = await getSaleReportRowsForUser(req.user);
+    const companyAccountId = String(req.query.company_account_id || "").trim();
+    const buyerId = String(req.query.company_id || req.query.buyer_id || "").trim();
+    const sales = (await getSaleReportRowsForUser(req.user)).filter((row) => {
+      if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
+      if (buyerId && String(row.buyer_id || row.company_id || "") !== buyerId) return false;
+      return true;
+    });
     const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
+    const receiptParams = [...filter.params];
+    let accountClause = "";
+    let buyerClause = "";
+    if (companyAccountId) {
+      accountClause = " AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)";
+      receiptParams.push(companyAccountId);
+    }
+    if (buyerId) {
+      buyerClause = " AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)";
+      receiptParams.push(buyerId);
+    }
     const receipts = await dbAll(
       `
-        SELECT r.*, w.name AS warehouse_name, c.name AS company_name, ca.account_name AS company_account_name
+        SELECT r.*, w.name AS warehouse_name, b.name AS buyer_name, ca.account_name AS company_account_name
         FROM wh_receipt_vouchers r
         LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(r.warehouse_id AS TEXT)
-        LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(r.company_id AS TEXT)
+        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(r.company_id AS TEXT)
         LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
-        WHERE 1 = 1 ${filter.clause}
+        WHERE 1 = 1 ${filter.clause}${accountClause}${buyerClause}
       `,
-      filter.params
+      receiptParams
     );
 
     const receiptIds = (receipts || []).map((row) => row.id);
@@ -3309,6 +3310,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           warehouse_name: row.warehouse_name,
           company_id: row.buyer_id || row.company_id,
           company_name: row.buyer_name || row.company_name,
+          company_account_id: row.company_account_id,
           company_account_name: row.company_account_name,
           buyer_id: row.buyer_id,
           buyer_name: row.buyer_name,
@@ -3331,8 +3333,11 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           warehouse_id: row.warehouse_id,
           warehouse_name: row.warehouse_name,
           company_id: row.company_id,
-          company_name: row.company_name,
+          company_name: row.buyer_name || row.company_name,
+          company_account_id: row.company_account_id,
           company_account_name: row.company_account_name,
+          buyer_id: row.company_id,
+          buyer_name: row.buyer_name || row.company_name,
           debit: 0,
           credit: Number(row.amount || 0),
           particulars: `Receipt adjusted against ${receiptItems.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || "sale bill"}`,
@@ -3341,7 +3346,11 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       }),
     ];
 
-    res.json(buildLedgerRows(rows, (row) => row.buyer_id || row.company_id, (row) => row.buyer_name || row.company_name || "Unknown Buyer"));
+    res.json(buildLedgerRows(
+      rows,
+      (row) => `${row.buyer_id || row.company_id || "unknown"}::${row.company_account_id || "no-account"}`,
+      (row) => row.buyer_name || row.company_name || "Unknown Buyer"
+    ));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
