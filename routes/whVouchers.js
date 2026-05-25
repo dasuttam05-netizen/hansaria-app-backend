@@ -3293,7 +3293,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       adjustmentsByReceipt.get(receiptId).push(detail);
       if (!adjustmentsBySale.has(saleId)) adjustmentsBySale.set(saleId, []);
       adjustmentsBySale.get(saleId).push(detail);
-    }, company_account_id || null);
+    });
 
     const rows = [
       ...sales.map((row) => {
