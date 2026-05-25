@@ -932,12 +932,18 @@ function computeOutstandingForFarmer(farmerId, callback, companyAccountId = null
   });
 }
 
-function computeOutstandingForCompany(companyId, callback) {
-  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT)`;
-  const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE company_id = ?`;
-  db.get(saleSql, [companyId], (err, sale) => {
+function computeOutstandingForCompany(companyId, callback, companyAccountId = null) {
+  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT)${companyAccountId ? " AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}`;
+  const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE company_id = ?${companyAccountId ? " AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}`;
+  const saleParams = [companyId];
+  const receiptParams = [companyId];
+  if (companyAccountId) {
+    saleParams.push(companyAccountId);
+    receiptParams.push(companyAccountId);
+  }
+  db.get(saleSql, saleParams, (err, sale) => {
     if (err) return callback(err);
-    db.get(receiptSql, [companyId], (err2, receipt) => {
+    db.get(receiptSql, receiptParams, (err2, receipt) => {
       if (err2) return callback(err2);
       const totalSale = sale?.total_sale || 0;
       const totalReceipt = receipt?.total_receipt || 0;
@@ -1864,6 +1870,10 @@ router.get("/outstanding", (req, res) => {
       filters.push("location_id = ?");
       params.push(location_id);
     }
+    if (company_account_id) {
+      filters.push("CAST(company_account_id AS TEXT) = CAST(? AS TEXT)");
+      params.push(company_account_id);
+    }
     detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT) ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
     computeOutstandingForCompany(id, (err, stats) => {
@@ -2166,7 +2176,7 @@ router.put("/sale/:id", (req, res) => {
           return res.json({ id, updated: 1, voucher_no: existing.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount });
         }
       );
-    });
+    }, company_account_id || null);
   }
 
   const amountValue = Number(amount) || 0;
