@@ -3296,6 +3296,64 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       adjustmentsBySale.get(saleId).push(detail);
     });
 
+    const adjustedBySale = new Map();
+    (receiptAdjustments || []).forEach((item) => {
+      const saleId = String(item.sale_id);
+      adjustedBySale.set(saleId, (adjustedBySale.get(saleId) || 0) + Number(item.adjusted_amount || 0));
+    });
+
+    (receipts || [])
+      .filter((receipt) => !(adjustmentsByReceipt.get(String(receipt.id)) || []).length)
+      .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+      .forEach((receipt) => {
+        let remaining = Number(receipt.amount || 0);
+        if (remaining <= 0) return;
+
+        const reference = String(receipt.reference_id || "").trim().toLowerCase();
+        const matchingSales = (sales || [])
+          .filter((sale) => {
+            const sameBuyer = String(sale.buyer_id || sale.company_id || "") === String(receipt.company_id || "");
+            const sameAccount = String(sale.company_account_id || "") === String(receipt.company_account_id || "");
+            return sameBuyer && sameAccount;
+          })
+          .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
+
+        const referencedSales = reference
+          ? matchingSales.filter((sale) => {
+              const saleId = String(sale.id || sale._id || "").toLowerCase();
+              const voucherNo = String(sale.voucher_no || "").toLowerCase();
+              return reference === saleId || reference === voucherNo || reference.includes(voucherNo);
+            })
+          : [];
+        const saleCandidates = referencedSales.length ? referencedSales : matchingSales;
+
+        saleCandidates.forEach((sale) => {
+          if (remaining <= 0) return;
+          const saleId = String(sale.id || sale._id);
+          const saleAmount = Number(sale.total_amount || sale.net_receivable_amount || sale.amount || 0);
+          const alreadyAdjusted = adjustedBySale.get(saleId) || 0;
+          const pending = Math.max(0, saleAmount - alreadyAdjusted);
+          const adjustedAmount = Math.min(remaining, pending);
+          if (adjustedAmount <= 0) return;
+
+          const detail = {
+            receipt_id: receipt.id,
+            sale_id: saleId,
+            adjusted_amount: Number(adjustedAmount.toFixed(2)),
+            sale_voucher_no: sale.voucher_no || saleId,
+            receipt_voucher_no: receipt.voucher_no || "",
+            receipt_date: receipt.date || "",
+            inferred_adjustment: true,
+          };
+          if (!adjustmentsByReceipt.has(String(receipt.id))) adjustmentsByReceipt.set(String(receipt.id), []);
+          adjustmentsByReceipt.get(String(receipt.id)).push(detail);
+          if (!adjustmentsBySale.has(saleId)) adjustmentsBySale.set(saleId, []);
+          adjustmentsBySale.get(saleId).push(detail);
+          adjustedBySale.set(saleId, alreadyAdjusted + adjustedAmount);
+          remaining -= adjustedAmount;
+        });
+      });
+
     const rows = [
       ...sales.map((row) => {
         const saleId = String(row.id || row._id);
