@@ -295,6 +295,73 @@ function dbGet(query, params = []) {
   });
 }
 
+function dbRunPromise(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(query, params, function (err) {
+      if (err) return reject(err);
+      resolve(this);
+    });
+  });
+}
+
+function createVoucherNoPromise(type, voucherNo = "") {
+  return new Promise((resolve, reject) => {
+    createVoucherNoIfMissing(type, voucherNo, (err, generatedVoucherNo) => {
+      if (err) return reject(err);
+      resolve(generatedVoucherNo);
+    });
+  });
+}
+
+async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deductionAmount, tdsAmount }) {
+  const saleVoucherNo = String(sale?.voucher_no || body?.voucher_no || "").trim();
+  if (!saleVoucherNo) return [];
+
+  await dbRunPromise("DELETE FROM wh_journal_vouchers WHERE description LIKE ?", [`Auto sale deduction:${saleVoucherNo}:%`]);
+
+  const journalBase = {
+    date: body.unloading_date || body.date || sale.date,
+    warehouse_id: body.warehouse_id || sale.warehouse_id,
+    company_account_id: body.company_account_id || sale.company_account_id,
+    employee_id: body.employee_id || sale.employee_id || null,
+    location_id: body.location_id || sale.location_id || null,
+  };
+
+  const rows = [
+    { key: "shortage", label: "Shortage", amount: Number(shortageAmount || 0) },
+    { key: "deduction", label: "Deduction", amount: Number(deductionAmount || 0) },
+    { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
+  ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
+
+  const created = [];
+  for (const row of rows) {
+    const voucherNo = await createVoucherNoPromise("journal");
+    const description = `Auto sale deduction:${saleVoucherNo}:${row.key}`;
+    const result = await dbRunPromise(
+      `
+        INSERT INTO wh_journal_vouchers
+          (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        voucherNo,
+        journalBase.date,
+        journalBase.warehouse_id,
+        journalBase.company_account_id,
+        "Sale Party",
+        row.label,
+        row.amount,
+        journalBase.employee_id,
+        journalBase.location_id,
+        description,
+      ]
+    );
+    created.push({ id: result.lastID, voucher_no: voucherNo, type: row.key, amount: row.amount });
+  }
+
+  return created;
+}
+
 function assignedWarehouseIdsForMongo(user) {
   const ids = user?.assigned_warehouse_ids || user?.assigned_sqlite_warehouse_ids || [];
   return ids.map((id) => String(id));
@@ -2176,9 +2243,8 @@ router.put("/sale/:id", (req, res) => {
         if (deductionOnly) {
           const existing = await SaleVoucher.findById(id);
           if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
-          // Recompute shortage based on submitted unloading/quantity/rate when available
           const grossAmount = Number(req.body.amount !== undefined ? req.body.amount : existing.amount || 0);
-          const claimValue = Number(req.body.claim_amount !== undefined ? req.body.claim_amount : existing.claim_amount) || 0;
+          const manualClaimValue = Number(req.body.claim_amount !== undefined ? req.body.claim_amount : existing.claim_amount) || 0;
           const adjustmentValue = Number(req.body.adjustment_amount !== undefined ? req.body.adjustment_amount : existing.adjustment_amount) || 0;
           const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
           const roundOffValue = Number(req.body.round_off !== undefined ? req.body.round_off : existing.round_off) || 0;
@@ -2187,15 +2253,22 @@ router.put("/sale/:id", (req, res) => {
           const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : existing.unloading_qty || req.body.quantity || existing.quantity) || 0;
 
           const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
-          const shortageAmount = Number((shortageQty * rateValue) || 0);
+          const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
 
-          // Merge other deduction: include any submitted other_deduction plus computed shortage amount
-          const baseOtherDeduction = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
-          const otherDeductionValue = baseOtherDeduction + shortageAmount;
+          const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : shortageAmount;
+          const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
 
           const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
 
+          existing.unloading_date = req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date;
+          existing.unloading_qty = unloadingQtyValue;
           existing.shortage_quantity = shortageQty;
+          existing.moisture = Number(req.body.moisture !== undefined ? req.body.moisture : existing.moisture) || 0;
+          existing.dunki = Number(req.body.dunki !== undefined ? req.body.dunki : existing.dunki) || 0;
+          existing.fungus = Number(req.body.fungus !== undefined ? req.body.fungus : existing.fungus) || 0;
+          existing.discolour = Number(req.body.discolour !== undefined ? req.body.discolour : existing.discolour) || 0;
+          existing.others = Number(req.body.others !== undefined ? req.body.others : existing.others) || 0;
+          existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : existing.total_deduction) || 0;
           existing.claim_amount = claimValue;
           existing.other_deduction = otherDeductionValue;
           existing.adjustment_amount = adjustmentValue;
@@ -2206,7 +2279,14 @@ router.put("/sale/:id", (req, res) => {
           existing.net_amount_payable = netAmount;
           existing.outstanding = netAmount;
           const saved = await existing.save();
-          return res.json({ id: String(saved._id), updated: 1, voucher_no: saved.voucher_no, deduction_only: true, saved_to: "mongodb", shortage_qty: existing.shortage_quantity, shortage_amount: shortageAmount });
+          const journals = await recreateSaleDeductionJournals({
+            sale: saved,
+            body: req.body,
+            shortageAmount,
+            deductionAmount: otherDeductionValue + adjustmentValue,
+            tdsAmount: tdsValue,
+          });
+          return res.json({ id: String(saved._id), updated: 1, voucher_no: saved.voucher_no, deduction_only: true, saved_to: "mongodb", shortage_qty: existing.shortage_quantity, shortage_amount: shortageAmount, journals });
         }
         if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
         if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
@@ -2234,12 +2314,10 @@ router.put("/sale/:id", (req, res) => {
   if (!deductionOnly && !product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
 
   if (deductionOnly) {
-    const claimValue = Number(req.body.claim_amount) || 0;
     const adjustmentValue = Number(req.body.adjustment_amount) || 0;
     const tdsValue = Number(req.body.tds_amount) || 0;
     const roundOffValue = Number(req.body.round_off) || 0;
-    // Recompute shortage and include shortage amount into other deduction when possible
-    return db.get("SELECT amount, voucher_no, quantity, unloading_qty, rate, other_deduction FROM wh_sale_vouchers WHERE id = ?", [id], (findErr, existing) => {
+    return db.get("SELECT * FROM wh_sale_vouchers WHERE id = ?", [id], async (findErr, existing) => {
       if (findErr) return res.status(500).json({ error: findErr.message });
       if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
       const grossAmount = Number(req.body.amount !== undefined ? req.body.amount : existing.amount || 0);
@@ -2247,25 +2325,52 @@ router.put("/sale/:id", (req, res) => {
       const saleQty = Number(existing.quantity || 0);
       const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : existing.unloading_qty || req.body.quantity || existing.quantity) || 0;
       const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
-      const shortageAmount = Number((shortageQty * rateValue) || 0);
-      const baseOtherDeduction = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
-      const mergedOtherDeduction = baseOtherDeduction + shortageAmount;
-      const netAmount = grossAmount - claimValue - mergedOtherDeduction - adjustmentValue - tdsValue + roundOffValue;
+      const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
+      const claimValue = req.body.claim_amount !== undefined ? Number(req.body.claim_amount) || 0 : shortageAmount;
+      const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
+      const totalDeductionValue = Number(req.body.total_deduction) || 0;
+      const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
       const deductionQuery = `
         UPDATE wh_sale_vouchers SET
-          shortage_quantity=?, claim_amount=?, other_deduction=?, adjustment_amount=?, tds_amount=?, round_off=?,
-          net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?, unloading_qty=?
+          unloading_date=?, shortage_quantity=?, unloading_qty=?, moisture=?, dunki=?, fungus=?, discolour=?, others=?, total_deduction=?,
+          claim_amount=?, other_deduction=?, adjustment_amount=?, tds_amount=?, round_off=?,
+          net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?
         WHERE id = ?
       `;
-      db.run(
-        deductionQuery,
-        [shortageQty, claimValue, mergedOtherDeduction, adjustmentValue, tdsValue, roundOffValue, netAmount, netAmount, netAmount, netAmount, unloadingQtyValue, id],
-        function (updateErr) {
-          if (updateErr) return res.status(500).json({ error: updateErr.message });
-          return res.json({ id, updated: 1, voucher_no: existing.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount, shortage_quantity: shortageQty, shortage_amount: shortageAmount });
-        }
-      );
-    }, company_account_id || null);
+      try {
+        await dbRunPromise(deductionQuery, [
+          req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date,
+          shortageQty,
+          unloadingQtyValue,
+          Number(req.body.moisture) || 0,
+          Number(req.body.dunki) || 0,
+          Number(req.body.fungus) || 0,
+          Number(req.body.discolour) || 0,
+          Number(req.body.others) || 0,
+          totalDeductionValue,
+          claimValue,
+          otherDeductionValue,
+          adjustmentValue,
+          tdsValue,
+          roundOffValue,
+          netAmount,
+          netAmount,
+          netAmount,
+          netAmount,
+          id,
+        ]);
+        const journals = await recreateSaleDeductionJournals({
+          sale: existing,
+          body: req.body,
+          shortageAmount,
+          deductionAmount: otherDeductionValue + adjustmentValue,
+          tdsAmount: tdsValue,
+        });
+        return res.json({ id, updated: 1, voucher_no: existing.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount, shortage_quantity: shortageQty, shortage_amount: shortageAmount, journals });
+      } catch (updateErr) {
+        return res.status(500).json({ error: updateErr.message });
+      }
+    });
   }
 
   const amountValue = Number(amount) || 0;
@@ -3163,6 +3268,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       adjustmentsByPurchase.get(purchaseId).push(detail);
     });
 
+    const saleVoucherNos = new Set((sales || []).map((row) => String(row.voucher_no || "")).filter(Boolean));
     const rows = [
       ...purchases.map((row) => {
         const purchaseId = String(row.id || row._id);
@@ -3259,6 +3365,23 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         WHERE 1 = 1 ${filter.clause}${accountClause}${buyerClause}
       `,
       receiptParams
+    );
+
+    const journalParams = [...filter.params];
+    let journalAccountClause = "";
+    if (companyAccountId) {
+      journalAccountClause = " AND CAST(j.company_account_id AS TEXT) = CAST(? AS TEXT)";
+      journalParams.push(companyAccountId);
+    }
+    const journals = await dbAll(
+      `
+        SELECT j.*, w.name AS warehouse_name, ca.account_name AS company_account_name
+        FROM wh_journal_vouchers j
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(j.warehouse_id AS TEXT)
+        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(j.company_account_id AS TEXT)
+        WHERE j.description LIKE 'Auto sale deduction:%' ${filter.clause.replace(/r\./g, "j.")}${journalAccountClause}
+      `,
+      journalParams
     );
 
     const receiptIds = (receipts || []).map((row) => row.id);
@@ -3400,6 +3523,28 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           credit: Number(row.amount || 0),
           particulars: `Receipt adjusted against ${receiptItems.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || "sale bill"}`,
           adjustment_details: receiptItems.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+        };
+      }),
+      ...journals.filter((row) => {
+        const sourceVoucher = String(row.description || "").split(":")[1] || "";
+        return !buyerId || !sourceVoucher || saleVoucherNos.has(sourceVoucher);
+      }).map((row) => {
+        const parts = String(row.description || "").split(":");
+        const sourceVoucher = parts[1] || "";
+        return {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: row.credit_account || "Journal",
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name,
+          company_account_id: row.company_account_id,
+          company_account_name: row.company_account_name,
+          buyer_id: `account-${row.company_account_id || "unknown"}`,
+          buyer_name: row.company_account_name || "Sale Deduction",
+          debit: 0,
+          credit: Number(row.amount || 0),
+          particulars: `${row.credit_account || "Deduction"} against ${sourceVoucher || "sale bill"}`,
+          adjustment_details: row.description || "",
         };
       }),
     ];
