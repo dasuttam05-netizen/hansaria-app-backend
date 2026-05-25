@@ -184,6 +184,7 @@ function buildSalePayload(body, voucherNo) {
     company_id: body.company_id || body.buyer_id ? String(body.company_id || body.buyer_id) : "",
     company_account_id: body.company_account_id ? String(body.company_account_id) : "",
     consignee_id: body.consignee_id ? String(body.consignee_id) : "",
+    lorry_no: body.lorry_no || body.reference_id || "",
     product_id: body.product_id ? String(body.product_id) : "",
     employee_id: body.employee_id ? String(body.employee_id) : "",
     location_id: body.location_id ? String(body.location_id) : "",
@@ -2309,7 +2310,7 @@ router.put("/sale/:id", (req, res) => {
     })();
   }
 
-  const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, lorry_no, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
   if (!deductionOnly && !company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
   if (!deductionOnly && !product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
 
@@ -2398,7 +2399,7 @@ router.put("/sale/:id", (req, res) => {
         }
         const query = `
           UPDATE wh_sale_vouchers SET
-            voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?, product_id=?,
+            voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?, lorry_no=?, product_id=?,
             quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?,
             adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, fifo_rate=?, fifo_amount=?,
             outstanding=?, employee_id=?, location_id=?, description=?
@@ -2406,7 +2407,7 @@ router.put("/sale/:id", (req, res) => {
         `;
 
         return db.run(query, [
-          voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id, product_id,
+          voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id, lorry_no || req.body.reference_id || "", product_id,
           quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue,
           adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, netAmount, fifoRateValue, fifoAmountValue,
           netAmount, employee_id, location_id, description, id
@@ -3686,6 +3687,7 @@ router.get("/sale/:id/pdf", (req, res) => {
     doc.fontSize(11).text(`Voucher No: ${row.voucher_no || "-"}`);
     doc.text(`Sale Date: ${fmtDate(row.date)}`);
     doc.text(`Unloading Date: ${fmtDate(row.unloading_date)}`);
+    doc.text(`Lorry No: ${row.lorry_no || row.reference_id || "-"}`);
     doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`);
     doc.text(`Buyer: ${row.buyer_name || row.company_name || "-"}`);
     doc.text(`Consignee: ${row.consignee_name || "-"}`);
