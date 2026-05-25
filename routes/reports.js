@@ -96,6 +96,7 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) =>
       i.lorry_no,
       i.weight,
       i.company_id,
+      i.company_account_id,
       c.id AS company_id_val,
       c.name AS party_name,
       c.address AS company_address,
@@ -105,11 +106,11 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) =>
       p.name AS product_name,
       IFNULL(SUM(a.qty), 0) AS adjusted_qty
     FROM inward i
-    LEFT JOIN companies c ON c.id = i.company_id
-    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
-    LEFT JOIN warehouses w ON w.id = i.warehouse_id
-    LEFT JOIN products p ON p.id = i.product_id
-    LEFT JOIN adjustment a ON a.inward_id = i.id
+    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
+    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
+    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(i.product_id AS TEXT)
+    LEFT JOIN adjustment a ON CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
     WHERE ${where.join(" AND ")}
     GROUP BY i.id
     ORDER BY i.date ASC, i.id ASC
@@ -134,6 +135,7 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) =>
         party_name: row.party_name,
         company_address: row.company_address,
         company_mobile: row.company_mobile,
+        company_account_id: row.company_account_id,
         account_name: row.account_name,
         warehouse_name: row.warehouse_name,
         product_name: row.product_name,
@@ -151,13 +153,15 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) =>
 
     const summaryMap = {};
     details.forEach((row) => {
-      const key = `${row.party_name}`;
+      const key = `${row.party_name || ""}::${row.company_account_id || row.account_name || ""}`;
 
       if (!summaryMap[key]) {
         summaryMap[key] = {
           party_name: row.party_name,
           company_address: row.company_address,
           company_mobile: row.company_mobile,
+          company_account_id: row.company_account_id,
+          account_name: row.account_name,
           gross_weight: 0,
           shortage_qty: 0,
           net_qty: 0,
