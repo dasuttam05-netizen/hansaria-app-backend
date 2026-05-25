@@ -330,6 +330,7 @@ const saleVoucherSchema =
     company_id: String,
     company_account_id: String,
     consignee_id: String,
+    lorry_no: String,
     product_id: String,
     quantity: { type: Number, default: 0 },
     shortage_quantity: { type: Number, default: 0 },
