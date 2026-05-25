@@ -2106,14 +2106,26 @@ router.put("/sale/:id", (req, res) => {
         if (deductionOnly) {
           const existing = await SaleVoucher.findById(id);
           if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
-          const grossAmount = Number(existing.amount || 0);
-          const claimValue = Number(req.body.claim_amount) || 0;
-          const otherDeductionValue = Number(req.body.other_deduction) || 0;
-          const adjustmentValue = Number(req.body.adjustment_amount) || 0;
-          const tdsValue = Number(req.body.tds_amount) || 0;
-          const roundOffValue = Number(req.body.round_off) || 0;
+          // Recompute shortage based on submitted unloading/quantity/rate when available
+          const grossAmount = Number(req.body.amount !== undefined ? req.body.amount : existing.amount || 0);
+          const claimValue = Number(req.body.claim_amount !== undefined ? req.body.claim_amount : existing.claim_amount) || 0;
+          const adjustmentValue = Number(req.body.adjustment_amount !== undefined ? req.body.adjustment_amount : existing.adjustment_amount) || 0;
+          const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
+          const roundOffValue = Number(req.body.round_off !== undefined ? req.body.round_off : existing.round_off) || 0;
+          const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
+          const saleQty = Number(existing.quantity || 0);
+          const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : existing.unloading_qty || req.body.quantity || existing.quantity) || 0;
+
+          const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
+          const shortageAmount = Number((shortageQty * rateValue) || 0);
+
+          // Merge other deduction: include any submitted other_deduction plus computed shortage amount
+          const baseOtherDeduction = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
+          const otherDeductionValue = baseOtherDeduction + shortageAmount;
+
           const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
-          existing.shortage_quantity = Number(req.body.shortage_quantity) || 0;
+
+          existing.shortage_quantity = shortageQty;
           existing.claim_amount = claimValue;
           existing.other_deduction = otherDeductionValue;
           existing.adjustment_amount = adjustmentValue;
@@ -2124,7 +2136,7 @@ router.put("/sale/:id", (req, res) => {
           existing.net_amount_payable = netAmount;
           existing.outstanding = netAmount;
           const saved = await existing.save();
-          return res.json({ id: String(saved._id), updated: 1, voucher_no: saved.voucher_no, deduction_only: true, saved_to: "mongodb" });
+          return res.json({ id: String(saved._id), updated: 1, voucher_no: saved.voucher_no, deduction_only: true, saved_to: "mongodb", shortage_qty: existing.shortage_quantity, shortage_amount: shortageAmount });
         }
         if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
         if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
@@ -2153,28 +2165,34 @@ router.put("/sale/:id", (req, res) => {
 
   if (deductionOnly) {
     const claimValue = Number(req.body.claim_amount) || 0;
-    const otherDeductionValue = Number(req.body.other_deduction) || 0;
     const adjustmentValue = Number(req.body.adjustment_amount) || 0;
     const tdsValue = Number(req.body.tds_amount) || 0;
     const roundOffValue = Number(req.body.round_off) || 0;
-    const shortageValue = Number(req.body.shortage_quantity) || 0;
-    return db.get("SELECT amount, voucher_no FROM wh_sale_vouchers WHERE id = ?", [id], (findErr, existing) => {
+    // Recompute shortage and include shortage amount into other deduction when possible
+    return db.get("SELECT amount, voucher_no, quantity, unloading_qty, rate, other_deduction FROM wh_sale_vouchers WHERE id = ?", [id], (findErr, existing) => {
       if (findErr) return res.status(500).json({ error: findErr.message });
       if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
-      const grossAmount = Number(existing.amount) || 0;
-      const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
+      const grossAmount = Number(req.body.amount !== undefined ? req.body.amount : existing.amount || 0);
+      const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
+      const saleQty = Number(existing.quantity || 0);
+      const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : existing.unloading_qty || req.body.quantity || existing.quantity) || 0;
+      const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
+      const shortageAmount = Number((shortageQty * rateValue) || 0);
+      const baseOtherDeduction = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
+      const mergedOtherDeduction = baseOtherDeduction + shortageAmount;
+      const netAmount = grossAmount - claimValue - mergedOtherDeduction - adjustmentValue - tdsValue + roundOffValue;
       const deductionQuery = `
         UPDATE wh_sale_vouchers SET
           shortage_quantity=?, claim_amount=?, other_deduction=?, adjustment_amount=?, tds_amount=?, round_off=?,
-          net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?
+          net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?, unloading_qty=?
         WHERE id = ?
       `;
       db.run(
         deductionQuery,
-        [shortageValue, claimValue, otherDeductionValue, adjustmentValue, tdsValue, roundOffValue, netAmount, netAmount, netAmount, netAmount, id],
+        [shortageQty, claimValue, mergedOtherDeduction, adjustmentValue, tdsValue, roundOffValue, netAmount, netAmount, netAmount, netAmount, unloadingQtyValue, id],
         function (updateErr) {
           if (updateErr) return res.status(500).json({ error: updateErr.message });
-          return res.json({ id, updated: 1, voucher_no: existing.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount });
+          return res.json({ id, updated: 1, voucher_no: existing.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount, shortage_quantity: shortageQty, shortage_amount: shortageAmount });
         }
       );
     }, company_account_id || null);
