@@ -244,6 +244,57 @@ function buildSalePayload(body, voucherNo) {
   return payload;
 }
 
+async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = null }) {
+  const wId = String(warehouseId || "").trim();
+  const pId = String(productId || "").trim();
+  if (!wId || !pId) return 0;
+
+  if (mongoReady()) {
+    const purchaseFilter = { warehouse_id: wId, product_id: pId };
+    const saleFilter = { warehouse_id: wId, product_id: pId };
+    if (excludeSaleId && mongoose.Types.ObjectId.isValid(String(excludeSaleId))) {
+      saleFilter._id = { $ne: String(excludeSaleId) };
+    }
+    const [purchaseRows, saleRows] = await Promise.all([
+      PurchaseVoucher.find(purchaseFilter).lean(),
+      SaleVoucher.find(saleFilter).lean(),
+    ]);
+    const purchaseQty = (purchaseRows || []).reduce(
+      (sum, row) => sum + Number(row.total_qty || row.net_weight || row.quantity || 0),
+      0
+    );
+    const saleQty = (saleRows || []).reduce(
+      (sum, row) => sum + Number(row.unloading_qty || row.quantity || 0),
+      0
+    );
+    return Number((purchaseQty - saleQty).toFixed(4));
+  }
+
+  const purchaseQuery = `
+    SELECT COALESCE(SUM(COALESCE(NULLIF(total_qty, 0), NULLIF(net_weight, 0), quantity, 0)), 0) AS purchase_qty
+    FROM wh_purchase_vouchers
+    WHERE CAST(warehouse_id AS TEXT) = CAST(? AS TEXT) AND CAST(product_id AS TEXT) = CAST(? AS TEXT)
+  `;
+  const saleQuery = `
+    SELECT COALESCE(SUM(COALESCE(NULLIF(unloading_qty, 0), quantity, 0)), 0) AS sale_qty
+    FROM wh_sale_vouchers
+    WHERE CAST(warehouse_id AS TEXT) = CAST(? AS TEXT) AND CAST(product_id AS TEXT) = CAST(? AS TEXT)
+    ${excludeSaleId ? "AND CAST(id AS TEXT) <> CAST(? AS TEXT)" : ""}
+  `;
+  const purchaseRow = await dbGet(purchaseQuery, [wId, pId]);
+  const saleParams = excludeSaleId ? [wId, pId, String(excludeSaleId)] : [wId, pId];
+  const saleRow = await dbGet(saleQuery, saleParams);
+  const purchaseQty = Number(purchaseRow?.purchase_qty || 0);
+  const saleQty = Number(saleRow?.sale_qty || 0);
+  return Number((purchaseQty - saleQty).toFixed(4));
+}
+
+function dbGet(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => (err ? reject(err) : resolve(row || null)));
+  });
+}
+
 function assignedWarehouseIdsForMongo(user) {
   const ids = user?.assigned_warehouse_ids || user?.assigned_sqlite_warehouse_ids || [];
   return ids.map((id) => String(id));
@@ -2000,6 +2051,9 @@ router.post("/sale", (req, res) => {
   }
 
   const { voucher_no } = req.body;
+  if (!req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
+  if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
+  if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
   if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
 
   if (mongoReady()) {
@@ -2007,6 +2061,14 @@ router.post("/sale", (req, res) => {
       if (err) return res.status(500).json({ error: err.message });
       try {
         const payload = buildSalePayload(req.body, generatedVoucherNo);
+        const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
+        const availableQty = await getAvailableSaleStock({
+          warehouseId: payload.warehouse_id,
+          productId: payload.product_id,
+        });
+        if (saleQty > availableQty + 0.0001) {
+          return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+        }
         const doc = await SaleVoucher.create(payload);
         return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: doc.voucher_no, saved_to: "mongodb" });
       } catch (mongoErr) {
@@ -2023,12 +2085,48 @@ router.put("/sale/:id", (req, res) => {
   }
 
   const id = req.params.id;
+  const deductionOnly = Boolean(req.body?.deduction_only);
+  if (!req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
   if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
 
   if (mongoReady() && mongoose.Types.ObjectId.isValid(id)) {
     return (async () => {
       try {
+        if (deductionOnly) {
+          const existing = await SaleVoucher.findById(id);
+          if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
+          const grossAmount = Number(existing.amount || 0);
+          const claimValue = Number(req.body.claim_amount) || 0;
+          const otherDeductionValue = Number(req.body.other_deduction) || 0;
+          const adjustmentValue = Number(req.body.adjustment_amount) || 0;
+          const tdsValue = Number(req.body.tds_amount) || 0;
+          const roundOffValue = Number(req.body.round_off) || 0;
+          const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
+          existing.shortage_quantity = Number(req.body.shortage_quantity) || 0;
+          existing.claim_amount = claimValue;
+          existing.other_deduction = otherDeductionValue;
+          existing.adjustment_amount = adjustmentValue;
+          existing.tds_amount = tdsValue;
+          existing.round_off = roundOffValue;
+          existing.net_amount = netAmount;
+          existing.net_receivable_amount = netAmount;
+          existing.net_amount_payable = netAmount;
+          existing.outstanding = netAmount;
+          const saved = await existing.save();
+          return res.json({ id: String(saved._id), updated: 1, voucher_no: saved.voucher_no, deduction_only: true, saved_to: "mongodb" });
+        }
+        if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
+        if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
         const payload = buildSalePayload(req.body);
+        const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
+        const availableQty = await getAvailableSaleStock({
+          warehouseId: payload.warehouse_id,
+          productId: payload.product_id,
+          excludeSaleId: id,
+        });
+        if (saleQty > availableQty + 0.0001) {
+          return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+        }
         const doc = await SaleVoucher.findByIdAndUpdate(id, payload, { new: true });
         if (!doc) return res.status(404).json({ error: "Sale voucher not found" });
         return res.json({ id: String(doc._id), updated: 1, voucher_no: doc.voucher_no, saved_to: "mongodb" });
@@ -2039,6 +2137,37 @@ router.put("/sale/:id", (req, res) => {
   }
 
   const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
+  if (!deductionOnly && !company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
+  if (!deductionOnly && !product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
+
+  if (deductionOnly) {
+    const claimValue = Number(req.body.claim_amount) || 0;
+    const otherDeductionValue = Number(req.body.other_deduction) || 0;
+    const adjustmentValue = Number(req.body.adjustment_amount) || 0;
+    const tdsValue = Number(req.body.tds_amount) || 0;
+    const roundOffValue = Number(req.body.round_off) || 0;
+    const shortageValue = Number(req.body.shortage_quantity) || 0;
+    return db.get("SELECT amount, voucher_no FROM wh_sale_vouchers WHERE id = ?", [id], (findErr, existing) => {
+      if (findErr) return res.status(500).json({ error: findErr.message });
+      if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
+      const grossAmount = Number(existing.amount) || 0;
+      const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
+      const deductionQuery = `
+        UPDATE wh_sale_vouchers SET
+          shortage_quantity=?, claim_amount=?, other_deduction=?, adjustment_amount=?, tds_amount=?, round_off=?,
+          net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?
+        WHERE id = ?
+      `;
+      db.run(
+        deductionQuery,
+        [shortageValue, claimValue, otherDeductionValue, adjustmentValue, tdsValue, roundOffValue, netAmount, netAmount, netAmount, netAmount, id],
+        function (updateErr) {
+          if (updateErr) return res.status(500).json({ error: updateErr.message });
+          return res.json({ id, updated: 1, voucher_no: existing.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount });
+        }
+      );
+    });
+  }
 
   const amountValue = Number(amount) || 0;
   const claimValue = Number(claim_amount) || 0;
@@ -2052,27 +2181,42 @@ router.put("/sale/:id", (req, res) => {
   const fifoRateValue = unloadingQtyValue > 0 ? amountValue / unloadingQtyValue : 0;
   const netReceivableValue = netAmount;
 
-  const query = `
-    UPDATE wh_sale_vouchers SET
-      voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?, product_id=?,
-      quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?,
-      adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, fifo_rate=?, fifo_amount=?,
-      outstanding=?, employee_id=?, location_id=?, description=?
-    WHERE id = ?
-  `;
+  if (!deductionOnly) {
+    const saleQtyValue = Number(unloading_qty) || Number(quantity) || 0;
+    return getAvailableSaleStock({
+      warehouseId: warehouse_id,
+      productId: product_id,
+      excludeSaleId: id,
+    })
+      .then((availableQty) => {
+        if (saleQtyValue > availableQty + 0.0001) {
+          return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+        }
+        const query = `
+          UPDATE wh_sale_vouchers SET
+            voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?, product_id=?,
+            quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?,
+            adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, fifo_rate=?, fifo_amount=?,
+            outstanding=?, employee_id=?, location_id=?, description=?
+          WHERE id = ?
+        `;
 
-  db.run(query, [
-    voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id, product_id,
-    quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue,
-    adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, netAmount, fifoRateValue, fifoAmountValue,
-    netAmount, employee_id, location_id, description, id
-  ], function (err) {
-    if (err) {
-      if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-      return res.status(500).json({ error: err.message });
-    }
-    res.json({ id, updated: 1, net_amount: netAmount, net_receivable_amount: netReceivableValue, outstanding: netAmount });
-  });
+        return db.run(query, [
+          voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id, product_id,
+          quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue,
+          adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, netAmount, fifoRateValue, fifoAmountValue,
+          netAmount, employee_id, location_id, description, id
+        ], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+          res.json({ id, updated: 1, net_amount: netAmount, net_receivable_amount: netReceivableValue, outstanding: netAmount });
+        });
+      })
+      .catch((e) => res.status(500).json({ error: e.message }));
+  }
+
 });
 
 router.delete("/sale/:id", (req, res) => {
