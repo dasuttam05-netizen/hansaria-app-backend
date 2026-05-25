@@ -3161,40 +3161,95 @@ router.get("/report/sale-party-ledger", async (req, res) => {
     const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
     const receipts = await dbAll(
       `
-        SELECT r.*, w.name AS warehouse_name, c.name AS company_name
+        SELECT r.*, w.name AS warehouse_name, c.name AS company_name, ca.account_name AS company_account_name
         FROM wh_receipt_vouchers r
         LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(r.warehouse_id AS TEXT)
         LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(r.company_id AS TEXT)
+        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
         WHERE 1 = 1 ${filter.clause}
       `,
       filter.params
     );
 
+    const receiptIds = (receipts || []).map((row) => row.id);
+    const receiptAdjustments = receiptIds.length
+      ? await dbAll(
+          `
+            SELECT a.*, sv.voucher_no AS sale_voucher_no
+            FROM wh_receipt_adjustments a
+            LEFT JOIN wh_sale_vouchers sv ON CAST(sv.id AS TEXT) = CAST(a.sale_id AS TEXT)
+            WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
+            ORDER BY a.id ASC
+          `,
+          receiptIds
+        )
+      : [];
+
+    const saleMap = new Map((sales || []).map((row) => [String(row.id || row._id), row]));
+    const receiptMap = new Map((receipts || []).map((row) => [String(row.id), row]));
+    const adjustmentsByReceipt = new Map();
+    const adjustmentsBySale = new Map();
+    (receiptAdjustments || []).forEach((item) => {
+      const receiptId = String(item.receipt_id);
+      const saleId = String(item.sale_id);
+      const sale = saleMap.get(saleId);
+      const receipt = receiptMap.get(receiptId);
+      const detail = {
+        ...item,
+        sale_voucher_no: item.sale_voucher_no || sale?.voucher_no || item.sale_id,
+        receipt_voucher_no: receipt?.voucher_no || "",
+        receipt_date: receipt?.date || "",
+      };
+      if (!adjustmentsByReceipt.has(receiptId)) adjustmentsByReceipt.set(receiptId, []);
+      adjustmentsByReceipt.get(receiptId).push(detail);
+      if (!adjustmentsBySale.has(saleId)) adjustmentsBySale.set(saleId, []);
+      adjustmentsBySale.get(saleId).push(detail);
+    }, company_account_id || null);
+
     const rows = [
-      ...sales.map((row) => ({
-        date: row.date,
-        voucher_no: row.voucher_no,
-        voucher_type: "Sale",
-        warehouse_id: row.warehouse_id,
-        warehouse_name: row.warehouse_name,
-        company_id: row.buyer_id || row.company_id,
-        company_name: row.buyer_name || row.company_name,
-        buyer_id: row.buyer_id,
-        buyer_name: row.buyer_name,
-        debit: Number(row.total_amount || row.net_receivable_amount || row.amount || 0),
-        credit: 0,
-      })),
-      ...receipts.map((row) => ({
-        date: row.date,
-        voucher_no: row.voucher_no,
-        voucher_type: "Receipt",
-        warehouse_id: row.warehouse_id,
-        warehouse_name: row.warehouse_name,
-        company_id: row.company_id,
-        company_name: row.company_name,
-        debit: 0,
-        credit: Number(row.amount || 0),
-      })),
+      ...sales.map((row) => {
+        const saleId = String(row.id || row._id);
+        const receiptDetails = adjustmentsBySale.get(saleId) || [];
+        const saleAmount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+        const receiptAmount = receiptDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
+        return {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Sale",
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name,
+          company_id: row.buyer_id || row.company_id,
+          company_name: row.buyer_name || row.company_name,
+          company_account_name: row.company_account_name,
+          buyer_id: row.buyer_id,
+          buyer_name: row.buyer_name,
+          sale_id: saleId,
+          sale_amount: Number(saleAmount.toFixed(2)),
+          receipt_amount: Number(receiptAmount.toFixed(2)),
+          journal_amount: 0,
+          payment_details: receiptDetails,
+          bill_balance: Number((saleAmount - receiptAmount).toFixed(2)),
+          debit: saleAmount,
+          credit: 0,
+        };
+      }),
+      ...receipts.map((row) => {
+        const receiptItems = adjustmentsByReceipt.get(String(row.id)) || [];
+        return {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Receipt",
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name,
+          company_id: row.company_id,
+          company_name: row.company_name,
+          company_account_name: row.company_account_name,
+          debit: 0,
+          credit: Number(row.amount || 0),
+          particulars: `Receipt adjusted against ${receiptItems.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || "sale bill"}`,
+          adjustment_details: receiptItems.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+        };
+      }),
     ];
 
     res.json(buildLedgerRows(rows, (row) => row.buyer_id || row.company_id, (row) => row.buyer_name || row.company_name || "Unknown Buyer"));
