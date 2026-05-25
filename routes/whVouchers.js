@@ -3269,7 +3269,8 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       adjustmentsByPurchase.get(purchaseId).push(detail);
     });
 
-    const saleVoucherNos = new Set((sales || []).map((row) => String(row.voucher_no || "")).filter(Boolean));
+    const saleByVoucherNo = new Map((sales || []).map((row) => [String(row.voucher_no || ""), row]).filter(([voucherNo]) => voucherNo));
+    const saleVoucherNos = new Set(saleByVoucherNo.keys());
     const rows = [
       ...purchases.map((row) => {
         const purchaseId = String(row.id || row._id);
@@ -3532,16 +3533,19 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       }).map((row) => {
         const parts = String(row.description || "").split(":");
         const sourceVoucher = parts[1] || "";
+        const sourceSale = saleByVoucherNo.get(sourceVoucher);
         return {
           date: row.date,
           voucher_no: row.voucher_no,
           voucher_type: row.credit_account || "Journal",
           warehouse_id: row.warehouse_id,
-          warehouse_name: row.warehouse_name,
-          company_account_id: row.company_account_id,
-          company_account_name: row.company_account_name,
-          buyer_id: `account-${row.company_account_id || "unknown"}`,
-          buyer_name: row.company_account_name || "Sale Deduction",
+          warehouse_name: row.warehouse_name || sourceSale?.warehouse_name,
+          company_id: sourceSale?.buyer_id || sourceSale?.company_id,
+          company_name: sourceSale?.buyer_name || sourceSale?.company_name,
+          company_account_id: row.company_account_id || sourceSale?.company_account_id,
+          company_account_name: row.company_account_name || sourceSale?.company_account_name,
+          buyer_id: sourceSale?.buyer_id || sourceSale?.company_id || `account-${row.company_account_id || "unknown"}`,
+          buyer_name: sourceSale?.buyer_name || sourceSale?.company_name || row.company_account_name || "Sale Deduction",
           debit: 0,
           credit: Number(row.amount || 0),
           particulars: `${row.credit_account || "Deduction"} against ${sourceVoucher || "sale bill"}`,
