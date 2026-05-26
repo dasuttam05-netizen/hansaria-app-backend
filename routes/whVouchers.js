@@ -3346,6 +3346,8 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       if (buyerId && String(row.buyer_id || row.company_id || "") !== buyerId) return false;
       return true;
     });
+    const saleByVoucherNo = new Map((sales || []).map((row) => [String(row.voucher_no || ""), row]).filter(([voucherNo]) => voucherNo));
+    const saleVoucherNos = new Set(saleByVoucherNo.keys());
     const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
     const receiptParams = [...filter.params];
     let accountClause = "";
