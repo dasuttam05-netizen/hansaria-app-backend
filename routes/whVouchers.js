@@ -3666,13 +3666,11 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           adjustment_details: receiptItems.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
         };
       }),
-      ...journals.filter((row) => {
-        const sourceVoucher = String(row.description || "").split(":")[1] || "";
-        return !buyerId || !sourceVoucher || saleVoucherNos.has(sourceVoucher);
-      }).map((row) => {
+      ...journals.map((row) => {
         const parts = String(row.description || "").split(":");
         const sourceVoucher = parts[1] || "";
         const sourceSale = saleByVoucherNo.get(sourceVoucher);
+        if (!sourceSale) return null;
         return {
           date: row.date,
           voucher_no: row.voucher_no,
@@ -3690,7 +3688,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           particulars: `${row.credit_account || "Deduction"} against ${sourceVoucher || "sale bill"}`,
           adjustment_details: row.description || "",
         };
-      }),
+      }).filter(Boolean),
     ];
 
     res.json(buildLedgerRows(
