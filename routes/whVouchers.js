@@ -2673,6 +2673,24 @@ router.get("/receipt", (req, res) => {
   getWarehouseScopedRows(req, res, "wh_receipt_vouchers");
 });
 
+router.get("/receipt/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    db.all("SELECT sale_id, voucher_no, adjusted_amount FROM wh_receipt_adjustments WHERE receipt_id = ?", [id], (adjErr, adjustments) => {
+      if (adjErr) return res.status(500).json({ error: adjErr.message });
+      res.json({ ...row, adjustments: adjustments || [] });
+    });
+  });
+});
+
 router.post("/receipt", (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.receipt.manage")) {
     return res.status(403).json({ error: "Permission denied" });
@@ -2751,6 +2769,116 @@ router.post("/receipt", (req, res) => {
             if (err2) return res.status(500).json({ error: err2.message });
             db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
               res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+router.put("/receipt/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+  if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
+
+  db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (findErr, oldRow) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!oldRow) return res.status(404).json({ error: "Receipt voucher not found" });
+    if (!ensureWarehouseAccess(req, res, oldRow.warehouse_id)) return;
+
+    validateReceiptAdjustments({ companyId: company_id, amount, adjustments }, (validationErr, cleanAdjustments) => {
+      if (validationErr) return res.status(400).json({ error: validationErr.message });
+
+      const finalReferenceType = reference_type || "sale";
+      const finalReferenceId = reference_id || buildReceiptReferenceId(cleanAdjustments);
+      const query = `
+        UPDATE wh_receipt_vouchers SET
+          voucher_no=?, date=?, warehouse_id=?, company_id=?, company_account_id=?, consignee_id=?, amount=?,
+          reference_type=?, reference_id=?, employee_id=?, location_id=?, description=?, updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+      `;
+
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION");
+        db.run(query, [voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description, id], function (err) {
+          if (err) {
+            db.run("ROLLBACK");
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+
+          db.run("DELETE FROM wh_receipt_adjustments WHERE receipt_id = ?", [id], (deleteErr) => {
+            if (deleteErr) {
+              db.run("ROLLBACK");
+              return res.status(500).json({ error: deleteErr.message });
+            }
+
+            insertReceiptAdjustments(id, cleanAdjustments, (adjErr) => {
+              if (adjErr) {
+                db.run("ROLLBACK");
+                return res.status(500).json({ error: adjErr.message });
+              }
+              computeOutstandingForCompany(company_id, (statsErr, stats) => {
+                if (statsErr) {
+                  db.run("ROLLBACK");
+                  return res.status(500).json({ error: statsErr.message });
+                }
+                db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, id], (outErr) => {
+                  if (outErr) {
+                    db.run("ROLLBACK");
+                    return res.status(500).json({ error: outErr.message });
+                  }
+                  db.run("COMMIT", (commitErr) => {
+                    if (commitErr) return res.status(500).json({ error: commitErr.message });
+                    res.json({ id, updated: 1, voucher_no, stats, adjustments: cleanAdjustments, reference_id: finalReferenceId });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+router.delete("/receipt/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (findErr, row) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION");
+      db.run("DELETE FROM wh_receipt_adjustments WHERE receipt_id = ?", [id], (adjErr) => {
+        if (adjErr) {
+          db.run("ROLLBACK");
+          return res.status(500).json({ error: adjErr.message });
+        }
+        db.run("DELETE FROM wh_receipt_vouchers WHERE id = ?", [id], function (deleteErr) {
+          if (deleteErr) {
+            db.run("ROLLBACK");
+            return res.status(500).json({ error: deleteErr.message });
+          }
+          computeOutstandingForCompany(row.company_id, (statsErr, stats) => {
+            if (statsErr) {
+              db.run("ROLLBACK");
+              return res.status(500).json({ error: statsErr.message });
+            }
+            db.run("COMMIT", (commitErr) => {
+              if (commitErr) return res.status(500).json({ error: commitErr.message });
+              res.json({ deleted: 1, stats });
             });
           });
         });
