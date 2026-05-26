@@ -2684,10 +2684,18 @@ router.get("/receipt/:id", (req, res) => {
     if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
     if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
 
-    db.all("SELECT sale_id, voucher_no, adjusted_amount FROM wh_receipt_adjustments WHERE receipt_id = ?", [id], (adjErr, adjustments) => {
-      if (adjErr) return res.status(500).json({ error: adjErr.message });
-      res.json({ ...row, adjustments: adjustments || [] });
-    });
+    // Join with wh_sale_vouchers to fetch voucher_no for each adjusted sale
+    db.all(
+      `SELECT r.sale_id, sv.voucher_no, r.adjusted_amount
+       FROM wh_receipt_adjustments r
+       LEFT JOIN wh_sale_vouchers sv ON CAST(sv.id AS TEXT) = CAST(r.sale_id AS TEXT)
+       WHERE r.receipt_id = ?`,
+      [id],
+      (adjErr, adjustments) => {
+        if (adjErr) return res.status(500).json({ error: adjErr.message });
+        res.json({ ...row, adjustments: adjustments || [] });
+      }
+    );
   });
 });
 
