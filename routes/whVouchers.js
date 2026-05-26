@@ -63,8 +63,8 @@ function getSqliteSaleRowsForUser(user) {
         ca.account_name AS company_account_name,
         w.name AS warehouse_name,
         p.name AS product_name,
-        COALESCE(NULLIF(v.unloading_qty, 0), v.quantity) AS total_quantity,
-        COALESCE(NULLIF(v.net_receivable_amount, 0), NULLIF(v.net_amount, 0), NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+        v.quantity AS total_quantity,
+        v.amount AS total_amount
       FROM wh_sale_vouchers v
       LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(v.buyer_id, v.company_id) AS TEXT)
       LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(v.consignee_id AS TEXT)
@@ -110,8 +110,8 @@ function getSaleVoucherRowsSqlite(req, res) {
       ca.account_name AS company_account_name,
       w.name AS warehouse_name,
       p.name AS product_name,
-      COALESCE(NULLIF(v.unloading_qty, 0), v.quantity) AS total_quantity,
-      COALESCE(NULLIF(v.net_receivable_amount, 0), NULLIF(v.net_amount, 0), NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+      v.quantity AS total_quantity,
+      v.amount AS total_amount
     FROM wh_sale_vouchers v
     LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(v.buyer_id, v.company_id) AS TEXT)
     LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(v.consignee_id AS TEXT)
@@ -264,10 +264,7 @@ async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = n
       (sum, row) => sum + Number(row.total_qty || row.net_weight || row.quantity || 0),
       0
     );
-    const saleQty = (saleRows || []).reduce(
-      (sum, row) => sum + Number(row.unloading_qty || row.quantity || 0),
-      0
-    );
+    const saleQty = (saleRows || []).reduce((sum, row) => sum + Number(row.quantity || 0), 0);
     return Number((purchaseQty - saleQty).toFixed(4));
   }
 
@@ -277,7 +274,7 @@ async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = n
     WHERE CAST(warehouse_id AS TEXT) = CAST(? AS TEXT) AND CAST(product_id AS TEXT) = CAST(? AS TEXT)
   `;
   const saleQuery = `
-    SELECT COALESCE(SUM(COALESCE(NULLIF(unloading_qty, 0), quantity, 0)), 0) AS sale_qty
+    SELECT COALESCE(SUM(COALESCE(quantity, 0)), 0) AS sale_qty
     FROM wh_sale_vouchers
     WHERE CAST(warehouse_id AS TEXT) = CAST(? AS TEXT) AND CAST(product_id AS TEXT) = CAST(? AS TEXT)
     ${excludeSaleId ? "AND CAST(id AS TEXT) <> CAST(? AS TEXT)" : ""}
@@ -491,8 +488,8 @@ async function decorateSaleRows(rows) {
     const account = mongoAccountMap.get(String(plain.company_account_id)) || sqliteAccounts.get(String(plain.company_account_id));
     const buyer = sqliteBuyers.get(String(buyerId));
     const consignee = sqliteConsignees.get(String(plain.consignee_id));
-    const totalQuantity = plain.unloading_qty || plain.quantity || Math.max(Number(plain.gross_weight || 0) - Number(plain.tare_weight || 0), 0);
-    const totalAmount = plain.net_receivable_amount || plain.net_amount || plain.net_amount_payable || plain.amount || 0;
+    const totalQuantity = plain.quantity || Math.max(Number(plain.gross_weight || 0) - Number(plain.tare_weight || 0), 0);
+    const totalAmount = plain.amount || 0;
     return {
       ...plain,
       id: String(plain._id || plain.id),
@@ -3076,8 +3073,8 @@ function groupStock(purchases, sales) {
 
   sales.forEach((row) => {
     const item = ensure(row);
-    const qty = Number(row.total_quantity || row.unloading_qty || row.quantity || 0);
-    const amount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+    const qty = Number(row.quantity || row.total_quantity || 0);
+    const amount = Number(row.amount || row.total_amount || 0);
     item.sale_qty += qty;
     item.sale_amount += amount;
     item.sale_details.push({
@@ -3135,7 +3132,7 @@ function buildFifoStock(purchases, sales) {
     .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
     .forEach((row) => {
       const lots = lotsByKey.get(keyOf(row)) || [];
-      let saleQty = Number(row.total_quantity || row.unloading_qty || row.quantity || 0);
+      let saleQty = Number(row.quantity || row.total_quantity || 0);
       for (const lot of lots) {
         if (saleQty <= 0) break;
         const used = Math.min(lot.remaining_qty, saleQty);
@@ -3175,8 +3172,8 @@ router.get("/report/sale-summary", (req, res) => {
       res.json(
         (rows || []).map((row) => ({
           ...row,
-          total_quantity: Number(Number(row.total_quantity || row.unloading_qty || row.quantity || 0).toFixed(4)),
-          total_amount: Number(Number(row.total_amount || row.net_receivable_amount || row.net_amount || row.amount || 0).toFixed(2)),
+          total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
+          total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
         }))
       )
     )
@@ -3315,7 +3312,7 @@ router.get("/report/profit-loss", async (req, res) => {
     });
     sales.forEach((row) => {
       const item = ensure(row);
-      item.sale_amount += Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+      item.sale_amount += Number(row.amount || row.total_amount || 0);
     });
 
     res.json(
