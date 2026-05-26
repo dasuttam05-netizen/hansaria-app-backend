@@ -3789,30 +3789,42 @@ router.get("/purchase/:id/pdf", (req, res) => {
   });
 });
 
-router.get("/sale/:id/pdf", (req, res) => {
+router.get("/sale/:id/pdf", async (req, res) => {
   const id = req.params.id;
-  const q = `
-    SELECT
-      s.*,
-      COALESCE(s.buyer_id, s.company_id) AS buyer_id,
-      w.name AS warehouse_name,
-      c.name AS company_name,
-      b.name AS buyer_name,
-      co.name AS consignee_name,
-      p.name AS product_name
-    FROM wh_sale_vouchers s
-    LEFT JOIN warehouses w ON w.id = s.warehouse_id
-    LEFT JOIN companies c ON c.id = s.company_id
-    LEFT JOIN buyer_names b ON b.id = COALESCE(s.buyer_id, s.company_id)
-    LEFT JOIN consignee_names co ON co.id = s.consignee_id
-    LEFT JOIN products p ON p.id = s.product_id
-    WHERE s.id = ?
-  `;
-
-  db.get(q, [id], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: "Not found" });
+  try {
     if (!req.user) return res.status(403).json({ error: "Authentication required" });
+
+    let row = null;
+    if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+      const doc = await SaleVoucher.findById(id).lean();
+      if (doc) {
+        const decorated = await decorateSaleRows([doc]);
+        row = decorated[0] || null;
+      }
+    }
+
+    if (!row) {
+      const q = `
+        SELECT
+          s.*,
+          COALESCE(s.buyer_id, s.company_id) AS buyer_id,
+          w.name AS warehouse_name,
+          c.name AS company_name,
+          b.name AS buyer_name,
+          co.name AS consignee_name,
+          p.name AS product_name
+        FROM wh_sale_vouchers s
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+        LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(s.buyer_id, s.company_id) AS TEXT)
+        LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
+        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
+        WHERE CAST(s.id AS TEXT) = CAST(? AS TEXT)
+      `;
+      row = await dbGet(q, [id]);
+    }
+
+    if (!row) return res.status(404).json({ error: "Not found" });
     if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
 
     const doc = new PDFDocument({ size: "A4", margin: 36 });
@@ -3831,15 +3843,13 @@ router.get("/sale/:id/pdf", (req, res) => {
     doc.text(`Consignee: ${row.consignee_name || "-"}`);
     doc.text(`Product: ${row.product_name || "-"}`);
     doc.moveDown(0.4);
-    doc.text(`Qty: ${fmtNum(row.quantity)}`);
+    doc.text(`Dispatch Qty: ${fmtNum(row.quantity)}`);
     doc.text(`Unloading Qty: ${fmtNum(row.unloading_qty || row.quantity)}`);
     doc.text(`Shortage Qty: ${fmtNum(row.shortage_quantity)}`);
     doc.text(`Rate: ${fmtNum(row.rate)}`);
     doc.text(`Amount: ${fmtNum(row.amount)}`);
-    doc.text(`Claim: ${fmtNum(row.claim_amount)}`);
-    doc.text(`Other Deduction: ${fmtNum(row.other_deduction)}`);
-    doc.text(`Adjustment: ${fmtNum(row.adjustment_amount)}`);
-    doc.text(`TDS: ${fmtNum(row.tds_amount)}`);
+    doc.text(`Shortage Amount: ${fmtNum(row.claim_amount)}`);
+    doc.text(`Total Deduction: ${fmtNum((Number(row.claim_amount) || 0) + (Number(row.other_deduction) || 0) + (Number(row.adjustment_amount) || 0) + (Number(row.tds_amount) || 0))}`);
     doc.text(`Net Receivable: ${fmtNum(row.net_receivable_amount || row.net_amount || row.amount)}`);
     doc.text(`Outstanding: ${fmtNum(row.outstanding)}`);
 
@@ -3849,7 +3859,9 @@ router.get("/sale/:id/pdf", (req, res) => {
     }
 
     doc.end();
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Update purchase voucher
