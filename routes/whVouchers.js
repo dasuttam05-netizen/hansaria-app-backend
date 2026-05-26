@@ -2244,13 +2244,13 @@ router.put("/sale/:id", (req, res) => {
         if (deductionOnly) {
           const existing = await SaleVoucher.findById(id);
           if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
-          const grossAmount = Number(req.body.amount !== undefined ? req.body.amount : existing.amount || 0);
           const manualClaimValue = Number(req.body.claim_amount !== undefined ? req.body.claim_amount : existing.claim_amount) || 0;
           const adjustmentValue = Number(req.body.adjustment_amount !== undefined ? req.body.adjustment_amount : existing.adjustment_amount) || 0;
           const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
           const roundOffValue = Number(req.body.round_off !== undefined ? req.body.round_off : existing.round_off) || 0;
           const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
           const saleQty = Number(existing.quantity || 0);
+          const grossAmount = Number(((saleQty * rateValue) || existing.amount || 0).toFixed(2));
           const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : existing.unloading_qty || req.body.quantity || existing.quantity) || 0;
 
           const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
@@ -2270,6 +2270,7 @@ router.put("/sale/:id", (req, res) => {
           existing.discolour = Number(req.body.discolour !== undefined ? req.body.discolour : existing.discolour) || 0;
           existing.others = Number(req.body.others !== undefined ? req.body.others : existing.others) || 0;
           existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : existing.total_deduction) || 0;
+          existing.amount = grossAmount;
           existing.claim_amount = claimValue;
           existing.other_deduction = otherDeductionValue;
           existing.adjustment_amount = adjustmentValue;
@@ -2279,6 +2280,8 @@ router.put("/sale/:id", (req, res) => {
           existing.net_receivable_amount = netAmount;
           existing.net_amount_payable = netAmount;
           existing.outstanding = netAmount;
+          existing.fifo_amount = grossAmount;
+          existing.fifo_rate = saleQty > 0 ? grossAmount / saleQty : 0;
           const saved = await existing.save();
           const journals = await recreateSaleDeductionJournals({
             sale: saved,
@@ -2321,9 +2324,9 @@ router.put("/sale/:id", (req, res) => {
     return db.get("SELECT * FROM wh_sale_vouchers WHERE id = ?", [id], async (findErr, existing) => {
       if (findErr) return res.status(500).json({ error: findErr.message });
       if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
-      const grossAmount = Number(req.body.amount !== undefined ? req.body.amount : existing.amount || 0);
       const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
       const saleQty = Number(existing.quantity || 0);
+      const grossAmount = Number(((saleQty * rateValue) || existing.amount || 0).toFixed(2));
       const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : existing.unloading_qty || req.body.quantity || existing.quantity) || 0;
       const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
       const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
@@ -2331,11 +2334,12 @@ router.put("/sale/:id", (req, res) => {
       const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
       const totalDeductionValue = Number(req.body.total_deduction) || 0;
       const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
+      const fifoRateValue = saleQty > 0 ? grossAmount / saleQty : 0;
       const deductionQuery = `
         UPDATE wh_sale_vouchers SET
           unloading_date=?, shortage_quantity=?, unloading_qty=?, moisture=?, dunki=?, fungus=?, discolour=?, others=?, total_deduction=?,
           claim_amount=?, other_deduction=?, adjustment_amount=?, tds_amount=?, round_off=?,
-          net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?
+          amount=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?, fifo_amount=?, fifo_rate=?
         WHERE id = ?
       `;
       try {
@@ -2354,10 +2358,13 @@ router.put("/sale/:id", (req, res) => {
           adjustmentValue,
           tdsValue,
           roundOffValue,
+          grossAmount,
           netAmount,
           netAmount,
           netAmount,
           netAmount,
+          grossAmount,
+          fifoRateValue,
           id,
         ]);
         const journals = await recreateSaleDeductionJournals({
@@ -3622,7 +3629,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       ...sales.map((row) => {
         const saleId = String(row.id || row._id);
         const receiptDetails = adjustmentsBySale.get(saleId) || [];
-        const saleAmount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+        const saleAmount = Number(row.amount || row.total_amount || row.net_receivable_amount || 0);
         const receiptAmount = receiptDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
         return {
           date: row.date,
