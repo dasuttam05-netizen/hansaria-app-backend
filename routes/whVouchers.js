@@ -3269,6 +3269,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       adjustmentsByPurchase.get(purchaseId).push(detail);
     });
 
+    const sales = await getSaleReportRowsForUser(req.user);
     const saleByVoucherNo = new Map((sales || []).map((row) => [String(row.voucher_no || ""), row]).filter(([voucherNo]) => voucherNo));
     const saleVoucherNos = new Set(saleByVoucherNo.keys());
     const rows = [
