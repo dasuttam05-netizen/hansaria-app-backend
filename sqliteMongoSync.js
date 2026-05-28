@@ -26,6 +26,7 @@ const TRACKED_TABLES = new Set([
   "expense_items",
   "cash_entries",
   "cash_entry_adjustments",
+  "cash_book_settings",
   "wh_payment_vouchers",
   "wh_payment_adjustments",
   "wh_purchase_vouchers",
@@ -282,7 +283,7 @@ async function restoreTableFromMongo(db, table) {
   const localCountRows = await dbAllAsync(db, `SELECT COUNT(*) AS total FROM ${safeTable}`);
   const localCount = Number(localCountRows?.[0]?.total || 0);
 
-  if (localCount > 0) {
+  if (localCount > 0 && safeTable !== "cash_book_settings") {
     if (!(safeTable === "employees" && localCount === 1)) {
       return 0;
     }
@@ -325,9 +326,10 @@ async function restoreTableFromMongo(db, table) {
     const values = columns.map((column) => baseRow[column]);
 
     try {
+      const insertMode = safeTable === "cash_book_settings" ? "INSERT OR REPLACE" : "INSERT OR IGNORE";
       const result = await dbRunAsync(
         db,
-        `INSERT OR IGNORE INTO ${safeTable} (${columns.join(", ")}) VALUES (${placeholders})`,
+        `${insertMode} INTO ${safeTable} (${columns.join(", ")}) VALUES (${placeholders})`,
         values
       );
       inserted += Number(result?.changes || 0);
