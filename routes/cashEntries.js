@@ -638,10 +638,10 @@ router.put("/opening/main", (req, res) => {
             return db.run("ROLLBACK", () => res.status(404).json({ error: "Main cash opening settings not found" }));
           }
 
-          if (Number(currentRow.opening_locked || 0) === 1 && !isAdminUser(req.user)) {
+          if (Number(currentRow.opening_locked || 0) === 1) {
             return db.run("ROLLBACK", () =>
               res.status(423).json({
-                error: "Main opening is locked. Only admin can edit while locked.",
+                error: "Main opening is locked. Unlock opening before editing.",
               })
             );
           }
@@ -1272,32 +1272,24 @@ upsertCashEntryToMongo({
             const runNext = () => {
               if (index >= cleanAdjustments.length) {
                 const adjDetails = buildAdjustmentDetailsText(cleanAdjustments, targetById);
-                const finalDescription = `${baseDescriptionText(description)}${adjDetails}`;
-                return db.run(
-                  "UPDATE cash_entries SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                  [finalDescription, newEntryId],
-                  (updateDescErr) => {
-                    if (updateDescErr) return res.status(500).json({ error: updateDescErr.message });
-                    writeCashAuditLog({
-                      req,
-                      action: "create",
-                      entry_id: newEntryId,
-                      voucher_no: finalVoucherNo,
-                      details: {
-                        entry_type,
-                        amount: Number(amount || 0),
-                        status: status || "pending",
-                        has_adjustments: true,
-                        adjustments: cleanAdjustments,
-                        adjustment_details: adjDetails,
-                      },
-                    });
-                    return res.json({
-                      id: newEntryId,
-                      message: "Cash entry created successfully",
-                    });
-                  }
-                );
+                writeCashAuditLog({
+                  req,
+                  action: "create",
+                  entry_id: newEntryId,
+                  voucher_no: finalVoucherNo,
+                  details: {
+                    entry_type,
+                    amount: Number(amount || 0),
+                    status: status || "pending",
+                    has_adjustments: true,
+                    adjustments: cleanAdjustments,
+                    adjustment_details: adjDetails,
+                  },
+                });
+                return res.json({
+                  id: newEntryId,
+                  message: "Cash entry created successfully",
+                });
               }
 
               const item = cleanAdjustments[index++];
@@ -1566,70 +1558,62 @@ router.put("/:id(\\d+)", async (req, res) => {
                 const runNext = () => {
                   if (index >= cleanAdjustments.length) {
                     const adjDetails = buildAdjustmentDetailsText(cleanAdjustments, targetById);
-                    const finalDescription = `${baseDescriptionText(description)}${adjDetails}`;
-                    return db.run(
-                      "UPDATE cash_entries SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                      [finalDescription, sourceEntryId],
-                      (updateDescErr) => {
-                        if (updateDescErr) return res.status(500).json({ error: updateDescErr.message });
-                        writeCashAuditLog({
-                          req,
-                          action: "edit",
-                          entry_id: sourceEntryId,
-                          voucher_no: oldRow.voucher_no || null,
-                          details: {
-                            before: oldRow,
-                            after: {
-                              entry_date,
-                              entry_type,
-                              warehouse_id: warehouse_id || null,
-                              company_id: company_id || null,
-                              company_account_id: company_account_id || null,
-                              description: finalDescription,
-                              amount: Number(amount || 0),
-                              payment_method: payment_method || "Cash",
-                              reference_no: reference_no || null,
-                              narration: narration || null,
-                              employee_id: employee_id || null,
-                              journal_group_no: journal_group_no || null,
-                              fund_source: String(fund_source || "main_cash"),
-                              status: status || "pending",
-                              adjustments: cleanAdjustments,
-                              adjustment_details: adjDetails,
-                            },
-                          },
-                        });
-
-                        upsertCashEntryToMongo({
-                          id: sourceEntryId,
-                          voucher_no: oldRow.voucher_no || null,
+                    writeCashAuditLog({
+                      req,
+                      action: "edit",
+                      entry_id: sourceEntryId,
+                      voucher_no: oldRow.voucher_no || null,
+                      details: {
+                        before: oldRow,
+                        after: {
                           entry_date,
                           entry_type,
                           warehouse_id: warehouse_id || null,
                           company_id: company_id || null,
                           company_account_id: company_account_id || null,
-                          description: finalDescription,
-                          amount,
+                          description: baseDescriptionText(description),
+                          amount: Number(amount || 0),
                           payment_method: payment_method || "Cash",
                           reference_no: reference_no || null,
                           narration: narration || null,
-                          created_by: oldRow.created_by || null,
                           employee_id: employee_id || null,
                           journal_group_no: journal_group_no || null,
                           fund_source: String(fund_source || "main_cash"),
                           status: status || "pending",
-                          source_expense_id: oldRow.source_expense_id || null,
-                          linked_entry_id: oldRow.linked_entry_id || null,
                           adjustments: cleanAdjustments,
-                          created_at: oldRow.created_at || new Date(),
-                          updated_at: new Date(),
-                        }).catch((err) => {
-                          console.error("Mongo mirror error:", err.message);
-                        });
+                          adjustment_details: adjDetails,
+                        },
+                      },
+                    });
 
-                        return res.json({ message: "Cash entry updated successfully" });
-                      }
-                    );
+                    upsertCashEntryToMongo({
+                      id: sourceEntryId,
+                      voucher_no: oldRow.voucher_no || null,
+                      entry_date,
+                      entry_type,
+                      warehouse_id: warehouse_id || null,
+                      company_id: company_id || null,
+                      company_account_id: company_account_id || null,
+                      description: baseDescriptionText(description),
+                      amount,
+                      payment_method: payment_method || "Cash",
+                      reference_no: reference_no || null,
+                      narration: narration || null,
+                      created_by: oldRow.created_by || null,
+                      employee_id: employee_id || null,
+                      journal_group_no: journal_group_no || null,
+                      fund_source: String(fund_source || "main_cash"),
+                      status: status || "pending",
+                      source_expense_id: oldRow.source_expense_id || null,
+                      linked_entry_id: oldRow.linked_entry_id || null,
+                      adjustments: cleanAdjustments,
+                      created_at: oldRow.created_at || new Date(),
+                      updated_at: new Date(),
+                    }).catch((err) => {
+                      console.error("Mongo mirror error:", err.message);
+                    });
+
+                    return res.json({ message: "Cash entry updated successfully" });
                   }
                   const item = cleanAdjustments[index++];
                   db.run(
@@ -1653,7 +1637,8 @@ router.put("/:id(\\d+)", async (req, res) => {
 
 router.get("/aging/company/:companyId", (req, res) => {
   const { companyId } = req.params;
-  const { entry_type, source_entry_id } = req.query;
+  const { entry_type, source_entry_id, include_all } = req.query;
+  const includeAll = String(include_all || "0") === "1";
   const safeEntryType =
     entry_type && ["income", "expense"].includes(String(entry_type))
       ? String(entry_type)
@@ -1665,6 +1650,7 @@ router.get("/aging/company/:companyId", (req, res) => {
       ? "expense"
       : "income"
     : null;
+  const filterType = includeAll ? null : preferredType;
 
   const sql = `
     SELECT
@@ -1699,7 +1685,7 @@ router.get("/aging/company/:companyId", (req, res) => {
     WHERE ce.company_id = ?
       AND (? IS NULL OR ce.entry_type = ?)
     GROUP BY ce.id
-    HAVING pending_amount > 0.0001
+    HAVING (? = 1 OR pending_amount > 0.0001)
     ORDER BY
       CASE WHEN ? IS NOT NULL AND ce.entry_type = ? THEN 0 ELSE 1 END,
       ce.entry_date ASC,
@@ -1714,8 +1700,9 @@ router.get("/aging/company/:companyId", (req, res) => {
       safeSourceEntryId,
       safeSourceEntryId,
       companyId,
-      preferredType,
-      preferredType,
+      filterType,
+      filterType,
+      includeAll ? 1 : 0,
       preferredType,
       preferredType,
     ],
