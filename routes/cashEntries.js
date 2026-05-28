@@ -55,6 +55,35 @@ async function findSqliteIdByName(table, name) {
   return row?.id || null;
 }
 
+async function resolveCompanyFilterIds(companyId) {
+  const rawCompanyId = String(companyId || "").trim();
+  if (!rawCompanyId) return [];
+
+  const ids = new Set();
+  if (isPositiveNumber(rawCompanyId)) ids.add(String(Number(rawCompanyId)));
+
+  const mongoCompany = await MongoCompany.findById(rawCompanyId).lean().catch(() => null);
+  const companyName = String(mongoCompany?.name || "").trim();
+  if (companyName) {
+    const rows = await new Promise((resolve, reject) => {
+      db.all(
+        "SELECT id FROM companies WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))",
+        [companyName],
+        (err, resultRows) => {
+          if (err) reject(err);
+          else resolve(resultRows || []);
+        }
+      );
+    });
+    rows.forEach((row) => {
+      if (row?.id != null) ids.add(String(row.id));
+    });
+  }
+
+  ids.add(rawCompanyId);
+  return Array.from(ids);
+}
+
 async function findSqliteAccountId(accountName) {
   const cleanedName = String(accountName || "").trim();
   if (!cleanedName) return null;
@@ -1635,7 +1664,7 @@ router.put("/:id(\\d+)", async (req, res) => {
   });
 });
 
-router.get("/aging/company/:companyId", (req, res) => {
+router.get("/aging/company/:companyId", async (req, res) => {
   const { companyId } = req.params;
   const { entry_type, source_entry_id, include_all } = req.query;
   const includeAll = String(include_all || "0") === "1";
@@ -1651,6 +1680,16 @@ router.get("/aging/company/:companyId", (req, res) => {
       : "income"
     : null;
   const filterType = includeAll ? null : preferredType;
+  let companyFilterIds = [];
+  try {
+    companyFilterIds = await resolveCompanyFilterIds(companyId);
+  } catch (resolveErr) {
+    return res.status(500).json({ error: resolveErr.message });
+  }
+
+  if (companyFilterIds.length === 0) {
+    return res.json([]);
+  }
 
   const sql = `
     SELECT
@@ -1682,7 +1721,7 @@ router.get("/aging/company/:companyId", (req, res) => {
       ) AS pending_amount
     FROM cash_entries ce
     LEFT JOIN cash_entry_adjustments cea ON cea.target_entry_id = ce.id
-    WHERE ce.company_id = ?
+    WHERE ce.company_id IN (${companyFilterIds.map(() => "?").join(",")})
       AND (? IS NULL OR ce.entry_type = ?)
     GROUP BY ce.id
     HAVING (? = 1 OR pending_amount > 0.0001)
@@ -1699,7 +1738,7 @@ router.get("/aging/company/:companyId", (req, res) => {
       safeSourceEntryId,
       safeSourceEntryId,
       safeSourceEntryId,
-      companyId,
+      ...companyFilterIds,
       filterType,
       filterType,
       includeAll ? 1 : 0,
