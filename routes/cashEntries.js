@@ -45,6 +45,18 @@ function dbRun(sql, params = []) {
   });
 }
 
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(rows || []);
+    });
+  });
+}
+
 async function findSqliteIdByName(table, name) {
   const cleanedName = String(name || "").trim();
   if (!cleanedName) return null;
@@ -391,6 +403,41 @@ function buildAdjustmentDetailsText(cleanAdjustments = [], targetById = new Map(
   return `${ADJ_DETAIL_MARKER}${parts.join(" | ")}`;
 }
 
+async function attachAdjustmentDetails(rows = []) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const ids = safeRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id) && id > 0);
+  if (ids.length === 0) return safeRows;
+
+  const detailsRows = await dbAll(
+    `
+    SELECT
+      cea.source_entry_id,
+      COALESCE(t.journal_group_no, t.voucher_no, 'CE-' || t.id) AS target_voucher_no,
+      t.entry_type AS target_entry_type,
+      t.entry_date AS target_entry_date,
+      cea.adjusted_amount
+    FROM cash_entry_adjustments cea
+    LEFT JOIN cash_entries t ON t.id = cea.target_entry_id
+    WHERE cea.source_entry_id IN (${ids.map(() => "?").join(",")})
+    ORDER BY cea.source_entry_id ASC, cea.id ASC
+    `,
+    ids
+  );
+
+  const detailMap = new Map();
+  for (const row of detailsRows || []) {
+    const key = Number(row.source_entry_id);
+    const text = `${row.target_voucher_no || "-"} ${String(row.target_entry_type || "").toUpperCase()} ${Number(row.adjusted_amount || 0).toFixed(2)}`;
+    if (!detailMap.has(key)) detailMap.set(key, []);
+    detailMap.get(key).push(text);
+  }
+
+  return safeRows.map((row) => ({
+    ...row,
+    adjustment_details: (detailMap.get(Number(row.id)) || []).join(" | "),
+  }));
+}
+
 const getVoucherPrefix = ({ transaction_mode, entry_type }) => {
   const mode = String(transaction_mode || "").toLowerCase();
   if (mode === "journal") return "JV";
@@ -518,13 +565,14 @@ router.get("/", (req, res) => {
   db.all(sql, params, async (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     const enrichedRows = await enrichCashRowsWithMongoNames(rows || []);
+    const rowsWithAdjustmentDetails = await attachAdjustmentDetails(enrichedRows);
     const shouldDedupePendingExpense =
       String(status || "").toLowerCase() === "pending" &&
       String(entry_type || "").toLowerCase() === "expense";
     res.json(
       shouldDedupePendingExpense
-        ? dedupePendingExpenseRows(enrichedRows)
-        : enrichedRows
+        ? dedupePendingExpenseRows(rowsWithAdjustmentDetails)
+        : rowsWithAdjustmentDetails
     );
   });
 });
@@ -900,8 +948,12 @@ router.get("/:id(\\d+)", (req, res) => {
       [req.params.id],
       (adjErr, adjustmentRows) => {
         if (adjErr) return res.status(500).json({ error: adjErr.message });
+        const adjustmentDetails = (Array.isArray(adjustmentRows) ? adjustmentRows : [])
+          .map((item) => `${item.target_voucher_no || `CE-${item.target_entry_id}`} ${String(item.target_entry_type || "").toUpperCase()} ${Number(item.adjusted_amount || 0).toFixed(2)}`)
+          .join(" | ");
         return res.json({
           ...enrichedRow,
+          adjustment_details: adjustmentDetails,
           adjustments: Array.isArray(adjustmentRows) ? adjustmentRows : [],
         });
       }
