@@ -133,6 +133,9 @@ router.get("/:id", async (req, res) => {
 
       id: row._id,
 
+      location_id:
+        getRecordId(row.location_id),
+
       location_ids:
         Array.isArray(row.location_ids)
           ? row.location_ids.map(getRecordId)
@@ -517,9 +520,9 @@ router.put("/:id", async (req, res) => {
     // PREVENT ROLE ESCALATION
     const safeRole =
       normalizeRole(
-        role ||
-          target.role ||
-          "staff"
+        role !== undefined
+          ? role
+          : target.role || "staff"
       );
 
     // Check if trying to set admin role without being admin
@@ -554,10 +557,15 @@ router.put("/:id", async (req, res) => {
     const safePermissions =
       safeRole === "admin"
         ? ["all"]
-        : parsePermissions(
-            permissions,
-            safeRole
-          );
+        : permissions !== undefined
+          ? parsePermissions(
+              permissions,
+              safeRole
+            )
+          : parsePermissions(
+              target.permissions,
+              safeRole
+            );
 
     // Parse location_ids array
     const safeLocationIds =
@@ -567,28 +575,36 @@ router.put("/:id", async (req, res) => {
             String(id).trim()
           )
           .filter((id) => id)
-        : [];
+        : Array.isArray(target.location_ids)
+          ? target.location_ids.map(getRecordId).filter(Boolean)
+          : [];
 
     const updateData = {
 
-      name,
+      name:
+        name ?? target.name,
 
       mobile:
-        mobile || "",
+        mobile ?? target.mobile ?? "",
 
       address:
-        address || "",
+        address ?? target.address ?? "",
 
-      username,
+      username:
+        username ?? target.username,
 
       location_id:
-        location_id || null,
+        location_id !== undefined
+          ? location_id || null
+          : target.location_id || null,
 
       location_ids:
         safeLocationIds,
 
       all_location_access:
-        !!all_location_access,
+        all_location_access !== undefined
+          ? !!all_location_access
+          : !!target.all_location_access,
 
       role:
         safeRole,
@@ -597,24 +613,36 @@ router.put("/:id", async (req, res) => {
         safePermissions,
 
       opening_balance:
-        Number(
-          opening_balance || 0
-        ),
+        opening_balance !== undefined
+          ? Number(
+              opening_balance || 0
+            )
+          : Number(target.opening_balance || 0),
 
       opening_balance_type:
-        String(
-          opening_balance_type || "dr"
-        ).toLowerCase() === "cr"
-          ? "cr"
-          : "dr",
+        opening_balance_type !== undefined
+          ? String(
+              opening_balance_type || "dr"
+            ).toLowerCase() === "cr"
+            ? "cr"
+            : "dr"
+          : String(target.opening_balance_type || "dr").toLowerCase() === "cr"
+            ? "cr"
+            : "dr",
 
       assigned_warehouse_ids:
-        parseWarehouseIds(
-          assigned_warehouse_ids
-        ),
+        assigned_warehouse_ids !== undefined
+          ? parseWarehouseIds(
+              assigned_warehouse_ids
+            )
+          : parseWarehouseIds(
+              target.assigned_warehouse_ids
+            ),
 
       all_warehouse_access:
-        !!all_warehouse_access,
+        all_warehouse_access !== undefined
+          ? !!all_warehouse_access
+          : !!target.all_warehouse_access,
     };
 
     if (password) {
