@@ -350,6 +350,8 @@ const saleVoucherSchema =
     bags_claim: { type: Number, default: 0 },
     other_deduction: { type: Number, default: 0 },
     claim_amount: { type: Number, default: 0 },
+    cd_percent: { type: Number, default: 0 },
+    cd_amount: { type: Number, default: 0 },
     adjustment_amount: { type: Number, default: 0 },
     tds_amount: { type: Number, default: 0 },
     net_amount: { type: Number, default: 0 },
