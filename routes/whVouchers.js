@@ -82,7 +82,8 @@ async function getAllSaleVoucherRowsForUser(user) {
   const sqliteRows = await getSqliteSaleRowsForUser(user);
   if (!mongoReady()) return sqliteRows;
   const mongoRows = await SaleVoucher.find(mongoPurchaseScope(user)).lean();
-  return mergeSaleRows(await decorateSaleRows(mongoRows), sqliteRows);
+  const mergedRows = mergeSaleRows(await decorateSaleRows(mongoRows), sqliteRows);
+  return attachSaleBiltiIds(mergedRows);
 }
 
 function getSaleVoucherRows(req, res) {
@@ -111,13 +112,20 @@ function getSaleVoucherRowsSqlite(req, res) {
       w.name AS warehouse_name,
       p.name AS product_name,
       v.quantity AS total_quantity,
-      v.amount AS total_amount
+      v.amount AS total_amount,
+      tb.bilti_id
     FROM wh_sale_vouchers v
     LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(v.buyer_id, v.company_id) AS TEXT)
     LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(v.consignee_id AS TEXT)
     LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
     LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
     LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
+    LEFT JOIN (
+      SELECT sale_id, MAX(id) AS bilti_id
+      FROM transport_bilti
+      WHERE sale_id IS NOT NULL
+      GROUP BY sale_id
+    ) tb ON CAST(tb.sale_id AS TEXT) = CAST(v.id AS TEXT)
     WHERE 1 = 1 ${filter.clause}
     ORDER BY v.date DESC, v.id DESC
   `;
@@ -559,6 +567,23 @@ function mergeSaleRows(mongoRows, sqliteRows) {
       sensitivity: "base",
     });
   });
+}
+
+async function attachSaleBiltiIds(rows) {
+  const saleIds = [...new Set((rows || []).map((row) => String(row.id || row._id).trim()).filter(Boolean))];
+  if (!saleIds.length) return rows;
+
+  const placeholders = saleIds.map(() => "?").join(",");
+  const biltiRows = await dbAll(
+    `SELECT sale_id, MAX(id) AS bilti_id FROM transport_bilti WHERE sale_id IS NOT NULL AND CAST(sale_id AS TEXT) IN (${placeholders}) GROUP BY sale_id`,
+    saleIds
+  );
+
+  const biltiMap = new Map((biltiRows || []).map((row) => [String(row.sale_id), row.bilti_id]));
+  return rows.map((row) => ({
+    ...row,
+    bilti_id: biltiMap.get(String(row.id || row._id)) || null,
+  }));
 }
 
 function getSqlitePurchaseRows(req) {
