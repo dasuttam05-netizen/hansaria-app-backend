@@ -210,6 +210,8 @@ function buildSalePayload(body, voucherNo) {
     "bags_claim",
     "other_deduction",
     "claim_amount",
+    "cd_percent",
+    "cd_amount",
     "adjustment_amount",
     "tds_amount",
     "net_amount",
@@ -231,6 +233,7 @@ function buildSalePayload(body, voucherNo) {
     grossAmount -
     payload.claim_amount -
     payload.other_deduction -
+    payload.cd_amount -
     payload.adjustment_amount -
     payload.tds_amount +
     payload.round_off;
@@ -311,7 +314,7 @@ function createVoucherNoPromise(type, voucherNo = "") {
   });
 }
 
-async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deductionAmount, tdsAmount }) {
+async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deductionAmount, cdAmount, tdsAmount }) {
   const saleVoucherNo = String(sale?.voucher_no || body?.voucher_no || "").trim();
   if (!saleVoucherNo) return [];
 
@@ -328,6 +331,7 @@ async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deduc
   const rows = [
     { key: "shortage", label: "Shortage", amount: Number(shortageAmount || 0) },
     { key: "deduction", label: "Deduction", amount: Number(deductionAmount || 0) },
+    { key: "cash_discount", label: "Cash Discount", amount: Number(cdAmount || 0) },
     { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
   ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
 
@@ -2255,8 +2259,10 @@ router.put("/sale/:id", (req, res) => {
 
           const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : shortageAmount;
           const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
+          const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
+          const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
 
-          const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
+          const netAmount = grossAmount - claimValue - otherDeductionValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
 
           existing.unloading_date = req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date;
           existing.unloading_qty = unloadingQtyValue;
@@ -2269,6 +2275,8 @@ router.put("/sale/:id", (req, res) => {
           existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : existing.total_deduction) || 0;
           existing.claim_amount = claimValue;
           existing.other_deduction = otherDeductionValue;
+          existing.cd_percent = cdPercentValue;
+          existing.cd_amount = cdAmountValue;
           existing.adjustment_amount = adjustmentValue;
           existing.tds_amount = tdsValue;
           existing.round_off = roundOffValue;
@@ -2282,6 +2290,7 @@ router.put("/sale/:id", (req, res) => {
             body: req.body,
             shortageAmount,
             deductionAmount: otherDeductionValue + adjustmentValue,
+            cdAmount: cdAmountValue,
             tdsAmount: tdsValue,
           });
           return res.json({ id: String(saved._id), updated: 1, voucher_no: saved.voucher_no, deduction_only: true, saved_to: "mongodb", shortage_qty: existing.shortage_quantity, shortage_amount: shortageAmount, journals });
@@ -2307,7 +2316,7 @@ router.put("/sale/:id", (req, res) => {
     })();
   }
 
-  const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, lorry_no, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, lorry_no, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, cd_percent, cd_amount, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
   if (!deductionOnly && !company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
   if (!deductionOnly && !product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
 
@@ -2326,12 +2335,14 @@ router.put("/sale/:id", (req, res) => {
       const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
       const claimValue = req.body.claim_amount !== undefined ? Number(req.body.claim_amount) || 0 : shortageAmount;
       const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
+      const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
+      const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
       const totalDeductionValue = Number(req.body.total_deduction) || 0;
-      const netAmount = grossAmount - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
+      const netAmount = grossAmount - claimValue - otherDeductionValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
       const deductionQuery = `
         UPDATE wh_sale_vouchers SET
           unloading_date=?, shortage_quantity=?, unloading_qty=?, moisture=?, dunki=?, fungus=?, discolour=?, others=?, total_deduction=?,
-          claim_amount=?, other_deduction=?, adjustment_amount=?, tds_amount=?, round_off=?,
+          claim_amount=?, other_deduction=?, cd_percent=?, cd_amount=?, adjustment_amount=?, tds_amount=?, round_off=?,
           net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?
         WHERE id = ?
       `;
@@ -2348,6 +2359,8 @@ router.put("/sale/:id", (req, res) => {
           totalDeductionValue,
           claimValue,
           otherDeductionValue,
+          cdPercentValue,
+          cdAmountValue,
           adjustmentValue,
           tdsValue,
           roundOffValue,
@@ -2362,6 +2375,7 @@ router.put("/sale/:id", (req, res) => {
           body: req.body,
           shortageAmount,
           deductionAmount: otherDeductionValue + adjustmentValue,
+          cdAmount: cdAmountValue,
           tdsAmount: tdsValue,
         });
         return res.json({ id, updated: 1, voucher_no: existing.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount, shortage_quantity: shortageQty, shortage_amount: shortageAmount, journals });
@@ -2374,10 +2388,12 @@ router.put("/sale/:id", (req, res) => {
   const amountValue = Number(amount) || 0;
   const claimValue = Number(claim_amount) || 0;
   const otherDeductionValue = Number(other_deduction) || 0;
+  const cdPercentValue = Number(cd_percent) || 0;
+  const cdAmountValue = Number(cd_amount) || 0;
   const adjustmentValue = Number(adjustment_amount) || 0;
   const tdsValue = Number(tds_amount) || 0;
   const roundOffValue = Number(round_off) || 0;
-  const netAmount = amountValue - claimValue - otherDeductionValue - adjustmentValue - tdsValue + roundOffValue;
+  const netAmount = amountValue - claimValue - otherDeductionValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
   const unloadingQtyValue = Number(unloading_qty) || Number(quantity) || 0;
   const fifoAmountValue = amountValue;
   const fifoRateValue = unloadingQtyValue > 0 ? amountValue / unloadingQtyValue : 0;
@@ -2397,7 +2413,7 @@ router.put("/sale/:id", (req, res) => {
         const query = `
           UPDATE wh_sale_vouchers SET
             voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?, lorry_no=?, product_id=?,
-            quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?,
+            quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?, cd_percent=?, cd_amount=?,
             adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, fifo_rate=?, fifo_amount=?,
             outstanding=?, employee_id=?, location_id=?, description=?
           WHERE id = ?
@@ -2405,7 +2421,7 @@ router.put("/sale/:id", (req, res) => {
 
         return db.run(query, [
           voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id, lorry_no || req.body.reference_id || "", product_id,
-          quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue,
+          quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, cdPercentValue, cdAmountValue,
           adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, netAmount, fifoRateValue, fifoAmountValue,
           netAmount, employee_id, location_id, description, id
         ], function (err) {
