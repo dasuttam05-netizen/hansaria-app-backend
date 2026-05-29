@@ -187,6 +187,8 @@ if (true) {
       amount REAL DEFAULT 0,
       claim_amount REAL DEFAULT 0,
       other_deduction REAL DEFAULT 0,
+      cd_percent REAL DEFAULT 0,
+      cd_amount REAL DEFAULT 0,
       adjustment_amount REAL DEFAULT 0,
       tds_amount REAL DEFAULT 0,
       round_off REAL DEFAULT 0,
@@ -694,6 +696,8 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN shortage_quantity REAL DEFAULT 0`, "wh_sale_vouchers shortage_quantity");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN claim_amount REAL DEFAULT 0`, "wh_sale_vouchers claim_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN other_deduction REAL DEFAULT 0`, "wh_sale_vouchers other_deduction");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN cd_percent REAL DEFAULT 0`, "wh_sale_vouchers cd_percent");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN cd_amount REAL DEFAULT 0`, "wh_sale_vouchers cd_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN adjustment_amount REAL DEFAULT 0`, "wh_sale_vouchers adjustment_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN tds_amount REAL DEFAULT 0`, "wh_sale_vouchers tds_amount");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN round_off REAL DEFAULT 0`, "wh_sale_vouchers round_off");
