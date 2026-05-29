@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { mongoose, SaleVoucher } = require("../mongo");
 
 const num = (v) => {
   const n = Number(v);
@@ -342,6 +343,69 @@ router.get("/:id", (req, res) => {
     );
   };
 
+  const loadFromSaleTableMongo = () => {
+    if (mongoose.connection.readyState !== 1 || !mongoose.Types.ObjectId.isValid(biltiIdOrOutwardId)) {
+      return false;
+    }
+
+    SaleVoucher.findById(biltiIdOrOutwardId)
+      .lean()
+      .then((saleDoc) => {
+        if (!saleDoc) {
+          return loadFromSaleTable();
+        }
+
+        const saleWeight = num(saleDoc.unloading_qty || saleDoc.quantity);
+        res.json(applyCalculatedBilti({
+          id: null,
+          outward_id: null,
+          sale_id: String(saleDoc._id || saleDoc.id),
+          bilti_no: "",
+          transporter_id: "",
+          transporter_name: "",
+          transporter_address: "",
+          transporter_pan_no: "",
+          transporter_mobile: "",
+          dispatch_date: saleDoc.date || saleDoc.unloading_date || "",
+          destination: "",
+          days: 0,
+          outward_qty: saleWeight,
+          dispatch_qty: saleWeight,
+          shortage_free_kg: 100,
+          shortage_qty: 0,
+          outward_rate: num(saleDoc.rate),
+          shortage_amount: 0,
+          transport_rate: 0,
+          gross_freight: 0,
+          detain_amount: 0,
+          others_exp: 0,
+          advance_amount: 0,
+          tds_percent: 0,
+          tds_amount: 0,
+          net_amount: 0,
+          payable_amount: 0,
+          narration: "",
+          sale_voucher_no: saleDoc.voucher_no || "",
+          sale_entry_date: saleDoc.date || saleDoc.unloading_date || "",
+          sale_quantity: num(saleDoc.quantity),
+          sale_unloading_qty: num(saleDoc.unloading_qty),
+          sale_master_rate: num(saleDoc.rate),
+          sale_buyer_name: saleDoc.buyer_name || saleDoc.company_name || "",
+          sale_consignee_name: saleDoc.consignee_name || "",
+          sale_lorry_no: saleDoc.lorry_no || "",
+          sale_account_name: saleDoc.company_account_name || saleDoc.account_name || "",
+          sale_warehouse_name: saleDoc.warehouse_name || "",
+          sale_product_name: saleDoc.product_name || "",
+        }));
+      })
+      .catch((mongoErr) => {
+        console.error("Mongo sale lookup failed:", mongoErr.message || mongoErr);
+        loadFromSaleTable();
+      });
+
+    return true;
+  };
+
   const loadFromSaleTable = () => {
     db.get(
       `
@@ -419,6 +483,7 @@ router.get("/:id", (req, res) => {
   };
 
   if (req.query.source === "sale") {
+    if (loadFromSaleTableMongo()) return;
     return loadFromSaleTable();
   }
   if (req.query.source === "outward") {
@@ -444,7 +509,10 @@ router.get("/:id", (req, res) => {
       db.get(sqlBySaleId, [biltiIdOrOutwardId], (err3, saleBiltiRow) => {
         if (err3) return res.status(500).json({ error: err3.message });
         if (saleBiltiRow) return res.json(applyCalculatedBilti(saleBiltiRow));
-        if (req.query.source === "sale") return loadFromSaleTable();
+        if (req.query.source === "sale") {
+          if (loadFromSaleTableMongo()) return;
+          return loadFromSaleTable();
+        }
         loadFromOutwardTable();
       });
     });
