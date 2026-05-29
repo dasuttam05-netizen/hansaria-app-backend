@@ -137,6 +137,7 @@ router.get("/sale-list", (req, res) => {
     LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
     LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
     LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
+    WHERE lb.bilti_id IS NULL
     ORDER BY s.id DESC
   `;
 
@@ -416,6 +417,13 @@ router.get("/:id", (req, res) => {
       }
     );
   };
+
+  if (req.query.source === "sale") {
+    return loadFromSaleTable();
+  }
+  if (req.query.source === "outward") {
+    return loadFromOutwardTable();
+  }
 
   const sqlByBiltiId = biltiJoinSql.replace("%WHERE_CONDITION%", "tb.id = ?");
   db.get(sqlByBiltiId, [biltiIdOrOutwardId], (err, biltiRow) => {
