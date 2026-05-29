@@ -290,6 +290,29 @@ async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = n
   return Number((purchaseQty - saleQty).toFixed(4));
 }
 
+router.get("/available-sale-stock", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.view") && !userHasPermission(req.user, "warehouse.trading.sale.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const { warehouse_id, product_id, exclude_sale_id } = req.query;
+  if (!warehouse_id || !product_id) {
+    return res.json({ stock_qty: null });
+  }
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+
+  try {
+    const stockQty = await getAvailableSaleStock({
+      warehouseId: warehouse_id,
+      productId: product_id,
+      excludeSaleId: exclude_sale_id || null,
+    });
+    res.json({ stock_qty: stockQty });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 function dbGet(query, params = []) {
   return new Promise((resolve, reject) => {
     db.get(query, params, (err, row) => (err ? reject(err) : resolve(row || null)));
