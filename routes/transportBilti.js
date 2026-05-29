@@ -13,6 +13,43 @@ const text = (v) => {
   return String(v).trim();
 };
 
+function dbGet(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => {
+      if (err) return reject(err);
+      resolve(row || null);
+    });
+  });
+}
+
+async function decorateMongoSale(row) {
+  const buyerId = String(row.buyer_id || "");
+  const companyId = String(row.company_id || "");
+  const accountId = String(row.company_account_id || "");
+  const warehouseId = String(row.warehouse_id || "");
+  const productId = String(row.product_id || "");
+  const consigneeId = String(row.consignee_id || "");
+
+  const [buyerRow, companyRow, accountRow, warehouseRow, productRow, consigneeRow] = await Promise.all([
+    buyerId ? dbGet(`SELECT name FROM buyer_names WHERE CAST(id AS TEXT) = ? LIMIT 1`, [buyerId]) : null,
+    companyId ? dbGet(`SELECT name FROM companies WHERE CAST(id AS TEXT) = ? LIMIT 1`, [companyId]) : null,
+    accountId ? dbGet(`SELECT account_name FROM company_accounts WHERE CAST(id AS TEXT) = ? LIMIT 1`, [accountId]) : null,
+    warehouseId ? dbGet(`SELECT name FROM warehouses WHERE CAST(id AS TEXT) = ? LIMIT 1`, [warehouseId]) : null,
+    productId ? dbGet(`SELECT name FROM products WHERE CAST(id AS TEXT) = ? LIMIT 1`, [productId]) : null,
+    consigneeId ? dbGet(`SELECT name FROM consignee_names WHERE CAST(id AS TEXT) = ? LIMIT 1`, [consigneeId]) : null,
+  ]);
+
+  return {
+    ...row,
+    sale_buyer_name:
+      row.buyer_name || buyerRow?.name || companyRow?.name || row.company_name || "",
+    sale_account_name: row.company_account_name || accountRow?.account_name || row.account_name || "",
+    sale_warehouse_name: row.warehouse_name || warehouseRow?.name || "",
+    sale_product_name: row.product_name || productRow?.name || "",
+    sale_consignee_name: row.consignee_name || consigneeRow?.name || "",
+  };
+}
+
 function calculateBilti(data) {
   const CLAIM_FREE_SHORTAGE_KG = num(data.shortage_free_kg) > 0 ? num(data.shortage_free_kg) : 100;
   const KG_PER_MT = 1000;
@@ -350,30 +387,31 @@ router.get("/:id", (req, res) => {
 
     SaleVoucher.findById(biltiIdOrOutwardId)
       .lean()
-      .then((saleDoc) => {
+      .then(async (saleDoc) => {
         if (!saleDoc) {
           return loadFromSaleTable();
         }
 
-        const saleWeight = num(saleDoc.unloading_qty || saleDoc.quantity);
+        const decoratedSale = await decorateMongoSale(saleDoc);
+        const saleWeight = num(decoratedSale.unloading_qty || decoratedSale.quantity);
         res.json(applyCalculatedBilti({
           id: null,
           outward_id: null,
-          sale_id: String(saleDoc._id || saleDoc.id),
+          sale_id: String(decoratedSale._id || decoratedSale.id),
           bilti_no: "",
           transporter_id: "",
           transporter_name: "",
           transporter_address: "",
           transporter_pan_no: "",
           transporter_mobile: "",
-          dispatch_date: saleDoc.unloading_date || saleDoc.date || "",
+          dispatch_date: decoratedSale.unloading_date || decoratedSale.date || "",
           destination: "",
           days: 0,
           outward_qty: saleWeight,
           dispatch_qty: saleWeight,
           shortage_free_kg: 100,
           shortage_qty: 0,
-          outward_rate: num(saleDoc.rate),
+          outward_rate: num(decoratedSale.rate),
           shortage_amount: 0,
           transport_rate: 0,
           gross_freight: 0,
@@ -385,18 +423,18 @@ router.get("/:id", (req, res) => {
           net_amount: 0,
           payable_amount: 0,
           narration: "",
-          sale_voucher_no: saleDoc.voucher_no || "",
-          sale_entry_date: saleDoc.date || "",
-          sale_unloading_date: saleDoc.unloading_date || "",
-          sale_quantity: num(saleDoc.quantity),
-          sale_unloading_qty: num(saleDoc.unloading_qty),
-          sale_master_rate: num(saleDoc.rate),
-          sale_buyer_name: saleDoc.buyer_name || saleDoc.company_name || "",
-          sale_consignee_name: saleDoc.consignee_name || "",
-          sale_lorry_no: saleDoc.lorry_no || "",
-          sale_account_name: saleDoc.company_account_name || saleDoc.account_name || "",
-          sale_warehouse_name: saleDoc.warehouse_name || "",
-          sale_product_name: saleDoc.product_name || "",
+          sale_voucher_no: decoratedSale.voucher_no || "",
+          sale_entry_date: decoratedSale.date || "",
+          sale_unloading_date: decoratedSale.unloading_date || "",
+          sale_quantity: num(decoratedSale.quantity),
+          sale_unloading_qty: num(decoratedSale.unloading_qty),
+          sale_master_rate: num(decoratedSale.rate),
+          sale_buyer_name: decoratedSale.sale_buyer_name || "",
+          sale_consignee_name: decoratedSale.sale_consignee_name || "",
+          sale_lorry_no: decoratedSale.lorry_no || "",
+          sale_account_name: decoratedSale.sale_account_name || "",
+          sale_warehouse_name: decoratedSale.sale_warehouse_name || "",
+          sale_product_name: decoratedSale.sale_product_name || "",
         }));
       })
       .catch((mongoErr) => {
