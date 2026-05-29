@@ -489,6 +489,7 @@ if (true) {
   CREATE TABLE IF NOT EXISTS transport_bilti (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     outward_id INTEGER,
+    sale_id INTEGER,
     bilti_no TEXT UNIQUE,
     transporter_id INTEGER,
     voucher_no TEXT,
@@ -521,6 +522,7 @@ if (true) {
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(outward_id) REFERENCES outward(id),
+    FOREIGN KEY(sale_id) REFERENCES wh_sale_vouchers(id),
     FOREIGN KEY(transporter_id) REFERENCES transporters(id)
   )
 `);
@@ -894,6 +896,15 @@ if (true) {
     (err) => {
       if (err && !err.message.includes("duplicate column")) {
         console.log("remaining_qty add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `ALTER TABLE transport_bilti ADD COLUMN sale_id INTEGER`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("transport_bilti sale_id add error:", err.message);
       }
     }
   );
