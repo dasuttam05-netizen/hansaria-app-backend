@@ -107,6 +107,45 @@ router.get("/outward-list", (req, res) => {
   });
 });
 
+router.get("/sale-list", (req, res) => {
+  const sql = `
+    SELECT
+      s.id,
+      lb.bilti_id,
+      s.voucher_no,
+      s.date,
+      s.lorry_no,
+      s.quantity,
+      s.unloading_qty,
+      s.rate,
+      s.amount,
+      COALESCE(b.name, c.name) AS buyer_name,
+      co.name AS consignee_name,
+      ca.account_name AS account_name,
+      w.name AS warehouse_name,
+      p.name AS product_name
+    FROM wh_sale_vouchers s
+    LEFT JOIN (
+      SELECT sale_id, MAX(id) AS bilti_id
+      FROM transport_bilti
+      WHERE sale_id IS NOT NULL
+      GROUP BY sale_id
+    ) lb ON lb.sale_id = s.id
+    LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(s.buyer_id AS TEXT)
+    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+    LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
+    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
+    ORDER BY s.id DESC
+  `;
+
+  db.all(sql, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
 router.get("/report/list", (req, res) => {
   const { from_date, to_date } = req.query;
   const reportDateExpr = "COALESCE(NULLIF(tb.dispatch_date, ''), NULLIF(tb.outward_date, ''))";
@@ -139,7 +178,18 @@ router.get("/report/list", (req, res) => {
       c.name AS outward_company_name,
       ca.account_name AS outward_account_name,
       w.name AS outward_warehouse_name,
-      p.name AS outward_product_name
+      p.name AS outward_product_name,
+      s.voucher_no AS sale_voucher_no,
+      s.date AS sale_entry_date,
+      s.quantity AS sale_quantity,
+      s.unloading_qty AS sale_unloading_qty,
+      s.rate AS sale_master_rate,
+      s.lorry_no AS sale_lorry_no,
+      COALESCE(sb.name, sc.name) AS sale_buyer_name,
+      sco.name AS sale_consignee_name,
+      sca.account_name AS sale_account_name,
+      sw.name AS sale_warehouse_name,
+      sp.name AS sale_product_name
     FROM transport_bilti tb
     LEFT JOIN outward o ON o.id = tb.outward_id
     LEFT JOIN transporters tr ON tr.id = tb.transporter_id
@@ -147,6 +197,13 @@ router.get("/report/list", (req, res) => {
     LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
     LEFT JOIN warehouses w ON o.warehouse_id = w.id
     LEFT JOIN products p ON o.product_id = p.id
+    LEFT JOIN wh_sale_vouchers s ON s.id = tb.sale_id
+    LEFT JOIN buyer_names sb ON CAST(sb.id AS TEXT) = CAST(s.buyer_id AS TEXT)
+    LEFT JOIN companies sc ON CAST(sc.id AS TEXT) = CAST(s.company_id AS TEXT)
+    LEFT JOIN consignee_names sco ON CAST(sco.id AS TEXT) = CAST(s.consignee_id AS TEXT)
+    LEFT JOIN company_accounts sca ON CAST(sca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
+    LEFT JOIN warehouses sw ON CAST(sw.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+    LEFT JOIN products sp ON CAST(sp.id AS TEXT) = CAST(s.product_id AS TEXT)
     WHERE ${where.join(" AND ")}
     ORDER BY ${reportDateExpr} DESC, tb.id DESC
   `;
@@ -179,7 +236,19 @@ router.get("/:id", (req, res) => {
       c.name AS outward_company_name,
       ca.account_name AS outward_account_name,
       w.name AS outward_warehouse_name,
-      p.name AS outward_product_name
+      p.name AS outward_product_name,
+      s.id AS sale_id,
+      s.voucher_no AS sale_voucher_no,
+      s.date AS sale_entry_date,
+      s.quantity AS sale_quantity,
+      s.unloading_qty AS sale_unloading_qty,
+      s.rate AS sale_master_rate,
+      s.lorry_no AS sale_lorry_no,
+      COALESCE(sb.name, sc.name) AS sale_buyer_name,
+      sco.name AS sale_consignee_name,
+      sca.account_name AS sale_account_name,
+      sw.name AS sale_warehouse_name,
+      sp.name AS sale_product_name
     FROM transport_bilti tb
     LEFT JOIN outward o ON o.id = tb.outward_id
     LEFT JOIN transporters tr ON tr.id = tb.transporter_id
@@ -187,6 +256,13 @@ router.get("/:id", (req, res) => {
     LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
     LEFT JOIN warehouses w ON o.warehouse_id = w.id
     LEFT JOIN products p ON o.product_id = p.id
+    LEFT JOIN wh_sale_vouchers s ON s.id = tb.sale_id
+    LEFT JOIN buyer_names sb ON CAST(sb.id AS TEXT) = CAST(s.buyer_id AS TEXT)
+    LEFT JOIN companies sc ON CAST(sc.id AS TEXT) = CAST(s.company_id AS TEXT)
+    LEFT JOIN consignee_names sco ON CAST(sco.id AS TEXT) = CAST(s.consignee_id AS TEXT)
+    LEFT JOIN company_accounts sca ON CAST(sca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
+    LEFT JOIN warehouses sw ON CAST(sw.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+    LEFT JOIN products sp ON CAST(sp.id AS TEXT) = CAST(s.product_id AS TEXT)
     WHERE %WHERE_CONDITION%
     LIMIT 1
   `;
@@ -265,6 +341,82 @@ router.get("/:id", (req, res) => {
     );
   };
 
+  const loadFromSaleTable = () => {
+    db.get(
+      `
+      SELECT
+        s.id AS sale_id,
+        s.voucher_no,
+        s.date,
+        s.lorry_no,
+        s.quantity,
+        s.unloading_qty,
+        s.rate,
+        COALESCE(b.name, c.name) AS buyer_name,
+        co.name AS consignee_name,
+        ca.account_name AS account_name,
+        w.name AS warehouse_name,
+        p.name AS product_name
+      FROM wh_sale_vouchers s
+      LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(s.buyer_id AS TEXT)
+      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+      LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+      LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
+      WHERE s.id = ?
+      `,
+      [biltiIdOrOutwardId],
+      (err2, saleRow) => {
+        if (err2) return res.status(500).json({ error: err2.message });
+        if (!saleRow) return res.status(404).json({ error: "Bilti not found" });
+
+        const saleWeight = num(saleRow.unloading_qty || saleRow.quantity);
+        res.json(applyCalculatedBilti({
+          id: null,
+          outward_id: null,
+          sale_id: saleRow.sale_id,
+          bilti_no: "",
+          transporter_id: "",
+          transporter_name: "",
+          transporter_address: "",
+          transporter_pan_no: "",
+          transporter_mobile: "",
+          dispatch_date: saleRow.date || "",
+          destination: "",
+          days: 0,
+          outward_qty: saleWeight,
+          dispatch_qty: saleWeight,
+          shortage_free_kg: 100,
+          shortage_qty: 0,
+          outward_rate: num(saleRow.rate),
+          shortage_amount: 0,
+          transport_rate: 0,
+          gross_freight: 0,
+          detain_amount: 0,
+          others_exp: 0,
+          advance_amount: 0,
+          tds_percent: 0,
+          tds_amount: 0,
+          net_amount: 0,
+          payable_amount: 0,
+          narration: "",
+          sale_voucher_no: saleRow.voucher_no || "",
+          sale_entry_date: saleRow.date || "",
+          sale_quantity: num(saleRow.quantity),
+          sale_unloading_qty: num(saleRow.unloading_qty),
+          sale_master_rate: num(saleRow.rate),
+          sale_buyer_name: saleRow.buyer_name || "",
+          sale_consignee_name: saleRow.consignee_name || "",
+          sale_lorry_no: saleRow.lorry_no || "",
+          sale_account_name: saleRow.account_name || "",
+          sale_warehouse_name: saleRow.warehouse_name || "",
+          sale_product_name: saleRow.product_name || "",
+        }));
+      }
+    );
+  };
+
   const sqlByBiltiId = biltiJoinSql.replace("%WHERE_CONDITION%", "tb.id = ?");
   db.get(sqlByBiltiId, [biltiIdOrOutwardId], (err, biltiRow) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -277,7 +429,16 @@ router.get("/:id", (req, res) => {
     db.get(sqlByOutwardId, [biltiIdOrOutwardId], (err2, outwardBiltiRow) => {
       if (err2) return res.status(500).json({ error: err2.message });
       if (outwardBiltiRow) return res.json(applyCalculatedBilti(outwardBiltiRow));
-      loadFromOutwardTable();
+      const sqlBySaleId = biltiJoinSql.replace(
+        "%WHERE_CONDITION%",
+        "tb.sale_id = ? ORDER BY tb.id DESC"
+      );
+      db.get(sqlBySaleId, [biltiIdOrOutwardId], (err3, saleBiltiRow) => {
+        if (err3) return res.status(500).json({ error: err3.message });
+        if (saleBiltiRow) return res.json(applyCalculatedBilti(saleBiltiRow));
+        if (req.query.source === "sale") return loadFromSaleTable();
+        loadFromOutwardTable();
+      });
     });
   });
 });
@@ -286,6 +447,7 @@ router.post("/save", (req, res) => {
   const {
     id,
     outward_id,
+    sale_id,
     transporter_id,
     voucher_no,
     outward_date,
@@ -404,10 +566,10 @@ router.post("/save", (req, res) => {
     return;
   }
 
-  if (outward_id) {
+  const saveLinkedBilti = ({ sourceColumn, sourceId, successPrefix }) => {
     db.get(
-      `SELECT id, bilti_no FROM transport_bilti WHERE outward_id = ?`,
-      [outward_id],
+      `SELECT id, bilti_no FROM transport_bilti WHERE ${sourceColumn} = ?`,
+      [sourceId],
       (err, existing) => {
         if (err) return res.status(500).json({ error: err.message });
 
@@ -446,9 +608,9 @@ router.post("/save", (req, res) => {
                 payable_amount = ?,
                 narration = ?,
                 updated_at = CURRENT_TIMESTAMP
-              WHERE outward_id = ?
+              WHERE ${sourceColumn} = ?
               `,
-              [...commonParams, outward_id],
+              [...commonParams, sourceId],
               function (updateErr) {
                 if (updateErr) return res.status(500).json({ error: updateErr.message });
                 res.json({ message: "Bilti updated successfully", id: existing.id });
@@ -459,6 +621,7 @@ router.post("/save", (req, res) => {
               `
               INSERT INTO transport_bilti (
                 outward_id,
+                sale_id,
                 bilti_no,
                 transporter_id,
                 voucher_no,
@@ -489,12 +652,17 @@ router.post("/save", (req, res) => {
                 net_amount,
                 payable_amount,
                 narration
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               `,
-              [outward_id, biltiNo, ...commonParams],
+              [
+                sourceColumn === "outward_id" ? sourceId : null,
+                sourceColumn === "sale_id" ? sourceId : null,
+                biltiNo,
+                ...commonParams,
+              ],
               function (insertErr) {
                 if (insertErr) return res.status(500).json({ error: insertErr.message });
-                res.json({ message: "Bilti created successfully", id: this.lastID });
+                res.json({ message: `${successPrefix} bilti created successfully`, id: this.lastID });
               }
             );
           }
@@ -510,6 +678,15 @@ router.post("/save", (req, res) => {
         }
       }
     );
+  };
+
+  if (outward_id) {
+    saveLinkedBilti({ sourceColumn: "outward_id", sourceId: outward_id, successPrefix: "Outward" });
+    return;
+  }
+
+  if (sale_id) {
+    saveLinkedBilti({ sourceColumn: "sale_id", sourceId: sale_id, successPrefix: "Sale" });
     return;
   }
 
@@ -520,6 +697,7 @@ router.post("/save", (req, res) => {
       `
       INSERT INTO transport_bilti (
         outward_id,
+        sale_id,
         bilti_no,
         transporter_id,
         voucher_no,
@@ -550,9 +728,9 @@ router.post("/save", (req, res) => {
         net_amount,
         payable_amount,
         narration
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
-      [null, biltiNo, ...commonParams],
+      [null, null, biltiNo, ...commonParams],
       function (insertErr) {
         if (insertErr) return res.status(500).json({ error: insertErr.message });
         res.json({ message: "Manual bilti created successfully", id: this.lastID });
