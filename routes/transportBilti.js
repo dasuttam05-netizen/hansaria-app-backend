@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const { mongoose, SaleVoucher } = require("../mongo");
+const { mongoose, SaleVoucher, Warehouse, CompanyAccount, Product, Company } = require("../mongo");
 
 const num = (v) => {
   const n = Number(v);
@@ -30,22 +30,29 @@ async function decorateMongoSale(row) {
   const productId = String(row.product_id || "");
   const consigneeId = String(row.consignee_id || "");
 
-  const [buyerRow, companyRow, accountRow, warehouseRow, productRow, consigneeRow] = await Promise.all([
+  const [buyerRow, companySqlRow, accountSqlRow, warehouseSqlRow, productSqlRow, consigneeRow, companyMongo, accountMongo, warehouseMongo, productMongo] = await Promise.all([
     buyerId ? dbGet(`SELECT name FROM buyer_names WHERE CAST(id AS TEXT) = ? LIMIT 1`, [buyerId]) : null,
     companyId ? dbGet(`SELECT name FROM companies WHERE CAST(id AS TEXT) = ? LIMIT 1`, [companyId]) : null,
     accountId ? dbGet(`SELECT account_name FROM company_accounts WHERE CAST(id AS TEXT) = ? LIMIT 1`, [accountId]) : null,
     warehouseId ? dbGet(`SELECT name FROM warehouses WHERE CAST(id AS TEXT) = ? LIMIT 1`, [warehouseId]) : null,
     productId ? dbGet(`SELECT name FROM products WHERE CAST(id AS TEXT) = ? LIMIT 1`, [productId]) : null,
     consigneeId ? dbGet(`SELECT name FROM consignee_names WHERE CAST(id AS TEXT) = ? LIMIT 1`, [consigneeId]) : null,
+    companyId && mongoose.Types.ObjectId.isValid(companyId) ? Company.findById(companyId).lean() : null,
+    accountId && mongoose.Types.ObjectId.isValid(accountId) ? CompanyAccount.findById(accountId).lean() : null,
+    warehouseId && mongoose.Types.ObjectId.isValid(warehouseId) ? Warehouse.findById(warehouseId).lean() : null,
+    productId && mongoose.Types.ObjectId.isValid(productId) ? Product.findById(productId).lean() : null,
   ]);
 
   return {
     ...row,
     sale_buyer_name:
-      row.buyer_name || buyerRow?.name || companyRow?.name || row.company_name || "",
-    sale_account_name: row.company_account_name || accountRow?.account_name || row.account_name || "",
-    sale_warehouse_name: row.warehouse_name || warehouseRow?.name || "",
-    sale_product_name: row.product_name || productRow?.name || "",
+      row.buyer_name || buyerRow?.name || companySqlRow?.name || row.company_name || "",
+    sale_account_name:
+      row.company_account_name || accountSqlRow?.account_name || accountMongo?.account_name || row.account_name || "",
+    sale_warehouse_name:
+      row.warehouse_name || warehouseSqlRow?.name || warehouseMongo?.name || "",
+    sale_product_name:
+      row.product_name || productSqlRow?.name || productMongo?.name || "",
     sale_consignee_name: row.consignee_name || consigneeRow?.name || "",
   };
 }
