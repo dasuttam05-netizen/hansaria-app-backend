@@ -294,6 +294,8 @@ router.post("/", async (req, res) => {
       location_id,
       employee_id,
       employee_ids,
+      opening_balance,
+      opening_balance_type,
     } = req.body;
 
     if (
@@ -315,6 +317,12 @@ router.post("/", async (req, res) => {
       safeEmployeeIds[0] ||
       employee_id ||
       null;
+
+    const safeOpeningBalance = Number.isFinite(Number(opening_balance)) ? Number(opening_balance) : 0;
+    const safeOpeningBalanceType =
+      String(opening_balance_type || "dr").toLowerCase() === "cr"
+        ? "cr"
+        : "dr";
 
     const warehouse =
       await Warehouse.create({
@@ -338,6 +346,9 @@ router.post("/", async (req, res) => {
 
         employee_ids:
           safeEmployeeIds,
+
+        opening_balance: safeOpeningBalance,
+        opening_balance_type: safeOpeningBalanceType,
 
       });
 
@@ -389,6 +400,8 @@ router.put("/:id", async (req, res) => {
       location_id,
       employee_id,
       employee_ids,
+      opening_balance,
+      opening_balance_type,
     } = req.body;
 
     const safeEmployeeIds =
@@ -398,6 +411,12 @@ router.put("/:id", async (req, res) => {
       safeEmployeeIds[0] ||
       employee_id ||
       null;
+
+    const safeOpeningBalance = Number.isFinite(Number(opening_balance)) ? Number(opening_balance) : 0;
+    const safeOpeningBalanceType =
+      String(opening_balance_type || "dr").toLowerCase() === "cr"
+        ? "cr"
+        : "dr";
 
     const updated =
       await Warehouse.findByIdAndUpdate(
@@ -423,6 +442,9 @@ router.put("/:id", async (req, res) => {
 
           employee_ids:
             safeEmployeeIds,
+
+          opening_balance: safeOpeningBalance,
+          opening_balance_type: safeOpeningBalanceType,
         },
 
         {
