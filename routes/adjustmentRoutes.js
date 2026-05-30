@@ -97,6 +97,7 @@ router.get("/inward/report", (req, res) => {
         p.balance AS remaining_qty,
         w.name AS warehouse_name,
         c.name AS company_name,
+        loc.name AS location_name,
         IFNULL((
           SELECT SUM(a.qty)
           FROM adjustment a
@@ -105,6 +106,7 @@ router.get("/inward/report", (req, res) => {
         ), 0) AS already_adjusted
       FROM palti_lorry_entries p
       INNER JOIN warehouses w ON w.id = p.warehouse_id
+      LEFT JOIN locations loc ON w.location_id = loc.id
       LEFT JOIN companies c ON c.id = p.company_id
       WHERE p.company_id = ?
         AND ${useWarehouse ? 'p.warehouse_id = ?' : 'w.location_id = ?'}
