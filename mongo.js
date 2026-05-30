@@ -255,6 +255,16 @@ const warehouseSchema =
         mongoose.Schema.Types.ObjectId,
       ref: "Employee",
     }],
+
+    opening_balance: {
+      type: Number,
+      default: 0,
+    },
+
+    opening_balance_type: {
+      type: String,
+      default: "dr",
+    },
   });
 
 
