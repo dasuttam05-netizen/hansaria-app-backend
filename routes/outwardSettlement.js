@@ -24,6 +24,39 @@ const canEditManualRate = (user) => {
   return role === "admin" || permissions.includes("all") || permissions.includes("settlement.manualRate");
 };
 
+function ensureAdjustmentCompanyRateColumn() {
+  return new Promise((resolve, reject) => {
+    db.run(`ALTER TABLE adjustment ADD COLUMN company_rate REAL`, (err) => {
+      if (err && !String(err.message || "").includes("duplicate column")) {
+        reject(err);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function getAdjustmentRateMap(outwardId) {
+  return ensureAdjustmentCompanyRateColumn()
+    .then(
+      () =>
+        new Promise((resolve) => {
+          db.all(
+            `SELECT id, company_rate FROM adjustment WHERE outward_id = ?`,
+            [outwardId],
+            (err, rows) => {
+              if (err) {
+                resolve(new Map());
+                return;
+              }
+              resolve(new Map((rows || []).map((row) => [String(row.id), row.company_rate])));
+            }
+          );
+        })
+    )
+    .catch(() => new Map());
+}
+
 function getAdjustmentDetails(outwardId) {
   return new Promise((resolve, reject) => {
     db.all(
@@ -33,7 +66,6 @@ function getAdjustmentDetails(outwardId) {
         a.outward_id,
         COALESCE(a.source_type, 'inward') AS source_type,
         a.qty AS settlement_weight,
-        a.company_rate AS manual_company_rate,
         COALESCE(i.voucher_no, p.voucher_no) AS inward_voucher_no,
         COALESCE(i.lorry_no, p.new_lorry_no, p.reg_lorry_no) AS lorry_no,
         COALESCE(i.date, p.expense_date) AS inward_date,
@@ -56,7 +88,16 @@ function getAdjustmentDetails(outwardId) {
           return;
         }
 
-        resolve(rows || []);
+        getAdjustmentRateMap(outwardId)
+          .then((rateMap) => {
+            resolve(
+              (rows || []).map((row) => ({
+                ...row,
+                manual_company_rate: rateMap.get(String(row.id)),
+              }))
+            );
+          })
+          .catch(() => resolve(rows || []));
       }
     );
   });
@@ -304,19 +345,23 @@ router.post("/save", async (req, res) => {
       const updateManualRates = (done) => {
         if (manualRateMap.size === 0) return done();
         const entries = [...manualRateMap.entries()];
-        const runNext = (index = 0) => {
-          if (index >= entries.length) return done();
-          const [adjustmentId, rate] = entries[index];
-          db.run(
-            `UPDATE adjustment SET company_rate = ? WHERE id = ? AND outward_id = ?`,
-            [rate, adjustmentId, outward_id],
-            (rateErr) => {
-              if (rateErr) return done(rateErr);
-              runNext(index + 1);
-            }
-          );
-        };
-        runNext();
+        ensureAdjustmentCompanyRateColumn()
+          .then(() => {
+            const runNext = (index = 0) => {
+              if (index >= entries.length) return done();
+              const [adjustmentId, rate] = entries[index];
+              db.run(
+                `UPDATE adjustment SET company_rate = ? WHERE id = ? AND outward_id = ?`,
+                [rate, adjustmentId, outward_id],
+                (rateErr) => {
+                  if (rateErr) return done(rateErr);
+                  runNext(index + 1);
+                }
+              );
+            };
+            runNext();
+          })
+          .catch(done);
       };
 
       db.get(
