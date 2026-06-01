@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { userHasPermission } = require("../middleware/auth");
 
 const num = (v) => {
   const n = Number(v);
@@ -269,6 +270,23 @@ router.post("/save", async (req, res) => {
     }
 
     try {
+      const existingSettlement = await new Promise((resolve, reject) => {
+        db.get(
+          `SELECT company_rate FROM outward_settlement WHERE outward_id = ?`,
+          [outward_id],
+          (existingErr, existingRow) => {
+            if (existingErr) return reject(existingErr);
+            return resolve(existingRow || null);
+          }
+        );
+      });
+      const canEditCompanyRate = userHasPermission(req.user, "settlement.companyRate");
+      const existingCompanyRate = num(existingSettlement?.company_rate);
+      const requestedCompanyRate = num(company_rate);
+      if (!canEditCompanyRate && requestedCompanyRate !== existingCompanyRate) {
+        return res.status(403).json({ error: "Company rate edit access required" });
+      }
+
       const adjustment_details = await getAdjustmentDetails(outward_id);
       const settlementWeight = adjustment_details.reduce(
         (sum, item) => sum + num(item.settlement_weight),
@@ -280,7 +298,7 @@ router.post("/save", async (req, res) => {
         unloading_qty,
         settlement_weight: settlementWeight,
         sale_rate,
-        company_rate,
+        company_rate: canEditCompanyRate ? company_rate : existingCompanyRate,
         freight,
         outward_labour_charges,
         other_charges,
