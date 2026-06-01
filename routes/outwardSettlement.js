@@ -7,56 +7,6 @@ const num = (v) => {
   return Number.isFinite(n) ? n : 0;
 };
 
-const parsePermissions = (permissions) => {
-  if (Array.isArray(permissions)) return permissions;
-  if (typeof permissions !== "string") return [];
-  try {
-    const parsed = JSON.parse(permissions);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_err) {
-    return permissions.split(",").map((item) => item.trim()).filter(Boolean);
-  }
-};
-
-const canEditManualRate = (user) => {
-  const role = String(user?.role || "").trim().toLowerCase();
-  const permissions = parsePermissions(user?.permissions);
-  return role === "admin" || permissions.includes("all") || permissions.includes("settlement.manualRate");
-};
-
-function ensureAdjustmentCompanyRateColumn() {
-  return new Promise((resolve, reject) => {
-    db.run(`ALTER TABLE adjustment ADD COLUMN company_rate REAL`, (err) => {
-      if (err && !String(err.message || "").includes("duplicate column")) {
-        reject(err);
-        return;
-      }
-      resolve();
-    });
-  });
-}
-
-function getAdjustmentRateMap(outwardId) {
-  return ensureAdjustmentCompanyRateColumn()
-    .then(
-      () =>
-        new Promise((resolve) => {
-          db.all(
-            `SELECT id, company_rate FROM adjustment WHERE outward_id = ?`,
-            [outwardId],
-            (err, rows) => {
-              if (err) {
-                resolve(new Map());
-                return;
-              }
-              resolve(new Map((rows || []).map((row) => [String(row.id), row.company_rate])));
-            }
-          );
-        })
-    )
-    .catch(() => new Map());
-}
-
 function getAdjustmentDetails(outwardId) {
   return new Promise((resolve, reject) => {
     db.all(
@@ -88,16 +38,7 @@ function getAdjustmentDetails(outwardId) {
           return;
         }
 
-        getAdjustmentRateMap(outwardId)
-          .then((rateMap) => {
-            resolve(
-              (rows || []).map((row) => ({
-                ...row,
-                manual_company_rate: rateMap.get(String(row.id)),
-              }))
-            );
-          })
-          .catch(() => resolve(rows || []));
+        resolve(rows || []);
       }
     );
   });
@@ -113,38 +54,20 @@ function calculateSettlement(data) {
   const outward_labour_charges = num(data.outward_labour_charges);
   const other_charges = num(data.other_charges);
   const charge_bearer = data.charge_bearer === "company" ? "company" : "self";
-  const adjustmentDetails = Array.isArray(data.adjustment_details) ? data.adjustment_details : [];
 
   const shortage_qty = Math.max(dispatch_qty - unloading_qty, 0);
   const sale_amount = dispatch_qty * sale_rate;
-  const company_amount = adjustmentDetails.length
-    ? adjustmentDetails.reduce((sum, item) => {
-        const itemRate =
-          item.company_rate === null || item.company_rate === undefined || item.company_rate === ""
-            ? company_rate
-            : num(item.company_rate);
-        return sum + num(item.settlement_weight) * itemRate;
-      }, 0)
-    : settlement_weight * company_rate;
+  const company_amount = settlement_weight * company_rate;
   const gross_amount = Math.max(
     dispatch_qty * sale_rate - freight - outward_labour_charges - other_charges,
     0
   );
+  const shortage_amount = shortage_qty * company_rate;
   const perMtCharges =
     dispatch_qty > 0
       ? (freight + outward_labour_charges + other_charges) / dispatch_qty
       : 0;
-  const company_payable = adjustmentDetails.length
-    ? adjustmentDetails.reduce((sum, item) => {
-        const weight = num(item.settlement_weight);
-        const itemRate =
-          item.company_rate === null || item.company_rate === undefined || item.company_rate === ""
-            ? company_rate
-            : num(item.company_rate);
-        const shortQty = dispatch_qty > 0 ? (weight / dispatch_qty) * shortage_qty : 0;
-        return sum + weight * itemRate - weight * perMtCharges - shortQty * itemRate;
-      }, 0)
-    : company_amount - settlement_weight * perMtCharges - shortage_qty * company_rate;
+  const company_payable = company_amount - settlement_weight * perMtCharges - shortage_amount;
   const receivable_amount = gross_amount - company_payable;
 
   return {
@@ -166,6 +89,57 @@ function calculateSettlement(data) {
     net_profit: receivable_amount,
     company_payable,
   };
+}
+
+function getApprovedLabourExpense(outwardId) {
+  return new Promise((resolve, reject) => {
+    db.all(
+      `
+      SELECT
+        x.id,
+        x.voucher_no,
+        x.total_expense_amount,
+        x.grand_total,
+        COALESCE(SUM(
+          CASE
+            WHEN LOWER(TRIM(ei.particular_name)) LIKE '%labour%'
+              OR LOWER(TRIM(ei.particular_name)) LIKE '%labor%'
+            THEN IFNULL(ei.amount, 0)
+            ELSE 0
+          END
+        ), 0) AS labour_item_amount
+      FROM expenses x
+      LEFT JOIN expense_items ei ON ei.expense_id = x.id
+      WHERE x.outward_id = ?
+        AND UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO'
+      GROUP BY x.id
+      ORDER BY x.id ASC
+      `,
+      [outwardId],
+      (err, rows) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+
+        const items = (rows || []).map((row) => {
+          const labourItemAmount = num(row.labour_item_amount);
+          const fallbackAmount = num(row.total_expense_amount || row.grand_total);
+          return {
+            id: row.id,
+            voucher_no: row.voucher_no,
+            amount: labourItemAmount > 0 ? labourItemAmount : fallbackAmount,
+          };
+        }).filter((row) => row.amount > 0);
+
+        resolve({
+          amount: items.reduce((sum, item) => sum + num(item.amount), 0),
+          count: items.length,
+          vouchers: items.map((item) => item.voucher_no || `EXP-${item.id}`).filter(Boolean),
+        });
+      }
+    );
+  });
 }
 
 router.get("/:outward_id", async (req, res) => {
@@ -210,6 +184,7 @@ router.get("/:outward_id", async (req, res) => {
 
     try {
       const adjustment_details = await getAdjustmentDetails(outwardId);
+      const labourExpense = await getApprovedLabourExpense(outwardId);
       const totalSettlementWeight = adjustment_details.reduce(
         (sum, item) => sum + num(item.settlement_weight),
         0
@@ -231,17 +206,12 @@ router.get("/:outward_id", async (req, res) => {
         location_name: row.location_name || null,
         product_name: row.product_name,
         outward_quantity: defaultDispatch,
-        adjustment_details: adjustment_details.map((item) => {
-          const effectiveRate =
-            item.manual_company_rate === null || item.manual_company_rate === undefined
-              ? num(row.company_rate ?? 0)
-              : num(item.manual_company_rate);
-          return {
-            ...item,
-            company_rate: effectiveRate,
-            amount: num(item.settlement_weight) * effectiveRate,
-          };
-        }),
+        labour_expense: labourExpense,
+        adjustment_details: adjustment_details.map((item) => ({
+          ...item,
+          company_rate: num(row.company_rate ?? 0),
+          amount: num(item.settlement_weight) * num(row.company_rate ?? 0),
+        })),
         settlement: {
           id: row.id || null,
           dispatch_qty: row.dispatch_qty ?? defaultDispatch,
@@ -284,7 +254,6 @@ router.post("/save", async (req, res) => {
     other_charges,
     charge_bearer,
     narration,
-    adjustment_rates,
   } = req.body;
 
   if (!outward_id) {
@@ -301,29 +270,6 @@ router.post("/save", async (req, res) => {
 
     try {
       const adjustment_details = await getAdjustmentDetails(outward_id);
-      const manualRateMap = new Map(
-        Array.isArray(adjustment_rates)
-          ? adjustment_rates
-              .filter((item) => item && item.id)
-              .map((item) => [
-                String(item.id),
-                item.company_rate === "" || item.company_rate === null || item.company_rate === undefined
-                  ? null
-                  : num(item.company_rate),
-              ])
-          : []
-      );
-
-      if (manualRateMap.size > 0 && !canEditManualRate(req.user)) {
-        return res.status(403).json({ error: "Manual rate permission required" });
-      }
-
-      const ratedAdjustmentDetails = adjustment_details.map((item) => ({
-        ...item,
-        company_rate: manualRateMap.has(String(item.id))
-          ? manualRateMap.get(String(item.id))
-          : item.manual_company_rate,
-      }));
       const settlementWeight = adjustment_details.reduce(
         (sum, item) => sum + num(item.settlement_weight),
         0
@@ -339,30 +285,7 @@ router.post("/save", async (req, res) => {
         outward_labour_charges,
         other_charges,
         charge_bearer,
-        adjustment_details: ratedAdjustmentDetails,
       });
-
-      const updateManualRates = (done) => {
-        if (manualRateMap.size === 0) return done();
-        const entries = [...manualRateMap.entries()];
-        ensureAdjustmentCompanyRateColumn()
-          .then(() => {
-            const runNext = (index = 0) => {
-              if (index >= entries.length) return done();
-              const [adjustmentId, rate] = entries[index];
-              db.run(
-                `UPDATE adjustment SET company_rate = ? WHERE id = ? AND outward_id = ?`,
-                [rate, adjustmentId, outward_id],
-                (rateErr) => {
-                  if (rateErr) return done(rateErr);
-                  runNext(index + 1);
-                }
-              );
-            };
-            runNext();
-          })
-          .catch(done);
-      };
 
       db.get(
         `SELECT id FROM outward_settlement WHERE outward_id = ?`,
@@ -421,12 +344,7 @@ router.post("/save", async (req, res) => {
                 if (updateErr) {
                   return res.status(500).json({ error: updateErr.message });
                 }
-                updateManualRates((rateErr) => {
-                  if (rateErr) {
-                    return res.status(500).json({ error: rateErr.message });
-                  }
-                  return res.json({ message: "Settlement updated successfully" });
-                });
+                return res.json({ message: "Settlement updated successfully" });
               }
             );
           } else {
@@ -458,12 +376,7 @@ router.post("/save", async (req, res) => {
                 if (insertErr) {
                   return res.status(500).json({ error: insertErr.message });
                 }
-                updateManualRates((rateErr) => {
-                  if (rateErr) {
-                    return res.status(500).json({ error: rateErr.message });
-                  }
-                  return res.json({ message: "Settlement saved successfully" });
-                });
+                return res.json({ message: "Settlement saved successfully" });
               }
             );
           }
@@ -562,17 +475,13 @@ router.get("/report/list", (req, res) => {
           const gross_amount = num(row.gross_amount || row.gross_profit);
 
           const mappedAdjustmentDetails = adjustment_details.map((item, index) => {
-            const effectiveRate =
-              item.manual_company_rate === null || item.manual_company_rate === undefined
-                ? num(row.company_rate)
-                : num(item.manual_company_rate);
-            const amount = num(item.settlement_weight) * effectiveRate;
+            const amount = num(item.settlement_weight) * num(row.company_rate);
             const perMtFreight = dispatchQty > 0 ? num(row.freight) / dispatchQty : 0;
             const perMtLabour = dispatchQty > 0 ? num(row.outward_labour_charges) / dispatchQty : 0;
             const perMtOther = dispatchQty > 0 ? num(row.other_charges) / dispatchQty : 0;
             const short_amount =
               dispatchQty > 0
-                ? (num(item.settlement_weight) / dispatchQty) * shortage_qty * effectiveRate
+                ? (num(item.settlement_weight) / dispatchQty) * shortage_qty * num(row.company_rate)
                 : 0;
             const freight = num(item.settlement_weight) * perMtFreight;
             const labour_charges = num(item.settlement_weight) * perMtLabour;
@@ -582,7 +491,7 @@ router.get("/report/list", (req, res) => {
             return {
               ...item,
               sr_no: index + 1,
-              company_rate: effectiveRate,
+              company_rate: num(row.company_rate),
               short_amount,
               freight,
               labour_charges,
