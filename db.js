@@ -399,6 +399,7 @@ if (true) {
       source_type TEXT DEFAULT 'inward',
       qty REAL,
       company_rate REAL DEFAULT 0,
+      whatsapp_sent_at TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(outward_id) REFERENCES outward(id),
       FOREIGN KEY(inward_id) REFERENCES inward(id),
@@ -673,6 +674,7 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN palti_lorry_id INTEGER`, "adjustment palti_lorry_id");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN source_type TEXT DEFAULT 'inward'`, "adjustment source_type");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN company_rate REAL DEFAULT 0`, "adjustment company_rate");
+  addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN whatsapp_sent_at TEXT`, "adjustment whatsapp_sent_at");
   addColIgnoreDup(`ALTER TABLE palti_lorry_entries ADD COLUMN updated_at TEXT`, "palti_lorry_entries updated_at");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN packet REAL DEFAULT 0`, "wh_purchase_vouchers packet");
   addColIgnoreDup(`ALTER TABLE wh_purchase_vouchers ADD COLUMN company_account_id INTEGER`, "wh_purchase_vouchers company_account_id");
