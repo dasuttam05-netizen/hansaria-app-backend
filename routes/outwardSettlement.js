@@ -18,6 +18,7 @@ function getAdjustmentDetails(outwardId) {
         COALESCE(a.source_type, 'inward') AS source_type,
         a.qty AS settlement_weight,
         a.company_rate AS adjustment_company_rate,
+        a.whatsapp_sent_at,
         COALESCE(i.voucher_no, p.voucher_no) AS inward_voucher_no,
         COALESCE(i.lorry_no, p.new_lorry_no, p.reg_lorry_no) AS lorry_no,
         COALESCE(i.date, p.expense_date) AS inward_date,
@@ -479,6 +480,19 @@ router.post("/save", async (req, res) => {
       return res.status(500).json({ error: detailsError.message });
     }
   });
+});
+
+router.post("/adjustment/:id/whatsapp-sent", (req, res) => {
+  const sentAt = new Date().toISOString();
+  db.run(
+    `UPDATE adjustment SET whatsapp_sent_at = ? WHERE id = ?`,
+    [sentAt, req.params.id],
+    function onUpdate(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!this.changes) return res.status(404).json({ error: "Adjustment not found" });
+      return res.json({ whatsapp_sent_at: sentAt });
+    }
+  );
 });
 
 router.get("/report/list", (req, res) => {
