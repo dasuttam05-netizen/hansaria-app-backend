@@ -183,6 +183,24 @@ function buildPurchasePayload(body, voucherNo) {
 }
 
 function buildSalePayload(body, voucherNo) {
+  const purchaseLinks = Array.isArray(body.against_purchase_links)
+    ? body.against_purchase_links
+        .map((item) => {
+          const quantity = Number(item.quantity || item.adjusted_qty || 0);
+          const rate = Number(item.rate || 0);
+          const amount = Number(item.amount || quantity * rate || 0);
+          return {
+            purchase_id: item.purchase_id ? String(item.purchase_id) : "",
+            voucher_no: item.voucher_no || item.purchase_voucher_no || "",
+            farmer_id: item.farmer_id ? String(item.farmer_id) : "",
+            quantity: Number.isFinite(quantity) ? quantity : 0,
+            rate: Number.isFinite(rate) ? rate : 0,
+            amount: Number.isFinite(amount) ? amount : 0,
+          };
+        })
+        .filter((item) => item.purchase_id && item.quantity > 0)
+    : [];
+
   const payload = {
     voucher_no: voucherNo || body.voucher_no,
     date: body.date,
@@ -192,6 +210,11 @@ function buildSalePayload(body, voucherNo) {
     company_id: body.company_id || body.buyer_id ? String(body.company_id || body.buyer_id) : "",
     company_account_id: body.company_account_id ? String(body.company_account_id) : "",
     consignee_id: body.consignee_id ? String(body.consignee_id) : "",
+    po_no: body.po_no || "",
+    due_date: body.due_date || "",
+    against_purchase_enabled: Boolean(body.against_purchase_enabled && purchaseLinks.length),
+    against_purchase_farmer_id: body.against_purchase_farmer_id ? String(body.against_purchase_farmer_id) : "",
+    against_purchase_links: purchaseLinks,
     lorry_no: body.lorry_no || body.reference_id || "",
     product_id: body.product_id ? String(body.product_id) : "",
     employee_id: body.employee_id ? String(body.employee_id) : "",
@@ -2364,7 +2387,7 @@ router.put("/sale/:id", (req, res) => {
     })();
   }
 
-  const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, lorry_no, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, cd_percent, cd_amount, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
+  const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, po_no, due_date, against_purchase_enabled, against_purchase_farmer_id, against_purchase_links, lorry_no, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, cd_percent, cd_amount, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
   if (!deductionOnly && !company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
   if (!deductionOnly && !product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
 
@@ -2460,7 +2483,8 @@ router.put("/sale/:id", (req, res) => {
         }
         const query = `
           UPDATE wh_sale_vouchers SET
-            voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?, lorry_no=?, product_id=?,
+            voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?,
+            po_no=?, due_date=?, against_purchase_enabled=?, against_purchase_farmer_id=?, against_purchase_links=?, lorry_no=?, product_id=?,
             quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?, cd_percent=?, cd_amount=?,
             adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, fifo_rate=?, fifo_amount=?,
             outstanding=?, employee_id=?, location_id=?, description=?
@@ -2468,7 +2492,8 @@ router.put("/sale/:id", (req, res) => {
         `;
 
         return db.run(query, [
-          voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id, lorry_no || req.body.reference_id || "", product_id,
+          voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id,
+          po_no || "", due_date || "", against_purchase_enabled ? 1 : 0, against_purchase_farmer_id || "", JSON.stringify(Array.isArray(against_purchase_links) ? against_purchase_links : []), lorry_no || req.body.reference_id || "", product_id,
           quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, cdPercentValue, cdAmountValue,
           adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, netAmount, fifoRateValue, fifoAmountValue,
           netAmount, employee_id, location_id, description, id
