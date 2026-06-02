@@ -361,7 +361,7 @@ async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deduc
 
   const rows = [
     { key: "shortage", label: "Shortage", amount: Number(shortageAmount || 0) },
-    { key: "deduction", label: "Deduction", amount: Number(deductionAmount || 0) },
+    { key: "claim", label: "Claim", amount: Number(deductionAmount || 0) },
     { key: "cash_discount", label: "Cash Discount", amount: Number(cdAmount || 0) },
     { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
   ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
@@ -3586,6 +3586,18 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       journalParams
     );
 
+    const getSaleVoucherNoFromJournal = (row) => {
+      const parts = String(row.description || "").split(":");
+      return String(parts[1] || "").trim();
+    };
+    const journalsBySaleVoucherNo = new Map();
+    (journals || []).forEach((row) => {
+      const sourceVoucher = getSaleVoucherNoFromJournal(row);
+      if (!sourceVoucher || !saleVoucherNos.has(sourceVoucher)) return;
+      if (!journalsBySaleVoucherNo.has(sourceVoucher)) journalsBySaleVoucherNo.set(sourceVoucher, []);
+      journalsBySaleVoucherNo.get(sourceVoucher).push(row);
+    });
+
     const receiptIds = (receipts || []).map((row) => row.id);
     const receiptAdjustments = receiptIds.length
       ? await dbAll(
@@ -3685,6 +3697,8 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         const receiptDetails = adjustmentsBySale.get(saleId) || [];
         const saleAmount = Number(row.amount || row.total_amount || row.net_receivable_amount || 0);
         const receiptAmount = receiptDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
+        const journalDetails = journalsBySaleVoucherNo.get(String(row.voucher_no || "")) || [];
+        const journalAmount = journalDetails.reduce((sum, item) => sum + Number(item.amount || 0), 0);
         return {
           date: row.date,
           voucher_no: row.voucher_no,
@@ -3700,9 +3714,16 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           sale_id: saleId,
           sale_amount: Number(saleAmount.toFixed(2)),
           receipt_amount: Number(receiptAmount.toFixed(2)),
-          journal_amount: 0,
+          journal_amount: Number(journalAmount.toFixed(2)),
           payment_details: receiptDetails,
-          bill_balance: Number((saleAmount - receiptAmount).toFixed(2)),
+          journal_details: journalDetails.map((item) => ({
+            date: item.date,
+            voucher_no: item.voucher_no,
+            type: item.credit_account || "Deduction",
+            amount: Number(item.amount || 0),
+            description: item.description || "",
+          })),
+          bill_balance: Number((saleAmount - receiptAmount - journalAmount).toFixed(2)),
           debit: saleAmount,
           credit: 0,
         };
@@ -3728,8 +3749,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         };
       }),
       ...journals.map((row) => {
-        const parts = String(row.description || "").split(":");
-        const sourceVoucher = parts[1] || "";
+        const sourceVoucher = getSaleVoucherNoFromJournal(row);
         const sourceSale = saleByVoucherNo.get(sourceVoucher);
         if (!sourceSale) return null;
         return {
