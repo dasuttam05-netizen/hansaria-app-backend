@@ -178,6 +178,11 @@ if (true) {
       company_id INTEGER,
       company_account_id INTEGER,
       consignee_id INTEGER,
+      po_no TEXT,
+      due_date TEXT,
+      against_purchase_enabled INTEGER DEFAULT 0,
+      against_purchase_farmer_id TEXT,
+      against_purchase_links TEXT,
       lorry_no TEXT,
       product_id INTEGER,
       quantity REAL DEFAULT 0,
@@ -698,6 +703,11 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN unloading_date TEXT`, "wh_sale_vouchers unloading_date");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN buyer_id INTEGER`, "wh_sale_vouchers buyer_id");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN company_account_id INTEGER`, "wh_sale_vouchers company_account_id");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN po_no TEXT`, "wh_sale_vouchers po_no");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN due_date TEXT`, "wh_sale_vouchers due_date");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN against_purchase_enabled INTEGER DEFAULT 0`, "wh_sale_vouchers against_purchase_enabled");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN against_purchase_farmer_id TEXT`, "wh_sale_vouchers against_purchase_farmer_id");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN against_purchase_links TEXT`, "wh_sale_vouchers against_purchase_links");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN lorry_no TEXT`, "wh_sale_vouchers lorry_no");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN shortage_quantity REAL DEFAULT 0`, "wh_sale_vouchers shortage_quantity");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN claim_amount REAL DEFAULT 0`, "wh_sale_vouchers claim_amount");
