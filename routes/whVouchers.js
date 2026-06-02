@@ -205,13 +205,17 @@ function buildSalePayload(body, voucherNo) {
     voucher_no: voucherNo || body.voucher_no,
     date: body.date,
     unloading_date: body.unloading_date || "",
+    sale_type: body.sale_type === "direct" ? "direct" : "warehouse",
     warehouse_id: body.warehouse_id ? String(body.warehouse_id) : "",
     buyer_id: body.buyer_id || body.company_id ? String(body.buyer_id || body.company_id) : "",
     company_id: body.company_id || body.buyer_id ? String(body.company_id || body.buyer_id) : "",
+    farmer_id: body.farmer_id || body.against_purchase_farmer_id ? String(body.farmer_id || body.against_purchase_farmer_id) : "",
     company_account_id: body.company_account_id ? String(body.company_account_id) : "",
     consignee_id: body.consignee_id ? String(body.consignee_id) : "",
     po_no: body.po_no || "",
     due_date: body.due_date || "",
+    direct_purchase_rate: Number(body.direct_purchase_rate) || 0,
+    direct_purchase_amount: Number(body.direct_purchase_amount) || 0,
     against_purchase_enabled: Boolean(body.against_purchase_enabled && purchaseLinks.length),
     against_purchase_farmer_id: body.against_purchase_farmer_id ? String(body.against_purchase_farmer_id) : "",
     against_purchase_links: purchaseLinks,
@@ -275,8 +279,52 @@ function buildSalePayload(body, voucherNo) {
   payload.outstanding = netAmount;
   payload.fifo_amount = grossAmount;
   payload.fifo_rate = qtyForFifo > 0 ? grossAmount / qtyForFifo : 0;
+  if (payload.sale_type === "direct") {
+    payload.warehouse_id = "";
+    payload.direct_purchase_amount = Number((qtyForFifo * payload.direct_purchase_rate).toFixed(2));
+  }
 
   return payload;
+}
+
+async function createDirectSalePurchaseVoucher(salePayload) {
+  if (salePayload.sale_type !== "direct") return null;
+  const farmerId = String(salePayload.farmer_id || salePayload.against_purchase_farmer_id || "").trim();
+  if (!farmerId) throw new Error("Farmer is required for direct sale purchase entry");
+  if (!salePayload.location_id) throw new Error("Location is required for direct sale");
+  if (!salePayload.direct_purchase_rate || salePayload.direct_purchase_rate <= 0) {
+    throw new Error("Purchase rate is required for direct sale");
+  }
+
+  const purchaseVoucherNo = await nextMongoVoucherNo("purchase");
+  const qty = Number(salePayload.unloading_qty || salePayload.quantity || 0);
+  const amount = Number((qty * Number(salePayload.direct_purchase_rate || 0)).toFixed(2));
+  const doc = await PurchaseVoucher.create({
+    voucher_no: purchaseVoucherNo,
+    date: salePayload.date,
+    warehouse_id: "",
+    farmer_id: farmerId,
+    company_account_id: salePayload.company_account_id || "",
+    product_id: salePayload.product_id || "",
+    employee_id: salePayload.employee_id || "",
+    location_id: salePayload.location_id || "",
+    quantity: qty,
+    rate: Number(salePayload.direct_purchase_rate || 0),
+    amount,
+    net_weight: qty,
+    total_qty: qty,
+    net_amount_payable: amount,
+    description: `Auto direct sale purchase against ${salePayload.voucher_no || "sale"}`,
+  });
+
+  return {
+    purchase_id: String(doc._id),
+    voucher_no: doc.voucher_no,
+    farmer_id: farmerId,
+    quantity: qty,
+    rate: Number(salePayload.direct_purchase_rate || 0),
+    amount,
+  };
 }
 
 async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = null }) {
@@ -2272,10 +2320,13 @@ router.post("/sale", (req, res) => {
   }
 
   const { voucher_no } = req.body;
-  if (!req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
+  const isDirectSale = req.body?.sale_type === "direct";
+  if (!isDirectSale && !req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
+  if (isDirectSale && !req.body?.location_id) return res.status(400).json({ error: "Location is required for direct sale" });
+  if (isDirectSale && !(req.body?.farmer_id || req.body?.against_purchase_farmer_id)) return res.status(400).json({ error: "Farmer is required for direct sale" });
   if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
   if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
-  if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
+  if (!isDirectSale && !ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
 
   if (mongoReady()) {
     return createVoucherNoIfMissing("sale", voucher_no, async (err, generatedVoucherNo) => {
@@ -2283,12 +2334,19 @@ router.post("/sale", (req, res) => {
       try {
         const payload = buildSalePayload(req.body, generatedVoucherNo);
         const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
-        const availableQty = await getAvailableSaleStock({
-          warehouseId: payload.warehouse_id,
-          productId: payload.product_id,
-        });
-        if (saleQty > availableQty + 0.0001) {
-          return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+        if (!isDirectSale) {
+          const availableQty = await getAvailableSaleStock({
+            warehouseId: payload.warehouse_id,
+            productId: payload.product_id,
+          });
+          if (saleQty > availableQty + 0.0001) {
+            return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+          }
+        } else {
+          const directPurchase = await createDirectSalePurchaseVoucher(payload);
+          payload.against_purchase_enabled = Boolean(directPurchase);
+          payload.against_purchase_farmer_id = directPurchase?.farmer_id || payload.against_purchase_farmer_id || "";
+          payload.against_purchase_links = directPurchase ? [directPurchase] : [];
         }
         const doc = await SaleVoucher.create(payload);
         return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: doc.voucher_no, saved_to: "mongodb" });
@@ -2307,8 +2365,10 @@ router.put("/sale/:id", (req, res) => {
 
   const id = req.params.id;
   const deductionOnly = Boolean(req.body?.deduction_only);
-  if (!req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
-  if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
+  const isDirectSale = req.body?.sale_type === "direct";
+  if (!isDirectSale && !req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
+  if (isDirectSale && !req.body?.location_id) return res.status(400).json({ error: "Location is required for direct sale" });
+  if (!isDirectSale && !ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
 
   if (mongoReady() && mongoose.Types.ObjectId.isValid(id)) {
     return (async () => {
@@ -2370,13 +2430,15 @@ router.put("/sale/:id", (req, res) => {
         if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
         const payload = buildSalePayload(req.body);
         const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
-        const availableQty = await getAvailableSaleStock({
-          warehouseId: payload.warehouse_id,
-          productId: payload.product_id,
-          excludeSaleId: id,
-        });
-        if (saleQty > availableQty + 0.0001) {
-          return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+        if (payload.sale_type !== "direct") {
+          const availableQty = await getAvailableSaleStock({
+            warehouseId: payload.warehouse_id,
+            productId: payload.product_id,
+            excludeSaleId: id,
+          });
+          if (saleQty > availableQty + 0.0001) {
+            return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+          }
         }
         const doc = await SaleVoucher.findByIdAndUpdate(id, payload, { new: true });
         if (!doc) return res.status(404).json({ error: "Sale voucher not found" });
