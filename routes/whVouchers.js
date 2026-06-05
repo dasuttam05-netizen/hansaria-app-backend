@@ -36,6 +36,104 @@ function fmtNum(value) {
   return n.toFixed(2);
 }
 
+function toDateOnly(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const parsed = new Date(`${text}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toISOString().slice(0, 10);
+}
+
+function addDaysToDate(value, days) {
+  const base = toDateOnly(value);
+  const offset = Number(days);
+  if (!base || !Number.isFinite(offset)) return "";
+  const parsed = new Date(`${base}T00:00:00Z`);
+  parsed.setUTCDate(parsed.getUTCDate() + offset);
+  return parsed.toISOString().slice(0, 10);
+}
+
+function calculateDaysDiff(startDate, endDate) {
+  const start = toDateOnly(startDate);
+  const end = toDateOnly(endDate);
+  if (!start || !end) return 0;
+  const msPerDay = 1000 * 60 * 60 * 24;
+  return Math.max(0, Math.floor((new Date(`${end}T00:00:00Z`) - new Date(`${start}T00:00:00Z`)) / msPerDay));
+}
+
+function resolveSaleDueFields(body, fallback = {}) {
+  const explicitDueDate = toDateOnly(body?.due_date);
+  const baseDate =
+    toDateOnly(body?.unloading_date) ||
+    toDateOnly(body?.deduction_details?.unloading_date) ||
+    toDateOnly(body?.date) ||
+    toDateOnly(fallback?.unloading_date) ||
+    toDateOnly(fallback?.date);
+  const fallbackDueDays = Number(fallback?.due_days || 0);
+  const dueDaysInput = body?.due_days;
+  const hasDueDays = dueDaysInput !== undefined && dueDaysInput !== null && String(dueDaysInput).trim() !== "";
+  let dueDays = hasDueDays ? Number(dueDaysInput) : fallbackDueDays;
+  if (!Number.isFinite(dueDays)) dueDays = 0;
+
+  let dueDate = explicitDueDate;
+  if (!dueDate && baseDate) {
+    dueDate = addDaysToDate(baseDate, dueDays);
+  }
+  if (!dueDate) {
+    dueDate = toDateOnly(fallback?.due_date) || "";
+  }
+  if (explicitDueDate && !hasDueDays && baseDate) {
+    dueDays = calculateDaysDiff(baseDate, explicitDueDate);
+  }
+
+  return {
+    due_date: dueDate,
+    due_days: Number.isFinite(dueDays) ? dueDays : 0,
+  };
+}
+
+function getFollowupStatusLabel(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "payment_done") return "Payment Done";
+  if (normalized === "unloading_pending") return "Unloading Pending";
+  if (normalized === "overdue") return "Overdue";
+  return "Payment Pending";
+}
+
+function resolveSaleDueDate(body, fallback = {}) {
+  return resolveSaleDueFields(body, fallback).due_date;
+}
+
+function calculateSaleFollowupMeta(row) {
+  const dueDate = toDateOnly(row?.due_date);
+  const outstanding = Number(row?.outstanding ?? row?.net_amount_payable ?? row?.net_receivable_amount ?? row?.amount ?? 0);
+  const unloadingDate = toDateOnly(row?.unloading_date);
+  const today = toDateOnly(new Date().toISOString().slice(0, 10));
+  const dueDays = Number(row?.due_days || 0);
+  const daysOverdue = dueDate ? calculateDaysDiff(dueDate, today) : 0;
+
+  let followupStatus = "pending";
+  let followupPriority = 1000;
+  if (!unloadingDate) {
+    followupStatus = "unloading_pending";
+    followupPriority = 2000;
+  } else if (outstanding <= 0) {
+    followupStatus = "payment_done";
+    followupPriority = 0;
+  } else if (daysOverdue > 0) {
+    followupStatus = "overdue";
+    followupPriority = 3000 + daysOverdue;
+  }
+
+  return {
+    due_date: dueDate,
+    due_days: Number.isFinite(dueDays) ? dueDays : 0,
+    days_overdue: followupStatus === "overdue" ? daysOverdue : 0,
+    followup_status: followupStatus,
+    followup_priority: followupPriority,
+  };
+}
+
 function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
   const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
   const query = `
@@ -59,7 +157,9 @@ function getSqliteSaleRowsForUser(user) {
         v.*,
         COALESCE(v.buyer_id, v.company_id) AS buyer_id,
         b.name AS buyer_name,
+        b.email AS buyer_email,
         co.name AS consignee_name,
+        co.email AS consignee_email,
         ca.account_name AS company_account_name,
         w.name AS warehouse_name,
         p.name AS product_name,
@@ -83,7 +183,11 @@ async function getAllSaleVoucherRowsForUser(user) {
   if (!mongoReady()) return sqliteRows;
   const mongoRows = await SaleVoucher.find(mongoPurchaseScope(user)).lean();
   const mergedRows = mergeSaleRows(await decorateSaleRows(mongoRows), sqliteRows);
-  return attachSaleBiltiIds(mergedRows);
+  const withBilti = await attachSaleBiltiIds(mergedRows);
+  return withBilti.map((row) => ({
+    ...row,
+    ...calculateSaleFollowupMeta(row),
+  }));
 }
 
 function getSaleVoucherRows(req, res) {
@@ -107,7 +211,9 @@ function getSaleVoucherRowsSqlite(req, res) {
       v.*,
       COALESCE(v.buyer_id, v.company_id) AS buyer_id,
       b.name AS buyer_name,
+      b.email AS buyer_email,
       co.name AS consignee_name,
+      co.email AS consignee_email,
       ca.account_name AS company_account_name,
       w.name AS warehouse_name,
       p.name AS product_name,
@@ -131,7 +237,12 @@ function getSaleVoucherRowsSqlite(req, res) {
   `;
   db.all(query, filter.params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json(rows || []);
+    res.json((rows || []).map((row) => ({
+      ...row,
+      ...calculateSaleFollowupMeta(row),
+      id: String(row.id),
+      _id: String(row.id),
+    })));
   });
 }
 
@@ -204,7 +315,7 @@ function buildSalePayload(body, voucherNo) {
   const payload = {
     voucher_no: voucherNo || body.voucher_no,
     date: body.date,
-    unloading_date: body.unloading_date || "",
+    unloading_date: body.unloading_date || body?.deduction_details?.unloading_date || "",
     sale_type: body.sale_type === "direct" ? "direct" : "warehouse",
     warehouse_id: body.warehouse_id ? String(body.warehouse_id) : "",
     buyer_id: body.buyer_id || body.company_id ? String(body.buyer_id || body.company_id) : "",
@@ -213,7 +324,6 @@ function buildSalePayload(body, voucherNo) {
     company_account_id: body.company_account_id ? String(body.company_account_id) : "",
     consignee_id: body.consignee_id ? String(body.consignee_id) : "",
     po_no: body.po_no || "",
-    due_date: body.due_date || "",
     direct_purchase_rate: Number(body.direct_purchase_rate) || 0,
     direct_purchase_amount: Number(body.direct_purchase_amount) || 0,
     against_purchase_enabled: Boolean(body.against_purchase_enabled && purchaseLinks.length),
@@ -262,6 +372,10 @@ function buildSalePayload(body, voucherNo) {
     const value = Number(body[field]);
     payload[field] = Number.isFinite(value) ? value : 0;
   });
+
+  const dueFields = resolveSaleDueFields(body);
+  payload.due_date = dueFields.due_date;
+  payload.due_days = dueFields.due_days;
 
   const grossAmount = payload.amount;
   const netAmount =
@@ -605,9 +719,12 @@ async function decorateSaleRows(rows) {
       product_name: product?.name || plain.product_name,
       company_account_name: account?.account_name || account?.name || plain.company_account_name,
       buyer_name: buyer?.name || plain.buyer_name || plain.company_name,
+      buyer_email: buyer?.email || plain.buyer_email || "",
       consignee_name: consignee?.name || plain.consignee_name,
+      consignee_email: consignee?.email || plain.consignee_email || "",
       total_quantity: totalQuantity,
       total_amount: totalAmount,
+      ...calculateSaleFollowupMeta(plain),
     };
   });
 }
@@ -3798,6 +3915,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           company_account_name: row.company_account_name,
           buyer_id: row.buyer_id,
           buyer_name: row.buyer_name,
+          buyer_email: row.buyer_email || "",
           sale_id: saleId,
           sale_amount: Number(saleAmount.toFixed(2)),
           receipt_amount: Number(receiptAmount.toFixed(2)),
@@ -3813,6 +3931,12 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           bill_balance: Number((saleAmount - receiptAmount - journalAmount).toFixed(2)),
           debit: saleAmount,
           credit: 0,
+          unloading_date: row.unloading_date || "",
+          due_date: row.due_date || "",
+          due_days: Number(row.due_days || 0),
+          days_overdue: Number(row.days_overdue || 0),
+          followup_status: row.followup_status || "pending",
+          followup_status_label: getFollowupStatusLabel(row.followup_status),
         };
       }),
       ...receipts.map((row) => {
@@ -3859,11 +3983,51 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       }).filter(Boolean),
     ];
 
-    res.json(buildLedgerRows(
+res.json(buildLedgerRows(
       rows,
       (row) => `${row.buyer_id || row.company_id || "unknown"}::${row.company_account_id || "no-account"}`,
       (row) => row.buyer_name || row.company_name || "Unknown Buyer"
     ));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/sale-followup", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const companyAccountId = String(req.query.company_account_id || "").trim();
+    const buyerId = String(req.query.company_id || req.query.buyer_id || "").trim();
+    const statusFilter = String(req.query.status || "").trim().toLowerCase();
+
+    const rows = (await getSaleReportRowsForUser(req.user))
+      .filter((row) => {
+        if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
+        if (buyerId && String(row.buyer_id || row.company_id || "") !== buyerId) return false;
+        if (statusFilter && String(row.followup_status || "").toLowerCase() !== statusFilter) return false;
+        return true;
+      })
+      .map((row) => ({
+        ...row,
+        buyer_email: row.buyer_email || row.consignee_email || "",
+        contact_email: row.buyer_email || row.consignee_email || "",
+        followup_status_label: getFollowupStatusLabel(row.followup_status),
+      }))
+      .sort((a, b) => {
+        if (a.followup_priority !== b.followup_priority) return a.followup_priority - b.followup_priority;
+        const dateA = new Date(a.due_date || a.date || 0).getTime();
+        const dateB = new Date(b.due_date || b.date || 0).getTime();
+        if (dateA !== dateB) return dateA - dateB;
+        return String(a.voucher_no || "").localeCompare(String(b.voucher_no || ""), undefined, {
+          numeric: true,
+          sensitivity: "base",
+        });
+      });
+
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -4008,6 +4172,8 @@ router.get("/sale/:id/pdf", async (req, res) => {
     doc.fontSize(11).text(`Voucher No: ${row.voucher_no || "-"}`);
     doc.text(`Sale Date: ${fmtDate(row.date)}`);
     doc.text(`Unloading Date: ${fmtDate(row.unloading_date)}`);
+    doc.text(`Due Date: ${fmtDate(row.due_date)}`);
+    doc.text(`Due Days: ${fmtNum(row.due_days)}`);
     doc.text(`Lorry No: ${row.lorry_no || row.reference_id || "-"}`);
     doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`);
     doc.text(`Buyer: ${row.buyer_name || row.company_name || "-"}`);
@@ -4023,6 +4189,7 @@ router.get("/sale/:id/pdf", async (req, res) => {
     doc.text(`Total Deduction: ${fmtNum((Number(row.claim_amount) || 0) + (Number(row.other_deduction) || 0) + (Number(row.adjustment_amount) || 0) + (Number(row.tds_amount) || 0))}`);
     doc.text(`Net Receivable: ${fmtNum(row.net_receivable_amount || row.net_amount || row.amount)}`);
     doc.text(`Outstanding: ${fmtNum(row.outstanding)}`);
+    doc.text(`Follow-up Status: ${getFollowupStatusLabel(row.followup_status)}`);
 
     if (row.description) {
       doc.moveDown(0.4);
