@@ -76,7 +76,7 @@ function resolveSaleDueFields(body, fallback = {}) {
   if (!Number.isFinite(dueDays)) dueDays = 0;
 
   let dueDate = explicitDueDate;
-  if (!dueDate && baseDate) {
+  if (!dueDate && baseDate && (hasDueDays || fallbackDueDays > 0)) {
     dueDate = addDaysToDate(baseDate, dueDays);
   }
   if (!dueDate) {
@@ -84,6 +84,9 @@ function resolveSaleDueFields(body, fallback = {}) {
   }
   if (explicitDueDate && !hasDueDays && baseDate) {
     dueDays = calculateDaysDiff(baseDate, explicitDueDate);
+  }
+  if (!dueDays && dueDate && baseDate) {
+    dueDays = calculateDaysDiff(baseDate, dueDate);
   }
 
   return {
@@ -110,7 +113,10 @@ function calculateSaleFollowupMeta(row) {
   const unloadingDate = toDateOnly(row?.unloading_date);
   const today = toDateOnly(new Date().toISOString().slice(0, 10));
   const dueDaysRaw = row?.due_days;
-  const dueDays = Number.isFinite(Number(dueDaysRaw)) ? Number(dueDaysRaw) : 0;
+  let dueDays = Number.isFinite(Number(dueDaysRaw)) ? Number(dueDaysRaw) : 0;
+  if (!dueDays && dueDate && unloadingDate) {
+    dueDays = calculateDaysDiff(unloadingDate, dueDate);
+  }
   const daysOverdue = dueDate ? calculateDaysDiff(dueDate, today) : 0;
 
   let followupStatus = "pending";
