@@ -180,6 +180,7 @@ if (true) {
       consignee_id INTEGER,
       po_no TEXT,
       due_date TEXT,
+      due_days REAL DEFAULT 0,
       sale_type TEXT DEFAULT 'warehouse',
       direct_purchase_rate REAL DEFAULT 0,
       direct_purchase_amount REAL DEFAULT 0,
@@ -708,6 +709,7 @@ if (true) {
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN company_account_id INTEGER`, "wh_sale_vouchers company_account_id");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN po_no TEXT`, "wh_sale_vouchers po_no");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN due_date TEXT`, "wh_sale_vouchers due_date");
+  addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN due_days REAL DEFAULT 0`, "wh_sale_vouchers due_days");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN sale_type TEXT DEFAULT 'warehouse'`, "wh_sale_vouchers sale_type");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN direct_purchase_rate REAL DEFAULT 0`, "wh_sale_vouchers direct_purchase_rate");
   addColIgnoreDup(`ALTER TABLE wh_sale_vouchers ADD COLUMN direct_purchase_amount REAL DEFAULT 0`, "wh_sale_vouchers direct_purchase_amount");
