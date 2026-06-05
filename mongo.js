@@ -342,6 +342,7 @@ const saleVoucherSchema =
     consignee_id: String,
     po_no: String,
     due_date: String,
+    due_days: { type: Number, default: 0 },
     sale_type: { type: String, default: "warehouse" },
     direct_purchase_rate: { type: Number, default: 0 },
     direct_purchase_amount: { type: Number, default: 0 },
