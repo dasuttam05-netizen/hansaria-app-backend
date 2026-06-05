@@ -109,7 +109,8 @@ function calculateSaleFollowupMeta(row) {
   const outstanding = Number(row?.outstanding ?? row?.net_amount_payable ?? row?.net_receivable_amount ?? row?.amount ?? 0);
   const unloadingDate = toDateOnly(row?.unloading_date);
   const today = toDateOnly(new Date().toISOString().slice(0, 10));
-  const dueDays = Number(row?.due_days || 0);
+  const dueDaysRaw = row?.due_days;
+  const dueDays = Number.isFinite(Number(dueDaysRaw)) ? Number(dueDaysRaw) : 0;
   const daysOverdue = dueDate ? calculateDaysDiff(dueDate, today) : 0;
 
   let followupStatus = "pending";
@@ -131,6 +132,7 @@ function calculateSaleFollowupMeta(row) {
     days_overdue: followupStatus === "overdue" ? daysOverdue : 0,
     followup_status: followupStatus,
     followup_priority: followupPriority,
+    balance: outstanding,
   };
 }
 
@@ -3916,6 +3918,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           buyer_id: row.buyer_id,
           buyer_name: row.buyer_name,
           buyer_email: row.buyer_email || "",
+          party_name: row.buyer_name || row.company_name || "-",
           sale_id: saleId,
           sale_amount: Number(saleAmount.toFixed(2)),
           receipt_amount: Number(receiptAmount.toFixed(2)),
@@ -3929,12 +3932,13 @@ router.get("/report/sale-party-ledger", async (req, res) => {
             description: item.description || "",
           })),
           bill_balance: Number((saleAmount - receiptAmount - journalAmount).toFixed(2)),
+          balance: Number((saleAmount - receiptAmount - journalAmount).toFixed(2)),
           debit: saleAmount,
           credit: 0,
           unloading_date: row.unloading_date || "",
           due_date: row.due_date || "",
-          due_days: Number(row.due_days || 0),
-          days_overdue: Number(row.days_overdue || 0),
+          due_days: Number.isFinite(Number(row.due_days)) ? Number(row.due_days) : calculateDaysDiff(row.unloading_date || row.date, row.due_date),
+          days_overdue: Number.isFinite(Number(row.days_overdue)) ? Number(row.days_overdue) : calculateDaysDiff(row.due_date, new Date().toISOString().slice(0, 10)),
           followup_status: row.followup_status || "pending",
           followup_status_label: getFollowupStatusLabel(row.followup_status),
         };
@@ -4013,6 +4017,10 @@ router.get("/report/sale-followup", async (req, res) => {
       .map((row) => ({
         ...row,
         buyer_email: row.buyer_email || row.consignee_email || "",
+        party_name: row.party_name || row.buyer_name || row.company_name || "-",
+        balance: Number(row.balance || row.bill_balance || row.outstanding || row.sale_amount || 0),
+        due_days: Number.isFinite(Number(row.due_days)) ? Number(row.due_days) : calculateDaysDiff(row.unloading_date || row.date, row.due_date),
+        days_overdue: Number.isFinite(Number(row.days_overdue)) ? Number(row.days_overdue) : calculateDaysDiff(row.due_date, new Date().toISOString().slice(0, 10)),
         contact_email: row.buyer_email || row.consignee_email || "",
         followup_status_label: getFollowupStatusLabel(row.followup_status),
       }))
