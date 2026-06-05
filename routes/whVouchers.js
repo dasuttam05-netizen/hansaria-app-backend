@@ -108,12 +108,17 @@ function resolveSaleDueDate(body, fallback = {}) {
 }
 
 function calculateSaleFollowupMeta(row) {
-  const dueDate = toDateOnly(row?.due_date);
-  const outstanding = Number(row?.outstanding ?? row?.net_amount_payable ?? row?.net_receivable_amount ?? row?.amount ?? 0);
   const unloadingDate = toDateOnly(row?.unloading_date);
+  const outstanding = Number(row?.outstanding ?? row?.net_amount_payable ?? row?.net_receivable_amount ?? row?.amount ?? 0);
   const today = toDateOnly(new Date().toISOString().slice(0, 10));
   const dueDaysRaw = row?.due_days;
   let dueDays = Number.isFinite(Number(dueDaysRaw)) ? Number(dueDaysRaw) : 0;
+  const rawDueDate = toDateOnly(row?.due_date);
+  const normalizedDueDate =
+    unloadingDate && dueDays > 0
+      ? addDaysToDate(unloadingDate, dueDays)
+      : rawDueDate;
+  const dueDate = normalizedDueDate || (unloadingDate && dueDays > 0 ? addDaysToDate(unloadingDate, dueDays) : "");
   if (!dueDays && dueDate && unloadingDate) {
     dueDays = calculateDaysDiff(unloadingDate, dueDate);
   }
@@ -2501,6 +2506,7 @@ router.put("/sale/:id", (req, res) => {
         if (deductionOnly) {
           const existing = await SaleVoucher.findById(id);
           if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
+          const dueFields = resolveSaleDueFields(req.body, existing);
           const manualClaimValue = Number(req.body.claim_amount !== undefined ? req.body.claim_amount : existing.claim_amount) || 0;
           const adjustmentValue = Number(req.body.adjustment_amount !== undefined ? req.body.adjustment_amount : existing.adjustment_amount) || 0;
           const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
@@ -2521,6 +2527,8 @@ router.put("/sale/:id", (req, res) => {
           const netAmount = grossAmount - claimValue - otherDeductionValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
 
           existing.unloading_date = req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date;
+          existing.due_date = dueFields.due_date || existing.due_date || "";
+          existing.due_days = dueFields.due_days;
           existing.unloading_qty = unloadingQtyValue;
           existing.shortage_quantity = shortageQty;
           existing.moisture = Number(req.body.moisture !== undefined ? req.body.moisture : existing.moisture) || 0;
