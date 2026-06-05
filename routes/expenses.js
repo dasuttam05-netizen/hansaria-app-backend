@@ -55,6 +55,70 @@ function buildDefaultExpenseItems() {
   }));
 }
 
+function resolveExpenseParticularName(item, fallbackName = "") {
+  const candidates = [item?.particular_name, item?.particulars, item?.name];
+  for (const candidate of candidates) {
+    const text = String(candidate ?? "").trim();
+    if (text) return text;
+  }
+
+  return String(fallbackName ?? "").trim();
+}
+
+function normalizeExpenseItemsForDisplay(items) {
+  const existingItems = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (existingItems.length === 0) {
+    return buildDefaultExpenseItems();
+  }
+
+  const unusedItems = [...existingItems];
+  const rows = EXPENSE_PARTICULAR_DEFAULTS.map((defaultName, index) => {
+    const normalizedDefaultName = defaultName.trim().toLowerCase();
+    let matchIndex = unusedItems.findIndex((item) => Number(item.line_no) === index + 1);
+
+    if (matchIndex === -1) {
+      matchIndex = unusedItems.findIndex(
+        (item) => resolveExpenseParticularName(item).trim().toLowerCase() === normalizedDefaultName
+      );
+    }
+
+    const matchedItem = matchIndex >= 0 ? unusedItems.splice(matchIndex, 1)[0] : null;
+
+    return {
+      id: matchedItem?.id || null,
+      line_no: index + 1,
+      particular_name: resolveExpenseParticularName(matchedItem, defaultName) || defaultName,
+      bags: matchedItem?.bags ?? 0,
+      rate: matchedItem?.rate ?? 0,
+      amount:
+        matchedItem?.amount ??
+        Number(
+          (
+            (Number(matchedItem?.bags) || 0) *
+            (Number(matchedItem?.rate) || 0)
+          ).toFixed(2)
+        ),
+    };
+  });
+
+  const extraRows = unusedItems.map((item, index) => ({
+    id: item?.id || null,
+    line_no: Number(item?.line_no) || EXPENSE_PARTICULAR_DEFAULTS.length + index + 1,
+    particular_name:
+      resolveExpenseParticularName(
+        item,
+        `Particular ${EXPENSE_PARTICULAR_DEFAULTS.length + index + 1}`
+      ) || `Particular ${EXPENSE_PARTICULAR_DEFAULTS.length + index + 1}`,
+    bags: item?.bags ?? 0,
+    rate: item?.rate ?? 0,
+    amount:
+      item?.amount ??
+      Number(((Number(item?.bags) || 0) * (Number(item?.rate) || 0)).toFixed(2)),
+  }));
+
+  return [...rows, ...extraRows];
+}
+
 function isEffectivelyEmptyExpenseItem(item) {
   return (
     (Number(item?.bags) || 0) === 0 &&
@@ -905,7 +969,7 @@ router.get("/", (req, res) => {
             return res.json(
               entries.map((entry) => ({
                 ...entry,
-                items: itemMap.get(entry.id) || [],
+                items: normalizeExpenseItemsForDisplay(itemMap.get(entry.id) || []),
               }))
             );
           }
@@ -1056,10 +1120,7 @@ router.get("/:id", (req, res) => {
             return res.status(500).json({ error: itemsErr.message });
           }
 
-          const normalizedItems =
-            Array.isArray(items) && items.length > 0
-              ? items
-              : buildDefaultExpenseItems();
+          const normalizedItems = normalizeExpenseItemsForDisplay(items);
 
           return res.json({
             ...row,
