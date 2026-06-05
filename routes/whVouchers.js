@@ -4203,6 +4203,7 @@ router.get("/sale/:id/pdf", async (req, res) => {
     doc.text(`Unloading Date: ${fmtDate(row.unloading_date)}`);
     doc.text(`Due Date: ${fmtDate(row.due_date)}`);
     doc.text(`Due Days: ${fmtNum(row.due_days)}`);
+    doc.text(`Days Overdue: ${fmtNum(row.days_overdue)}`);
     doc.text(`Lorry No: ${row.lorry_no || row.reference_id || "-"}`);
     doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`);
     doc.text(`Buyer: ${row.buyer_name || row.company_name || "-"}`);
