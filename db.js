@@ -896,6 +896,42 @@ if (true) {
   );
 
   db.run(
+    `ALTER TABLE outward_settlement ADD COLUMN claim_amount REAL DEFAULT 0`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("outward_settlement claim_amount add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `ALTER TABLE outward_settlement ADD COLUMN other_deduction REAL DEFAULT 0`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("outward_settlement other_deduction add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `ALTER TABLE outward_settlement ADD COLUMN average_rate REAL DEFAULT 0`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("outward_settlement average_rate add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `ALTER TABLE outward_settlement ADD COLUMN average_amount REAL DEFAULT 0`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("outward_settlement average_amount add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
     `ALTER TABLE inward ADD COLUMN narration TEXT`,
     (err) => {
       if (err && !err.message.includes("duplicate column")) {
