@@ -57,10 +57,20 @@ function calculateSettlement(data) {
   const freight = num(data.freight);
   const outward_labour_charges = num(data.outward_labour_charges);
   const other_charges = num(data.other_charges);
+  const claim_amount = num(data.claim_amount);
+  const other_deduction = num(data.other_deduction);
   const charge_bearer = data.charge_bearer === "company" ? "company" : "self";
 
   const shortage_qty = Math.max(dispatch_qty - unloading_qty, 0);
   const sale_amount = dispatch_qty * sale_rate;
+  const average_rate = settlement_weight > 0
+    ? adjustment_details.reduce((sum, item) => {
+        const weight = num(item.settlement_weight);
+        const rowRate = num(item.company_rate) || company_rate;
+        return sum + weight * rowRate;
+      }, 0) / settlement_weight
+    : company_rate;
+  const average_amount = settlement_weight * average_rate;
   const company_amount = adjustment_details.length
     ? adjustment_details.reduce((sum, item) => {
         const rowRate = num(item.company_rate) || company_rate;
@@ -91,7 +101,7 @@ function calculateSettlement(data) {
         return sum + weight * rowRate - weight * perMtCharges - shortQty * rowRate;
       }, 0)
     : company_amount - settlement_weight * perMtCharges - shortage_amount;
-  const receivable_amount = gross_amount - company_payable;
+  const receivable_amount = gross_amount - company_payable - claim_amount - other_deduction;
 
   return {
     dispatch_qty,
@@ -100,6 +110,8 @@ function calculateSettlement(data) {
     settlement_weight,
     sale_rate,
     company_rate,
+    average_rate,
+    average_amount,
     sale_amount,
     company_amount,
     gross_amount,
@@ -107,6 +119,8 @@ function calculateSettlement(data) {
     freight,
     outward_labour_charges,
     other_charges,
+    claim_amount,
+    other_deduction,
     charge_bearer,
     gross_profit: gross_amount,
     net_profit: receivable_amount,
@@ -235,7 +249,7 @@ router.get("/:outward_id", async (req, res) => {
           company_rate: num(item.adjustment_company_rate) || num(row.company_rate ?? 0),
           amount: num(item.settlement_weight) * (num(item.adjustment_company_rate) || num(row.company_rate ?? 0)),
         })),
-        settlement: {
+          settlement: {
           id: row.id || null,
           dispatch_qty: row.dispatch_qty ?? defaultDispatch,
           unloading_qty: row.unloading_qty ?? totalSettlementWeight,
@@ -243,6 +257,8 @@ router.get("/:outward_id", async (req, res) => {
           billable_qty: row.billable_qty ?? 0,
           sale_rate: row.sale_rate ?? num(row.outward_rate),
           company_rate: row.company_rate ?? 0,
+          average_rate: row.average_rate ?? 0,
+          average_amount: row.average_amount ?? 0,
           sale_amount: row.sale_amount ?? 0,
           company_amount: row.company_amount ?? 0,
           gross_amount: row.gross_amount ?? row.gross_profit ?? 0,
@@ -250,6 +266,8 @@ router.get("/:outward_id", async (req, res) => {
           freight: row.freight ?? 0,
           outward_labour_charges: row.outward_labour_charges ?? 0,
           other_charges: row.other_charges ?? 0,
+          claim_amount: row.claim_amount ?? 0,
+          other_deduction: row.other_deduction ?? 0,
           charge_bearer: row.charge_bearer || "self",
           gross_profit: row.gross_profit ?? 0,
           net_profit: row.net_profit ?? 0,
@@ -276,6 +294,8 @@ router.post("/save", async (req, res) => {
     freight,
     outward_labour_charges,
     other_charges,
+    claim_amount,
+    other_deduction,
     charge_bearer,
     narration,
   } = req.body;
@@ -346,6 +366,8 @@ router.post("/save", async (req, res) => {
         freight,
         outward_labour_charges,
         other_charges,
+        claim_amount,
+        other_deduction,
         charge_bearer,
       });
 
@@ -394,6 +416,8 @@ router.post("/save", async (req, res) => {
             settlement.billable_qty,
             settlement.sale_rate,
             settlement.company_rate,
+            settlement.average_rate,
+            settlement.average_amount,
             settlement.sale_amount,
             settlement.company_amount,
             settlement.gross_amount,
@@ -401,6 +425,8 @@ router.post("/save", async (req, res) => {
             settlement.freight,
             settlement.outward_labour_charges,
             settlement.other_charges,
+            settlement.claim_amount,
+            settlement.other_deduction,
             settlement.charge_bearer,
             settlement.gross_profit,
             settlement.net_profit,
@@ -417,6 +443,8 @@ router.post("/save", async (req, res) => {
                 billable_qty = ?,
                 sale_rate = ?,
                 company_rate = ?,
+                average_rate = ?,
+                average_amount = ?,
                 sale_amount = ?,
                 company_amount = ?,
                 gross_amount = ?,
@@ -424,6 +452,8 @@ router.post("/save", async (req, res) => {
                 freight = ?,
                 outward_labour_charges = ?,
                 other_charges = ?,
+                claim_amount = ?,
+                other_deduction = ?,
                 charge_bearer = ?,
                 gross_profit = ?,
                 net_profit = ?,
@@ -450,6 +480,8 @@ router.post("/save", async (req, res) => {
                 billable_qty,
                 sale_rate,
                 company_rate,
+                average_rate,
+                average_amount,
                 sale_amount,
                 company_amount,
                 gross_amount,
@@ -457,12 +489,14 @@ router.post("/save", async (req, res) => {
                 freight,
                 outward_labour_charges,
                 other_charges,
+                claim_amount,
+                other_deduction,
                 charge_bearer,
                 gross_profit,
                 net_profit,
                 company_payable,
                 narration
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               `,
               [outward_id, ...params],
               (insertErr) => {
@@ -540,6 +574,8 @@ router.get("/report/list", (req, res) => {
       s.billable_qty,
       s.sale_rate,
       s.company_rate,
+      s.average_rate,
+      s.average_amount,
       s.sale_amount,
       s.company_amount,
       s.gross_amount,
@@ -547,6 +583,8 @@ router.get("/report/list", (req, res) => {
       s.freight,
       s.outward_labour_charges,
       s.other_charges,
+      s.claim_amount,
+      s.other_deduction,
       s.charge_bearer,
       s.gross_profit,
       s.net_profit,
@@ -580,6 +618,10 @@ router.get("/report/list", (req, res) => {
           const dispatchQty = num(row.dispatch_qty);
           const shortage_qty = num(row.billable_qty);
           const gross_amount = num(row.gross_amount || row.gross_profit);
+          const average_rate = num(row.average_rate);
+          const average_amount = num(row.average_amount);
+          const claim_amount = num(row.claim_amount);
+          const other_deduction = num(row.other_deduction);
 
           const mappedAdjustmentDetails = adjustment_details.map((item, index) => {
             const rowCompanyRate = num(item.adjustment_company_rate) || num(row.company_rate);
@@ -620,7 +662,11 @@ router.get("/report/list", (req, res) => {
             settlement_weight,
             gross_amount,
             company_payable,
-            receivable_amount: gross_amount - company_payable,
+            receivable_amount: gross_amount - company_payable - claim_amount - other_deduction,
+            average_rate,
+            average_amount,
+            claim_amount,
+            other_deduction,
             adjustment_details: mappedAdjustmentDetails,
           };
         })
