@@ -441,7 +441,6 @@ app.use(
 app.use(
   "/api/buyer-adjustment",
   authenticate,
-  authorize("adjustment.manage"),
   buyerAdjustmentRoutes
 );
 
