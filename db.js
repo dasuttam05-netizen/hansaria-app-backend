@@ -417,6 +417,25 @@ if (true) {
   `);
 
   db.run(`
+    CREATE TABLE IF NOT EXISTS buyer_adjustments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      outward_id INTEGER NOT NULL,
+      buyer_id INTEGER,
+      unloading_date TEXT,
+      weight REAL DEFAULT 0,
+      qty REAL DEFAULT 0,
+      rate REAL DEFAULT 0,
+      claim REAL DEFAULT 0,
+      other_deduction REAL DEFAULT 0,
+      shortage REAL DEFAULT 0,
+      status TEXT DEFAULT 'Pending',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(outward_id) REFERENCES outward(id)
+    )
+  `);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS idempotency_keys (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       key TEXT NOT NULL UNIQUE,
