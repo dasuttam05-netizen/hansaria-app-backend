@@ -5,7 +5,7 @@ const { installSqliteMongoMirror } = require("./sqliteMongoSync");
 let sqlite3;
 let db = null;
 
-if (true) {
+if (process.env.NODE_ENV !== "production") {
   sqlite3 = require("sqlite3").verbose();
   const dbPath = path.join(__dirname, "database.sqlite");
 
