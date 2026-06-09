@@ -178,6 +178,21 @@ const adjustmentSchema = new mongoose.Schema({
   created_at: { type: Date, default: Date.now },
 });
 
+const buyerAdjustmentSchema = new mongoose.Schema({
+  outward_id: { type: Number, required: true, index: true },
+  buyer_id: Number,
+  unloading_date: Date,
+  weight: { type: Number, default: 0 },
+  qty: { type: Number, default: 0 },
+  rate: { type: Number, default: 0 },
+  claim: { type: Number, default: 0 },
+  other_deduction: { type: Number, default: 0 },
+  shortage: { type: Number, default: 0 },
+  status: { type: String, default: 'Pending' },
+  created_at: { type: Date, default: Date.now },
+  updated_at: { type: Date, default: Date.now },
+});
+
 const stockSchema = new mongoose.Schema({
   location: String,
   product: String,
@@ -266,6 +281,7 @@ module.exports = {
   Inward: mongoose.models.Inward || mongoose.model('Inward', inwardSchema),
   Outward: mongoose.models.Outward || mongoose.model('Outward', outwardSchema),
   Adjustment: mongoose.models.Adjustment || mongoose.model('Adjustment', adjustmentSchema),
+  BuyerAdjustment: mongoose.models.BuyerAdjustment || mongoose.model('BuyerAdjustment', buyerAdjustmentSchema),
   Stock: mongoose.models.Stock || mongoose.model('Stock', stockSchema),
   Transporter: mongoose.models.Transporter || mongoose.model('Transporter', transporterSchema),
   Expense: mongoose.models.Expense || mongoose.model('Expense', expenseSchema),
