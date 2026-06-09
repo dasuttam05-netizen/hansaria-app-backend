@@ -14,7 +14,6 @@ router.get("/without-unloading", async (req, res) => {
   }
 
   try {
-    // First, try the full query with buyer_adjustments check
     const query = `
       SELECT o.*, 
              e.name as employee_name,
@@ -31,13 +30,49 @@ router.get("/without-unloading", async (req, res) => {
       LEFT JOIN products p ON o.product_id = p.id
       LEFT JOIN companies c ON o.company_id = c.id
       LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-      WHERE o.status IN ('Pending', 'Partial')
+      WHERE o.id NOT IN (
+        SELECT DISTINCT outward_id FROM buyer_adjustments
+      )
+      AND o.status IN ('Pending', 'Partial')
       ORDER BY o.created_at DESC
     `;
 
     db.all(query, [], (err, rows) => {
       if (err) {
         console.error("Error fetching outward entries:", err);
+
+        // Fallback for older / un-migrated databases without buyer_adjustments table
+        if (err.message && err.message.includes("no such table: buyer_adjustments")) {
+          const fallbackQuery = `
+            SELECT o.*, 
+                   e.name as employee_name,
+                   l.name as location_name,
+                   w.name as warehouse_name,
+                   p.name as product_name,
+                   c.name as company_name,
+                   ca.account_name as account_name,
+                   ca.party_name
+            FROM outward o
+            LEFT JOIN employees e ON o.employee_id = e.id
+            LEFT JOIN locations l ON o.location_id = l.id
+            LEFT JOIN warehouses w ON o.warehouse_id = w.id
+            LEFT JOIN products p ON o.product_id = p.id
+            LEFT JOIN companies c ON o.company_id = c.id
+            LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
+            WHERE o.status IN ('Pending', 'Partial')
+            ORDER BY o.created_at DESC
+          `;
+
+          db.all(fallbackQuery, [], (fallbackErr, fallbackRows) => {
+            if (fallbackErr) {
+              console.error("Fallback error fetching outward entries:", fallbackErr);
+              return res.status(500).json({ error: "Database error: " + fallbackErr.message });
+            }
+            return res.json(Array.isArray(fallbackRows) ? fallbackRows : []);
+          });
+          return;
+        }
+
         return res.status(500).json({ error: "Database error: " + err.message });
       }
 
