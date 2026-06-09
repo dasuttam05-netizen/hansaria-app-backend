@@ -8,6 +8,55 @@ const num = (v) => {
   return Number.isFinite(n) ? n : 0;
 };
 
+const safeJsonParse = (value, fallback = []) => {
+  if (Array.isArray(value)) return value;
+  if (value == null || value === "") return fallback;
+  if (typeof value === "object") return fallback;
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : fallback;
+  } catch (err) {
+    return fallback;
+  }
+};
+
+const normalizeDetailRows = (value, fallbackAmount = 0, fallbackLabel = "") => {
+  const rows = safeJsonParse(value, []);
+  if (rows.length > 0) {
+    return rows.map((item, index) => ({
+      id: item?.id ?? `${Date.now()}-${index}`,
+      description: String(item?.description ?? item?.particular ?? item?.name ?? fallbackLabel ?? "").trim(),
+      amount: num(item?.amount),
+    }));
+  }
+
+  const amount = num(fallbackAmount);
+  if (amount > 0) {
+    return [
+      {
+        id: `${Date.now()}-0`,
+        description: fallbackLabel || "",
+        amount,
+      },
+    ];
+  }
+
+  return [
+    {
+      id: `${Date.now()}-0`,
+      description: fallbackLabel || "",
+      amount: 0,
+    },
+  ];
+};
+
+const stripEmptyDetailRows = (rows) =>
+  (Array.isArray(rows) ? rows : []).filter((row) => String(row?.description || "").trim() || num(row?.amount) !== 0);
+
+const sumDetailRows = (rows) =>
+  (Array.isArray(rows) ? rows : []).reduce((sum, row) => sum + num(row?.amount), 0);
+
 function getAdjustmentDetails(outwardId) {
   return new Promise((resolve, reject) => {
     db.all(
@@ -57,8 +106,10 @@ function calculateSettlement(data) {
   const freight = num(data.freight);
   const outward_labour_charges = num(data.outward_labour_charges);
   const other_charges = num(data.other_charges);
-  const claim_amount = num(data.claim_amount);
-  const other_deduction = num(data.other_deduction);
+  const claim_details = Array.isArray(data.claim_details) ? data.claim_details : [];
+  const other_deduction_details = Array.isArray(data.other_deduction_details) ? data.other_deduction_details : [];
+  const claim_amount = num(data.claim_amount) || sumDetailRows(claim_details);
+  const other_deduction = num(data.other_deduction) || sumDetailRows(other_deduction_details);
   const charge_bearer = data.charge_bearer === "company" ? "company" : "self";
 
   const shortage_qty = Math.max(dispatch_qty - unloading_qty, 0);
@@ -121,6 +172,8 @@ function calculateSettlement(data) {
     other_charges,
     claim_amount,
     other_deduction,
+    claim_details,
+    other_deduction_details,
     charge_bearer,
     gross_profit: gross_amount,
     net_profit: receivable_amount,
@@ -226,6 +279,12 @@ router.get("/:outward_id", async (req, res) => {
         (sum, item) => sum + num(item.settlement_weight),
         0
       );
+      const claimDetails = normalizeDetailRows(row.claim_details, row.claim_amount, "Claim");
+      const otherDeductionDetails = normalizeDetailRows(
+        row.other_deduction_details,
+        row.other_deduction,
+        "Deduction"
+      );
 
       const defaultDispatch = num(row.outward_quantity || row.outward_weight);
 
@@ -268,6 +327,8 @@ router.get("/:outward_id", async (req, res) => {
           other_charges: row.other_charges ?? 0,
           claim_amount: row.claim_amount ?? 0,
           other_deduction: row.other_deduction ?? 0,
+          claim_details: claimDetails,
+          other_deduction_details: otherDeductionDetails,
           charge_bearer: row.charge_bearer || "self",
           gross_profit: row.gross_profit ?? 0,
           net_profit: row.net_profit ?? 0,
@@ -296,6 +357,8 @@ router.post("/save", async (req, res) => {
     other_charges,
     claim_amount,
     other_deduction,
+    claim_details,
+    other_deduction_details,
     charge_bearer,
     narration,
   } = req.body;
@@ -355,6 +418,16 @@ router.post("/save", async (req, res) => {
         (sum, item) => sum + num(item.settlement_weight),
         0
       );
+      const normalizedClaimDetails = stripEmptyDetailRows(
+        normalizeDetailRows(claim_details, claim_amount, "Claim")
+      );
+      const normalizedOtherDeductionDetails = stripEmptyDetailRows(
+        normalizeDetailRows(
+          other_deduction_details,
+          other_deduction,
+          "Deduction"
+        )
+      );
 
       const settlement = calculateSettlement({
         dispatch_qty: dispatch_qty ?? num(outward.quantity || outward.weight),
@@ -368,6 +441,8 @@ router.post("/save", async (req, res) => {
         other_charges,
         claim_amount,
         other_deduction,
+        claim_details: normalizedClaimDetails,
+        other_deduction_details: normalizedOtherDeductionDetails,
         charge_bearer,
       });
 
@@ -427,6 +502,8 @@ router.post("/save", async (req, res) => {
             settlement.other_charges,
             settlement.claim_amount,
             settlement.other_deduction,
+            JSON.stringify(settlement.claim_details || []),
+            JSON.stringify(settlement.other_deduction_details || []),
             settlement.charge_bearer,
             settlement.gross_profit,
             settlement.net_profit,
@@ -454,6 +531,8 @@ router.post("/save", async (req, res) => {
                 other_charges = ?,
                 claim_amount = ?,
                 other_deduction = ?,
+                claim_details = ?,
+                other_deduction_details = ?,
                 charge_bearer = ?,
                 gross_profit = ?,
                 net_profit = ?,
@@ -491,12 +570,14 @@ router.post("/save", async (req, res) => {
                 other_charges,
                 claim_amount,
                 other_deduction,
+                claim_details,
+                other_deduction_details,
                 charge_bearer,
                 gross_profit,
                 net_profit,
                 company_payable,
                 narration
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               `,
               [outward_id, ...params],
               (insertErr) => {
@@ -585,6 +666,8 @@ router.get("/report/list", (req, res) => {
       s.other_charges,
       s.claim_amount,
       s.other_deduction,
+      s.claim_details,
+      s.other_deduction_details,
       s.charge_bearer,
       s.gross_profit,
       s.net_profit,
@@ -622,6 +705,12 @@ router.get("/report/list", (req, res) => {
           const average_amount = num(row.average_amount);
           const claim_amount = num(row.claim_amount);
           const other_deduction = num(row.other_deduction);
+          const claim_details = normalizeDetailRows(row.claim_details, claim_amount, "Claim");
+          const other_deduction_details = normalizeDetailRows(
+            row.other_deduction_details,
+            other_deduction,
+            "Deduction"
+          );
 
           const mappedAdjustmentDetails = adjustment_details.map((item, index) => {
             const rowCompanyRate = num(item.adjustment_company_rate) || num(row.company_rate);
@@ -667,6 +756,8 @@ router.get("/report/list", (req, res) => {
             average_amount,
             claim_amount,
             other_deduction,
+            claim_details,
+            other_deduction_details,
             adjustment_details: mappedAdjustmentDetails,
           };
         })
