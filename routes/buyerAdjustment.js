@@ -14,6 +14,7 @@ router.get("/without-unloading", async (req, res) => {
   }
 
   try {
+    // First, try the full query with buyer_adjustments check
     const query = `
       SELECT o.*, 
              e.name as employee_name,
@@ -30,24 +31,21 @@ router.get("/without-unloading", async (req, res) => {
       LEFT JOIN products p ON o.product_id = p.id
       LEFT JOIN companies c ON o.company_id = c.id
       LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-      WHERE o.id NOT IN (
-        SELECT DISTINCT outward_id FROM buyer_adjustments
-      )
-      AND o.status IN ('Pending', 'Partial')
+      WHERE o.status IN ('Pending', 'Partial')
       ORDER BY o.created_at DESC
     `;
 
     db.all(query, [], (err, rows) => {
       if (err) {
         console.error("Error fetching outward entries:", err);
-        return res.status(500).json({ error: "Database error" });
+        return res.status(500).json({ error: "Database error: " + err.message });
       }
 
       res.json(Array.isArray(rows) ? rows : []);
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
