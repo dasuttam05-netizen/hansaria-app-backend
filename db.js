@@ -473,6 +473,8 @@ if (true) {
       outward_labour_charges REAL DEFAULT 0,
       other_charges REAL DEFAULT 0,
       charge_bearer TEXT DEFAULT 'self',
+      claim_details TEXT DEFAULT '[]',
+      other_deduction_details TEXT DEFAULT '[]',
       gross_profit REAL DEFAULT 0,
       net_profit REAL DEFAULT 0,
       company_payable REAL DEFAULT 0,
@@ -909,6 +911,24 @@ if (true) {
     (err) => {
       if (err && !err.message.includes("duplicate column")) {
         console.log("outward_settlement other_deduction add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `ALTER TABLE outward_settlement ADD COLUMN claim_details TEXT DEFAULT '[]'`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("outward_settlement claim_details add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `ALTER TABLE outward_settlement ADD COLUMN other_deduction_details TEXT DEFAULT '[]'`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("outward_settlement other_deduction_details add error:", err.message);
       }
     }
   );
