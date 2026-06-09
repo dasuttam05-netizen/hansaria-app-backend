@@ -469,6 +469,7 @@ if (true) {
       company_amount REAL DEFAULT 0,
       gross_amount REAL DEFAULT 0,
       receivable_amount REAL DEFAULT 0,
+      unloading_date TEXT,
       freight REAL DEFAULT 0,
       outward_labour_charges REAL DEFAULT 0,
       other_charges REAL DEFAULT 0,
@@ -893,6 +894,15 @@ if (true) {
     (err) => {
       if (err && !err.message.includes("duplicate column")) {
         console.log("outward_settlement receivable_amount add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `ALTER TABLE outward_settlement ADD COLUMN unloading_date TEXT`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("outward_settlement unloading_date add error:", err.message);
       }
     }
   );
