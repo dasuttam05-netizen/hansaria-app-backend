@@ -211,6 +211,8 @@ const reportsRoute = require("./routes/reports");
 
 const adjustmentRoutes = require("./routes/adjustmentRoutes");
 
+const buyerAdjustmentRoutes = require("./routes/buyerAdjustment");
+
 const stockRoutes = require("./routes/stockRoutes");
 
 const outwardSettlementRoutes = require("./routes/outwardSettlement");
@@ -434,6 +436,13 @@ app.use(
   authenticate,
   authorize("adjustment.manage"),
   adjustmentRoutes
+);
+
+app.use(
+  "/api/buyer-adjustment",
+  authenticate,
+  authorize("adjustment.manage"),
+  buyerAdjustmentRoutes
 );
 
 app.use(
