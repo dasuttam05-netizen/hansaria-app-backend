@@ -106,6 +106,7 @@ function calculateSettlement(data) {
   const freight = num(data.freight);
   const outward_labour_charges = num(data.outward_labour_charges);
   const other_charges = num(data.other_charges);
+  const unloading_date = data.unloading_date || "";
   const claim_details = Array.isArray(data.claim_details) ? data.claim_details : [];
   const other_deduction_details = Array.isArray(data.other_deduction_details) ? data.other_deduction_details : [];
   const claim_amount = num(data.claim_amount) || sumDetailRows(claim_details);
@@ -167,9 +168,11 @@ function calculateSettlement(data) {
     company_amount,
     gross_amount,
     receivable_amount,
+    unloading_date,
     freight,
     outward_labour_charges,
     other_charges,
+    unloading_date,
     claim_amount,
     other_deduction,
     claim_details,
@@ -322,6 +325,7 @@ router.get("/:outward_id", async (req, res) => {
           company_amount: row.company_amount ?? 0,
           gross_amount: row.gross_amount ?? row.gross_profit ?? 0,
           receivable_amount: row.receivable_amount ?? row.net_profit ?? 0,
+          unloading_date: row.unloading_date || "",
           freight: row.freight ?? 0,
           outward_labour_charges: row.outward_labour_charges ?? 0,
           other_charges: row.other_charges ?? 0,
@@ -439,6 +443,7 @@ router.post("/save", async (req, res) => {
         freight,
         outward_labour_charges,
         other_charges,
+        unloading_date,
         claim_amount,
         other_deduction,
         claim_details: normalizedClaimDetails,
@@ -493,11 +498,12 @@ router.post("/save", async (req, res) => {
             settlement.company_rate,
             settlement.average_rate,
             settlement.average_amount,
-            settlement.sale_amount,
-            settlement.company_amount,
-            settlement.gross_amount,
-            settlement.receivable_amount,
-            settlement.freight,
+          settlement.sale_amount,
+          settlement.company_amount,
+          settlement.gross_amount,
+          settlement.receivable_amount,
+          settlement.unloading_date,
+          settlement.freight,
             settlement.outward_labour_charges,
             settlement.other_charges,
             settlement.claim_amount,
@@ -526,6 +532,7 @@ router.post("/save", async (req, res) => {
                 company_amount = ?,
                 gross_amount = ?,
                 receivable_amount = ?,
+                unloading_date = ?,
                 freight = ?,
                 outward_labour_charges = ?,
                 other_charges = ?,
@@ -565,6 +572,7 @@ router.post("/save", async (req, res) => {
                 company_amount,
                 gross_amount,
                 receivable_amount,
+                unloading_date,
                 freight,
                 outward_labour_charges,
                 other_charges,
@@ -661,6 +669,7 @@ router.get("/report/list", (req, res) => {
       s.company_amount,
       s.gross_amount,
       s.receivable_amount,
+      s.unloading_date,
       s.freight,
       s.outward_labour_charges,
       s.other_charges,
@@ -705,6 +714,7 @@ router.get("/report/list", (req, res) => {
           const average_amount = num(row.average_amount);
           const claim_amount = num(row.claim_amount);
           const other_deduction = num(row.other_deduction);
+          const unloadingDate = row.unloading_date || "";
           const claim_details = normalizeDetailRows(row.claim_details, claim_amount, "Claim");
           const other_deduction_details = normalizeDetailRows(
             row.other_deduction_details,
@@ -756,6 +766,7 @@ router.get("/report/list", (req, res) => {
             average_amount,
             claim_amount,
             other_deduction,
+            unloading_date: unloadingDate,
             claim_details,
             other_deduction_details,
             adjustment_details: mappedAdjustmentDetails,
