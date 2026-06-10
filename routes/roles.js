@@ -137,74 +137,83 @@ function normalizePermissions(permissions) {
   return Array.from(new Set(raw.filter(Boolean).map((item) => String(item).trim()).filter(Boolean)));
 }
 
-function ensureDefaultRoles(callback) {
-  if (!db.isSqliteEnabled) {
-    dbMongo.Role.find({ name: { $in: DEFAULT_ROLES.map((role) => role.name) } })
-      .lean()
-      .exec((findErr, docs) => {
-        if (findErr) {
-          callback(findErr);
-          return;
-        }
-
-        const existingNames = new Set((docs || []).map((doc) => String(doc.name || "").toLowerCase()));
-        const missingRoles = DEFAULT_ROLES.filter((role) => !existingNames.has(role.name.toLowerCase()));
-        if (missingRoles.length === 0) {
-          callback(null);
-          return;
-        }
-
-        dbMongo.Role.insertMany(
-          missingRoles.map((role) => ({
-            name: role.name,
-            permissions: normalizePermissions(role.permissions),
-            is_admin: role.is_admin,
-          })),
-          callback
-        );
-      });
+async function ensureDefaultRoles() {
+  if (dbMongo.mongoose.connection.readyState !== 1) {
     return;
   }
 
-  db.all("SELECT LOWER(name) AS name FROM roles", [], (selectErr, rows) => {
-    if (selectErr) {
-      callback(selectErr);
-      return;
-    }
+  if (!db.isSqliteEnabled) {
+    const docs = await dbMongo.Role.find({
+      name: { $in: DEFAULT_ROLES.map((role) => role.name) },
+    })
+      .lean()
+      .exec();
 
-    const existingNames = new Set((rows || []).map((row) => row.name));
+    const existingNames = new Set((docs || []).map((doc) => String(doc.name || "").toLowerCase()));
     const missingRoles = DEFAULT_ROLES.filter((role) => !existingNames.has(role.name.toLowerCase()));
-    if (missingRoles.length === 0) {
-      callback(null);
-      return;
+
+    if (missingRoles.length > 0) {
+      await dbMongo.Role.insertMany(
+        missingRoles.map((role) => ({
+          name: role.name,
+          permissions: normalizePermissions(role.permissions),
+          is_admin: role.is_admin,
+        }))
+      );
     }
 
-    const stmt = db.prepare("INSERT INTO roles (name, permissions, is_admin) VALUES (?, ?, ?)");
+    return;
+  }
+
+  const rows = await new Promise((resolve, reject) => {
+    db.all("SELECT LOWER(name) AS name FROM roles", [], (selectErr, resultRows) => {
+      if (selectErr) {
+        reject(selectErr);
+        return;
+      }
+      resolve(resultRows || []);
+    });
+  });
+
+  const existingNames = new Set((rows || []).map((row) => row.name));
+  const missingRoles = DEFAULT_ROLES.filter((role) => !existingNames.has(role.name.toLowerCase()));
+
+  if (!missingRoles.length) {
+    return;
+  }
+
+  const stmt = db.prepare("INSERT INTO roles (name, permissions, is_admin) VALUES (?, ?, ?)");
+  try {
     missingRoles.forEach((role) => {
       stmt.run([role.name, JSON.stringify(role.permissions), role.is_admin]);
     });
-    stmt.finalize(callback);
-  });
+  } finally {
+    await new Promise((resolve, reject) => {
+      stmt.finalize((err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
 }
 
-router.get("/", (req, res) => {
-  ensureDefaultRoles((seedErr) => {
-    if (seedErr) {
-      console.error("Role seed error:", seedErr.message);
-    }
+router.get("/", async (req, res) => {
+  if (dbMongo.mongoose.connection.readyState !== 1 && !db.isSqliteEnabled) {
+    return res.json(getDefaultRoleRows());
+  }
+
+  try {
+    await ensureDefaultRoles();
 
     if (!db.isSqliteEnabled) {
-      dbMongo.Role.find({})
+      const docs = await dbMongo.Role.find({})
         .sort({ name: 1 })
         .lean()
-        .exec((err, docs) => {
-          if (err) {
-            console.error("Failed to load roles from MongoDB:", err.message);
-            return res.json(getDefaultRoleRows());
-          }
-          return res.json((docs || []).map(formatRoleRow));
-        });
-      return;
+        .exec();
+      return res.json((docs || []).map(formatRoleRow));
     }
 
     db.all("SELECT * FROM roles ORDER BY LOWER(name) ASC", [], (err, rows) => {
@@ -225,7 +234,10 @@ router.get("/", (req, res) => {
         }))
       );
     });
-  });
+  } catch (err) {
+    console.error("Role endpoint failed:", err.message);
+    return res.json(getDefaultRoleRows());
+  }
 });
 
 router.post("/", (req, res) => {
