@@ -1297,4 +1297,76 @@ if (db) {
   installSqliteMongoMirror(db);
 }
 
-module.exports = db;
+// Create a wrapper object with safe methods that handle null db
+const dbWrapper = {
+  run: function(sql, params, callback) {
+    if (!db) {
+      // In production (MongoDB mode), skip SQLite operations silently
+      if (typeof params === 'function') {
+        params({ message: 'SQLite not available in production mode' });
+      } else if (typeof callback === 'function') {
+        callback({ message: 'SQLite not available in production mode' });
+      }
+      return;
+    }
+    return db.run(sql, params, callback);
+  },
+  
+  all: function(sql, params, callback) {
+    if (!db) {
+      // In production (MongoDB mode), return empty array
+      if (typeof params === 'function') {
+        params(null, []);
+      } else if (typeof callback === 'function') {
+        callback(null, []);
+      }
+      return;
+    }
+    return db.all(sql, params, callback);
+  },
+  
+  get: function(sql, params, callback) {
+    if (!db) {
+      // In production (MongoDB mode), return null
+      if (typeof params === 'function') {
+        params(null, null);
+      } else if (typeof callback === 'function') {
+        callback(null, null);
+      }
+      return;
+    }
+    return db.get(sql, params, callback);
+  },
+  
+  exec: function(sql, callback) {
+    if (!db) {
+      if (typeof callback === 'function') {
+        callback({ message: 'SQLite not available in production mode' });
+      }
+      return;
+    }
+    return db.exec(sql, callback);
+  },
+  
+  serialize: function(callback) {
+    if (!db) {
+      if (typeof callback === 'function') {
+        callback();
+      }
+      return;
+    }
+    return db.serialize(callback);
+  },
+  
+  configure: function(key, value, callback) {
+    if (!db) {
+      if (typeof callback === 'function') {
+        callback();
+      }
+      return;
+    }
+    return db.configure(key, value, callback);
+  }
+};
+
+module.exports = dbWrapper;
