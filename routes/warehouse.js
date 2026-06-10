@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 
 const {
+  mongoose,
   Warehouse,
 } = require("../mongo");
 
@@ -14,6 +15,9 @@ const {
 router.get("/", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.json([]);
+    }
 
     const assignedIds =
       req.user?.assigned_warehouse_ids || [];
@@ -106,6 +110,11 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     if (
       !isAdminUser(req.user)
@@ -171,6 +180,11 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     if (
       !isAdminUser(req.user)
@@ -239,6 +253,11 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     if (
       !isAdminUser(req.user)
