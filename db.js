@@ -1347,6 +1347,59 @@ const dbWrapper = {
     }
     return db.exec(sql, callback);
   },
+
+  prepare: function(sql) {
+    if (!db) {
+      const fakeStatement = {
+        run(params, callback) {
+          if (typeof params === 'function') {
+            params({ message: 'SQLite not available in production mode' });
+          } else if (typeof callback === 'function') {
+            callback({ message: 'SQLite not available in production mode' });
+          }
+          return this;
+        },
+        finalize(callback) {
+          if (typeof callback === 'function') {
+            callback(null);
+          }
+          return null;
+        },
+        bind(params, callback) {
+          if (typeof params === 'function') {
+            params(null);
+          } else if (typeof callback === 'function') {
+            callback(null);
+          }
+          return this;
+        },
+        reset(callback) {
+          if (typeof callback === 'function') {
+            callback(null);
+          }
+          return this;
+        },
+        get(params, callback) {
+          if (typeof params === 'function') {
+            params(null, null);
+          } else if (typeof callback === 'function') {
+            callback(null, null);
+          }
+          return this;
+        },
+        all(params, callback) {
+          if (typeof params === 'function') {
+            params(null, []);
+          } else if (typeof callback === 'function') {
+            callback(null, []);
+          }
+          return this;
+        },
+      };
+      return fakeStatement;
+    }
+    return db.prepare(sql);
+  },
   
   serialize: function(callback) {
     if (!db) {
