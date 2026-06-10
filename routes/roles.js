@@ -1,5 +1,6 @@
 const express = require("express");
 const db = require("../db");
+const dbMongo = require("../db-mongodb");
 const { isAdminUser } = require("../middleware/auth");
 
 const router = express.Router();
@@ -115,6 +116,34 @@ function normalizePermissions(permissions) {
 }
 
 function ensureDefaultRoles(callback) {
+  if (!db.isSqliteEnabled) {
+    dbMongo.Role.find({ name: { $in: DEFAULT_ROLES.map((role) => role.name) } })
+      .lean()
+      .exec((findErr, docs) => {
+        if (findErr) {
+          callback(findErr);
+          return;
+        }
+
+        const existingNames = new Set((docs || []).map((doc) => String(doc.name || "").toLowerCase()));
+        const missingRoles = DEFAULT_ROLES.filter((role) => !existingNames.has(role.name.toLowerCase()));
+        if (missingRoles.length === 0) {
+          callback(null);
+          return;
+        }
+
+        dbMongo.Role.insertMany(
+          missingRoles.map((role) => ({
+            name: role.name,
+            permissions: normalizePermissions(role.permissions),
+            is_admin: role.is_admin,
+          })),
+          callback
+        );
+      });
+    return;
+  }
+
   db.all("SELECT LOWER(name) AS name FROM roles", [], (selectErr, rows) => {
     if (selectErr) {
       callback(selectErr);
@@ -139,6 +168,26 @@ function ensureDefaultRoles(callback) {
 router.get("/", (req, res) => {
   ensureDefaultRoles((seedErr) => {
     if (seedErr) return res.status(500).json({ error: seedErr.message });
+
+    if (!db.isSqliteEnabled) {
+      dbMongo.Role.find({})
+        .sort({ name: 1 })
+        .lean()
+        .exec((err, docs) => {
+          if (err) return res.status(500).json({ error: err.message });
+          return res.json(
+            (docs || []).map((row) => ({
+              id: row.id || row._id,
+              name: row.name,
+              permissions: Array.isArray(row.permissions) ? row.permissions : [],
+              is_admin: Number(row.is_admin) || 0,
+              created_at: row.created_at,
+              updated_at: row.updated_at,
+            }))
+          );
+        });
+      return;
+    }
 
     db.all("SELECT * FROM roles ORDER BY LOWER(name) ASC", [], (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
