@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 
-const { Location } = require("../mongo");
+const { mongoose, Location } = require("../mongo");
 
 const {
   userHasPermission,
@@ -30,6 +30,9 @@ function canReadLocations(user) {
 
 router.get("/", async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.json([]);
+    }
 
     if (!canReadLocations(req.user)) {
       return res.status(403).json({
@@ -56,6 +59,11 @@ router.get("/", async (req, res) => {
 
 router.post("/", async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     if (!isAdminUser(req.user)) {
       return res.status(403).json({
@@ -93,6 +101,11 @@ router.post("/", async (req, res) => {
 
 router.put("/:id", async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     if (!isAdminUser(req.user)) {
       return res.status(403).json({
@@ -136,6 +149,11 @@ router.put("/:id", async (req, res) => {
 
 router.delete("/:id", async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     if (!isAdminUser(req.user)) {
       return res.status(403).json({
