@@ -84,6 +84,45 @@ router.get("/without-unloading", async (req, res) => {
   }
 });
 
+// Get outward entries that already have buyer adjustments
+router.get("/with-adjustments", async (req, res) => {
+  if (!userHasPermission(req.user, "outward.view") && !userHasPermission(req.user, "outward.create")) {
+    return res.status(403).json({ error: "You do not have permission to view outward entries" });
+  }
+
+  try {
+    const query = `
+      SELECT o.*, 
+             w.name as warehouse_name,
+             p.name as product_name,
+             b.name as buyer_name,
+             SUM(ba.qty) as total_qty,
+             CASE WHEN SUM(ba.qty) > 0 THEN SUM(ba.qty * ba.rate) / SUM(ba.qty) ELSE 0 END as avg_rate,
+             SUM(ba.claim) as total_claim,
+             SUM(ba.other_deduction) as total_deduction
+      FROM outward o
+      JOIN buyer_adjustments ba ON ba.outward_id = o.id
+      LEFT JOIN warehouses w ON o.warehouse_id = w.id
+      LEFT JOIN products p ON o.product_id = p.id
+      LEFT JOIN buyer_names b ON ba.buyer_id = b.id
+      GROUP BY o.id
+      ORDER BY o.created_at DESC
+    `;
+
+    db.all(query, [], (err, rows) => {
+      if (err) {
+        console.error("Error fetching outward entries with buyer adjustments:", err);
+        return res.status(500).json({ error: "Database error: " + err.message });
+      }
+
+      res.json(Array.isArray(rows) ? rows : []);
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error: " + err.message });
+  }
+});
+
 // Get buyer adjustments for a specific outward
 router.get("/:outwardId", async (req, res) => {
   if (!userHasPermission(req.user, "outward.view")) {
