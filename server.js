@@ -158,28 +158,31 @@ const alterQueries = [
 
 ];
 
-alterQueries.forEach((query) => {
+// Only run SQLite queries in development mode
+if (db && process.env.NODE_ENV !== "production") {
+  alterQueries.forEach((query) => {
 
-  db.run(query, (err) => {
+    db.run(query, (err) => {
 
-    if (err) {
+      if (err) {
 
-      console.log(
-        "ALTER TABLE SKIPPED:",
-        err.message
-      );
+        console.log(
+          "ALTER TABLE SKIPPED:",
+          err.message
+        );
 
-    } else {
+      } else {
 
-      console.log(
-        "ALTER TABLE SUCCESS"
-      );
+        console.log(
+          "ALTER TABLE SUCCESS"
+        );
 
-    }
+      }
+
+    });
 
   });
-
-});
+}
 
 const app = express();
 
