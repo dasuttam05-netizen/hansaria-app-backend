@@ -2,6 +2,7 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 
 const {
+  mongoose,
   Employee,
   Location,
   Warehouse,
@@ -46,6 +47,9 @@ function getRecordId(value) {
 router.get("/", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.json([]);
+    }
 
     const employees =
       await Employee.find()
@@ -113,6 +117,11 @@ router.get("/", async (req, res) => {
 router.get("/:id", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     const row =
       await Employee.findById(
@@ -182,6 +191,11 @@ router.get("/:id", async (req, res) => {
 router.post("/", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     if (!isAdminUser(req.user)) {
 
@@ -464,6 +478,11 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     const targetEmployeeId =
       req.params.id;
@@ -680,6 +699,11 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database is temporarily unavailable",
+      });
+    }
 
     if (!isAdminUser(req.user)) {
 
