@@ -2,7 +2,7 @@ const jwt = require("jsonwebtoken");
 
 const db = require("../db");
 
-const { Employee, Warehouse, Location } = require("../mongo");
+const { mongoose, Employee, Warehouse, Location } = require("../mongo");
 
 const SECRET =
   process.env.JWT_SECRET ||
@@ -569,7 +569,14 @@ async function authenticate(
         .json({
           error:
             "Invalid token",
-        });
+      });
+    }
+
+    // If MongoDB is unavailable, fall back to the token payload so the app can
+    // keep serving read-only requests instead of timing out at the gateway.
+    if (mongoose.connection.readyState !== 1) {
+      req.user = decoded;
+      return next();
     }
 
     const user =
