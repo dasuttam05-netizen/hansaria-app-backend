@@ -110,6 +110,28 @@ const DEFAULT_ROLES = [
   },
 ];
 
+function formatRoleRow(row) {
+  return {
+    id: row.id || row._id,
+    name: row.name,
+    permissions: Array.isArray(row.permissions) ? row.permissions : [],
+    is_admin: Number(row.is_admin) || 0,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function getDefaultRoleRows() {
+  return DEFAULT_ROLES.map((role, index) => ({
+    id: `default-${index + 1}`,
+    name: role.name,
+    permissions: Array.isArray(role.permissions) ? role.permissions : [],
+    is_admin: Number(role.is_admin) || 0,
+    created_at: null,
+    updated_at: null,
+  }));
+}
+
 function normalizePermissions(permissions) {
   const raw = Array.isArray(permissions) ? permissions : [];
   return Array.from(new Set(raw.filter(Boolean).map((item) => String(item).trim()).filter(Boolean)));
@@ -167,30 +189,29 @@ function ensureDefaultRoles(callback) {
 
 router.get("/", (req, res) => {
   ensureDefaultRoles((seedErr) => {
-    if (seedErr) return res.status(500).json({ error: seedErr.message });
+    if (seedErr) {
+      console.error("Role seed error:", seedErr.message);
+    }
 
     if (!db.isSqliteEnabled) {
       dbMongo.Role.find({})
         .sort({ name: 1 })
         .lean()
         .exec((err, docs) => {
-          if (err) return res.status(500).json({ error: err.message });
-          return res.json(
-            (docs || []).map((row) => ({
-              id: row.id || row._id,
-              name: row.name,
-              permissions: Array.isArray(row.permissions) ? row.permissions : [],
-              is_admin: Number(row.is_admin) || 0,
-              created_at: row.created_at,
-              updated_at: row.updated_at,
-            }))
-          );
+          if (err) {
+            console.error("Failed to load roles from MongoDB:", err.message);
+            return res.json(getDefaultRoleRows());
+          }
+          return res.json((docs || []).map(formatRoleRow));
         });
       return;
     }
 
     db.all("SELECT * FROM roles ORDER BY LOWER(name) ASC", [], (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
+      if (err) {
+        console.error("Failed to load roles from SQLite:", err.message);
+        return res.json(getDefaultRoleRows());
+      }
       return res.json(
         (rows || []).map((row) => ({
           ...row,
