@@ -1299,6 +1299,7 @@ if (db) {
 
 // Create a wrapper object with safe methods that handle null db
 const dbWrapper = {
+  isSqliteEnabled: Boolean(db),
   run: function(sql, params, callback) {
     if (!db) {
       // In production (MongoDB mode), skip SQLite operations silently
