@@ -1,11 +1,12 @@
 const path = require("path");
 const { installSqliteMongoMirror } = require("./sqliteMongoSync");
 
-// Only load sqlite3 in development - not needed in production on Render
+// Keep SQLite enabled in every environment as a local cache layer.
+// MongoDB remains the cloud source of truth through the mirror/restore sync.
 let sqlite3;
 let db = null;
 
-if (process.env.NODE_ENV !== "production") {
+{
   sqlite3 = require("sqlite3").verbose();
   const dbPath = path.join(__dirname, "database.sqlite");
 
@@ -1289,8 +1290,6 @@ if (process.env.NODE_ENV !== "production") {
     console.log("Skipping cash entries reset on startup. Set RESET_CASH_ENTRIES_ON_START=true to enable.");
   }
   });
-} else {
-  console.log("Running in production mode - SQLite disabled, using MongoDB only");
 }
 
 if (db) {
