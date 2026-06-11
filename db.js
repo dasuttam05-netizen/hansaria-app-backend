@@ -422,6 +422,8 @@ let db = null;
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       outward_id INTEGER NOT NULL,
       buyer_id INTEGER,
+      buyer_name TEXT,
+      consignee_name TEXT,
       unloading_date TEXT,
       weight REAL DEFAULT 0,
       qty REAL DEFAULT 0,
@@ -429,6 +431,7 @@ let db = null;
       claim REAL DEFAULT 0,
       other_deduction REAL DEFAULT 0,
       shortage REAL DEFAULT 0,
+      shortage_amount REAL DEFAULT 0,
       status TEXT DEFAULT 'Pending',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -693,6 +696,8 @@ let db = null;
   addColIgnoreDup(`ALTER TABLE buyer_names ADD COLUMN state TEXT`, "buyer_names state");
   addColIgnoreDup(`ALTER TABLE buyer_names ADD COLUMN location TEXT`, "buyer_names location");
   addColIgnoreDup(`ALTER TABLE buyer_adjustments ADD COLUMN buyer_name TEXT`, "buyer_adjustments buyer_name");
+  addColIgnoreDup(`ALTER TABLE buyer_adjustments ADD COLUMN consignee_name TEXT`, "buyer_adjustments consignee_name");
+  addColIgnoreDup(`ALTER TABLE buyer_adjustments ADD COLUMN shortage_amount REAL DEFAULT 0`, "buyer_adjustments shortage_amount");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN buyer_id INTEGER`, "consignee_names buyer_id");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN mobile TEXT`, "consignee_names mobile");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN email TEXT`, "consignee_names email");
