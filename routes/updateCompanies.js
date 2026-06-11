@@ -2,7 +2,13 @@ const mongoose = require("mongoose");
 
 require("dotenv").config();
 
-mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/warehouse", {
+const mongoUri = process.env.MONGODB_URI;
+if (!mongoUri) {
+  console.error("MONGODB_URI is required for updateCompanies.js");
+  process.exit(1);
+}
+
+mongoose.connect(mongoUri, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
 });
