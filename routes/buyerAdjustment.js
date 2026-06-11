@@ -99,11 +99,15 @@ router.get("/with-adjustments", async (req, res) => {
              w.name as warehouse_name,
              p.name as product_name,
              COALESCE(ba.buyer_name, b.name) as buyer_name,
+             COALESCE(ba.consignee_name, o.consignee_name) as consignee_name,
+             o.lorry_no,
              ba.qty,
              ba.rate,
              ba.claim,
              ba.other_deduction,
              ba.shortage,
+             ba.shortage_amount,
+             (COALESCE(ba.claim, 0) + COALESCE(ba.other_deduction, 0) + COALESCE(ba.shortage_amount, 0)) as net_amount,
              ba.status as adjustment_status,
              ba.id as adjustment_id
       FROM buyer_adjustments ba
@@ -139,7 +143,8 @@ router.get("/:outwardId", async (req, res) => {
   try {
     const query = `
       SELECT ba.*, 
-             COALESCE(ba.buyer_name, b.name) as buyer_name
+             COALESCE(ba.buyer_name, b.name) as buyer_name,
+             COALESCE(ba.consignee_name, '') as consignee_name
       FROM buyer_adjustments ba
       LEFT JOIN buyer_names b ON ba.buyer_id = b.id
       WHERE ba.outward_id = ?
@@ -166,7 +171,7 @@ router.post("/", async (req, res) => {
     return res.status(403).json({ error: "You do not have permission to create adjustments" });
   }
 
-  const { outward_id, buyer_id, buyer_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status } = req.body;
+  const { outward_id, buyer_id, buyer_name, consignee_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, shortage_amount, status } = req.body;
 
   if (!outward_id || !qty) {
     return res.status(400).json({ error: "Missing required fields: outward_id, qty" });
@@ -175,14 +180,15 @@ router.post("/", async (req, res) => {
   try {
     const stmt = db.prepare(`
       INSERT INTO buyer_adjustments 
-      (outward_id, buyer_id, buyer_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (outward_id, buyer_id, buyer_name, consignee_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, shortage_amount, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
       safeNumber(outward_id),
       safeNumber(buyer_id) || null,
       safeText(buyer_name),
+      safeText(consignee_name),
       safeText(unloading_date),
       safeNumber(weight),
       safeNumber(qty),
@@ -190,6 +196,7 @@ router.post("/", async (req, res) => {
       safeNumber(claim),
       safeNumber(other_deduction),
       safeNumber(shortage),
+      safeNumber(shortage_amount),
       safeText(status) || "Pending"
     );
 
@@ -210,19 +217,20 @@ router.put("/:id", async (req, res) => {
   }
 
   const { id } = req.params;
-  const { buyer_id, buyer_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status } = req.body;
+  const { buyer_id, buyer_name, consignee_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, shortage_amount, status } = req.body;
 
   try {
     const stmt = db.prepare(`
       UPDATE buyer_adjustments 
-      SET buyer_id = ?, buyer_name = ?, unloading_date = ?, weight = ?, qty = ?, rate = ?, 
-          claim = ?, other_deduction = ?, shortage = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+      SET buyer_id = ?, buyer_name = ?, consignee_name = ?, unloading_date = ?, weight = ?, qty = ?, rate = ?, 
+          claim = ?, other_deduction = ?, shortage = ?, shortage_amount = ?, status = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `);
 
     stmt.run(
       safeNumber(buyer_id) || null,
       safeText(buyer_name),
+      safeText(consignee_name),
       safeText(unloading_date),
       safeNumber(weight),
       safeNumber(qty),
@@ -230,6 +238,7 @@ router.put("/:id", async (req, res) => {
       safeNumber(claim),
       safeNumber(other_deduction),
       safeNumber(shortage),
+      safeNumber(shortage_amount),
       safeText(status) || "Pending",
       safeNumber(id)
     );
