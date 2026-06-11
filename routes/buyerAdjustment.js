@@ -22,7 +22,7 @@ router.get("/without-unloading", async (req, res) => {
              p.name as product_name,
              c.name as company_name,
              ca.account_name as account_name,
-             ca.party_name
+             ca.account_name as party_name
       FROM outward o
       LEFT JOIN employees e ON o.employee_id = e.id
       LEFT JOIN locations l ON o.location_id = l.id
@@ -51,7 +51,7 @@ router.get("/without-unloading", async (req, res) => {
                    p.name as product_name,
                    c.name as company_name,
                    ca.account_name as account_name,
-                   ca.party_name
+                   ca.account_name as party_name
             FROM outward o
             LEFT JOIN employees e ON o.employee_id = e.id
             LEFT JOIN locations l ON o.location_id = l.id
