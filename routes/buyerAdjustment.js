@@ -92,21 +92,26 @@ router.get("/with-adjustments", async (req, res) => {
 
   try {
     const query = `
-      SELECT o.*, 
+      SELECT o.id as outward_id,
+             o.voucher_no,
+             o.date,
+             o.status as outward_status,
              w.name as warehouse_name,
              p.name as product_name,
-             b.name as buyer_name,
-             SUM(ba.qty) as total_qty,
-             CASE WHEN SUM(ba.qty) > 0 THEN SUM(ba.qty * ba.rate) / SUM(ba.qty) ELSE 0 END as avg_rate,
-             SUM(ba.claim) as total_claim,
-             SUM(ba.other_deduction) as total_deduction
-      FROM outward o
-      JOIN buyer_adjustments ba ON ba.outward_id = o.id
+             COALESCE(ba.buyer_name, b.name) as buyer_name,
+             ba.qty,
+             ba.rate,
+             ba.claim,
+             ba.other_deduction,
+             ba.shortage,
+             ba.status as adjustment_status,
+             ba.id as adjustment_id
+      FROM buyer_adjustments ba
+      JOIN outward o ON ba.outward_id = o.id
       LEFT JOIN warehouses w ON o.warehouse_id = w.id
       LEFT JOIN products p ON o.product_id = p.id
       LEFT JOIN buyer_names b ON ba.buyer_id = b.id
-      GROUP BY o.id
-      ORDER BY o.created_at DESC
+      ORDER BY o.created_at DESC, ba.created_at DESC
     `;
 
     db.all(query, [], (err, rows) => {
@@ -134,7 +139,7 @@ router.get("/:outwardId", async (req, res) => {
   try {
     const query = `
       SELECT ba.*, 
-             b.name as buyer_name
+             COALESCE(ba.buyer_name, b.name) as buyer_name
       FROM buyer_adjustments ba
       LEFT JOIN buyer_names b ON ba.buyer_id = b.id
       WHERE ba.outward_id = ?
@@ -161,7 +166,7 @@ router.post("/", async (req, res) => {
     return res.status(403).json({ error: "You do not have permission to create adjustments" });
   }
 
-  const { outward_id, buyer_id, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status } = req.body;
+  const { outward_id, buyer_id, buyer_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status } = req.body;
 
   if (!outward_id || !qty) {
     return res.status(400).json({ error: "Missing required fields: outward_id, qty" });
@@ -170,13 +175,14 @@ router.post("/", async (req, res) => {
   try {
     const stmt = db.prepare(`
       INSERT INTO buyer_adjustments 
-      (outward_id, buyer_id, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (outward_id, buyer_id, buyer_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
       safeNumber(outward_id),
       safeNumber(buyer_id) || null,
+      safeText(buyer_name),
       safeText(unloading_date),
       safeNumber(weight),
       safeNumber(qty),
@@ -204,18 +210,19 @@ router.put("/:id", async (req, res) => {
   }
 
   const { id } = req.params;
-  const { buyer_id, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status } = req.body;
+  const { buyer_id, buyer_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, status } = req.body;
 
   try {
     const stmt = db.prepare(`
       UPDATE buyer_adjustments 
-      SET buyer_id = ?, unloading_date = ?, weight = ?, qty = ?, rate = ?, 
+      SET buyer_id = ?, buyer_name = ?, unloading_date = ?, weight = ?, qty = ?, rate = ?, 
           claim = ?, other_deduction = ?, shortage = ?, status = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `);
 
     stmt.run(
       safeNumber(buyer_id) || null,
+      safeText(buyer_name),
       safeText(unloading_date),
       safeNumber(weight),
       safeNumber(qty),
