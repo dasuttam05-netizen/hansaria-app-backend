@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 
-const BASE_URL = process.env.BENCH_BASE_URL || "http://localhost:4001";
+const BASE_URL = process.env.BENCH_BASE_URL || "https://hansaria-app-backend.onrender.com";
 const USERNAME = process.env.BENCH_USER || "admin";
 const PASSWORD = process.env.BENCH_PASS || "1234";
 const DURATION_SEC = Number(process.env.BENCH_DURATION_SEC || 20);
