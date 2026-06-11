@@ -343,6 +343,11 @@ router.get("/:outward_id", async (req, res) => {
 
       return res.json(payload);
     } catch (detailsError) {
+      console.error("Outward settlement fetch error", {
+        outwardId,
+        message: detailsError.message,
+        stack: detailsError.stack,
+      });
       return res.status(500).json({ error: detailsError.message });
     }
   });
@@ -363,6 +368,7 @@ router.post("/save", async (req, res) => {
     other_deduction,
     claim_details,
     other_deduction_details,
+    unloading_date,
     charge_bearer,
     narration,
   } = req.body;
