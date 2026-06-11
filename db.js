@@ -692,6 +692,7 @@ let db = null;
   addColIgnoreDup(`ALTER TABLE buyer_names ADD COLUMN pan_no TEXT`, "buyer_names pan_no");
   addColIgnoreDup(`ALTER TABLE buyer_names ADD COLUMN state TEXT`, "buyer_names state");
   addColIgnoreDup(`ALTER TABLE buyer_names ADD COLUMN location TEXT`, "buyer_names location");
+  addColIgnoreDup(`ALTER TABLE buyer_adjustments ADD COLUMN buyer_name TEXT`, "buyer_adjustments buyer_name");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN buyer_id INTEGER`, "consignee_names buyer_id");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN mobile TEXT`, "consignee_names mobile");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN email TEXT`, "consignee_names email");
