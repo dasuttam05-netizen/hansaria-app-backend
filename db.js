@@ -595,7 +595,7 @@ let db = null;
       mb_no TEXT,
       paid_by TEXT,
       paid_by_mobile TEXT,
-      status TEXT DEFAULT 'PENDING',
+      status TEXT DEFAULT 'pending',
       receive_cash_from_party REAL DEFAULT 0,
       receive_cash_from_driver REAL DEFAULT 0,
       grand_total REAL DEFAULT 0,
@@ -627,14 +627,19 @@ let db = null;
   `);
 
   db.run(
-    `ALTER TABLE expenses ADD COLUMN narration TEXT`,
+    `
+    UPDATE expenses
+    SET status = LOWER(COALESCE(status, 'pending'))
+    WHERE status IS NULL OR status != LOWER(status)
+    `,
     (err) => {
-      if (err && !err.message.includes("duplicate column")) {
-        console.log("expenses narration add error:", err.message);
+      if (err) {
+        console.log("expenses status normalization error:", err.message);
       }
     }
   );
-  db.run(`ALTER TABLE expenses ADD COLUMN reg_from_company_id INTEGER`, () => {});
+
+  db.run(`ALTER TABLE expenses ADD COLUMN narration TEXT`, () => {});
   db.run(`ALTER TABLE expenses ADD COLUMN send_to_company_id INTEGER`, () => {});
   db.run(`ALTER TABLE expenses ADD COLUMN reg_lorry_no TEXT`, () => {});
   db.run(`ALTER TABLE expenses ADD COLUMN loading REAL DEFAULT 0`, () => {});
