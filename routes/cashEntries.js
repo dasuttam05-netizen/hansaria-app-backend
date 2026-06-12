@@ -501,7 +501,7 @@ router.get("/", (req, res) => {
     params.push(entry_type);
   }
   if (status) {
-    where.push("COALESCE(ce.status, 'pending') = ?");
+    where.push("LOWER(COALESCE(ce.status, 'pending')) = LOWER(?)");
     params.push(status);
   }
 
