@@ -181,6 +181,8 @@ const adjustmentSchema = new mongoose.Schema({
 const buyerAdjustmentSchema = new mongoose.Schema({
   outward_id: { type: Number, required: true, index: true },
   buyer_id: Number,
+  buyer_name: String,
+  consignee_name: String,
   unloading_date: Date,
   weight: { type: Number, default: 0 },
   qty: { type: Number, default: 0 },
@@ -188,6 +190,7 @@ const buyerAdjustmentSchema = new mongoose.Schema({
   claim: { type: Number, default: 0 },
   other_deduction: { type: Number, default: 0 },
   shortage: { type: Number, default: 0 },
+  shortage_amount: { type: Number, default: 0 },
   status: { type: String, default: 'Pending' },
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now },
