@@ -1,7 +1,6 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const dbMongo = require("../db-mongodb");
 const { userHasPermission } = require("../middleware/auth");
 
 const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
@@ -178,32 +177,36 @@ router.post("/", async (req, res) => {
   }
 
   try {
-    const stmt = db.prepare(`
+    db.run(
+      `
       INSERT INTO buyer_adjustments 
       (outward_id, buyer_id, buyer_name, consignee_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, shortage_amount, status)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    `,
+      [
+        safeNumber(outward_id),
+        safeNumber(buyer_id) || null,
+        safeText(buyer_name),
+        safeText(consignee_name),
+        safeText(unloading_date),
+        safeNumber(weight),
+        safeNumber(qty),
+        safeNumber(rate),
+        safeNumber(claim),
+        safeNumber(other_deduction),
+        safeNumber(shortage),
+        safeNumber(shortage_amount),
+        safeText(status) || "Pending",
+      ],
+      function (err) {
+        if (err) {
+          console.error("Error creating buyer adjustment:", err);
+          return res.status(500).json({ error: "Failed to create buyer adjustment" });
+        }
 
-    stmt.run(
-      safeNumber(outward_id),
-      safeNumber(buyer_id) || null,
-      safeText(buyer_name),
-      safeText(consignee_name),
-      safeText(unloading_date),
-      safeNumber(weight),
-      safeNumber(qty),
-      safeNumber(rate),
-      safeNumber(claim),
-      safeNumber(other_deduction),
-      safeNumber(shortage),
-      safeNumber(shortage_amount),
-      safeText(status) || "Pending"
+        res.json({ id: this.lastID, message: "Buyer adjustment created successfully" });
+      }
     );
-
-    const lastId = stmt.lastID;
-    stmt.finalize();
-
-    res.json({ id: lastId, message: "Buyer adjustment created successfully" });
   } catch (err) {
     console.error("Error creating buyer adjustment:", err);
     res.status(500).json({ error: "Failed to create buyer adjustment" });
@@ -220,32 +223,37 @@ router.put("/:id", async (req, res) => {
   const { buyer_id, buyer_name, consignee_name, unloading_date, weight, qty, rate, claim, other_deduction, shortage, shortage_amount, status } = req.body;
 
   try {
-    const stmt = db.prepare(`
+    db.run(
+      `
       UPDATE buyer_adjustments 
       SET buyer_id = ?, buyer_name = ?, consignee_name = ?, unloading_date = ?, weight = ?, qty = ?, rate = ?, 
           claim = ?, other_deduction = ?, shortage = ?, shortage_amount = ?, status = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `);
+    `,
+      [
+        safeNumber(buyer_id) || null,
+        safeText(buyer_name),
+        safeText(consignee_name),
+        safeText(unloading_date),
+        safeNumber(weight),
+        safeNumber(qty),
+        safeNumber(rate),
+        safeNumber(claim),
+        safeNumber(other_deduction),
+        safeNumber(shortage),
+        safeNumber(shortage_amount),
+        safeText(status) || "Pending",
+        safeNumber(id),
+      ],
+      function (err) {
+        if (err) {
+          console.error("Error updating buyer adjustment:", err);
+          return res.status(500).json({ error: "Failed to update buyer adjustment" });
+        }
 
-    stmt.run(
-      safeNumber(buyer_id) || null,
-      safeText(buyer_name),
-      safeText(consignee_name),
-      safeText(unloading_date),
-      safeNumber(weight),
-      safeNumber(qty),
-      safeNumber(rate),
-      safeNumber(claim),
-      safeNumber(other_deduction),
-      safeNumber(shortage),
-      safeNumber(shortage_amount),
-      safeText(status) || "Pending",
-      safeNumber(id)
+        res.json({ message: "Buyer adjustment updated successfully" });
+      }
     );
-
-    stmt.finalize();
-
-    res.json({ message: "Buyer adjustment updated successfully" });
   } catch (err) {
     console.error("Error updating buyer adjustment:", err);
     res.status(500).json({ error: "Failed to update buyer adjustment" });
@@ -261,14 +269,16 @@ router.delete("/:id", async (req, res) => {
   const { id } = req.params;
 
   try {
-    const stmt = db.prepare(`
+    db.run(`
       DELETE FROM buyer_adjustments WHERE id = ?
-    `);
+    `, [safeNumber(id)], function (err) {
+      if (err) {
+        console.error("Error deleting buyer adjustment:", err);
+        return res.status(500).json({ error: "Failed to delete buyer adjustment" });
+      }
 
-    stmt.run(safeNumber(id));
-    stmt.finalize();
-
-    res.json({ message: "Buyer adjustment deleted successfully" });
+      res.json({ message: "Buyer adjustment deleted successfully" });
+    });
   } catch (err) {
     console.error("Error deleting buyer adjustment:", err);
     res.status(500).json({ error: "Failed to delete buyer adjustment" });
