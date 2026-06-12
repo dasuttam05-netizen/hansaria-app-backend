@@ -377,7 +377,7 @@ function getCashEntryBasicById(entryId, cb) {
     `
     SELECT id, voucher_no, entry_date, entry_type, warehouse_id, company_id, company_account_id,
            description, amount, payment_method, reference_no, narration, employee_id, status, fund_source,
-           journal_group_no, source_expense_id
+           source_expense_id
     FROM cash_entries
     WHERE id = ?
     `,
@@ -412,7 +412,7 @@ async function attachAdjustmentDetails(rows = []) {
     `
     SELECT
       cea.source_entry_id,
-      COALESCE(t.journal_group_no, t.voucher_no, 'CE-' || t.id) AS target_voucher_no,
+      COALESCE(t.voucher_no, 'CE-' || t.id) AS target_voucher_no,
       t.entry_type AS target_entry_type,
       t.entry_date AS target_entry_date,
       cea.adjusted_amount
@@ -515,7 +515,6 @@ router.get("/", (req, res) => {
     SELECT
       ce.id,
       ce.voucher_no,
-      ce.journal_group_no,
       ce.entry_date,
       ce.entry_type,
       ce.warehouse_id,
@@ -880,7 +879,6 @@ router.get("/:id(\\d+)", (req, res) => {
     SELECT
       ce.id,
       ce.voucher_no,
-      ce.journal_group_no,
       ce.entry_date,
       ce.entry_type,
       ce.warehouse_id,
@@ -936,7 +934,7 @@ router.get("/:id(\\d+)", (req, res) => {
       SELECT
         cea.target_entry_id,
         cea.adjusted_amount,
-        COALESCE(t.journal_group_no, t.voucher_no) AS target_voucher_no,
+        t.voucher_no AS target_voucher_no,
         t.entry_date AS target_entry_date,
         t.entry_type AS target_entry_type,
         t.description AS target_description
@@ -982,7 +980,6 @@ router.post("/", async (req, res) => {
     narration,
     created_by,
     employee_id,
-    journal_group_no,
     status,
     fund_source,
     source_expense_id,
@@ -1030,12 +1027,11 @@ router.post("/", async (req, res) => {
         narration,
         created_by,
         employee_id,
-        journal_group_no,
         fund_source,
         status,
         source_expense_id,
         linked_entry_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     db.run(
@@ -1054,7 +1050,6 @@ router.post("/", async (req, res) => {
         narration || null,
         req.user?.id || created_by || null,
         resolvedIds.employee_id || null,
-        journal_group_no || null,
         String(fund_source || "main_cash"),
         status || "pending",
         source_expense_id || null,
@@ -1117,9 +1112,9 @@ router.post("/", async (req, res) => {
                 `INSERT INTO cash_entries (
                   voucher_no, entry_date, entry_type, warehouse_id, company_id, 
                   company_account_id, description, amount, payment_method, reference_no, 
-                  narration, created_by, employee_id, journal_group_no, fund_source, 
+                  narration, created_by, employee_id, fund_source, 
                   status, source_expense_id, linked_entry_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                   staffVoucherNo,
                   entry_date,
@@ -1134,7 +1129,6 @@ router.post("/", async (req, res) => {
                   narration || null,
                   req.user?.id || created_by || null,
                   resolvedIds.employee_id || null,
-                  journal_group_no || null,
                   "employee_cash",
                   status || "pending",
                   null,
@@ -1294,7 +1288,7 @@ upsertCashEntryToMongo({
           `
           SELECT
             ce.id,
-            COALESCE(ce.journal_group_no, ce.voucher_no) AS voucher_no,
+            ce.voucher_no,
             ce.company_id,
             ce.entry_type,
             ce.amount,
@@ -1442,7 +1436,6 @@ router.put("/:id(\\d+)", async (req, res) => {
     reference_no,
     narration,
     employee_id,
-    journal_group_no,
     status,
     fund_source,
     adjustments,
@@ -1474,7 +1467,6 @@ router.put("/:id(\\d+)", async (req, res) => {
       reference_no = ?,
       narration = ?,
       employee_id = ?,
-      journal_group_no = ?,
       fund_source = ?,
       status = ?,
       updated_at = CURRENT_TIMESTAMP
@@ -1500,7 +1492,6 @@ router.put("/:id(\\d+)", async (req, res) => {
         reference_no || null,
         narration || null,
         resolvedIds.employee_id || null,
-        journal_group_no === undefined ? oldRow.journal_group_no || null : journal_group_no || null,
         String(fund_source || "main_cash"),
         status || "pending",
         req.params.id,
@@ -1597,7 +1588,7 @@ router.put("/:id(\\d+)", async (req, res) => {
               `
               SELECT
                 ce.id,
-                COALESCE(ce.journal_group_no, ce.voucher_no) AS voucher_no,
+                ce.voucher_no,
                 ce.company_id,
                 ce.entry_type,
                 ce.amount,
@@ -1746,7 +1737,7 @@ router.get("/aging/company/:companyId", async (req, res) => {
   const sql = `
     SELECT
       ce.id,
-      COALESCE(ce.journal_group_no, ce.voucher_no) AS voucher_no,
+      ce.voucher_no,
       ce.entry_date,
       ce.entry_type,
       ce.description,
