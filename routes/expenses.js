@@ -880,7 +880,7 @@ router.get("/", (req, res) => {
     const warehouseClause = bypassWarehouseScope ? "" : warehouseFilter.clause;
 
     if (status) {
-      queryWhereParts.push("x.status = ?");
+      queryWhereParts.push("LOWER(x.status) = LOWER(?)");
       queryParams.push(status);
     }
 
