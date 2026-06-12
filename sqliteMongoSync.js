@@ -15,6 +15,7 @@ const TRACKED_TABLES = new Set([
   "products",
   "buyer_names",
   "consignee_names",
+  "buyer_adjustments",
   "inward",
   "outward",
   "adjustment",
@@ -474,6 +475,38 @@ function patchRunMethod(db) {
   };
 }
 
+function patchPrepareMethod(db) {
+  const originalPrepare = db.prepare.bind(db);
+
+  db.prepare = function patchedPrepare(sql, ...prepareArgs) {
+    const statement = originalPrepare(sql, ...prepareArgs);
+    const mutation = parseMutation(sql);
+
+    if (!mutation || !statement || typeof statement.run !== "function") {
+      return statement;
+    }
+
+    const originalStatementRun = statement.run.bind(statement);
+
+    statement.run = function patchedStatementRun(...runArgs) {
+      const { argsWithoutCallback, callback, params } = normalizeRunArgs(runArgs);
+      const wrappedCallback = function wrappedStatementRunCallback(error) {
+        if (!error && !restoreInProgress) {
+          scheduleMutationSync(db, mutation, sql, params, this);
+        }
+
+        if (typeof callback === "function") {
+          callback.apply(this, arguments);
+        }
+      };
+
+      return originalStatementRun(...argsWithoutCallback, wrappedCallback);
+    };
+
+    return statement;
+  };
+}
+
 function runInitialBackfill(db) {
   if (!mongoMirrorConfigured || initialBackfillDone) return;
   initialBackfillDone = true;
@@ -508,6 +541,7 @@ function installSqliteMongoMirror(db) {
   }
 
   patchRunMethod(db);
+  patchPrepareMethod(db);
   runInitialBackfill(db);
   logMirror("SQLite mutation hook installed");
 }
