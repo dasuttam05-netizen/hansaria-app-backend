@@ -693,6 +693,70 @@ let db = null;
       }
     }
   );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN posted_to_inward INTEGER DEFAULT 0`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses posted_to_inward add error:", err.message);
+      }
+    }
+  );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN inward_id INTEGER`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses inward_id add error:", err.message);
+      }
+    }
+  );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN inward_posted_at TEXT`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses inward_posted_at add error:", err.message);
+      }
+    }
+  );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN posted_to_outward INTEGER DEFAULT 0`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses posted_to_outward add error:", err.message);
+      }
+    }
+  );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN outward_id INTEGER`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses outward_id add error:", err.message);
+      }
+    }
+  );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN outward_posted_at TEXT`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses outward_posted_at add error:", err.message);
+      }
+    }
+  );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN posted_to_palti INTEGER DEFAULT 0`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses posted_to_palti add error:", err.message);
+      }
+    }
+  );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN palti_posted_at TEXT`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses palti_posted_at add error:", err.message);
+      }
+    }
+  );
 
   const addColIgnoreDup = (sql, label) => {
     db.run(sql, (err) => {
