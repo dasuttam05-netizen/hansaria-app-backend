@@ -896,8 +896,8 @@ router.get("/", (req, res) => {
       `
       SELECT
         x.*,
-        COALESCE(x.location_id, w.location_id) AS effective_location_id,
-        COALESCE(loc.name, wl.name) AS location_name,
+        w.location_id AS effective_location_id,
+        wl.name AS location_name,
         w.name AS warehouse_name,
         e.name AS employee_name,
         p.name AS product_name,
@@ -917,7 +917,6 @@ router.get("/", (req, res) => {
         ) AS send_to_company_name
       FROM expenses x
       LEFT JOIN warehouses w ON w.id = x.warehouse_id
-      LEFT JOIN locations loc ON loc.id = x.location_id
       LEFT JOIN locations wl ON wl.id = w.location_id
       LEFT JOIN employees e ON e.id = x.employee_id
       LEFT JOIN products p ON p.id = x.product_id
@@ -1008,8 +1007,8 @@ router.get("/inward-posted", (req, res) => {
       x.voucher_no AS expense_voucher_no,
       x.expense_date,
       x.work_description,
-      COALESCE(x.location_id, w.location_id) AS effective_location_id,
-      COALESCE(loc.name, wl.name) AS location_name,
+      w.location_id AS effective_location_id,
+      wl.name AS location_name,
       x.inward_posted_at,
       x.inward_id,
       i.voucher_no AS inward_voucher_no,
@@ -1022,7 +1021,6 @@ router.get("/inward-posted", (req, res) => {
     FROM expenses x
     LEFT JOIN inward i ON i.id = x.inward_id
     LEFT JOIN warehouses w ON w.id = x.warehouse_id
-    LEFT JOIN locations loc ON loc.id = x.location_id
     LEFT JOIN locations wl ON wl.id = w.location_id
     LEFT JOIN employees e ON e.id = x.employee_id
     LEFT JOIN products p ON p.id = x.product_id
@@ -1077,9 +1075,9 @@ router.get("/:id", (req, res) => {
       `
       SELECT
         e.*,
-        COALESCE(e.location_id, w.location_id) AS effective_location_id,
-        COALESCE(l.name, wl.name) AS effective_location_name,
-        l.name AS location_name,
+        w.location_id AS effective_location_id,
+        wl.name AS effective_location_name,
+        wl.name AS location_name,
         w.name AS warehouse_name,
         w.location_id AS warehouse_location_id,
         wl.name AS warehouse_location_name,
@@ -1091,7 +1089,6 @@ router.get("/:id", (req, res) => {
         rc.name AS reg_from_company_name,
         stc.name AS send_to_company_name
       FROM expenses e
-      LEFT JOIN locations l ON l.id = e.location_id
       LEFT JOIN warehouses w ON w.id = e.warehouse_id
       LEFT JOIN locations wl ON wl.id = w.location_id
       LEFT JOIN employees emp ON emp.id = e.employee_id
@@ -1158,12 +1155,11 @@ router.post("/:id/approve-cash-book", (req, res) => {
     SELECT
       x.*,
       w.location_id AS warehouse_location_id,
-      COALESCE(loc.name, wl.name) AS location_name,
+      wl.name AS location_name,
       w.name AS warehouse_name,
       c.name AS company_name
     FROM expenses x
     LEFT JOIN warehouses w ON w.id = x.warehouse_id
-    LEFT JOIN locations loc ON loc.id = x.location_id
     LEFT JOIN locations wl ON wl.id = w.location_id
     LEFT JOIN companies c ON c.id = x.company_id
     WHERE x.id = ?
