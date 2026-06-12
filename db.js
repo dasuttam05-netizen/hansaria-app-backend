@@ -685,6 +685,14 @@ let db = null;
       }
     }
   );
+  db.run(
+    `ALTER TABLE expenses ADD COLUMN location_id INTEGER`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("expenses location_id add error:", err.message);
+      }
+    }
+  );
 
   const addColIgnoreDup = (sql, label) => {
     db.run(sql, (err) => {
