@@ -454,7 +454,7 @@ router.post("/final-save", (req, res) => {
   });
 });
 
-router.put("/log/:id", (req, res) => {
+const handleAdjustmentLogUpdate = (req, res) => {
   const { qty } = req.body;
   const adjustmentId = Number(req.params.id);
   const newQty = normalizeQty(qty);
@@ -629,9 +629,12 @@ router.put("/log/:id", (req, res) => {
       );
     }
   );
-});
+};
 
-router.delete("/log/:id", (req, res) => {
+router.put("/log/:id", handleAdjustmentLogUpdate);
+router.post("/log/:id/update", handleAdjustmentLogUpdate);
+
+const handleAdjustmentLogDelete = (req, res) => {
   const adjustmentId = Number(req.params.id);
   if (!Number.isFinite(adjustmentId) || adjustmentId <= 0) {
     return res.status(400).json({ error: "Invalid adjustment id" });
@@ -731,7 +734,11 @@ router.delete("/log/:id", (req, res) => {
       });
     });
   });
-});
+};
+
+router.delete("/log/:id", handleAdjustmentLogDelete);
+router.post("/log/:id/delete", handleAdjustmentLogDelete);
+
 
 router.get("/:id", (req, res) => {
   db.all(
