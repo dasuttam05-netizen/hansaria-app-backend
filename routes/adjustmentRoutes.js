@@ -456,9 +456,14 @@ router.post("/final-save", (req, res) => {
 
 router.put("/log/:id", (req, res) => {
   const { qty } = req.body;
-  const adjustmentId = req.params.id;
+  const adjustmentId = Number(req.params.id);
+  const newQty = normalizeQty(qty);
 
-  if (!qty || Number(qty) <= 0) {
+  if (!Number.isFinite(adjustmentId) || adjustmentId <= 0) {
+    return res.status(400).json({ error: "Invalid adjustment id" });
+  }
+
+  if (newQty <= 0) {
     return res.status(400).json({ error: "Valid qty required" });
   }
 
@@ -485,15 +490,14 @@ router.put("/log/:id", (req, res) => {
         return res.status(404).json({ error: "Adjustment not found" });
       }
 
-      const oldQty = Number(row.qty) || 0;
-      const newQty = Number(qty);
+      const oldQty = normalizeQty(row.qty || 0);
       const isPalti = String(row.source_type || "inward") === "palti_lorry";
-      const currentRemaining = Number(row.remaining_qty) || 0;
-      const grossQty = isPalti ? Number(row.palti_balance) || 0 : Number(row.inward_weight) || 0;
+      const currentRemaining = normalizeQty(row.remaining_qty || 0);
+      const grossQty = normalizeQty(isPalti ? row.palti_balance : row.inward_weight || 0);
 
       const slab = isPalti ? { monthsDiff: 1 } : calculateMonthSlab(row.inward_date, row.outward_date);
-      const shortageQty = isPalti ? 0 : grossQty * 0.02 * slab.monthsDiff;
-      const netOpeningQty = grossQty - shortageQty;
+      const shortageQty = isPalti ? 0 : normalizeQty(grossQty * 0.02 * slab.monthsDiff);
+      const netOpeningQty = normalizeQty(grossQty - shortageQty);
 
       db.get(
         `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id=? AND id<>?`,
@@ -501,8 +505,9 @@ router.put("/log/:id", (req, res) => {
         (err2, outwardSumRow) => {
           if (err2) return res.status(500).json({ error: err2.message });
 
-          const otherOutwardAdjusted = Number(outwardSumRow?.totalAdj) || 0;
-          if (otherOutwardAdjusted + newQty > Number(row.outward_qty)) {
+          const otherOutwardAdjusted = normalizeQty(outwardSumRow?.totalAdj || 0);
+          const outwardQty = normalizeQty(row.outward_qty || 0);
+          if (normalizeQty(otherOutwardAdjusted + newQty) > outwardQty) {
             return res.status(400).json({ error: "Updated qty exceeds outward qty" });
           }
 
@@ -514,14 +519,14 @@ router.put("/log/:id", (req, res) => {
             (err3, inwardSumRow) => {
               if (err3) return res.status(500).json({ error: err3.message });
 
-              const otherInwardAdjusted = Number(inwardSumRow?.totalAdj) || 0;
-              const availableQty = netOpeningQty - otherInwardAdjusted;
+              const otherInwardAdjusted = normalizeQty(inwardSumRow?.totalAdj || 0);
+              const availableQty = normalizeQty(netOpeningQty - otherInwardAdjusted);
 
               if (newQty > availableQty) {
                 return res.status(400).json({ error: "Updated qty exceeds available qty" });
               }
 
-              if (!isPalti && newQty > currentRemaining + oldQty) {
+              if (!isPalti && newQty > normalizeQty(currentRemaining + oldQty)) {
                 return res.status(400).json({ error: "Not enough physical stock available" });
               }
 
@@ -564,9 +569,9 @@ router.put("/log/:id", (req, res) => {
                                 return;
                               }
 
-                              const totalAdj = Number(finalRow?.totalAdj) || 0;
+                              const totalAdj = normalizeQty(finalRow?.totalAdj || 0);
                               const status =
-                                totalAdj >= Number(oRow.quantity)
+                                totalAdj >= normalizeQty(Number(oRow.quantity) || 0)
                                   ? "Completed"
                                   : totalAdj > 0
                                   ? "Partial"
@@ -601,7 +606,7 @@ router.put("/log/:id", (req, res) => {
 
                     db.run(
                       `UPDATE inward SET remaining_qty = remaining_qty + ? WHERE id=?`,
-                      [oldQty - newQty, row.inward_id],
+                      [normalizeQty(oldQty - newQty), row.inward_id],
                       (iErr) => {
                         if (iErr) {
                           db.run("ROLLBACK", () => {
