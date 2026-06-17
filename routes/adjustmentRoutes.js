@@ -491,7 +491,9 @@ router.put("/log/:id", (req, res) => {
       }
 
       const oldQty = normalizeQty(row.qty || 0);
-      const isPalti = String(row.source_type || "inward") === "palti_lorry";
+      const isPalti =
+        String(row.source_type || "").trim().toLowerCase() === "palti_lorry" ||
+        Number(row.palti_lorry_id) > 0;
       const currentRemaining = normalizeQty(row.remaining_qty || 0);
       const grossQty = normalizeQty(isPalti ? row.palti_balance : row.inward_weight || 0);
 
@@ -640,7 +642,9 @@ router.delete("/log/:id", (req, res) => {
       return res.status(404).json({ error: "Adjustment not found" });
     }
 
-    const isPalti = String(row.source_type || "inward") === "palti_lorry";
+    const isPalti =
+      String(row.source_type || "").trim().toLowerCase() === "palti_lorry" ||
+      Number(row.palti_lorry_id) > 0;
     const adjustmentQty = normalizeQty(row.qty || 0);
 
     db.run("BEGIN TRANSACTION", (beginErr) => {
