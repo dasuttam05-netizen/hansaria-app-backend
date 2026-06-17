@@ -18,6 +18,16 @@ function calculateMonthSlab(inwardDateStr, outwardDateStr) {
   };
 }
 
+function normalizeQty(value) {
+  const qty = Number(value);
+  if (!Number.isFinite(qty)) return 0;
+  return Number(qty.toFixed(4));
+}
+
+function addQty(...values) {
+  return normalizeQty(values.reduce((sum, value) => sum + normalizeQty(value), 0));
+}
+
 router.get("/parties", (req, res) => {
   const { warehouse_id, location_id, product_id } = req.query;
   const warehouseId = Number(warehouse_id) || null;
@@ -212,10 +222,10 @@ router.post("/final-save", (req, res) => {
       return res.status(404).json({ error: "Outward not found" });
     }
 
-    const outwardQty = Number(outward.quantity) || 0;
+    const outwardQty = normalizeQty(outward.quantity);
     const outwardWarehouseId = Number(outward.warehouse_id) || null;
     const outwardLocationId = Number(outward.location_id) || null;
-    const totalAdjust = adjustments.reduce((sum, a) => sum + Number(a.qty || 0), 0);
+    const totalAdjust = addQty(...adjustments.map((a) => normalizeQty(a.qty || 0)));
 
     db.get(
       `SELECT IFNULL(SUM(qty), 0) AS alreadyAdjusted FROM adjustment WHERE outward_id=?`,
@@ -223,8 +233,8 @@ router.post("/final-save", (req, res) => {
       (err2, row2) => {
         if (err2) return res.status(500).json({ error: err2.message });
 
-        const alreadyAdj = Number(row2?.alreadyAdjusted) || 0;
-        const remainingToAdjust = outwardQty - alreadyAdj;
+        const alreadyAdj = normalizeQty(row2?.alreadyAdjusted);
+        const remainingToAdjust = normalizeQty(outwardQty - alreadyAdj);
 
         if (remainingToAdjust <= 0) {
           return res.status(400).json({ error: "This outward is already fully adjusted" });
@@ -273,8 +283,9 @@ router.post("/final-save", (req, res) => {
             }
 
             const adj = adjustments[i];
+            const adjQty = normalizeQty(adj.qty);
 
-            if (!adj.company_id || !adj.qty || Number(adj.qty) <= 0) {
+            if (!adj.company_id || adjQty <= 0) {
               return rollback400("Invalid adjustment row");
             }
 
@@ -324,11 +335,11 @@ router.post("/final-save", (req, res) => {
                     }
                   }
 
-                  const grossQty = Number(paltiRow.balance) || 0;
-                  const alreadyAdjustedForThisPalti = Number(paltiRow.already_adjusted) || 0;
-                  const availableQty = grossQty - alreadyAdjustedForThisPalti;
+                  const grossQty = normalizeQty(paltiRow.balance);
+                  const alreadyAdjustedForThisPalti = normalizeQty(paltiRow.already_adjusted);
+                  const availableQty = normalizeQty(grossQty - alreadyAdjustedForThisPalti);
 
-                  if (Number(adj.qty) > availableQty) {
+                  if (adjQty > availableQty) {
                     return rollback400(
                       `Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`
                     );
@@ -396,19 +407,19 @@ router.post("/final-save", (req, res) => {
                 }
 
                 const slab = calculateMonthSlab(inwardRow.date, outward.date);
-                const grossQty = Number(inwardRow.weight) || 0;
-                const alreadyAdjustedForThisInward = Number(inwardRow.already_adjusted) || 0;
-                const shortageQty = grossQty * 0.02 * slab.monthsDiff;
-                const netOpeningQty = grossQty - shortageQty;
-                const availableQty = netOpeningQty - alreadyAdjustedForThisInward;
+                const grossQty = normalizeQty(inwardRow.weight);
+                const alreadyAdjustedForThisInward = normalizeQty(inwardRow.already_adjusted);
+                const shortageQty = normalizeQty(grossQty * 0.02 * slab.monthsDiff);
+                const netOpeningQty = normalizeQty(grossQty - shortageQty);
+                const availableQty = normalizeQty(netOpeningQty - alreadyAdjustedForThisInward);
 
-                if (Number(adj.qty) > availableQty) {
+                if (adjQty > availableQty) {
                   return rollback400(
                     `Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`
                   );
                 }
 
-                if (Number(adj.qty) > Number(inwardRow.remaining_qty || 0)) {
+                if (adjQty > normalizeQty(inwardRow.remaining_qty || 0)) {
                   return rollback400(
                     `Adjusted qty exceeds physical remaining qty for inward_id ${adj.inward_id}`
                   );
