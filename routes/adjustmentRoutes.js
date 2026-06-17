@@ -625,7 +625,10 @@ router.put("/log/:id", (req, res) => {
 });
 
 router.delete("/log/:id", (req, res) => {
-  const adjustmentId = req.params.id;
+  const adjustmentId = Number(req.params.id);
+  if (!Number.isFinite(adjustmentId) || adjustmentId <= 0) {
+    return res.status(400).json({ error: "Invalid adjustment id" });
+  }
 
   db.get(`SELECT * FROM adjustment WHERE id=?`, [adjustmentId], (err, row) => {
     if (err || !row) {
@@ -633,7 +636,8 @@ router.delete("/log/:id", (req, res) => {
     }
 
     const isPalti = String(row.source_type || "inward") === "palti_lorry";
-    
+    const adjustmentQty = normalizeQty(row.qty || 0);
+
     db.run("BEGIN TRANSACTION", (beginErr) => {
       if (beginErr) {
         return res.status(500).json({ error: beginErr.message });
@@ -647,7 +651,7 @@ router.delete("/log/:id", (req, res) => {
           return;
         }
 
-        const updateInwardAndContinue = () => {
+        const updateOutwardStatus = () => {
           db.get(`SELECT quantity FROM outward WHERE id=?`, [row.outward_id], (oErr, oRow) => {
             if (oErr || !oRow) {
               db.run("ROLLBACK", () => {
@@ -667,9 +671,10 @@ router.delete("/log/:id", (req, res) => {
                   return;
                 }
 
-                const totalAdj = Number(finalRow?.totalAdj) || 0;
+                const totalAdj = normalizeQty(finalRow?.totalAdj || 0);
+                const outwardQty = normalizeQty(Number(oRow.quantity) || 0);
                 const status =
-                  totalAdj >= Number(oRow.quantity)
+                  totalAdj >= outwardQty
                     ? "Completed"
                     : totalAdj > 0
                     ? "Partial"
@@ -698,12 +703,12 @@ router.delete("/log/:id", (req, res) => {
         };
 
         if (isPalti) {
-          return updateInwardAndContinue();
+          return updateOutwardStatus();
         }
 
         db.run(
           `UPDATE inward SET remaining_qty = remaining_qty + ? WHERE id=?`,
-          [row.qty, row.inward_id],
+          [adjustmentQty, row.inward_id],
           (uErr) => {
             if (uErr) {
               db.run("ROLLBACK", () => {
@@ -711,7 +716,7 @@ router.delete("/log/:id", (req, res) => {
               });
               return;
             }
-            return updateInwardAndContinue();
+            return updateOutwardStatus();
           }
         );
       });
