@@ -739,6 +739,10 @@ const handleAdjustmentLogDelete = (req, res) => {
               return updateOutwardStatus();
             }
 
+            if (!row.inward_id) {
+              return updateOutwardStatus();
+            }
+
             db.run(
               `UPDATE inward SET remaining_qty = remaining_qty + ? WHERE id=?`,
               [adjustmentQty, row.inward_id],
@@ -746,6 +750,7 @@ const handleAdjustmentLogDelete = (req, res) => {
                 if (uErr) {
                   return rollback(500, uErr.message);
                 }
+
                 return updateOutwardStatus();
               }
             );
