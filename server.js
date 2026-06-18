@@ -261,7 +261,12 @@ const adjustmentRoutes = require("./routes/adjustmentRoutes");
 
 const buyerAdjustmentRoutes = require("./routes/buyerAdjustment");
 
-const systemRoutes = require("./routes/system");
+let systemRoutes;
+try {
+  systemRoutes = require("./routes/system");
+} catch (err) {
+  console.warn("Warning: system route module not loaded:", err.message);
+}
 
 const stockRoutes = require("./routes/stockRoutes");
 
@@ -481,11 +486,13 @@ app.use(
   reportsRoute
 );
 
-app.use(
-  "/api/system",
-  authenticate,
-  systemRoutes
-);
+if (systemRoutes) {
+  app.use(
+    "/api/system",
+    authenticate,
+    systemRoutes
+  );
+}
 
 app.use(
   "/api/adjustment",
