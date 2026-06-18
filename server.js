@@ -223,16 +223,36 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
-
 app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const isAllowedOrigin =
+    origin &&
+    (allowedOrigins.includes(origin) ||
+      allowedOriginPatterns.some((pattern) => pattern.test(origin)));
+
+  if (isAllowedOrigin) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+    res.header("Access-Control-Allow-Credentials", "true");
+    res.header(
+      "Access-Control-Allow-Methods",
+      "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS"
+    );
+    res.header(
+      "Access-Control-Allow-Headers",
+      "Content-Type,Authorization,Accept,Origin,X-Requested-With"
+    );
+  }
+
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
+
   next();
 });
 
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json());
 
 const authRoutes = require("./routes/auth");
