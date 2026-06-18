@@ -193,21 +193,23 @@ const allowedOrigins = [
   "http://127.0.0.1:3000",
 ];
 
+const allowedOriginPatterns = [/\.vercel\.app$/i, /\.onrender\.com$/i];
+
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) {
       return callback(null, true);
     }
 
-    if (
+    const isAllowedOrigin =
       allowedOrigins.includes(origin) ||
-      origin.endsWith(".vercel.app") ||
-      origin.endsWith(".onrender.com")
-    ) {
+      allowedOriginPatterns.some((pattern) => pattern.test(origin));
+
+    if (isAllowedOrigin) {
       return callback(null, true);
     }
 
-    callback(new Error("Not allowed by CORS"));
+    return callback(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: [
@@ -218,10 +220,18 @@ const corsOptions = {
     "X-Requested-With",
   ],
   credentials: true,
+  optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.use(express.json());
 
@@ -250,6 +260,8 @@ const reportsRoute = require("./routes/reports");
 const adjustmentRoutes = require("./routes/adjustmentRoutes");
 
 const buyerAdjustmentRoutes = require("./routes/buyerAdjustment");
+
+const systemRoutes = require("./routes/system");
 
 const stockRoutes = require("./routes/stockRoutes");
 
@@ -467,6 +479,12 @@ app.use(
   "/api/reports",
   authenticate,
   reportsRoute
+);
+
+app.use(
+  "/api/system",
+  authenticate,
+  systemRoutes
 );
 
 app.use(
