@@ -291,6 +291,8 @@ router.get("/:outward_id", async (req, res) => {
           LEFT JOIN outward o ON o.id = ba.outward_id
           LEFT JOIN products p ON p.id = o.product_id
           WHERE ba.outward_id = ?
+            AND TRIM(COALESCE(ba.consignee_name, '')) <> ''
+            AND IFNULL(ba.rate, 0) > 0
           ORDER BY ba.created_at DESC
           `,
           [outwardId],
