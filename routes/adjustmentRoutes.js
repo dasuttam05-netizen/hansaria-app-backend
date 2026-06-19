@@ -676,85 +676,69 @@ const handleAdjustmentLogDelete = (req, res) => {
       const inwardId = Number(row.inward_id) || null;
       const outwardQty = normalizeQty(row.outward_qty || 0);
 
-      db.serialize(() => {
-        const rollback = (statusCode, message) => {
-          return db.run("ROLLBACK", () => res.status(statusCode).json({ error: message }));
-        };
+      const finishSuccess = () => res.json({ message: "Adjustment deleted successfully" });
 
-        db.run("BEGIN IMMEDIATE TRANSACTION", (beginErr) => {
-          if (beginErr) {
-            return res.status(500).json({ error: beginErr.message });
+      const recalculateOutwardStatus = () => {
+        if (!outwardId || outwardQty <= 0) {
+          return finishSuccess();
+        }
+
+        db.get(
+          `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id = ?`,
+          [outwardId],
+          (sumErr, finalRow) => {
+            if (sumErr) {
+              return res.status(500).json({ error: sumErr.message });
+            }
+
+            const totalAdj = normalizeQty(finalRow?.totalAdj || 0);
+            const status =
+              totalAdj >= outwardQty
+                ? "Completed"
+                : totalAdj > 0
+                ? "Partial"
+                : "Pending";
+
+            db.run(`UPDATE outward SET status = ? WHERE id = ?`, [status, outwardId], (statusErr) => {
+              if (statusErr) {
+                return res.status(500).json({ error: statusErr.message });
+              }
+
+              return finishSuccess();
+            });
+          }
+        );
+      };
+
+      const deleteRow = () => {
+        db.run(`DELETE FROM adjustment WHERE id = ?`, [adjustmentId], (deleteErr, deleteResult) => {
+          if (deleteErr) {
+            return res.status(500).json({ error: deleteErr.message });
           }
 
-          const finish = () => {
-            db.run(`DELETE FROM adjustment WHERE id = ?`, [adjustmentId], (deleteErr, deleteResult) => {
-              if (deleteErr) {
-                return rollback(500, deleteErr.message);
-              }
+          if (!deleteResult?.changes) {
+            return res.status(404).json({ error: "Adjustment not found" });
+          }
 
-              if (!deleteResult?.changes) {
-                return rollback(404, "Adjustment not found");
-              }
-
-              const finalize = () => {
-                if (!outwardId || outwardQty <= 0) {
-                  return db.run("COMMIT", (commitErr) => {
-                    if (commitErr) return rollback(500, commitErr.message);
-                    return res.json({ message: "Adjustment deleted successfully" });
-                  });
-                }
-
-                db.get(
-                  `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id = ?`,
-                  [outwardId],
-                  (sumErr, finalRow) => {
-                    if (sumErr) {
-                      return rollback(500, sumErr.message);
-                    }
-
-                    const totalAdj = normalizeQty(finalRow?.totalAdj || 0);
-                    const status =
-                      totalAdj >= outwardQty
-                        ? "Completed"
-                        : totalAdj > 0
-                        ? "Partial"
-                        : "Pending";
-
-                    db.run(`UPDATE outward SET status = ? WHERE id = ?`, [status, outwardId], (statusErr) => {
-                      if (statusErr) {
-                        return rollback(500, statusErr.message);
-                      }
-
-                      db.run("COMMIT", (commitErr) => {
-                        if (commitErr) return rollback(500, commitErr.message);
-                        return res.json({ message: "Adjustment deleted successfully" });
-                      });
-                    });
-                  }
-                );
-              };
-
-              if (isPalti || !inwardId) {
-                return finalize();
-              }
-
-              db.run(
-                `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
-                [adjustmentQty, inwardId],
-                (inwardErr) => {
-                  if (inwardErr) {
-                    return rollback(500, inwardErr.message);
-                  }
-
-                  return finalize();
-                }
-              );
-            });
-          };
-
-          finish();
+          return recalculateOutwardStatus();
         });
-      });
+      };
+
+      if (isPalti || !inwardId) {
+        return deleteRow();
+      }
+
+      db.run(
+        `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
+        [adjustmentQty, inwardId],
+        (inwardErr) => {
+          if (inwardErr) {
+            return res.status(500).json({ error: inwardErr.message });
+          }
+
+          return deleteRow();
+        }
+      );
     }
   );
 };
