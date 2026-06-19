@@ -384,6 +384,7 @@ let db = null;
       buyer_name TEXT,
       consignee_name TEXT,
       inv_no TEXT,
+      self_loading TEXT DEFAULT 'No',
       narration TEXT,
       labour_charges REAL DEFAULT 0,
       total_freight REAL DEFAULT 0,
@@ -786,6 +787,7 @@ let db = null;
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN gst_no TEXT`, "transporters gst_no");
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN aadhar_no TEXT`, "transporters aadhar_no");
   addColIgnoreDup(`ALTER TABLE outward ADD COLUMN inv_no TEXT`, "outward inv_no");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN self_loading TEXT DEFAULT 'No'`, "outward self_loading");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN palti_lorry_id INTEGER`, "adjustment palti_lorry_id");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN source_type TEXT DEFAULT 'inward'`, "adjustment source_type");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN company_rate REAL DEFAULT 0`, "adjustment company_rate");
