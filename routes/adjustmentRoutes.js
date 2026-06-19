@@ -210,15 +210,22 @@ router.get("/inward/report", (req, res) => {
   });
 });
 
-router.post("/final-save", (req, res) => {
-  const { outward_id, adjustments } = req.body;
+router.post("/final-save", async (req, res) => {
+  const fail = (status, message) => {
+    const error = new Error(message);
+    error.status = status;
+    throw error;
+  };
 
-  if (!outward_id || !Array.isArray(adjustments) || adjustments.length === 0) {
-    return res.status(400).json({ error: "Data required" });
-  }
+  try {
+    const { outward_id, adjustments } = req.body;
 
-  db.get(`SELECT * FROM outward WHERE id=?`, [outward_id], (err, outward) => {
-    if (err || !outward) {
+    if (!outward_id || !Array.isArray(adjustments) || adjustments.length === 0) {
+      return res.status(400).json({ error: "Data required" });
+    }
+
+    const outward = await dbGetAsync(`SELECT * FROM outward WHERE id=?`, [outward_id]);
+    if (!outward) {
       return res.status(404).json({ error: "Outward not found" });
     }
 
@@ -227,236 +234,175 @@ router.post("/final-save", (req, res) => {
     const outwardLocationId = Number(outward.location_id) || null;
     const totalAdjust = addQty(...adjustments.map((a) => normalizeQty(a.qty || 0)));
 
-    db.get(
+    const alreadyRow = await dbGetAsync(
       `SELECT IFNULL(SUM(qty), 0) AS alreadyAdjusted FROM adjustment WHERE outward_id=?`,
-      [outward_id],
-      (err2, row2) => {
-        if (err2) return res.status(500).json({ error: err2.message });
-
-        const alreadyAdj = normalizeQty(row2?.alreadyAdjusted);
-        const remainingToAdjust = normalizeQty(outwardQty - alreadyAdj);
-
-        if (remainingToAdjust <= 0) {
-          return res.status(400).json({ error: "This outward is already fully adjusted" });
-        }
-
-        if (totalAdjust > remainingToAdjust) {
-          return res.status(400).json({
-            error: `Total adjustment cannot exceed remaining ${remainingToAdjust}`,
-          });
-        }
-
-        db.serialize(() => {
-          db.run("BEGIN TRANSACTION", (beginErr) => {
-            if (beginErr) {
-              return res.status(500).json({ error: beginErr.message });
-            }
-
-            let i = 0;
-
-            const rollback400 = (message) => {
-              db.run("ROLLBACK", () => res.status(400).json({ error: message }));
-            };
-
-            const rollback500 = (message) => {
-              db.run("ROLLBACK", () => res.status(500).json({ error: message }));
-            };
-
-            const saveNext = () => {
-            if (i >= adjustments.length) {
-              const finalStatus =
-                totalAdjust === remainingToAdjust ? "Completed" : "Partial";
-
-              db.run(
-                `UPDATE outward SET status=? WHERE id=?`,
-                [finalStatus, outward_id],
-                (statusErr) => {
-                  if (statusErr) return rollback500(statusErr.message);
-
-                  db.run("COMMIT", (commitErr) => {
-                    if (commitErr) return rollback500(commitErr.message);
-                    res.json({
-                      message: "Adjustment Saved Successfully",
-                      status: finalStatus,
-                    });
-                  });
-                }
-              );
-              return;
-            }
-
-            const adj = adjustments[i];
-            const adjQty = normalizeQty(adj.qty);
-
-            if (!adj.company_id || adjQty <= 0) {
-              return rollback400("Invalid adjustment row");
-            }
-
-            if ((adj.source_type || "inward") === "palti_lorry") {
-              if (!adj.palti_lorry_id) {
-                return rollback400("Invalid Palti Lorry adjustment row");
-              }
-
-              return db.get(
-                `
-                SELECT
-                  p.id,
-                  p.balance,
-                  p.warehouse_id,
-                  p.company_id,
-                  w.location_id,
-                  IFNULL((
-                    SELECT SUM(a.qty)
-                    FROM adjustment a
-                    WHERE a.palti_lorry_id = p.id
-                      AND COALESCE(a.source_type, 'inward') = 'palti_lorry'
-                  ), 0) AS already_adjusted
-                FROM palti_lorry_entries p
-                LEFT JOIN warehouses w ON w.id = p.warehouse_id
-                WHERE p.id = ?
-                `,
-                [adj.palti_lorry_id],
-                (paltiErr, paltiRow) => {
-                  if (paltiErr) return rollback500(paltiErr.message);
-                  if (!paltiRow) return rollback400(`Invalid palti_lorry_id ${adj.palti_lorry_id}`);
-
-                  if (Number(paltiRow.company_id) !== Number(adj.company_id)) {
-                    return rollback400(`Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
-                  }
-
-                  // Check warehouse/location compatibility
-                  if (outwardWarehouseId) {
-                    // If outward is warehouse-specific, palti must be in same warehouse
-                    if (Number(paltiRow.warehouse_id) !== outwardWarehouseId) {
-                      return rollback400(`Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
-                    }
-                  } else if (outwardLocationId) {
-                    // If outward is location-specific, palti's warehouse must be in same location
-                    const paltiLocationId = paltiRow.location_id;
-                    if (Number(paltiLocationId || 0) !== outwardLocationId) {
-                      return rollback400(`Location mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
-                    }
-                  }
-
-                  const grossQty = normalizeQty(paltiRow.balance);
-                  const alreadyAdjustedForThisPalti = normalizeQty(paltiRow.already_adjusted);
-                  const availableQty = normalizeQty(grossQty - alreadyAdjustedForThisPalti);
-
-                  if (adjQty > availableQty) {
-                    return rollback400(
-                      `Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`
-                    );
-                  }
-
-                  db.run(
-                    `INSERT INTO adjustment (outward_id, inward_id, palti_lorry_id, source_type, qty) VALUES (?, ?, ?, ?, ?)`,
-                    [outward_id, null, adj.palti_lorry_id, "palti_lorry", adj.qty],
-                    (insertErr) => {
-                      if (insertErr) return rollback500(insertErr.message);
-
-                      i += 1;
-                      saveNext();
-                    }
-                  );
-                }
-              );
-            }
-
-            if (!adj.inward_id) {
-              return rollback400("Invalid inward adjustment row");
-            }
-
-            db.get(
-              `
-              SELECT
-                i.id,
-                i.date,
-                i.weight,
-                i.remaining_qty,
-                i.warehouse_id,
-                i.location_id,
-                i.company_id,
-                w.location_id AS warehouse_location_id,
-                IFNULL((
-                  SELECT SUM(a.qty)
-                  FROM adjustment a
-                  WHERE a.inward_id = i.id
-                ), 0) AS already_adjusted
-              FROM inward i
-              LEFT JOIN warehouses w ON w.id = i.warehouse_id
-              WHERE i.id=?
-              `,
-              [adj.inward_id],
-              (inwardErr, inwardRow) => {
-                if (inwardErr) return rollback500(inwardErr.message);
-                if (!inwardRow) return rollback400(`Invalid inward_id ${adj.inward_id}`);
-
-                // Check warehouse/location compatibility
-                if (outwardWarehouseId) {
-                  // If outward is warehouse-specific, inward must be in same warehouse
-                  if (Number(inwardRow.warehouse_id) !== outwardWarehouseId) {
-                    return rollback400(`Warehouse mismatch for inward_id ${adj.inward_id}`);
-                  }
-                } else if (outwardLocationId) {
-                  // If outward is location-specific, inward's warehouse must be in same location
-                  const inwardLocationId = inwardRow.location_id || inwardRow.warehouse_location_id;
-                  if (Number(inwardLocationId || 0) !== outwardLocationId) {
-                    return rollback400(`Location mismatch for inward_id ${adj.inward_id}`);
-                  }
-                }
-
-                if (Number(inwardRow.company_id) !== Number(adj.company_id)) {
-                  return rollback400(`Company mismatch for inward_id ${adj.inward_id}`);
-                }
-
-                const slab = calculateMonthSlab(inwardRow.date, outward.date);
-                const grossQty = normalizeQty(inwardRow.weight);
-                const alreadyAdjustedForThisInward = normalizeQty(inwardRow.already_adjusted);
-                const shortageQty = normalizeQty(grossQty * 0.02 * slab.monthsDiff);
-                const netOpeningQty = normalizeQty(grossQty - shortageQty);
-                const availableQty = normalizeQty(netOpeningQty - alreadyAdjustedForThisInward);
-
-                if (adjQty > availableQty) {
-                  return rollback400(
-                    `Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`
-                  );
-                }
-
-                if (adjQty > normalizeQty(inwardRow.remaining_qty || 0)) {
-                  return rollback400(
-                    `Adjusted qty exceeds physical remaining qty for inward_id ${adj.inward_id}`
-                  );
-                }
-
-                db.run(
-                  `UPDATE inward SET remaining_qty = remaining_qty - ? WHERE id=?`,
-                  [adj.qty, adj.inward_id],
-                  (updateErr) => {
-                    if (updateErr) return rollback500(updateErr.message);
-
-                    db.run(
-                      `INSERT INTO adjustment (outward_id, inward_id, palti_lorry_id, source_type, qty) VALUES (?, ?, ?, ?, ?)`,
-                      [outward_id, adj.inward_id, null, "inward", adj.qty],
-                      (insertErr) => {
-                        if (insertErr) return rollback500(insertErr.message);
-
-                        i += 1;
-                        saveNext();
-                      }
-                    );
-                  }
-                );
-              }
-            );
-          };
-
-          saveNext();
-        });
-      }
+      [outward_id]
     );
-  });
-});
 
+    const alreadyAdj = normalizeQty(alreadyRow?.alreadyAdjusted);
+    const remainingToAdjust = normalizeQty(outwardQty - alreadyAdj);
+
+    if (remainingToAdjust <= 0) {
+      return res.status(400).json({ error: "This outward is already fully adjusted" });
+    }
+
+    if (totalAdjust > remainingToAdjust) {
+      return res.status(400).json({
+        error: `Total adjustment cannot exceed remaining ${remainingToAdjust}`,
+      });
+    }
+
+    await dbRunAsync("BEGIN TRANSACTION");
+
+    try {
+      for (const adj of adjustments) {
+        const adjQty = normalizeQty(adj.qty);
+        const sourceType = String(adj.source_type || "inward").trim().toLowerCase();
+
+        if (!adj.company_id || adjQty <= 0) {
+          fail(400, "Invalid adjustment row");
+        }
+
+        if (sourceType === "palti_lorry") {
+          if (!adj.palti_lorry_id) {
+            fail(400, "Invalid Palti Lorry adjustment row");
+          }
+
+          const paltiRow = await dbGetAsync(
+            `
+            SELECT
+              p.id,
+              p.balance,
+              p.warehouse_id,
+              p.company_id,
+              w.location_id,
+              IFNULL((
+                SELECT SUM(a.qty)
+                FROM adjustment a
+                WHERE a.palti_lorry_id = p.id
+                  AND COALESCE(a.source_type, 'inward') = 'palti_lorry'
+              ), 0) AS already_adjusted
+            FROM palti_lorry_entries p
+            LEFT JOIN warehouses w ON w.id = p.warehouse_id
+            WHERE p.id = ?
+            `,
+            [adj.palti_lorry_id]
+          );
+
+          if (!paltiRow) fail(400, `Invalid palti_lorry_id ${adj.palti_lorry_id}`);
+          if (Number(paltiRow.company_id) !== Number(adj.company_id)) {
+            fail(400, `Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
+          }
+
+          if (outwardWarehouseId) {
+            if (Number(paltiRow.warehouse_id) !== outwardWarehouseId) {
+              fail(400, `Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
+            }
+          } else if (outwardLocationId) {
+            if (Number(paltiRow.location_id || 0) !== outwardLocationId) {
+              fail(400, `Location mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
+            }
+          }
+
+          const availableQty = normalizeQty(normalizeQty(paltiRow.balance) - normalizeQty(paltiRow.already_adjusted));
+          if (adjQty > availableQty) {
+            fail(400, `Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`);
+          }
+
+          await dbRunAsync(
+            `INSERT INTO adjustment (outward_id, inward_id, palti_lorry_id, source_type, qty) VALUES (?, ?, ?, ?, ?)`,
+            [outward_id, null, adj.palti_lorry_id, "palti_lorry", adj.qty]
+          );
+          continue;
+        }
+
+        if (!adj.inward_id) {
+          fail(400, "Invalid inward adjustment row");
+        }
+
+        const inwardRow = await dbGetAsync(
+          `
+          SELECT
+            i.id,
+            i.date,
+            i.weight,
+            i.remaining_qty,
+            i.warehouse_id,
+            i.location_id,
+            i.company_id,
+            w.location_id AS warehouse_location_id,
+            IFNULL((
+              SELECT SUM(a.qty)
+              FROM adjustment a
+              WHERE a.inward_id = i.id
+            ), 0) AS already_adjusted
+          FROM inward i
+          LEFT JOIN warehouses w ON w.id = i.warehouse_id
+          WHERE i.id=?
+          `,
+          [adj.inward_id]
+        );
+
+        if (!inwardRow) fail(400, `Invalid inward_id ${adj.inward_id}`);
+
+        if (outwardWarehouseId) {
+          if (Number(inwardRow.warehouse_id) !== outwardWarehouseId) {
+            fail(400, `Warehouse mismatch for inward_id ${adj.inward_id}`);
+          }
+        } else if (outwardLocationId) {
+          const inwardLocationId = inwardRow.location_id || inwardRow.warehouse_location_id;
+          if (Number(inwardLocationId || 0) !== outwardLocationId) {
+            fail(400, `Location mismatch for inward_id ${adj.inward_id}`);
+          }
+        }
+
+        if (Number(inwardRow.company_id) !== Number(adj.company_id)) {
+          fail(400, `Company mismatch for inward_id ${adj.inward_id}`);
+        }
+
+        const slab = calculateMonthSlab(inwardRow.date, outward.date);
+        const grossQty = normalizeQty(inwardRow.weight);
+        const alreadyAdjustedForThisInward = normalizeQty(inwardRow.already_adjusted);
+        const shortageQty = normalizeQty(grossQty * 0.02 * slab.monthsDiff);
+        const netOpeningQty = normalizeQty(grossQty - shortageQty);
+        const availableQty = normalizeQty(netOpeningQty - alreadyAdjustedForThisInward);
+
+        if (adjQty > availableQty) {
+          fail(400, `Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`);
+        }
+
+        if (adjQty > normalizeQty(inwardRow.remaining_qty || 0)) {
+          fail(400, `Adjusted qty exceeds physical remaining qty for inward_id ${adj.inward_id}`);
+        }
+
+        await dbRunAsync(`UPDATE inward SET remaining_qty = remaining_qty - ? WHERE id=?`, [
+          adj.qty,
+          adj.inward_id,
+        ]);
+
+        await dbRunAsync(
+          `INSERT INTO adjustment (outward_id, inward_id, palti_lorry_id, source_type, qty) VALUES (?, ?, ?, ?, ?)`,
+          [outward_id, adj.inward_id, null, "inward", adj.qty]
+        );
+      }
+
+      const finalStatus = totalAdjust === remainingToAdjust ? "Completed" : "Partial";
+      await dbRunAsync(`UPDATE outward SET status=? WHERE id=?`, [finalStatus, outward_id]);
+      await dbRunAsync("COMMIT");
+
+      return res.json({
+        message: "Adjustment Saved Successfully",
+        status: finalStatus,
+      });
+    } catch (error) {
+      await dbRunAsync("ROLLBACK").catch(() => {});
+      throw error;
+    }
+  } catch (err) {
+    console.error("[adjustment final-save] error:", err);
+    const status = Number(err?.status) || 500;
+    return res.status(status).json({ error: err?.message || "Adjustment save failed" });
+  }
 });
 
 const handleAdjustmentLogUpdate = (req, res) => {
