@@ -643,87 +643,120 @@ function dbRunAsync(sql, params = []) {
   });
 }
 
-const handleAdjustmentLogDelete = async (req, res) => {
+const handleAdjustmentLogDelete = (req, res) => {
   const adjustmentId = Number(req.params.id);
   if (!Number.isFinite(adjustmentId) || adjustmentId <= 0) {
     return res.status(400).json({ error: "Invalid adjustment id" });
   }
 
-  let transactionStarted = false;
-
-  try {
-    await dbRunAsync("BEGIN IMMEDIATE TRANSACTION");
-    transactionStarted = true;
-
-    const row = await dbGetAsync(
-      `
-      SELECT
-        a.*,
-        o.quantity AS outward_qty
-      FROM adjustment a
-      LEFT JOIN outward o ON o.id = a.outward_id
-      WHERE a.id = ?
-      `,
-      [adjustmentId]
-    );
-
-    if (!row) {
-      await dbRunAsync("ROLLBACK");
-      transactionStarted = false;
-      return res.status(404).json({ error: "Adjustment not found" });
-    }
-
-    const isPalti =
-      String(row.source_type || "").trim().toLowerCase() === "palti_lorry" ||
-      Number(row.palti_lorry_id) > 0;
-    const adjustmentQty = normalizeQty(row.qty || 0);
-
-    if (!isPalti && row.inward_id) {
-      await dbRunAsync(
-        `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
-        [adjustmentQty, row.inward_id]
-      );
-    }
-
-    const deleteResult = await dbRunAsync(`DELETE FROM adjustment WHERE id = ?`, [adjustmentId]);
-    if (!deleteResult.changes) {
-      await dbRunAsync("ROLLBACK");
-      transactionStarted = false;
-      return res.status(404).json({ error: "Adjustment not found" });
-    }
-
-    const outwardQty = normalizeQty(row.outward_qty || 0);
-    if (row.outward_id && outwardQty > 0) {
-      const finalRow = await dbGetAsync(
-        `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id = ?`,
-        [row.outward_id]
-      );
-      const totalAdj = normalizeQty(finalRow?.totalAdj || 0);
-      const status =
-        totalAdj >= outwardQty
-          ? "Completed"
-          : totalAdj > 0
-          ? "Partial"
-          : "Pending";
-
-      await dbRunAsync(`UPDATE outward SET status = ? WHERE id = ?`, [status, row.outward_id]);
-    }
-
-    await dbRunAsync("COMMIT");
-    transactionStarted = false;
-    return res.json({ message: "Adjustment deleted successfully" });
-  } catch (err) {
-    if (transactionStarted) {
-      try {
-        await dbRunAsync("ROLLBACK");
-      } catch (rollbackErr) {
-        console.error("Adjustment delete rollback failed:", rollbackErr.message);
+  db.get(
+    `
+    SELECT
+      a.*,
+      o.quantity AS outward_qty
+    FROM adjustment a
+    LEFT JOIN outward o ON o.id = a.outward_id
+    WHERE a.id = ?
+    `,
+    [adjustmentId],
+    (err, row) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
       }
-    }
 
-    console.error("Adjustment delete failed:", err.message);
-    return res.status(500).json({ error: err.message || "Delete failed" });
-  }
+      if (!row) {
+        return res.status(404).json({ error: "Adjustment not found" });
+      }
+
+      const isPalti =
+        String(row.source_type || "").trim().toLowerCase() === "palti_lorry" ||
+        Number(row.palti_lorry_id) > 0;
+      const adjustmentQty = normalizeQty(row.qty || 0);
+      const outwardId = Number(row.outward_id) || null;
+      const inwardId = Number(row.inward_id) || null;
+      const outwardQty = normalizeQty(row.outward_qty || 0);
+
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION", (beginErr) => {
+          if (beginErr) {
+            return res.status(500).json({ error: beginErr.message });
+          }
+
+          const rollback = (statusCode, message) => {
+            db.run("ROLLBACK", () => res.status(statusCode).json({ error: message }));
+          };
+
+          const finishDelete = () => {
+            db.run(`DELETE FROM adjustment WHERE id = ?`, [adjustmentId], (deleteErr, deleteResult) => {
+              if (deleteErr) {
+                return rollback(500, deleteErr.message);
+              }
+
+              if (!deleteResult?.changes) {
+                return rollback(404, "Adjustment not found");
+              }
+
+              const updateOutwardStatus = () => {
+                if (!outwardId || outwardQty <= 0) {
+                  return db.run("COMMIT", (commitErr) => {
+                    if (commitErr) return rollback(500, commitErr.message);
+                    return res.json({ message: "Adjustment deleted successfully" });
+                  });
+                }
+
+                db.get(
+                  `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id = ?`,
+                  [outwardId],
+                  (sumErr, finalRow) => {
+                    if (sumErr) {
+                      return rollback(500, sumErr.message);
+                    }
+
+                    const totalAdj = normalizeQty(finalRow?.totalAdj || 0);
+                    const status =
+                      totalAdj >= outwardQty
+                        ? "Completed"
+                        : totalAdj > 0
+                        ? "Partial"
+                        : "Pending";
+
+                    db.run(`UPDATE outward SET status = ? WHERE id = ?`, [status, outwardId], (statusErr) => {
+                      if (statusErr) {
+                        return rollback(500, statusErr.message);
+                      }
+
+                      db.run("COMMIT", (commitErr) => {
+                        if (commitErr) return rollback(500, commitErr.message);
+                        return res.json({ message: "Adjustment deleted successfully" });
+                      });
+                    });
+                  }
+                );
+              };
+
+              if (isPalti || !inwardId) {
+                return updateOutwardStatus();
+              }
+
+              db.run(
+                `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
+                [adjustmentQty, inwardId],
+                (inwardErr) => {
+                  if (inwardErr) {
+                    return rollback(500, inwardErr.message);
+                  }
+
+                  return updateOutwardStatus();
+                }
+              );
+            });
+          };
+
+          finishDelete();
+        });
+      });
+    }
+  );
 };
 
 router.delete("/log/:id", handleAdjustmentLogDelete);
