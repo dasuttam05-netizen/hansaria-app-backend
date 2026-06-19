@@ -247,19 +247,22 @@ router.post("/final-save", (req, res) => {
         }
 
         db.serialize(() => {
-          db.run("BEGIN TRANSACTION");
+          db.run("BEGIN TRANSACTION", (beginErr) => {
+            if (beginErr) {
+              return res.status(500).json({ error: beginErr.message });
+            }
 
-          let i = 0;
+            let i = 0;
 
-          const rollback400 = (message) => {
-            db.run("ROLLBACK", () => res.status(400).json({ error: message }));
-          };
+            const rollback400 = (message) => {
+              db.run("ROLLBACK", () => res.status(400).json({ error: message }));
+            };
 
-          const rollback500 = (message) => {
-            db.run("ROLLBACK", () => res.status(500).json({ error: message }));
-          };
+            const rollback500 = (message) => {
+              db.run("ROLLBACK", () => res.status(500).json({ error: message }));
+            };
 
-          const saveNext = () => {
+            const saveNext = () => {
             if (i >= adjustments.length) {
               const finalStatus =
                 totalAdjust === remainingToAdjust ? "Completed" : "Partial";
