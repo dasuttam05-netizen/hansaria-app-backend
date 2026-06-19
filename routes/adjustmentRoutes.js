@@ -677,16 +677,16 @@ const handleAdjustmentLogDelete = (req, res) => {
       const outwardQty = normalizeQty(row.outward_qty || 0);
 
       db.serialize(() => {
-        db.run("BEGIN TRANSACTION", (beginErr) => {
+        const rollback = (statusCode, message) => {
+          return db.run("ROLLBACK", () => res.status(statusCode).json({ error: message }));
+        };
+
+        db.run("BEGIN IMMEDIATE TRANSACTION", (beginErr) => {
           if (beginErr) {
             return res.status(500).json({ error: beginErr.message });
           }
 
-          const rollback = (statusCode, message) => {
-            db.run("ROLLBACK", () => res.status(statusCode).json({ error: message }));
-          };
-
-          const finishDelete = () => {
+          const finish = () => {
             db.run(`DELETE FROM adjustment WHERE id = ?`, [adjustmentId], (deleteErr, deleteResult) => {
               if (deleteErr) {
                 return rollback(500, deleteErr.message);
@@ -696,7 +696,7 @@ const handleAdjustmentLogDelete = (req, res) => {
                 return rollback(404, "Adjustment not found");
               }
 
-              const updateOutwardStatus = () => {
+              const finalize = () => {
                 if (!outwardId || outwardQty <= 0) {
                   return db.run("COMMIT", (commitErr) => {
                     if (commitErr) return rollback(500, commitErr.message);
@@ -735,7 +735,7 @@ const handleAdjustmentLogDelete = (req, res) => {
               };
 
               if (isPalti || !inwardId) {
-                return updateOutwardStatus();
+                return finalize();
               }
 
               db.run(
@@ -746,13 +746,13 @@ const handleAdjustmentLogDelete = (req, res) => {
                     return rollback(500, inwardErr.message);
                   }
 
-                  return updateOutwardStatus();
+                  return finalize();
                 }
               );
             });
           };
 
-          finishDelete();
+          finish();
         });
       });
     }
