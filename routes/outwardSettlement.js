@@ -278,6 +278,28 @@ router.get("/:outward_id", async (req, res) => {
     try {
       const adjustment_details = await getAdjustmentDetails(outwardId);
       const labourExpense = await getApprovedLabourExpense(outwardId);
+      const unloadingDetails = await new Promise((resolve, reject) => {
+        db.all(
+          `
+          SELECT
+            ba.*,
+            COALESCE(ba.buyer_name, b.name) AS buyer_name,
+            COALESCE(ba.consignee_name, '') AS consignee_name,
+            p.name AS product_name
+          FROM buyer_adjustments ba
+          LEFT JOIN buyer_names b ON ba.buyer_id = b.id
+          LEFT JOIN outward o ON o.id = ba.outward_id
+          LEFT JOIN products p ON p.id = o.product_id
+          WHERE ba.outward_id = ?
+          ORDER BY ba.created_at DESC
+          `,
+          [outwardId],
+          (buyerErr, rows) => {
+            if (buyerErr) return reject(buyerErr);
+            return resolve(Array.isArray(rows) ? rows : []);
+          }
+        );
+      });
       const totalSettlementWeight = adjustment_details.reduce(
         (sum, item) => sum + num(item.settlement_weight),
         0
@@ -306,6 +328,7 @@ router.get("/:outward_id", async (req, res) => {
         product_name: row.product_name,
         outward_quantity: defaultDispatch,
         labour_expense: labourExpense,
+        unloading_details: unloadingDetails,
         adjustment_details: adjustment_details.map((item) => ({
           ...item,
           company_rate: num(item.adjustment_company_rate) || num(row.company_rate ?? 0),
