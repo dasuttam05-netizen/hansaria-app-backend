@@ -660,11 +660,23 @@ const handleAdjustmentLogDelete = (req, res) => {
     `,
     [adjustmentId],
     (err, row) => {
+      console.log("[adjustment delete] request:", {
+        adjustmentId,
+        hasError: Boolean(err),
+        rowFound: Boolean(row),
+        outwardId: row?.outward_id || null,
+        inwardId: row?.inward_id || null,
+        paltiLorryId: row?.palti_lorry_id || null,
+        sourceType: row?.source_type || null,
+      });
+
       if (err) {
+        console.error("[adjustment delete] lookup error:", err.message);
         return res.status(500).json({ error: err.message });
       }
 
       if (!row) {
+        console.warn("[adjustment delete] row not found for id:", adjustmentId);
         return res.status(404).json({ error: "Adjustment not found" });
       }
 
@@ -728,16 +740,17 @@ const handleAdjustmentLogDelete = (req, res) => {
         return deleteRow();
       }
 
-      db.run(
-        `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
-        [adjustmentQty, inwardId],
-        (inwardErr) => {
-          if (inwardErr) {
-            return res.status(500).json({ error: inwardErr.message });
-          }
+        db.run(
+          `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
+          [adjustmentQty, inwardId],
+          (inwardErr) => {
+            if (inwardErr) {
+              console.error("[adjustment delete] inward restore failed:", inwardErr.message);
+              return res.status(500).json({ error: inwardErr.message });
+            }
 
-          return deleteRow();
-        }
+            return deleteRow();
+          }
       );
     }
   );
