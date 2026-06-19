@@ -457,6 +457,8 @@ router.post("/final-save", (req, res) => {
   });
 });
 
+});
+
 const handleAdjustmentLogUpdate = (req, res) => {
   const { qty } = req.body;
   const adjustmentId = Number(req.params.id);
@@ -743,17 +745,17 @@ const handleAdjustmentLogDelete = (req, res) => {
         return deleteRow();
       }
 
-        db.run(
-          `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
-          [adjustmentQty, inwardId],
-          (inwardErr) => {
-            if (inwardErr) {
-              console.error("[adjustment delete] inward restore failed:", inwardErr.message);
-              return res.status(500).json({ error: inwardErr.message });
-            }
-
-            return deleteRow();
+      db.run(
+        `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
+        [adjustmentQty, inwardId],
+        (inwardErr) => {
+          if (inwardErr) {
+            console.error("[adjustment delete] inward restore failed:", inwardErr.message);
+            return res.status(500).json({ error: inwardErr.message });
           }
+
+          return deleteRow();
+        }
       );
     }
   );
