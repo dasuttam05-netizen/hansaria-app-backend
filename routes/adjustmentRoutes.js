@@ -677,7 +677,7 @@ const handleAdjustmentLogDelete = (req, res) => {
 
       if (!row) {
         console.warn("[adjustment delete] row not found for id:", adjustmentId);
-        return res.status(404).json({ error: "Adjustment not found" });
+        return res.json({ message: "Adjustment already deleted" });
       }
 
       const isPalti =
