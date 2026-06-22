@@ -211,16 +211,19 @@ router.get("/inward/report", (req, res) => {
 });
 
 router.post("/final-save", async (req, res) => {
-  const fail = (status, message) => {
-    const error = new Error(message);
-    error.status = status;
-    throw error;
-  };
-
   try {
-    const { outward_id, adjustments } = req.body;
+    const { outward_id, adjustments } = req.body || {};
+    const cleanAdjustments = Array.isArray(adjustments)
+      ? adjustments.map((item) => ({
+          inward_id: item?.inward_id ?? null,
+          palti_lorry_id: item?.palti_lorry_id ?? null,
+          source_type: String(item?.source_type || "inward").trim().toLowerCase(),
+          company_id: item?.company_id ?? null,
+          qty: Number(item?.qty) || 0,
+        }))
+      : [];
 
-    if (!outward_id || !Array.isArray(adjustments) || adjustments.length === 0) {
+    if (!outward_id || cleanAdjustments.length === 0) {
       return res.status(400).json({ error: "Data required" });
     }
 
@@ -232,7 +235,7 @@ router.post("/final-save", async (req, res) => {
     const outwardQty = normalizeQty(outward.quantity);
     const outwardWarehouseId = Number(outward.warehouse_id) || null;
     const outwardLocationId = Number(outward.location_id) || null;
-    const totalAdjust = addQty(...adjustments.map((a) => normalizeQty(a.qty || 0)));
+    const totalAdjust = addQty(...cleanAdjustments.map((a) => normalizeQty(a.qty)));
 
     const alreadyRow = await dbGetAsync(
       `SELECT IFNULL(SUM(qty), 0) AS alreadyAdjusted FROM adjustment WHERE outward_id=?`,
@@ -255,17 +258,18 @@ router.post("/final-save", async (req, res) => {
     await dbRunAsync("BEGIN TRANSACTION");
 
     try {
-      for (const adj of adjustments) {
+      for (const adj of cleanAdjustments) {
         const adjQty = normalizeQty(adj.qty);
-        const sourceType = String(adj.source_type || "inward").trim().toLowerCase();
+        const sourceType = adj.source_type;
+        const companyId = Number(adj.company_id) || null;
 
-        if (!adj.company_id || adjQty <= 0) {
-          fail(400, "Invalid adjustment row");
+        if (!companyId || adjQty <= 0) {
+          throw Object.assign(new Error("Invalid adjustment row"), { status: 400 });
         }
 
         if (sourceType === "palti_lorry") {
           if (!adj.palti_lorry_id) {
-            fail(400, "Invalid Palti Lorry adjustment row");
+            throw Object.assign(new Error("Invalid Palti Lorry adjustment row"), { status: 400 });
           }
 
           const paltiRow = await dbGetAsync(
@@ -289,24 +293,24 @@ router.post("/final-save", async (req, res) => {
             [adj.palti_lorry_id]
           );
 
-          if (!paltiRow) fail(400, `Invalid palti_lorry_id ${adj.palti_lorry_id}`);
-          if (Number(paltiRow.company_id) !== Number(adj.company_id)) {
-            fail(400, `Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
+          if (!paltiRow) throw Object.assign(new Error(`Invalid palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
+          if (Number(paltiRow.company_id) !== companyId) {
+            throw Object.assign(new Error(`Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
           }
 
           if (outwardWarehouseId) {
             if (Number(paltiRow.warehouse_id) !== outwardWarehouseId) {
-              fail(400, `Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
+              throw Object.assign(new Error(`Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
             }
           } else if (outwardLocationId) {
             if (Number(paltiRow.location_id || 0) !== outwardLocationId) {
-              fail(400, `Location mismatch for palti_lorry_id ${adj.palti_lorry_id}`);
+              throw Object.assign(new Error(`Location mismatch for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
             }
           }
 
           const availableQty = normalizeQty(normalizeQty(paltiRow.balance) - normalizeQty(paltiRow.already_adjusted));
           if (adjQty > availableQty) {
-            fail(400, `Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`);
+            throw Object.assign(new Error(`Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
           }
 
           await dbRunAsync(
@@ -317,7 +321,7 @@ router.post("/final-save", async (req, res) => {
         }
 
         if (!adj.inward_id) {
-          fail(400, "Invalid inward adjustment row");
+          throw Object.assign(new Error("Invalid inward adjustment row"), { status: 400 });
         }
 
         const inwardRow = await dbGetAsync(
@@ -343,21 +347,21 @@ router.post("/final-save", async (req, res) => {
           [adj.inward_id]
         );
 
-        if (!inwardRow) fail(400, `Invalid inward_id ${adj.inward_id}`);
+        if (!inwardRow) throw Object.assign(new Error(`Invalid inward_id ${adj.inward_id}`), { status: 400 });
 
         if (outwardWarehouseId) {
           if (Number(inwardRow.warehouse_id) !== outwardWarehouseId) {
-            fail(400, `Warehouse mismatch for inward_id ${adj.inward_id}`);
+            throw Object.assign(new Error(`Warehouse mismatch for inward_id ${adj.inward_id}`), { status: 400 });
           }
         } else if (outwardLocationId) {
           const inwardLocationId = inwardRow.location_id || inwardRow.warehouse_location_id;
           if (Number(inwardLocationId || 0) !== outwardLocationId) {
-            fail(400, `Location mismatch for inward_id ${adj.inward_id}`);
+            throw Object.assign(new Error(`Location mismatch for inward_id ${adj.inward_id}`), { status: 400 });
           }
         }
 
-        if (Number(inwardRow.company_id) !== Number(adj.company_id)) {
-          fail(400, `Company mismatch for inward_id ${adj.inward_id}`);
+        if (Number(inwardRow.company_id) !== companyId) {
+          throw Object.assign(new Error(`Company mismatch for inward_id ${adj.inward_id}`), { status: 400 });
         }
 
         const slab = calculateMonthSlab(inwardRow.date, outward.date);
@@ -368,11 +372,11 @@ router.post("/final-save", async (req, res) => {
         const availableQty = normalizeQty(netOpeningQty - alreadyAdjustedForThisInward);
 
         if (adjQty > availableQty) {
-          fail(400, `Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`);
+          throw Object.assign(new Error(`Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`), { status: 400 });
         }
 
         if (adjQty > normalizeQty(inwardRow.remaining_qty || 0)) {
-          fail(400, `Adjusted qty exceeds physical remaining qty for inward_id ${adj.inward_id}`);
+          throw Object.assign(new Error(`Adjusted qty exceeds physical remaining qty for inward_id ${adj.inward_id}`), { status: 400 });
         }
 
         await dbRunAsync(`UPDATE inward SET remaining_qty = remaining_qty - ? WHERE id=?`, [
@@ -386,7 +390,7 @@ router.post("/final-save", async (req, res) => {
         );
       }
 
-      const finalStatus = totalAdjust === remainingToAdjust ? "Completed" : "Partial";
+      const finalStatus = Math.abs(totalAdjust - remainingToAdjust) < 0.0001 ? "Completed" : "Partial";
       await dbRunAsync(`UPDATE outward SET status=? WHERE id=?`, [finalStatus, outward_id]);
       await dbRunAsync("COMMIT");
 
