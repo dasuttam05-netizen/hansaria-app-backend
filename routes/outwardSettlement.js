@@ -204,9 +204,8 @@ function getApprovedLabourExpense(outwardId) {
       FROM expenses x
       LEFT JOIN expense_items ei ON ei.expense_id = x.id
       WHERE x.outward_id = ?
-        AND UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO'
       GROUP BY x.id
-      ORDER BY x.id ASC
+      ORDER BY CASE WHEN UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO' THEN 0 ELSE 1 END, x.id ASC
       `,
       [outwardId],
       (err, rows) => {
@@ -222,6 +221,7 @@ function getApprovedLabourExpense(outwardId) {
             id: row.id,
             voucher_no: row.voucher_no,
             amount: labourItemAmount > 0 ? labourItemAmount : fallbackAmount,
+            status: row.status || null,
           };
         }).filter((row) => row.amount > 0);
 
