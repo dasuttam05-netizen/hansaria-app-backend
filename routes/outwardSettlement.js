@@ -229,6 +229,7 @@ function getApprovedLabourExpense(outwardId) {
           amount: items.reduce((sum, item) => sum + num(item.amount), 0),
           count: items.length,
           vouchers: items.map((item) => item.voucher_no || `EXP-${item.id}`).filter(Boolean),
+          entries: items,
         });
       }
     );
