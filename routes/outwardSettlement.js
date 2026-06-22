@@ -352,7 +352,7 @@ router.get("/:outward_id", async (req, res) => {
           receivable_amount: row.receivable_amount ?? row.net_profit ?? 0,
           unloading_date: row.unloading_date || "",
           freight: row.freight ?? 0,
-          outward_labour_charges: row.outward_labour_charges ?? 0,
+          outward_labour_charges: row.outward_labour_charges == null ? null : row.outward_labour_charges,
           other_charges: row.other_charges ?? 0,
           claim_amount: row.claim_amount ?? 0,
           other_deduction: row.other_deduction ?? 0,
