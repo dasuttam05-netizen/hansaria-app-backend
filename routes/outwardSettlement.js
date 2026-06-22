@@ -186,35 +186,17 @@ function calculateSettlement(data) {
 
 function getApprovedLabourExpense(outwardId) {
   return new Promise((resolve, reject) => {
-    db.all(
-      `
-      SELECT
-        x.id,
-        x.voucher_no,
-        x.total_expense_amount,
-        x.grand_total,
-        COALESCE(SUM(
-          CASE
-            WHEN LOWER(TRIM(ei.particular_name)) LIKE '%labour%'
-              OR LOWER(TRIM(ei.particular_name)) LIKE '%labor%'
-            THEN IFNULL(ei.amount, 0)
-            ELSE 0
-          END
-        ), 0) AS labour_item_amount
-      FROM expenses x
-      LEFT JOIN expense_items ei ON ei.expense_id = x.id
-      WHERE x.outward_id = ?
-      GROUP BY x.id
-      ORDER BY CASE WHEN UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO' THEN 0 ELSE 1 END, x.id ASC
-      `,
-      [outwardId],
-      (err, rows) => {
-        if (err) {
-          reject(err);
-          return;
-        }
+    const loadExpenseRows = (sql, params) =>
+      new Promise((resolveRows, rejectRows) => {
+        db.all(sql, params, (err, rows) => {
+          if (err) return rejectRows(err);
+          return resolveRows(rows || []);
+        });
+      });
 
-        const items = (rows || []).map((row) => {
+    const mapRows = (rows) =>
+      (rows || [])
+        .map((row) => {
           const labourItemAmount = num(row.labour_item_amount);
           const fallbackAmount = num(row.total_expense_amount || row.grand_total);
           return {
@@ -223,16 +205,84 @@ function getApprovedLabourExpense(outwardId) {
             amount: labourItemAmount > 0 ? labourItemAmount : fallbackAmount,
             status: row.status || null,
           };
-        }).filter((row) => row.amount > 0);
+        })
+        .filter((row) => row.amount > 0);
 
-        resolve({
-          amount: items.reduce((sum, item) => sum + num(item.amount), 0),
-          count: items.length,
-          vouchers: items.map((item) => item.voucher_no || `EXP-${item.id}`).filter(Boolean),
-          entries: items,
-        });
+    (async () => {
+      const primaryRows = await loadExpenseRows(
+        `
+        SELECT
+          x.id,
+          x.voucher_no,
+          x.total_expense_amount,
+          x.grand_total,
+          x.status,
+          COALESCE(SUM(
+            CASE
+              WHEN LOWER(TRIM(ei.particular_name)) LIKE '%labour%'
+                OR LOWER(TRIM(ei.particular_name)) LIKE '%labor%'
+              THEN IFNULL(ei.amount, 0)
+              ELSE 0
+            END
+          ), 0) AS labour_item_amount
+        FROM expenses x
+        LEFT JOIN expense_items ei ON ei.expense_id = x.id
+        WHERE x.outward_id = ?
+        GROUP BY x.id
+        ORDER BY CASE WHEN UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO' THEN 0 ELSE 1 END, x.id ASC
+        `,
+        [outwardId]
+      );
+
+      let items = mapRows(primaryRows);
+
+      if (!items.length) {
+        const outwardRow = await dbGetAsync(
+          `SELECT date, lorry_no, voucher_no, company_id, warehouse_id, location_id FROM outward WHERE id = ?`,
+          [outwardId]
+        );
+
+        if (outwardRow) {
+          const fallbackRows = await loadExpenseRows(
+            `
+            SELECT
+              x.id,
+              x.voucher_no,
+              x.total_expense_amount,
+              x.grand_total,
+              x.status,
+              COALESCE(SUM(
+                CASE
+                  WHEN LOWER(TRIM(ei.particular_name)) LIKE '%labour%'
+                    OR LOWER(TRIM(ei.particular_name)) LIKE '%labor%'
+                  THEN IFNULL(ei.amount, 0)
+                  ELSE 0
+                END
+              ), 0) AS labour_item_amount
+            FROM expenses x
+            LEFT JOIN expense_items ei ON ei.expense_id = x.id
+            WHERE (
+              (TRIM(IFNULL(x.lorry_no, '')) <> '' AND TRIM(IFNULL(x.lorry_no, '')) = TRIM(IFNULL(?, '')))
+              OR x.reference_no = ?
+            )
+              AND DATE(x.expense_date) = DATE(?)
+            GROUP BY x.id
+            ORDER BY CASE WHEN UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO' THEN 0 ELSE 1 END, x.id ASC
+            `,
+            [outwardRow.lorry_no, outwardRow.voucher_no, outwardRow.date]
+          );
+
+          items = mapRows(fallbackRows);
+        }
       }
-    );
+
+      resolve({
+        amount: items.reduce((sum, item) => sum + num(item.amount), 0),
+        count: items.length,
+        vouchers: items.map((item) => item.voucher_no || `EXP-${item.id}`).filter(Boolean),
+        entries: items,
+      });
+    })().catch(reject);
   });
 }
 
