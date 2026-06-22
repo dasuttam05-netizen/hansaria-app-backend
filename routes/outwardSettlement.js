@@ -262,14 +262,16 @@ function getApprovedLabourExpense(outwardId) {
             FROM expenses x
             LEFT JOIN expense_items ei ON ei.expense_id = x.id
             WHERE (
-              (TRIM(IFNULL(x.lorry_no, '')) <> '' AND TRIM(IFNULL(x.lorry_no, '')) = TRIM(IFNULL(?, '')))
-              OR x.reference_no = ?
+              (TRIM(IFNULL(x.reg_lorry_no, '')) <> '' AND (
+                TRIM(IFNULL(x.reg_lorry_no, '')) = TRIM(IFNULL(?, ''))
+                OR TRIM(IFNULL(x.new_lorry_no, '')) = TRIM(IFNULL(?, ''))
+              ))
             )
               AND DATE(x.expense_date) = DATE(?)
             GROUP BY x.id
             ORDER BY CASE WHEN UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO' THEN 0 ELSE 1 END, x.id ASC
             `,
-            [outwardRow.lorry_no, outwardRow.voucher_no, outwardRow.date]
+            [outwardRow.lorry_no, outwardRow.lorry_no, outwardRow.date]
           );
 
           items = mapRows(fallbackRows);
