@@ -126,9 +126,10 @@ async function createSqliteMasterFromMongo(sqliteTable, doc) {
       if (existingByUsername?.id) return existingByUsername.id;
     }
     const result = await dbRun(
-      "INSERT INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO employees (name, mobile, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       [
         doc.name || "",
+        doc.mobile || "",
         doc.address || "",
         locationId || null,
         username,
