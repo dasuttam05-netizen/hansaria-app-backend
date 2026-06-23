@@ -49,6 +49,18 @@ function getIncomingMobile(body = {}) {
   return String(body.mobile ?? body.mobile_no ?? body.phone ?? "").trim();
 }
 
+function normalizeIdArray(input) {
+  return Array.isArray(input)
+    ? Array.from(
+        new Set(
+          input
+            .map((id) => String(id).trim())
+            .filter(Boolean)
+        )
+      )
+    : [];
+}
+
 // =========================
 // GET ALL EMPLOYEES
 // =========================
@@ -362,14 +374,7 @@ router.post("/", async (req, res) => {
       );
 
     // Parse location_ids array
-    const safeLocationIds =
-      Array.isArray(location_ids)
-        ? location_ids
-          .map((id) =>
-            String(id).trim()
-          )
-          .filter((id) => id)
-        : [];
+    const safeLocationIds = normalizeIdArray(location_ids);
 
     const employee =
       await Employee.create({
@@ -607,12 +612,8 @@ router.put("/:id", async (req, res) => {
 
     // Parse location_ids array
     const safeLocationIds =
-      Array.isArray(location_ids)
-        ? location_ids
-          .map((id) =>
-            String(id).trim()
-          )
-          .filter((id) => id)
+      normalizeIdArray(location_ids).length
+        ? normalizeIdArray(location_ids)
         : Array.isArray(target.location_ids)
           ? target.location_ids.map(getRecordId).filter(Boolean)
           : [];
@@ -692,10 +693,9 @@ router.put("/:id", async (req, res) => {
         );
     }
 
-    await Employee.findByIdAndUpdate(
-      targetEmployeeId,
-      updateData
-    );
+    console.log("[employee.update] updateData:", updateData);
+    Object.assign(target, updateData);
+    await target.save();
 
     const refreshedEmployee = await Employee.findById(targetEmployeeId);
     console.log(
