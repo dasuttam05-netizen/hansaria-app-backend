@@ -61,6 +61,30 @@ function normalizeIdArray(input) {
     : [];
 }
 
+function buildEmployeeResponse(employee) {
+  if (!employee) return null;
+
+  return {
+    id: employee._id,
+    employee_id: employee.employee_id,
+    name: employee.name,
+    mobile: getEmployeeMobile(employee),
+    address: employee.address,
+    username: employee.username,
+    location_id: getRecordId(employee.location_id),
+    location_ids: Array.isArray(employee.location_ids)
+      ? employee.location_ids.map(getRecordId)
+      : [],
+    all_location_access: !!employee.all_location_access,
+    role: employee.role,
+    permissions: employee.permissions,
+    opening_balance: employee.opening_balance,
+    opening_balance_type: employee.opening_balance_type,
+    assigned_warehouse_ids: parseWarehouseIds(employee.assigned_warehouse_ids),
+    all_warehouse_access: !!employee.all_warehouse_access,
+  };
+}
+
 // =========================
 // GET ALL EMPLOYEES
 // =========================
@@ -241,8 +265,6 @@ router.post("/", async (req, res) => {
       all_warehouse_access,
     } = req.body;
     const mobile = getIncomingMobile(req.body);
-
-    console.log("[employee.create] incoming mobile:", mobile, "username:", username);
 
     if (
       !name ||
@@ -428,60 +450,7 @@ router.post("/", async (req, res) => {
           !!all_warehouse_access,
       });
 
-    console.log(
-      "[employee.create] saved mobile:",
-      getEmployeeMobile(employee),
-      "employee_id:",
-      employee.employee_id
-    );
-
-    return res.json({
-
-      id: employee._id,
-
-      employee_id:
-        employee.employee_id,
-
-      name: employee.name,
-
-      mobile:
-        getEmployeeMobile(employee),
-
-      address:
-        employee.address,
-
-      username:
-        employee.username,
-
-      location_id:
-        employee.location_id,
-
-      location_ids:
-        employee.location_ids,
-
-      all_location_access:
-        !!employee.all_location_access,
-
-      role:
-        employee.role,
-
-      permissions:
-        employee.permissions,
-
-      opening_balance:
-        employee.opening_balance,
-
-      opening_balance_type:
-        employee.opening_balance_type,
-
-      assigned_warehouse_ids:
-        parseWarehouseIds(
-          employee.assigned_warehouse_ids
-        ),
-
-      all_warehouse_access:
-        !!employee.all_warehouse_access,
-    });
+    return res.json(buildEmployeeResponse(employee));
 
   } catch (err) {
 
@@ -545,8 +514,6 @@ router.put("/:id", async (req, res) => {
       all_warehouse_access,
     } = req.body;
     const mobile = getIncomingMobile(req.body);
-
-    console.log("[employee.update] incoming mobile:", mobile, "employee_id:", targetEmployeeId);
 
     const target =
       await Employee.findById(
@@ -693,41 +660,14 @@ router.put("/:id", async (req, res) => {
         );
     }
 
-    console.log("[employee.update] updateData:", updateData);
     Object.assign(target, updateData);
     await target.save();
 
     const refreshedEmployee = await Employee.findById(targetEmployeeId);
-    console.log(
-      "[employee.update] saved mobile:",
-      getEmployeeMobile(refreshedEmployee),
-      "employee_id:",
-      targetEmployeeId
-    );
 
     return res.json({
       updated: 1,
-      employee: refreshedEmployee
-        ? {
-            id: refreshedEmployee._id,
-            employee_id: refreshedEmployee.employee_id,
-            name: refreshedEmployee.name,
-            mobile: getEmployeeMobile(refreshedEmployee),
-            address: refreshedEmployee.address,
-            username: refreshedEmployee.username,
-            location_id: getRecordId(refreshedEmployee.location_id),
-            location_ids: Array.isArray(refreshedEmployee.location_ids)
-              ? refreshedEmployee.location_ids.map(getRecordId)
-              : [],
-            all_location_access: !!refreshedEmployee.all_location_access,
-            role: refreshedEmployee.role,
-            permissions: refreshedEmployee.permissions,
-            opening_balance: refreshedEmployee.opening_balance,
-            opening_balance_type: refreshedEmployee.opening_balance_type,
-            assigned_warehouse_ids: parseWarehouseIds(refreshedEmployee.assigned_warehouse_ids),
-            all_warehouse_access: !!refreshedEmployee.all_warehouse_access,
-          }
-        : null,
+      employee: buildEmployeeResponse(refreshedEmployee),
     });
 
   } catch (err) {
