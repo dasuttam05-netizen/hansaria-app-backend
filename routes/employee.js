@@ -41,6 +41,10 @@ function getRecordId(value) {
   return String(value);
 }
 
+function getEmployeeMobile(value) {
+  return String(value?.mobile ?? value?.mobile_no ?? value?.phone ?? "").trim();
+}
+
 // =========================
 // GET ALL EMPLOYEES
 // =========================
@@ -78,7 +82,7 @@ router.get("/", async (req, res) => {
           row.employee_id || "",
 
         mobile:
-          row.mobile || "",
+          getEmployeeMobile(row),
 
         location_name:
           row.location_id?.name || "",
@@ -157,7 +161,7 @@ router.get("/:id", async (req, res) => {
         row.employee_id || "",
 
       mobile:
-        row.mobile || "",
+        getEmployeeMobile(row),
 
       permissions:
         parsePermissions(
@@ -368,8 +372,8 @@ router.post("/", async (req, res) => {
 
         name,
 
-        mobile:
-          mobile || "",
+      mobile:
+          String(mobile ?? "").trim(),
 
         address:
           address || "",
@@ -423,7 +427,7 @@ router.post("/", async (req, res) => {
       name: employee.name,
 
       mobile:
-        employee.mobile || "",
+        getEmployeeMobile(employee),
 
       address:
         employee.address,
@@ -604,7 +608,7 @@ router.put("/:id", async (req, res) => {
         name ?? target.name,
 
       mobile:
-        mobile ?? target.mobile ?? "",
+        String(mobile ?? target.mobile ?? target.mobile_no ?? target.phone ?? "").trim(),
 
       address:
         address ?? target.address ?? "",
