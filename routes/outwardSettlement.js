@@ -8,6 +8,15 @@ const num = (v) => {
   return Number.isFinite(n) ? n : 0;
 };
 
+function dbGetAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) return reject(err);
+      return resolve(row || null);
+    });
+  });
+}
+
 const safeJsonParse = (value, fallback = []) => {
   if (Array.isArray(value)) return value;
   if (value == null || value === "") return fallback;
