@@ -68,12 +68,20 @@ const locationSchema = new mongoose.Schema({
 
 const employeeSchema = new mongoose.Schema({
   name: { type: String, required: true },
+  employee_id: { type: String, unique: true, sparse: true },
   address: String,
+  mobile: String,
   location_id: mongoose.Schema.Types.ObjectId,
+  location_ids: [{ type: mongoose.Schema.Types.ObjectId, ref: "Location" }],
+  all_location_access: { type: Boolean, default: false },
   username: { type: String, unique: true, sparse: true },
   password: String,
   role: { type: String, default: 'staff' },
   permissions: { type: [String], default: [] },
+  opening_balance: { type: Number, default: 0 },
+  opening_balance_type: { type: String, default: "dr" },
+  assigned_warehouse_ids: [{ type: mongoose.Schema.Types.ObjectId, ref: "Warehouse" }],
+  all_warehouse_access: { type: Boolean, default: false },
   created_at: { type: Date, default: Date.now },
 });
 
