@@ -45,6 +45,10 @@ function getEmployeeMobile(value) {
   return String(value?.mobile ?? value?.mobile_no ?? value?.phone ?? "").trim();
 }
 
+function getIncomingMobile(body = {}) {
+  return String(body.mobile ?? body.mobile_no ?? body.phone ?? "").trim();
+}
+
 // =========================
 // GET ALL EMPLOYEES
 // =========================
@@ -211,7 +215,6 @@ router.post("/", async (req, res) => {
 
     const {
       name,
-      mobile,
       address,
       username,
       password,
@@ -225,6 +228,7 @@ router.post("/", async (req, res) => {
       assigned_warehouse_ids,
       all_warehouse_access,
     } = req.body;
+    const mobile = getIncomingMobile(req.body);
 
     if (
       !name ||
@@ -513,7 +517,6 @@ router.put("/:id", async (req, res) => {
 
     const {
       name,
-      mobile,
       address,
       username,
       password,
@@ -527,6 +530,7 @@ router.put("/:id", async (req, res) => {
       assigned_warehouse_ids,
       all_warehouse_access,
     } = req.body;
+    const mobile = getIncomingMobile(req.body);
 
     const target =
       await Employee.findById(
