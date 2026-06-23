@@ -334,9 +334,10 @@ async function createSqliteMasterFromMongo(model, sqliteTable, doc) {
 
     try {
       const result = await dbRun(
-        "INSERT OR IGNORE INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO employees (name, mobile, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
           employeeName,
+          doc.mobile || "",
           doc.address || "",
           locationId || null,
           username,
