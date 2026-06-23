@@ -56,9 +56,10 @@ async function createSqliteMasterFromMongo(db, model, sqliteTable, doc) {
     const locationId = await resolveMongoMasterId(db, doc.location_id, MongoLocation, "locations");
     const result = await dbRun(
       db,
-      "INSERT INTO employees (name, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO employees (name, mobile, address, location_id, username, password, role, permissions) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       [
         doc.name || "",
+        doc.mobile || "",
         doc.address || "",
         locationId || null,
         doc.username || "",
