@@ -189,11 +189,17 @@ async function resolveMongoMasterId(value, model, sqliteTable) {
 }
 
 async function resolveCashEntryMasterIds(values) {
+  const companyId = await resolveMongoMasterId(values.company_id, MongoCompany, "companies");
+  const companyAccountId = await resolveMongoMasterId(values.company_account_id, MongoCompanyAccount, "company_accounts");
+  const warehouseId = await resolveMongoMasterId(values.warehouse_id, MongoWarehouse, "warehouses");
+  const employeeId = await resolveMongoMasterId(values.employee_id, MongoEmployee, "employees");
+
   return {
-    warehouse_id: await resolveMongoMasterId(values.warehouse_id, MongoWarehouse, "warehouses"),
-    company_id: await resolveMongoMasterId(values.company_id, MongoCompany, "companies"),
-    company_account_id: await resolveMongoMasterId(values.company_account_id, MongoCompanyAccount, "company_accounts"),
-    employee_id: await resolveMongoMasterId(values.employee_id, MongoEmployee, "employees"),
+    warehouse_id: warehouseId || (isPositiveNumber(values.warehouse_id) ? Number(values.warehouse_id) : null),
+    company_id: companyId || (isPositiveNumber(values.company_id) ? Number(values.company_id) : null),
+    company_account_id:
+      companyAccountId || (isPositiveNumber(values.company_account_id) ? Number(values.company_account_id) : null),
+    employee_id: employeeId || (isPositiveNumber(values.employee_id) ? Number(values.employee_id) : null),
   };
 }
 
@@ -999,6 +1005,19 @@ router.post("/", async (req, res) => {
       : normalizedMode === "receipt"
       ? "income"
       : entry_type;
+  const normalizedFundSource = (() => {
+    const source = String(fund_source || "main_cash").toLowerCase();
+    if (resolvedIds?.company_id && !resolvedIds?.employee_id) {
+      return "party_cash";
+    }
+    if (resolvedIds?.employee_id && !resolvedIds?.company_id) {
+      return "employee_cash";
+    }
+    if (source === "party_cash" || source === "employee_cash" || source === "main_cash") {
+      return source;
+    }
+    return "main_cash";
+  })();
 
   let resolvedIds;
   try {
@@ -1051,7 +1070,7 @@ router.post("/", async (req, res) => {
         narration || null,
         req.user?.id || created_by || null,
         resolvedIds.employee_id || null,
-        String(fund_source || "main_cash"),
+        normalizedFundSource,
         status || "pending",
         source_expense_id || null,
         linkedEntryId || null,
@@ -1087,7 +1106,7 @@ router.post("/", async (req, res) => {
             auto_staff_entry === "true" ||
             auto_staff_entry === 1 ||
             auto_staff_entry === "1";
-          const isMainCash = String(fund_source || "main_cash") === "main_cash";
+          const isMainCash = normalizedFundSource === "main_cash";
           const isReceiptFromEmployee =
             shouldCreateStaffEntry &&
             resolvedIds.employee_id &&
@@ -1130,7 +1149,7 @@ router.post("/", async (req, res) => {
                   narration || null,
                   req.user?.id || created_by || null,
                   resolvedIds.employee_id || null,
-                  "employee_cash",
+                        "employee_cash",
                   status || "pending",
                   null,
                   newEntryId,
@@ -1264,7 +1283,7 @@ upsertCashEntryToMongo({
             created_by: req.user?.id || created_by || null,
             employee_id: resolvedIds.employee_id || null,
             journal_group_no: journal_group_no || null,
-            fund_source: String(fund_source || "main_cash"),
+            fund_source: normalizedFundSource,
             status: status || "pending",
             source_expense_id: source_expense_id || null,
             linked_entry_id: linkedEntryId || null,
