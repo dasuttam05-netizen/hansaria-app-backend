@@ -1005,6 +1005,19 @@ router.post("/", async (req, res) => {
       : normalizedMode === "receipt"
       ? "income"
       : entry_type;
+
+  let resolvedIds;
+  try {
+    resolvedIds = await resolveCashEntryMasterIds({
+      warehouse_id,
+      company_id,
+      company_account_id,
+      employee_id,
+    });
+  } catch (resolveErr) {
+    return res.status(400).json({ error: resolveErr.message });
+  }
+
   const normalizedFundSource = (() => {
     const source = String(fund_source || "main_cash").toLowerCase();
     if (resolvedIds?.company_id && !resolvedIds?.employee_id) {
@@ -1018,18 +1031,6 @@ router.post("/", async (req, res) => {
     }
     return "main_cash";
   })();
-
-  let resolvedIds;
-  try {
-    resolvedIds = await resolveCashEntryMasterIds({
-      warehouse_id,
-      company_id,
-      company_account_id,
-      employee_id,
-    });
-  } catch (resolveErr) {
-    return res.status(400).json({ error: resolveErr.message });
-  }
 
   const insertEntry = (finalVoucherNo, linkedEntryId = null) => {
     const sql = `
