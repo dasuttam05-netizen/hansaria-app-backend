@@ -186,31 +186,8 @@ if (db && process.env.NODE_ENV !== "production") {
 
 const app = express();
 
-const allowedOrigins = [
-  process.env.FRONTEND_ORIGIN || "https://hansaria-app-frontend.vercel.app",
-  process.env.BACKEND_ORIGIN || "https://hansaria-app-backend.onrender.com",
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-];
-
-const allowedOriginPatterns = [/\.vercel\.app$/i, /\.onrender\.com$/i];
-
 const corsOptions = {
-  origin: (origin, callback) => {
-    if (!origin) {
-      return callback(null, true);
-    }
-
-    const isAllowedOrigin =
-      allowedOrigins.includes(origin) ||
-      allowedOriginPatterns.some((pattern) => pattern.test(origin));
-
-    if (isAllowedOrigin) {
-      return callback(null, true);
-    }
-
-    return callback(new Error("Not allowed by CORS"));
-  },
+  origin: true,
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
@@ -219,12 +196,22 @@ const corsOptions = {
     "Origin",
     "X-Requested-With",
   ],
+  exposedHeaders: ["Authorization"],
   credentials: true,
   optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Vary", "Origin");
+  }
+  return next();
+});
 app.use(express.json());
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
