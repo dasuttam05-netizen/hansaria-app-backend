@@ -189,17 +189,11 @@ async function resolveMongoMasterId(value, model, sqliteTable) {
 }
 
 async function resolveCashEntryMasterIds(values) {
-  const companyId = await resolveMongoMasterId(values.company_id, MongoCompany, "companies");
-  const companyAccountId = await resolveMongoMasterId(values.company_account_id, MongoCompanyAccount, "company_accounts");
-  const warehouseId = await resolveMongoMasterId(values.warehouse_id, MongoWarehouse, "warehouses");
-  const employeeId = await resolveMongoMasterId(values.employee_id, MongoEmployee, "employees");
-
   return {
-    warehouse_id: warehouseId || (isPositiveNumber(values.warehouse_id) ? Number(values.warehouse_id) : null),
-    company_id: companyId || (isPositiveNumber(values.company_id) ? Number(values.company_id) : null),
-    company_account_id:
-      companyAccountId || (isPositiveNumber(values.company_account_id) ? Number(values.company_account_id) : null),
-    employee_id: employeeId || (isPositiveNumber(values.employee_id) ? Number(values.employee_id) : null),
+    warehouse_id: await resolveMongoMasterId(values.warehouse_id, MongoWarehouse, "warehouses"),
+    company_id: await resolveMongoMasterId(values.company_id, MongoCompany, "companies"),
+    company_account_id: await resolveMongoMasterId(values.company_account_id, MongoCompanyAccount, "company_accounts"),
+    employee_id: await resolveMongoMasterId(values.employee_id, MongoEmployee, "employees"),
   };
 }
 
