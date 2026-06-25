@@ -359,6 +359,10 @@ const saleVoucherSchema =
       },
     ],
     lorry_no: String,
+    journey_token: {
+      type: String,
+      index: true,
+    },
     product_id: String,
     quantity: { type: Number, default: 0 },
     shortage_quantity: { type: Number, default: 0 },
