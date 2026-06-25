@@ -352,6 +352,7 @@ function buildSalePayload(body, voucherNo) {
     employee_id: body.employee_id ? String(body.employee_id) : "",
     location_id: body.location_id ? String(body.location_id) : "",
     description: body.description || "",
+    reject_qty: Number(body.reject_qty) || 0,
   };
 
   const saleFields = [
@@ -364,6 +365,7 @@ function buildSalePayload(body, voucherNo) {
     "tare_weight",
     "net_weight",
     "unloading_qty",
+    "reject_qty",
     "moisture",
     "dunki",
     "fungus",
