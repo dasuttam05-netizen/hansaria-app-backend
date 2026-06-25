@@ -373,6 +373,7 @@ const saleVoucherSchema =
     tare_weight: { type: Number, default: 0 },
     net_weight: { type: Number, default: 0 },
     unloading_qty: { type: Number, default: 0 },
+    reject_qty: { type: Number, default: 0 },
     moisture: { type: Number, default: 0 },
     dunki: { type: Number, default: 0 },
     fungus: { type: Number, default: 0 },
