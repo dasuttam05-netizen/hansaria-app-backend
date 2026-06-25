@@ -347,6 +347,7 @@ function buildSalePayload(body, voucherNo) {
     against_purchase_farmer_id: body.against_purchase_farmer_id ? String(body.against_purchase_farmer_id) : "",
     against_purchase_links: purchaseLinks,
     lorry_no: body.lorry_no || body.reference_id || "",
+    journey_token: body.journey_token || "",
     product_id: body.product_id ? String(body.product_id) : "",
     employee_id: body.employee_id ? String(body.employee_id) : "",
     location_id: body.location_id ? String(body.location_id) : "",
