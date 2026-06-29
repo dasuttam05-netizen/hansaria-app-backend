@@ -1,17 +1,8 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const { userHasPermission, isAdminUser } = require("../middleware/auth");
-
-function canReadTransporters(user) {
-  return isAdminUser(user) || userHasPermission(user, "transport.manage");
-}
 
 router.get("/", (req, res) => {
-  if (!canReadTransporters(req.user)) {
-    return res.status(403).json({ error: "You do not have permission to view transporters" });
-  }
-
   db.all(`SELECT * FROM transporters ORDER BY name ASC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
@@ -19,10 +10,6 @@ router.get("/", (req, res) => {
 });
 
 router.post("/verify-pan-aadhaar-link", (req, res) => {
-  if (!canReadTransporters(req.user)) {
-    return res.status(403).json({ error: "You do not have permission to verify transporters" });
-  }
-
   const pan = String(req.body?.pan_no || "")
     .trim()
     .toUpperCase();
@@ -52,10 +39,6 @@ router.post("/verify-pan-aadhaar-link", (req, res) => {
 });
 
 router.post("/", (req, res) => {
-  if (!canReadTransporters(req.user)) {
-    return res.status(403).json({ error: "You do not have permission to create transporters" });
-  }
-
   const { name, address, pan_no, gst_no, aadhar_no, mobile } = req.body;
 
   if (!name || !String(name).trim()) {
@@ -73,10 +56,6 @@ router.post("/", (req, res) => {
 });
 
 router.put("/:id", (req, res) => {
-  if (!canReadTransporters(req.user)) {
-    return res.status(403).json({ error: "You do not have permission to update transporters" });
-  }
-
   const { name, address, pan_no, gst_no, aadhar_no, mobile } = req.body;
 
   if (!name || !String(name).trim()) {
