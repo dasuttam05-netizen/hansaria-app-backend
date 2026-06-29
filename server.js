@@ -403,28 +403,24 @@ app.use(
 app.use(
   "/api/companies",
   authenticate,
-  authorize("companies.manage"),
   companiesRoute
 );
 
 app.use(
   "/api/company-accounts",
   authenticate,
-  authorize("companyAccounts.manage"),
   companyAccountsRoute
 );
 
 app.use(
   "/api/warehouses",
   authenticate,
-  authorize("warehouses.manage"),
   warehouseRoutes
 );
 
 app.use(
   "/api/products",
   authenticate,
-  authorize("products.manage"),
   productsRoute
 );
 
@@ -445,7 +441,6 @@ app.use(
 app.use(
   "/api/consignee-names",
   authenticate,
-  authorize(["outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.view", "expense.create", "expense.edit"]),
   authorizeConsigneeOrExpense,
   consigneeNamesRoutes
 );
@@ -453,7 +448,6 @@ app.use(
 app.use(
   "/api/buyer-names",
   authenticate,
-  authorize(["outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.view", "expense.create", "expense.edit"]),
   authorizeConsigneeOrExpense,
   buyerNamesRoutes
 );
@@ -461,7 +455,6 @@ app.use(
 app.use(
   "/api/farmers",
   authenticate,
-  authorize(["farmers.view", "farmers.create", "farmers.edit", "farmers.delete"]),
   farmersRoutes
 );
 
@@ -496,7 +489,6 @@ app.use(
 app.use(
   "/api/buyer-adjustment",
   authenticate,
-  authorize(["outward.view", "outward.create", "outward.edit", "adjustment.manage"]),
   buyerAdjustmentRoutes
 );
 
@@ -537,21 +529,18 @@ app.use(
 app.use(
   "/api/palti-lorry",
   authenticate,
-  authorize("expense.palti"),
   paltiLorryRoutes
 );
 
 app.use(
   "/api/self-loading",
   authenticate,
-  authorize("expense.selfLoading"),
   selfLoadingRoutes
 );
 
 app.use(
   "/api/local-sale",
   authenticate,
-  authorize("expense.localSale"),
   localSaleRoutes
 );
 
