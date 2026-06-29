@@ -4,7 +4,20 @@ const db = require("../db");
 const multer = require("multer");
 const XLSX = require("xlsx");
 const { isAdminUser } = require("../middleware/auth");
+const { userHasPermission } = require("../middleware/auth");
 const upload = multer({ storage: multer.memoryStorage() });
+
+function canAccessBuyerNames(user) {
+  return [
+    "outward.view",
+    "outward.create",
+    "outward.edit",
+    "adjustment.manage",
+    "expense.view",
+    "expense.create",
+    "expense.edit",
+  ].some((permission) => userHasPermission(user, permission));
+}
 
 function rowBody(body) {
   const name = (body.name || "").trim();
@@ -21,6 +34,10 @@ function rowBody(body) {
 }
 
 router.get("/", (req, res) => {
+  if (!canAccessBuyerNames(req.user)) {
+    return res.status(403).json({ error: "You do not have permission to view buyer names" });
+  }
+
   db.all("SELECT * FROM buyer_names ORDER BY name COLLATE NOCASE", [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
@@ -28,6 +45,10 @@ router.get("/", (req, res) => {
 });
 
 router.post("/", (req, res) => {
+  if (!canAccessBuyerNames(req.user)) {
+    return res.status(403).json({ error: "You do not have permission to create buyer names" });
+  }
+
   const r = rowBody(req.body);
   if (!r.name) return res.status(400).json({ error: "Name is required" });
 
@@ -147,6 +168,10 @@ router.post("/import-xlsx", upload.single("file"), (req, res) => {
 });
 
 router.put("/:id", (req, res) => {
+  if (!canAccessBuyerNames(req.user)) {
+    return res.status(403).json({ error: "You do not have permission to update buyer names" });
+  }
+
   const { id } = req.params;
   const r = rowBody(req.body);
   if (!r.name) return res.status(400).json({ error: "Name is required" });
@@ -171,6 +196,10 @@ router.put("/:id", (req, res) => {
 });
 
 router.delete("/:id", (req, res) => {
+  if (!canAccessBuyerNames(req.user)) {
+    return res.status(403).json({ error: "You do not have permission to delete buyer names" });
+  }
+
   const { id } = req.params;
   db.run("DELETE FROM buyer_names WHERE id = ?", [id], function (err) {
     if (err) return res.status(500).json({ error: err.message });
