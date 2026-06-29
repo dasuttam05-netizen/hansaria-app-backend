@@ -5,14 +5,10 @@ const { userHasPermission } = require("../middleware/auth");
 
 const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
 const safeText = (v) => (v ? v : null);
-const canViewBuyerAdjustments = (user) =>
-  userHasPermission(user, "outward.view") ||
-  userHasPermission(user, "outward.create") ||
-  userHasPermission(user, "adjustment.manage");
 
 // Get outward entries without unloading details (no buyer_adjustments)
 router.get("/without-unloading", async (req, res) => {
-  if (!canViewBuyerAdjustments(req.user)) {
+  if (!userHasPermission(req.user, "outward.view") && !userHasPermission(req.user, "outward.create")) {
     return res.status(403).json({ error: "You do not have permission to view outward entries" });
   }
 
@@ -89,7 +85,7 @@ router.get("/without-unloading", async (req, res) => {
 
 // Get outward entries that already have buyer adjustments
 router.get("/with-adjustments", async (req, res) => {
-  if (!canViewBuyerAdjustments(req.user)) {
+  if (!userHasPermission(req.user, "outward.view") && !userHasPermission(req.user, "outward.create")) {
     return res.status(403).json({ error: "You do not have permission to view outward entries" });
   }
 
@@ -137,7 +133,7 @@ router.get("/with-adjustments", async (req, res) => {
 
 // Get buyer adjustments for a specific outward
 router.get("/:outwardId", async (req, res) => {
-  if (!canViewBuyerAdjustments(req.user)) {
+  if (!userHasPermission(req.user, "outward.view")) {
     return res.status(403).json({ error: "You do not have permission" });
   }
 
