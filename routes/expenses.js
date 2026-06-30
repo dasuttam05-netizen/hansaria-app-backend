@@ -1244,7 +1244,9 @@ router.post("/:id/approve-cash-book", (req, res) => {
                 );
               }
 
-              if (expense.company_id) {
+              const partyCompanyId = expense.company_id || expense.send_to_company_id || null;
+
+              if (partyCompanyId) {
                 cashEntryInserts.push(
                   new Promise((resolve, reject) => {
                     db.run(
@@ -1254,7 +1256,7 @@ router.post("/:id/approve-cash-book", (req, res) => {
                         expense.expense_date,
                         "expense",
                         expense.warehouse_id || null,
-                        expense.company_id || null,
+                        partyCompanyId,
                         expense.company_account_id || null,
                         baseDescription,
                         Number(expense.total_expense_amount) || 0,
@@ -1283,8 +1285,8 @@ router.post("/:id/approve-cash-book", (req, res) => {
                   [expense.status || "PENDING", id],
                   () => {}
                 );
-                return res.status(400).json({ error: "Employee or party is required to move expense to Cash Book" });
-              }
+                  return res.status(400).json({ error: "Employee or party is required to move expense to Cash Book" });
+                }
 
               const sendSuccessResponse = (inwardInfo, outwardInfo, paltiInfo) => {
                 const inwardPosted = !!inwardInfo?.posted || !!inwardInfo?.already_posted;
@@ -1928,17 +1930,42 @@ router.delete("/:id", (req, res) => {
       return res.status(403).json({ error: "You cannot delete expenses for this warehouse" });
     }
 
-    db.run("DELETE FROM expense_items WHERE expense_id = ?", [id], (itemErr) => {
-      if (itemErr) {
-        return res.status(500).json({ error: itemErr.message });
+    db.get("SELECT id FROM cash_entries WHERE source_expense_id = ? LIMIT 1", [id], (cashLookupErr, cashEntry) => {
+      if (cashLookupErr) {
+        return res.status(500).json({ error: cashLookupErr.message });
       }
 
-      db.run("DELETE FROM expenses WHERE id = ?", [id], function deleteExpense(expenseErr) {
-        if (expenseErr) {
-          return res.status(500).json({ error: expenseErr.message });
+      db.run("DELETE FROM expense_items WHERE expense_id = ?", [id], (itemErr) => {
+        if (itemErr) {
+          return res.status(500).json({ error: itemErr.message });
         }
 
-        return res.json({ deleted: this.changes > 0 });
+        const finalizeExpenseDelete = () =>
+          db.run("DELETE FROM expenses WHERE id = ?", [id], function deleteExpense(expenseErr) {
+            if (expenseErr) {
+              return res.status(500).json({ error: expenseErr.message });
+            }
+
+            return res.json({ deleted: this.changes > 0 });
+          });
+
+        if (!cashEntry?.id) {
+          return finalizeExpenseDelete();
+        }
+
+        db.run("DELETE FROM cash_entry_adjustments WHERE source_entry_id = ? OR target_entry_id = ?", [cashEntry.id, cashEntry.id], (adjErr) => {
+          if (adjErr) {
+            return res.status(500).json({ error: adjErr.message });
+          }
+
+          db.run("DELETE FROM cash_entries WHERE source_expense_id = ?", [id], (cashDeleteErr) => {
+            if (cashDeleteErr) {
+              return res.status(500).json({ error: cashDeleteErr.message });
+            }
+
+            finalizeExpenseDelete();
+          });
+        });
       });
     });
   });
