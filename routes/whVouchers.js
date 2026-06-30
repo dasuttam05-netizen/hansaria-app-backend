@@ -4065,6 +4065,52 @@ router.get("/report/sale-followup", async (req, res) => {
   }
 });
 
+router.get("/report/sale-journey", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const journeyToken = String(req.query.journey_token || "").trim();
+    const lorryNo = String(req.query.lorry_no || "").trim().toLowerCase();
+    const billNo = String(req.query.bill_no || req.query.voucher_no || "").trim().toLowerCase();
+
+    let rows = await getSaleReportRowsForUser(req.user);
+    rows = rows.filter((row) => {
+      const rowJourney = String(row.journey_token || row.journey_id || row.journey_group_no || "").trim();
+      const rowLorry = String(row.lorry_no || row.reference_id || "").trim().toLowerCase();
+      const rowBill = String(row.voucher_no || row.bill_no || "").trim().toLowerCase();
+      if (journeyToken) return rowJourney === journeyToken;
+      if (lorryNo) return rowLorry === lorryNo;
+      if (billNo) return rowBill === billNo;
+      return false;
+    });
+
+    rows = rows
+      .sort((a, b) => {
+        const dateSort = String(a.date || "").localeCompare(String(b.date || ""));
+        if (dateSort) return dateSort;
+        return Number(a.id || 0) - Number(b.id || 0);
+      })
+      .map((row, index, arr) => {
+        const dispatchQty = Number(row.dispatch_qty || row.quantity || row.total_quantity || row.unloading_qty || 0);
+        const unloadQty = Number(row.unloading_qty || 0);
+        const remainAfter = Math.max(dispatchQty - unloadQty, 0);
+        return {
+          ...row,
+          journey_leg: index + 1,
+          journey_running_total: arr.slice(0, index + 1).reduce((sum, item) => sum + Number(item.dispatch_qty || item.quantity || item.total_quantity || item.unloading_qty || 0), 0),
+          journey_running_unloaded: arr.slice(0, index + 1).reduce((sum, item) => sum + Number(item.unloading_qty || 0), 0),
+          journey_remain_after_leg: remainAfter,
+        };
+      });
+
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/report/warehouse-stock", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.purchase") && !userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
