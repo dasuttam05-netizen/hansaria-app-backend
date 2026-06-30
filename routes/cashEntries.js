@@ -547,6 +547,7 @@ router.get("/", (req, res) => {
       COALESCE(assignedEmp.name, expEmp.name, e.name) AS employee_name,
       ce.created_at,
       ce.updated_at,
+      x.id AS source_expense_exists,
       x.voucher_no AS source_expense_voucher_no,
       x.work_description AS source_expense_work_description,
       x.paid_by AS source_expense_paid_by,
@@ -564,6 +565,7 @@ router.get("/", (req, res) => {
     LEFT JOIN companies expCompany ON expCompany.id = x.company_id
     LEFT JOIN company_accounts expCa ON expCa.id = x.company_account_id
     WHERE ${where.join(" AND ")}
+      AND (ce.source_expense_id IS NULL OR x.id IS NOT NULL)
     GROUP BY ce.id
     ORDER BY ce.entry_date DESC, ce.id DESC
   `;
@@ -575,10 +577,14 @@ router.get("/", (req, res) => {
     const shouldDedupePendingExpense =
       String(status || "").toLowerCase() === "pending" &&
       String(entry_type || "").toLowerCase() === "expense";
+    const visibleRows = rowsWithAdjustmentDetails.filter((row) => {
+      if (row?.source_expense_id && !row?.source_expense_exists) return false;
+      return true;
+    });
     res.json(
       shouldDedupePendingExpense
-        ? dedupePendingExpenseRows(rowsWithAdjustmentDetails)
-        : rowsWithAdjustmentDetails
+        ? dedupePendingExpenseRows(visibleRows)
+        : visibleRows
     );
   });
 });
