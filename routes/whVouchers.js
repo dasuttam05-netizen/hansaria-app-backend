@@ -2479,11 +2479,15 @@ router.post("/sale", (req, res) => {
           if (saleQty > availableQty + 0.0001) {
             return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
           }
-        } else {
+        } else if (req.body?.create_against_purchase === true) {
           const directPurchase = await createDirectSalePurchaseVoucher(payload);
           payload.against_purchase_enabled = Boolean(directPurchase);
           payload.against_purchase_farmer_id = directPurchase?.farmer_id || payload.against_purchase_farmer_id || "";
           payload.against_purchase_links = directPurchase ? [directPurchase] : [];
+        } else {
+          payload.against_purchase_enabled = false;
+          payload.against_purchase_farmer_id = "";
+          payload.against_purchase_links = [];
         }
         const doc = await SaleVoucher.create(payload);
         return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: doc.voucher_no, saved_to: "mongodb" });
