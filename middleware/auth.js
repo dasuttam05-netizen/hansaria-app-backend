@@ -504,9 +504,11 @@ function isAdminUser(
 ) {
 
   return (
-    normalizeRole(
-      user?.role
-    ) === "admin"
+    ["admin", "bm", "ho"].includes(
+      normalizeRole(
+        user?.role
+      )
+    )
   );
 }
 
