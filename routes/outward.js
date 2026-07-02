@@ -317,6 +317,12 @@ router.post("/", async (req, res) => {
   }
 
   const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
+  if (!isSelfLoading && !normalizedWarehouseId) {
+    return res.status(400).json({ error: "Warehouse could not be resolved. Please select a valid warehouse." });
+  }
+  if (!resolvedIds.product_id) {
+    return res.status(400).json({ error: "Product could not be resolved. Please select a valid product." });
+  }
 
   if (!isSelfLoading && !canAccessWarehouse(req.user, warehouse_id) && !canAccessWarehouse(req.user, normalizedWarehouseId)) {
     return res.status(403).json({ error: "You can only create entries for your assigned warehouse" });
