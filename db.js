@@ -566,6 +566,52 @@ let db = null;
 `);
 
   db.run(`
+    CREATE TABLE IF NOT EXISTS warehouse_journeys (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      journey_no TEXT NOT NULL UNIQUE,
+      journey_date TEXT NOT NULL,
+      warehouse_id INTEGER,
+      location_id INTEGER,
+      lorry_no TEXT,
+      farmer_id INTEGER,
+      product_id INTEGER,
+      buyer_id INTEGER,
+      consignee_id INTEGER,
+      status TEXT DEFAULT 'open',
+      total_loading_qty REAL DEFAULT 0,
+      total_sale_qty REAL DEFAULT 0,
+      total_reject_qty REAL DEFAULT 0,
+      total_amount REAL DEFAULT 0,
+      notes TEXT,
+      created_by INTEGER,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(warehouse_id) REFERENCES warehouses(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS warehouse_journey_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      journey_id INTEGER NOT NULL,
+      event_date TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      qty REAL DEFAULT 0,
+      amount REAL DEFAULT 0,
+      reject_qty REAL DEFAULT 0,
+      warehouse_id INTEGER,
+      from_location TEXT,
+      to_location TEXT,
+      buyer_id INTEGER,
+      consignee_id INTEGER,
+      narration TEXT,
+      created_by INTEGER,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(journey_id) REFERENCES warehouse_journeys(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS expenses (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       voucher_no TEXT UNIQUE,
@@ -786,8 +832,30 @@ let db = null;
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN location TEXT`, "consignee_names location");
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN gst_no TEXT`, "transporters gst_no");
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN aadhar_no TEXT`, "transporters aadhar_no");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN sl_no INTEGER`, "outward sl_no");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN voucher_no TEXT`, "outward voucher_no");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN date TEXT`, "outward date");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN employee_id INTEGER`, "outward employee_id");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN location_id INTEGER`, "outward location_id");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN warehouse_id INTEGER`, "outward warehouse_id");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN product_id INTEGER`, "outward product_id");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN company_id INTEGER`, "outward company_id");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN company_account_id INTEGER`, "outward company_account_id");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN lorry_no TEXT`, "outward lorry_no");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN weight REAL DEFAULT 0`, "outward weight");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN quantity REAL DEFAULT 0`, "outward quantity");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN rate REAL DEFAULT 0`, "outward rate");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN amount REAL DEFAULT 0`, "outward amount");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN buyer_name TEXT`, "outward buyer_name");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN consignee_name TEXT`, "outward consignee_name");
   addColIgnoreDup(`ALTER TABLE outward ADD COLUMN inv_no TEXT`, "outward inv_no");
   addColIgnoreDup(`ALTER TABLE outward ADD COLUMN self_loading TEXT DEFAULT 'No'`, "outward self_loading");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN narration TEXT`, "outward narration");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN labour_charges REAL DEFAULT 0`, "outward labour_charges");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN total_freight REAL DEFAULT 0`, "outward total_freight");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN rent REAL DEFAULT 0`, "outward rent");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN shortage REAL DEFAULT 0`, "outward shortage");
+  addColIgnoreDup(`ALTER TABLE outward ADD COLUMN status TEXT DEFAULT 'Pending'`, "outward status");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN palti_lorry_id INTEGER`, "adjustment palti_lorry_id");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN source_type TEXT DEFAULT 'inward'`, "adjustment source_type");
   addColIgnoreDup(`ALTER TABLE adjustment ADD COLUMN company_rate REAL DEFAULT 0`, "adjustment company_rate");
@@ -1071,15 +1139,6 @@ let db = null;
     (err) => {
       if (err && !err.message.includes("duplicate column")) {
         console.log("inward narration add error:", err.message);
-      }
-    }
-  );
-
-  db.run(
-    `ALTER TABLE outward ADD COLUMN narration TEXT`,
-    (err) => {
-      if (err && !err.message.includes("duplicate column")) {
-        console.log("outward narration add error:", err.message);
       }
     }
   );
