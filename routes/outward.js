@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { mongoose, Outward: MongoOutward, mongoMirrorConfigured } = require("../db-mongodb");
 const { userHasPermission } = require("../middleware/auth");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
 const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
@@ -8,6 +9,89 @@ const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqlit
 const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
 const safeText = (v) => (v ? v : null);
 const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
+const mongoReady = () => mongoMirrorConfigured && mongoose.connection.readyState === 1;
+
+function buildMongoOutwardPayload(reqBody, resolvedIds, normalizedWarehouseId) {
+  const qty = safeNumber(reqBody.quantity) || safeNumber(reqBody.weight);
+  const rateVal = safeNumber(reqBody.rate);
+  return {
+    date: safeText(reqBody.date) ? new Date(safeText(reqBody.date)) : null,
+    location: resolvedIds.location_id ? String(resolvedIds.location_id) : safeText(reqBody.location_id),
+    outward_no: safeText(reqBody.inv_no) || "",
+    employee_id: resolvedIds.employee_id || safeText(reqBody.employee_id) || null,
+    location_id: resolvedIds.location_id || safeText(reqBody.location_id) || null,
+    warehouse_id: normalizedWarehouseId || safeText(reqBody.warehouse_id) || null,
+    product_id: resolvedIds.product_id || safeText(reqBody.product_id) || null,
+    company_id: resolvedIds.company_id || safeText(reqBody.company_id) || null,
+    company_account_id: resolvedIds.company_account_id || safeText(reqBody.company_account_id) || null,
+    buyer: safeText(reqBody.buyer_name) || "",
+    buyer_name: safeText(reqBody.buyer_name) || "",
+    consignee_id: safeText(reqBody.consignee_id) || null,
+    consignee_name: safeText(reqBody.consignee_name) || "",
+    product: resolvedIds.product_id ? String(resolvedIds.product_id) : safeText(reqBody.product_id),
+    quantity: qty,
+    rate: rateVal,
+    amount: qty * rateVal,
+    transporter: safeText(reqBody.lorry_no) || "",
+    lorry_no: safeText(reqBody.lorry_no) || "",
+    inv_no: safeText(reqBody.inv_no) || "",
+    self_loading: safeText(reqBody.self_loading) || "No",
+    status: "Pending",
+    narration: safeText(reqBody.narration) || "",
+  };
+}
+
+function insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, callback) {
+  const qty = safeNumber(payload.quantity) || safeNumber(payload.weight);
+  const rateVal = safeNumber(payload.rate);
+  const amount = qty * rateVal;
+
+  db.get("SELECT IFNULL(MAX(sl_no),0)+1 as sl FROM outward", (err, row) => {
+    if (err) return callback(err);
+
+    const sl_no = row?.sl || 1;
+    const voucher_no = formatOutwardVoucher(sl_no);
+
+    db.run(
+      `
+      INSERT INTO outward (
+        sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
+        product_id, company_id, company_account_id,
+        buyer_name, consignee_name,
+        lorry_no, weight, quantity, rate, amount,
+        inv_no, self_loading,
+        status
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        sl_no,
+        voucher_no,
+        safeText(payload.date),
+        resolvedIds.employee_id || null,
+        resolvedIds.location_id || null,
+        normalizedWarehouseId,
+        resolvedIds.product_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
+        safeText(payload.buyer_name),
+        safeText(payload.consignee_name),
+        safeText(payload.lorry_no),
+        safeNumber(payload.weight),
+        qty,
+        rateVal,
+        amount,
+        safeText(payload.inv_no),
+        safeText(payload.self_loading) || "No",
+        "Pending",
+      ],
+      function onInsert(insertErr) {
+        if (insertErr) return callback(insertErr);
+        return callback(null, { id: this.lastID, voucher_no });
+      }
+    );
+  });
+}
 
 function getAvailableWarehouseStock({ warehouse_id, product_id, outwardId }, callback) {
   const params = [safeNumber(product_id), safeNumber(warehouse_id)];
@@ -111,6 +195,27 @@ router.get("/available-stock", async (req, res) => {
 router.get("/pending", async (req, res) => {
   if (!userHasPermission(req.user, "outward.view")) {
     return res.status(403).json({ error: "You do not have permission to view outward entries" });
+  }
+
+  if (mongoReady()) {
+    try {
+      const docs = await MongoOutward.find({ status: { $in: ["Pending", "Partial"] } }).lean();
+      const rows = (docs || [])
+        .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
+        .map((row) => ({
+          ...row,
+          id: String(row._id),
+          voucher_no: row.outward_no || row.voucher_no || null,
+          warehouse_name: row.warehouse_name || "",
+          product_name: row.product_name || row.product || "",
+          company_name: row.buyer_name || row.buyer || "",
+          party_name: row.company_account_name || "",
+          saved_from: "mongodb",
+        }));
+      return res.json(rows);
+    } catch (err) {
+      console.error("Mongo outward pending fetch failed, falling back to SQLite:", err.message);
+    }
   }
 
   const rawWarehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
@@ -246,6 +351,29 @@ router.get("/", async (req, res) => {
     return res.status(403).json({ error: "You do not have permission to view outward entries" });
   }
 
+  if (mongoReady()) {
+    try {
+      const docs = await MongoOutward.find({}).sort({ created_at: -1, _id: -1 }).lean();
+      const rows = (docs || [])
+        .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
+        .map((row) => ({
+          ...row,
+          id: String(row._id),
+          voucher_no: row.outward_no || row.voucher_no || null,
+          location_name: row.location_name || "",
+          employee_name: row.employee_name || "",
+          warehouse_name: row.warehouse_name || "",
+          product_name: row.product_name || row.product || "",
+          company_name: row.buyer_name || row.buyer || "",
+          party_name: row.company_account_name || "",
+          saved_from: "mongodb",
+        }));
+      return res.json(rows);
+    } catch (err) {
+      console.error("Mongo outward fetch failed, falling back to SQLite:", err.message);
+    }
+  }
+
   const rawWarehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
   const resolvedWarehouseIds = await resolveWarehouseIds(db, rawWarehouseScope.params).catch(() => []);
   const warehouseScope = rawWarehouseScope.clause
@@ -328,62 +456,65 @@ router.post("/", async (req, res) => {
     return res.status(403).json({ error: "You can only create entries for your assigned warehouse" });
   }
 
-  const continueInsert = () => {
-    db.get("SELECT IFNULL(MAX(sl_no),0)+1 as sl FROM outward", (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
+  const payload = {
+    date,
+    employee_id,
+    location_id,
+    warehouse_id,
+    product_id,
+    company_id,
+    company_account_id,
+    buyer_name,
+    consignee_name,
+    lorry_no,
+    weight,
+    quantity,
+    rate,
+    inv_no,
+    self_loading,
+  };
 
-      const sl_no = row?.sl || 1;
-      const voucher_no = formatOutwardVoucher(sl_no);
-
-      db.run(
-        `
-        INSERT INTO outward (
-          sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
-          product_id, company_id, company_account_id,
-          buyer_name, consignee_name,
-          lorry_no, weight, quantity, rate, amount,
-          inv_no, self_loading,
-          status
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-        [
-          sl_no,
-          voucher_no,
-          safeText(date),
-          resolvedIds.employee_id || null,
-          resolvedIds.location_id || null,
-          normalizedWarehouseId,
-          resolvedIds.product_id || null,
-          resolvedIds.company_id || null,
-          resolvedIds.company_account_id || null,
-          safeText(buyer_name),
-          safeText(consignee_name),
-          safeText(lorry_no),
-          safeNumber(weight),
-          qty,
-          rateVal,
-          amount,
-          safeText(inv_no),
-          safeText(self_loading) || "No",
-          "Pending",
-        ],
-        function onInsert(err2) {
-          if (err2) {
-            return res.status(500).json({ error: err2.message });
-          }
-
-          return res.json({
-            id: this.lastID,
-            message: "Outward Saved",
-          });
-        }
-      );
+  const finalizeResponse = (source, mongoDoc, sqliteRow, extra = {}) => {
+    return res.json({
+      id: mongoDoc?._id ? String(mongoDoc._id) : sqliteRow?.id,
+      voucher_no: mongoDoc?.outward_no || sqliteRow?.voucher_no || null,
+      saved_to: source,
+      ...extra,
     });
   };
 
+  const saveToSQLiteCache = (mongoDoc) => {
+    insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
+      if (sqliteErr) {
+        console.error("Outward SQLite cache save failed:", sqliteErr.message);
+        return finalizeResponse("mongodb", mongoDoc, null);
+      }
+      return finalizeResponse("mongodb", mongoDoc, sqliteRow);
+    });
+  };
+
+  const saveToMongoFirst = () => {
+    if (!mongoReady()) {
+      return insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
+        if (sqliteErr) return res.status(500).json({ error: sqliteErr.message });
+        return finalizeResponse("sqlite", null, sqliteRow);
+      });
+    }
+
+    const mongoPayload = buildMongoOutwardPayload(payload, resolvedIds, normalizedWarehouseId);
+    MongoOutward.create(mongoPayload)
+      .then((doc) => saveToSQLiteCache(doc))
+      .catch((mongoErr) => {
+        console.error("Mongo outward save failed:", mongoErr.message);
+        insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
+          if (sqliteErr) return res.status(500).json({ error: mongoErr.message || sqliteErr.message });
+          return finalizeResponse("sqlite_fallback", null, sqliteRow, { mongo_error: mongoErr.message });
+        });
+      });
+  };
+
   if (isSelfLoading) {
-    return continueInsert();
+    return saveToMongoFirst();
   }
 
   validateOutwardStock({ warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty }, (stockErr, validation) => {
@@ -393,7 +524,7 @@ router.post("/", async (req, res) => {
     if (!validation?.ok) {
       return res.status(400).json({ error: validation.error });
     }
-    return continueInsert();
+    return saveToMongoFirst();
   });
 });
 
