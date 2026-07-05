@@ -93,6 +93,32 @@ function insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, 
   });
 }
 
+function getSQLiteOutwardDetail(id, callback) {
+  if (!id) return callback(null, null);
+
+  db.get(
+    `
+    SELECT o.*,
+      l.name AS location_name,
+      e.name AS employee_name,
+      w.name AS warehouse_name,
+      p.name AS product_name,
+      c.name AS company_name,
+      ca.account_name AS party_name
+    FROM outward o
+    LEFT JOIN locations l ON o.location_id = l.id
+    LEFT JOIN employees e ON o.employee_id = e.id
+    LEFT JOIN warehouses w ON o.warehouse_id = w.id
+    LEFT JOIN products p ON o.product_id = p.id
+    LEFT JOIN companies c ON o.company_id = c.id
+    LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
+    WHERE o.id = ?
+    `,
+    [id],
+    callback
+  );
+}
+
 function getAvailableWarehouseStock({ warehouse_id, product_id, outwardId }, callback) {
   const params = [safeNumber(product_id), safeNumber(warehouse_id)];
   let excludeClause = "";
@@ -475,12 +501,28 @@ router.post("/", async (req, res) => {
   };
 
   const finalizeResponse = (source, mongoDoc, sqliteRow, extra = {}) => {
-    return res.json({
-      id: mongoDoc?._id ? String(mongoDoc._id) : sqliteRow?.id,
-      voucher_no: mongoDoc?.outward_no || sqliteRow?.voucher_no || null,
-      saved_to: source,
-      ...extra,
-    });
+    const responseId = mongoDoc?._id ? String(mongoDoc._id) : sqliteRow?.id;
+    const send = (detailRow) =>
+      res.json({
+        ...(detailRow || {}),
+        id: responseId,
+        sqlite_id: sqliteRow?.id || detailRow?.id || null,
+        voucher_no: mongoDoc?.outward_no || detailRow?.voucher_no || sqliteRow?.voucher_no || null,
+        saved_to: source,
+        saved_from: source,
+        ...extra,
+      });
+
+    if (sqliteRow?.id) {
+      return getSQLiteOutwardDetail(sqliteRow.id, (detailErr, detailRow) => {
+        if (detailErr) {
+          console.error("Outward detail fetch after save failed:", detailErr.message);
+        }
+        return send(detailRow || sqliteRow);
+      });
+    }
+
+    return send(null);
   };
 
   const saveToSQLiteCache = (mongoDoc) => {
@@ -611,7 +653,14 @@ router.put("/:id", async (req, res) => {
         ],
         function onUpdate(err) {
           if (err) return res.status(500).json({ error: err.message });
-          return res.json({ message: "Updated & Reset to Pending" });
+          return getSQLiteOutwardDetail(req.params.id, (detailErr, detailRow) => {
+            if (detailErr) return res.status(500).json({ error: detailErr.message });
+            return res.json({
+              ...(detailRow || {}),
+              id: req.params.id,
+              message: "Updated & Reset to Pending",
+            });
+          });
         }
       );
     };
