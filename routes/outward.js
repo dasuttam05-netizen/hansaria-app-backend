@@ -28,6 +28,29 @@ function normalizeId(value) {
   return value ? String(value) : "";
 }
 
+function isValidObjectId(value) {
+  return mongoose.Types.ObjectId.isValid(String(value || ""));
+}
+
+async function fetchDocsByIds(Model, ids, { customField } = {}) {
+  const list = [...(ids || [])].filter(Boolean);
+  if (list.length === 0) return [];
+
+  const objectIds = list.filter((id) => isValidObjectId(id));
+  const nonObjectIds = list.filter((id) => !isValidObjectId(id));
+
+  const queries = [];
+  if (objectIds.length) {
+    queries.push(Model.find({ _id: { $in: objectIds } }).lean());
+  }
+  if (nonObjectIds.length && customField) {
+    queries.push(Model.find({ [customField]: { $in: nonObjectIds } }).lean());
+  }
+
+  const results = await Promise.all(queries.map((q) => q.catch(() => [])));
+  return results.flat();
+}
+
 async function buildMongoLookupMaps(docs) {
   const ids = {
     employeeIds: new Set(),
@@ -55,12 +78,12 @@ async function buildMongoLookupMaps(docs) {
   });
 
   const [employees, locations, warehouses, products, companies, accounts] = await Promise.all([
-    ids.employeeIds.size ? MongoEmployee.find({ _id: { $in: [...ids.employeeIds] } }).lean() : Promise.resolve([]),
-    ids.locationIds.size ? MongoLocation.find({ _id: { $in: [...ids.locationIds] } }).lean() : Promise.resolve([]),
-    ids.warehouseIds.size ? MongoWarehouse.find({ _id: { $in: [...ids.warehouseIds] } }).lean() : Promise.resolve([]),
-    ids.productIds.size ? MongoProduct.find({ _id: { $in: [...ids.productIds] } }).lean() : Promise.resolve([]),
-    ids.companyIds.size ? MongoCompany.find({ _id: { $in: [...ids.companyIds] } }).lean() : Promise.resolve([]),
-    ids.accountIds.size ? MongoCompanyAccount.find({ _id: { $in: [...ids.accountIds] } }).lean() : Promise.resolve([]),
+    fetchDocsByIds(MongoEmployee, ids.employeeIds, { customField: "employee_id" }),
+    fetchDocsByIds(MongoLocation, ids.locationIds),
+    fetchDocsByIds(MongoWarehouse, ids.warehouseIds),
+    fetchDocsByIds(MongoProduct, ids.productIds),
+    fetchDocsByIds(MongoCompany, ids.companyIds),
+    fetchDocsByIds(MongoCompanyAccount, ids.accountIds),
   ]);
 
   const byId = (rows, nameField = "name") =>
