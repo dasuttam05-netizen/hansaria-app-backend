@@ -16,8 +16,6 @@ const TRACKED_TABLES = new Set([
   "buyer_names",
   "consignee_names",
   "buyer_adjustments",
-  "inward",
-  "outward",
   "adjustment",
   "palti_lorry_entries",
   "outward_settlement",
