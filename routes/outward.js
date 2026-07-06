@@ -1,7 +1,17 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const { mongoose, Outward: MongoOutward, mongoMirrorConfigured } = require("../db-mongodb");
+const {
+  mongoose,
+  Outward: MongoOutward,
+  mongoMirrorConfigured,
+  Location: MongoLocation,
+  Employee: MongoEmployee,
+  Warehouse: MongoWarehouse,
+  Product: MongoProduct,
+  Company: MongoCompany,
+  CompanyAccount: MongoCompanyAccount,
+} = require("../db-mongodb");
 const { userHasPermission } = require("../middleware/auth");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
 const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
@@ -10,6 +20,61 @@ const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Numbe
 const safeText = (v) => (v ? v : null);
 const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
 const mongoReady = () => mongoMirrorConfigured && mongoose.connection.readyState === 1;
+
+function normalizeId(value) {
+  if (value && typeof value === "object") {
+    return String(value._id || value.id || value);
+  }
+  return value ? String(value) : "";
+}
+
+async function buildMongoLookupMaps(docs) {
+  const ids = {
+    employeeIds: new Set(),
+    locationIds: new Set(),
+    warehouseIds: new Set(),
+    productIds: new Set(),
+    companyIds: new Set(),
+    accountIds: new Set(),
+  };
+
+  (docs || []).forEach((row) => {
+    const employeeId = normalizeId(row.employee_id);
+    const locationId = normalizeId(row.location_id);
+    const warehouseId = normalizeId(row.warehouse_id);
+    const productId = normalizeId(row.product_id);
+    const companyId = normalizeId(row.company_id);
+    const accountId = normalizeId(row.company_account_id);
+
+    if (employeeId) ids.employeeIds.add(employeeId);
+    if (locationId) ids.locationIds.add(locationId);
+    if (warehouseId) ids.warehouseIds.add(warehouseId);
+    if (productId) ids.productIds.add(productId);
+    if (companyId) ids.companyIds.add(companyId);
+    if (accountId) ids.accountIds.add(accountId);
+  });
+
+  const [employees, locations, warehouses, products, companies, accounts] = await Promise.all([
+    ids.employeeIds.size ? MongoEmployee.find({ _id: { $in: [...ids.employeeIds] } }).lean() : Promise.resolve([]),
+    ids.locationIds.size ? MongoLocation.find({ _id: { $in: [...ids.locationIds] } }).lean() : Promise.resolve([]),
+    ids.warehouseIds.size ? MongoWarehouse.find({ _id: { $in: [...ids.warehouseIds] } }).lean() : Promise.resolve([]),
+    ids.productIds.size ? MongoProduct.find({ _id: { $in: [...ids.productIds] } }).lean() : Promise.resolve([]),
+    ids.companyIds.size ? MongoCompany.find({ _id: { $in: [...ids.companyIds] } }).lean() : Promise.resolve([]),
+    ids.accountIds.size ? MongoCompanyAccount.find({ _id: { $in: [...ids.accountIds] } }).lean() : Promise.resolve([]),
+  ]);
+
+  const byId = (rows, nameField = "name") =>
+    new Map((rows || []).map((item) => [normalizeId(item._id || item.id), item?.[nameField] || item?.account_name || item?.name || ""]));
+
+  return {
+    employeeNames: byId(employees),
+    locationNames: byId(locations),
+    warehouseNames: byId(warehouses),
+    productNames: byId(products),
+    companyNames: byId(companies),
+    accountNames: byId(accounts, "account_name"),
+  };
+}
 
 function buildMongoOutwardPayload(reqBody, resolvedIds, normalizedWarehouseId) {
   const qty = safeNumber(reqBody.quantity) || safeNumber(reqBody.weight);
@@ -200,16 +265,19 @@ router.get("/pending", async (req, res) => {
   if (mongoReady()) {
     try {
       const docs = await MongoOutward.find({ status: { $in: ["Pending", "Partial"] } }).lean();
+      const lookup = await buildMongoLookupMaps(docs);
       const rows = (docs || [])
         .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
         .map((row) => ({
           ...row,
           id: String(row._id),
           voucher_no: row.outward_no || row.voucher_no || null,
-          warehouse_name: row.warehouse_name || "",
-          product_name: row.product_name || row.product || "",
-          company_name: row.buyer_name || row.buyer || "",
-          party_name: row.company_account_name || "",
+          employee_name: lookup.employeeNames.get(normalizeId(row.employee_id)) || row.employee_name || "",
+          location_name: lookup.locationNames.get(normalizeId(row.location_id)) || row.location_name || "",
+          warehouse_name: lookup.warehouseNames.get(normalizeId(row.warehouse_id)) || row.warehouse_name || "",
+          product_name: lookup.productNames.get(normalizeId(row.product_id)) || row.product_name || row.product || "",
+          company_name: lookup.companyNames.get(normalizeId(row.company_id)) || row.company_name || row.buyer_name || row.buyer || "",
+          party_name: lookup.accountNames.get(normalizeId(row.company_account_id)) || row.party_name || row.company_account_name || "",
           saved_from: "mongodb",
         }));
       return res.json(rows);
@@ -354,18 +422,19 @@ router.get("/", async (req, res) => {
   if (mongoReady()) {
     try {
       const docs = await MongoOutward.find({}).sort({ created_at: -1, _id: -1 }).lean();
+      const lookup = await buildMongoLookupMaps(docs);
       const rows = (docs || [])
         .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
         .map((row) => ({
           ...row,
           id: String(row._id),
           voucher_no: row.outward_no || row.voucher_no || null,
-          location_name: row.location_name || "",
-          employee_name: row.employee_name || "",
-          warehouse_name: row.warehouse_name || "",
-          product_name: row.product_name || row.product || "",
-          company_name: row.buyer_name || row.buyer || "",
-          party_name: row.company_account_name || "",
+          location_name: lookup.locationNames.get(normalizeId(row.location_id)) || row.location_name || "",
+          employee_name: lookup.employeeNames.get(normalizeId(row.employee_id)) || row.employee_name || "",
+          warehouse_name: lookup.warehouseNames.get(normalizeId(row.warehouse_id)) || row.warehouse_name || "",
+          product_name: lookup.productNames.get(normalizeId(row.product_id)) || row.product_name || row.product || "",
+          company_name: lookup.companyNames.get(normalizeId(row.company_id)) || row.company_name || row.buyer_name || row.buyer || "",
+          party_name: lookup.accountNames.get(normalizeId(row.company_account_id)) || row.party_name || row.company_account_name || "",
           saved_from: "mongodb",
         }));
       return res.json(rows);
