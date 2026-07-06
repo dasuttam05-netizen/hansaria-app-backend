@@ -2,9 +2,6 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const {
-  mongoose,
-  Outward: MongoOutward,
-  mongoMirrorConfigured,
   Location: MongoLocation,
   Employee: MongoEmployee,
   Warehouse: MongoWarehouse,
@@ -19,85 +16,7 @@ const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqlit
 const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
 const safeText = (v) => (v ? v : null);
 const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
-const mongoReady = () => mongoMirrorConfigured && mongoose.connection.readyState === 1;
-
-function normalizeId(value) {
-  if (value && typeof value === "object") {
-    return String(value._id || value.id || value);
-  }
-  return value ? String(value) : "";
-}
-
-function isValidObjectId(value) {
-  return mongoose.Types.ObjectId.isValid(String(value || ""));
-}
-
-async function fetchDocsByIds(Model, ids, { customField } = {}) {
-  const list = [...(ids || [])].filter(Boolean);
-  if (list.length === 0) return [];
-
-  const objectIds = list.filter((id) => isValidObjectId(id));
-  const nonObjectIds = list.filter((id) => !isValidObjectId(id));
-
-  const queries = [];
-  if (objectIds.length) {
-    queries.push(Model.find({ _id: { $in: objectIds } }).lean());
-  }
-  if (nonObjectIds.length && customField) {
-    queries.push(Model.find({ [customField]: { $in: nonObjectIds } }).lean());
-  }
-
-  const results = await Promise.all(queries.map((q) => q.catch(() => [])));
-  return results.flat();
-}
-
-async function buildMongoLookupMaps(docs) {
-  const ids = {
-    employeeIds: new Set(),
-    locationIds: new Set(),
-    warehouseIds: new Set(),
-    productIds: new Set(),
-    companyIds: new Set(),
-    accountIds: new Set(),
-  };
-
-  (docs || []).forEach((row) => {
-    const employeeId = normalizeId(row.employee_id);
-    const locationId = normalizeId(row.location_id);
-    const warehouseId = normalizeId(row.warehouse_id);
-    const productId = normalizeId(row.product_id);
-    const companyId = normalizeId(row.company_id);
-    const accountId = normalizeId(row.company_account_id);
-
-    if (employeeId) ids.employeeIds.add(employeeId);
-    if (locationId) ids.locationIds.add(locationId);
-    if (warehouseId) ids.warehouseIds.add(warehouseId);
-    if (productId) ids.productIds.add(productId);
-    if (companyId) ids.companyIds.add(companyId);
-    if (accountId) ids.accountIds.add(accountId);
-  });
-
-  const [employees, locations, warehouses, products, companies, accounts] = await Promise.all([
-    fetchDocsByIds(MongoEmployee, ids.employeeIds, { customField: "employee_id" }),
-    fetchDocsByIds(MongoLocation, ids.locationIds),
-    fetchDocsByIds(MongoWarehouse, ids.warehouseIds),
-    fetchDocsByIds(MongoProduct, ids.productIds),
-    fetchDocsByIds(MongoCompany, ids.companyIds),
-    fetchDocsByIds(MongoCompanyAccount, ids.accountIds),
-  ]);
-
-  const byId = (rows, nameField = "name") =>
-    new Map((rows || []).map((item) => [normalizeId(item._id || item.id), item?.[nameField] || item?.account_name || item?.name || ""]));
-
-  return {
-    employeeNames: byId(employees),
-    locationNames: byId(locations),
-    warehouseNames: byId(warehouses),
-    productNames: byId(products),
-    companyNames: byId(companies),
-    accountNames: byId(accounts, "account_name"),
-  };
-}
+const mongoReady = () => false;
 
 function buildMongoOutwardPayload(reqBody, resolvedIds, normalizedWarehouseId) {
   const qty = safeNumber(reqBody.quantity) || safeNumber(reqBody.weight);
@@ -298,7 +217,7 @@ router.get("/pending", async (req, res) => {
   if (mongoReady()) {
     try {
       const docs = await MongoOutward.find({ status: { $in: ["Pending", "Partial"] } }).lean();
-      const lookup = await buildMongoLookupMaps(docs);
+      const lookup = mergeLookupMaps(await buildMongoLookupMaps(docs), await buildSqliteLookupMaps(docs));
       const rows = (docs || [])
         .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
         .map((row) => ({
@@ -455,7 +374,7 @@ router.get("/", async (req, res) => {
   if (mongoReady()) {
     try {
       const docs = await MongoOutward.find({}).sort({ created_at: -1, _id: -1 }).lean();
-      const lookup = await buildMongoLookupMaps(docs);
+      const lookup = mergeLookupMaps(await buildMongoLookupMaps(docs), await buildSqliteLookupMaps(docs));
       const rows = (docs || [])
         .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
         .map((row) => ({
