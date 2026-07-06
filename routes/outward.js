@@ -158,6 +158,16 @@ function insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, 
   });
 }
 
+function buildOutwardResponse(doc, source = "mongodb") {
+  if (!doc) return null;
+  const plain = typeof doc.toObject === "function" ? doc.toObject() : doc;
+  return {
+    ...plain,
+    id: String(plain._id || plain.id || ""),
+    saved_to: source,
+  };
+}
+
 function getAvailableWarehouseStock({ warehouse_id, product_id, outwardId }, callback) {
   const params = [safeNumber(product_id), safeNumber(warehouse_id)];
   let excludeClause = "";
@@ -635,6 +645,64 @@ router.put("/:id", async (req, res) => {
   }
 
   const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
+
+  if (mongoReady() && mongoose.Types.ObjectId.isValid(req.params.id)) {
+    const mongoPayload = buildMongoOutwardPayload(
+      {
+        date,
+        employee_id,
+        location_id,
+        warehouse_id,
+        product_id,
+        company_id,
+        company_account_id,
+        buyer_name,
+        consignee_name,
+        lorry_no,
+        weight,
+        quantity,
+        rate,
+        inv_no,
+        self_loading,
+      },
+      resolvedIds,
+      normalizedWarehouseId
+    );
+
+    const currentDoc = await MongoOutward.findById(req.params.id).lean();
+    if (!currentDoc) {
+      return res.status(404).json({ error: "Outward not found" });
+    }
+
+    const canAccessExistingWarehouse = !currentDoc.warehouse_id || canAccessWarehouse(req.user, currentDoc.warehouse_id);
+    const canAccessNewWarehouse =
+      isSelfLoading ||
+      canAccessWarehouse(req.user, warehouse_id) ||
+      canAccessWarehouse(req.user, normalizedWarehouseId);
+
+    if (!canAccessExistingWarehouse || !canAccessNewWarehouse) {
+      return res.status(403).json({ error: "You can only edit entries for your assigned warehouse" });
+    }
+
+    if (!isSelfLoading && normalizedWarehouseId) {
+      const stockCheck = await new Promise((resolve, reject) => {
+        validateOutwardStock(
+          { warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty, outwardId: req.params.id },
+          (stockErr, validation) => {
+            if (stockErr) return reject(stockErr);
+            return resolve(validation);
+          }
+        );
+      }).catch((err) => ({ ok: false, error: err.message }));
+
+      if (!stockCheck?.ok) {
+        return res.status(400).json({ error: stockCheck.error || "Not enough stock in this warehouse." });
+      }
+    }
+
+    const updatedDoc = await MongoOutward.findByIdAndUpdate(req.params.id, mongoPayload, { new: true }).lean();
+    return res.json(buildOutwardResponse(updatedDoc, "mongodb"));
+  }
 
   db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
