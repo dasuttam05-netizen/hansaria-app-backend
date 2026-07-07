@@ -20,13 +20,104 @@ const safeText = (v) => (v ? v : null);
 const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
 const mongoReady = () => isMongoMirrorReady();
 
+function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normalizedWarehouseId, callback) {
+  const cleanedVoucherNo = safeText(voucherNo);
+  if (!cleanedVoucherNo) {
+    return callback(new Error("Missing voucher number for outward mirror sync"));
+  }
+
+  const qty = safeNumber(payload.quantity) || safeNumber(payload.weight);
+  const rateVal = safeNumber(payload.rate);
+  const amount = qty * rateVal;
+  const selfLoading = safeText(payload.self_loading) || "No";
+
+  const saveRow = (rowId = null) => {
+    const sql = rowId
+      ? `
+        UPDATE outward SET
+          date=?, employee_id=?, location_id=?, warehouse_id=?,
+          product_id=?, company_id=?, company_account_id=?,
+          buyer_name=?, consignee_name=?,
+          lorry_no=?, weight=?, quantity=?, rate=?, amount=?,
+          inv_no=?, self_loading=?,
+          status='Pending'
+        WHERE id=?
+      `
+      : `
+        INSERT INTO outward (
+          sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
+          product_id, company_id, company_account_id,
+          lorry_no, weight, quantity, rate, amount,
+          buyer_name, consignee_name,
+          inv_no, self_loading,
+          status
+        ) VALUES (
+          COALESCE((SELECT MAX(sl_no) + 1 FROM outward), 1),
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending'
+        )
+      `;
+
+    const params = rowId
+      ? [
+          safeText(payload.date),
+          resolvedIds.employee_id || null,
+          resolvedIds.location_id || null,
+          normalizedWarehouseId,
+          resolvedIds.product_id || null,
+          resolvedIds.company_id || null,
+          resolvedIds.company_account_id || null,
+          safeText(payload.buyer_name),
+          safeText(payload.consignee_name),
+          safeText(payload.lorry_no),
+          safeNumber(payload.weight),
+          qty,
+          rateVal,
+          amount,
+          cleanedVoucherNo,
+          selfLoading,
+          rowId,
+        ]
+      : [
+          cleanedVoucherNo,
+          safeText(payload.date),
+          resolvedIds.employee_id || null,
+          resolvedIds.location_id || null,
+          normalizedWarehouseId,
+          resolvedIds.product_id || null,
+          resolvedIds.company_id || null,
+          resolvedIds.company_account_id || null,
+          safeText(payload.lorry_no),
+          safeNumber(payload.weight),
+          qty,
+          rateVal,
+          amount,
+          safeText(payload.buyer_name),
+          safeText(payload.consignee_name),
+          cleanedVoucherNo,
+          selfLoading,
+        ];
+
+    db.run(sql, params, function onSync(err) {
+      if (err) return callback(err);
+      return callback(null, { id: rowId || this.lastID, voucher_no: cleanedVoucherNo });
+    });
+  };
+
+  db.get(`SELECT id FROM outward WHERE voucher_no = ?`, [cleanedVoucherNo], (findErr, existing) => {
+    if (findErr) return callback(findErr);
+    if (existing?.id) return saveRow(existing.id);
+    return saveRow(null);
+  });
+}
+
 function buildMongoOutwardPayload(reqBody, resolvedIds, normalizedWarehouseId) {
   const qty = safeNumber(reqBody.quantity) || safeNumber(reqBody.weight);
   const rateVal = safeNumber(reqBody.rate);
   return {
     date: safeText(reqBody.date) ? new Date(safeText(reqBody.date)) : null,
     location: resolvedIds.location_id ? String(resolvedIds.location_id) : safeText(reqBody.location_id),
-    outward_no: safeText(reqBody.inv_no) || "",
+    outward_no:
+      safeText(reqBody.outward_no) || safeText(reqBody.voucher_no) || safeText(reqBody.inv_no) || "",
     employee_id: resolvedIds.employee_id || safeText(reqBody.employee_id) || null,
     location_id: resolvedIds.location_id || safeText(reqBody.location_id) || null,
     warehouse_id: normalizedWarehouseId || safeText(reqBody.warehouse_id) || null,
@@ -506,13 +597,33 @@ router.post("/", async (req, res) => {
     });
   };
 
-  const saveToSQLiteCache = (mongoDoc) => {
+  const saveToSQLiteCache = (mongoDoc, callback) => {
     insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
       if (sqliteErr) {
         console.error("Outward SQLite cache save failed:", sqliteErr.message);
+        if (typeof callback === "function") return callback(sqliteErr);
         return;
       }
-      console.log("Outward SQLite cache synced for Mongo record", mongoDoc?._id ? String(mongoDoc._id) : "");
+
+      if (mongoDoc?._id && !mongoDoc.outward_no && sqliteRow?.voucher_no) {
+        MongoOutward.findByIdAndUpdate(
+          mongoDoc._id,
+          { outward_no: sqliteRow.voucher_no },
+          { new: true }
+        )
+          .lean()
+          .then((updatedDoc) => {
+            if (typeof callback === "function") return callback(null, updatedDoc || mongoDoc, sqliteRow);
+            return;
+          })
+          .catch((updateErr) => {
+            console.error("Failed to update Mongo outward_no after SQLite cache save:", updateErr.message);
+            if (typeof callback === "function") return callback(null, mongoDoc, sqliteRow);
+          });
+        return;
+      }
+
+      if (typeof callback === "function") return callback(null, mongoDoc, sqliteRow);
     });
   };
 
@@ -527,8 +638,13 @@ router.post("/", async (req, res) => {
     const mongoPayload = buildMongoOutwardPayload(payload, resolvedIds, normalizedWarehouseId);
     MongoOutward.create(mongoPayload)
       .then((doc) => {
-        finalizeResponse("mongodb", doc, null);
-        saveToSQLiteCache(doc);
+        saveToSQLiteCache(doc, (cacheErr, cachedDoc, sqliteRow) => {
+          if (cacheErr) {
+            console.error("Outward SQLite cache save failed:", cacheErr.message);
+            return res.status(500).json({ error: cacheErr.message });
+          }
+          return finalizeResponse("mongodb", cachedDoc || doc, sqliteRow);
+        });
       })
       .catch((mongoErr) => {
         console.error("Mongo outward save failed:", mongoErr.message);
@@ -577,6 +693,24 @@ router.put("/:id", async (req, res) => {
     self_loading,
   } = req.body;
 
+  const payload = {
+    date,
+    employee_id,
+    location_id,
+    warehouse_id,
+    product_id,
+    company_id,
+    company_account_id,
+    buyer_name,
+    consignee_name,
+    lorry_no,
+    weight,
+    quantity,
+    rate,
+    inv_no,
+    self_loading,
+  };
+
   const qty = safeNumber(quantity) || safeNumber(weight);
   const rateVal = safeNumber(rate);
   const amount = qty * rateVal;
@@ -591,27 +725,7 @@ router.put("/:id", async (req, res) => {
   const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
 
   if (mongoReady() && mongoose.Types.ObjectId.isValid(req.params.id)) {
-    const mongoPayload = buildMongoOutwardPayload(
-      {
-        date,
-        employee_id,
-        location_id,
-        warehouse_id,
-        product_id,
-        company_id,
-        company_account_id,
-        buyer_name,
-        consignee_name,
-        lorry_no,
-        weight,
-        quantity,
-        rate,
-        inv_no,
-        self_loading,
-      },
-      resolvedIds,
-      normalizedWarehouseId
-    );
+    const mongoPayload = buildMongoOutwardPayload(payload, resolvedIds, normalizedWarehouseId);
 
     const currentDoc = await MongoOutward.findById(req.params.id).lean();
     if (!currentDoc) {
@@ -645,7 +759,16 @@ router.put("/:id", async (req, res) => {
     }
 
     const updatedDoc = await MongoOutward.findByIdAndUpdate(req.params.id, mongoPayload, { new: true }).lean();
-    return res.json(buildOutwardResponse(updatedDoc, "mongodb"));
+    const mirrorVoucherNo = currentDoc.outward_no || currentDoc.voucher_no || mongoPayload.outward_no || safeText(inv_no);
+
+    return upsertOutwardMirrorByVoucherNo(mirrorVoucherNo, payload, resolvedIds, normalizedWarehouseId, (mirrorErr) => {
+      if (mirrorErr) {
+        console.error("Mongo outward mirror sync failed:", mirrorErr.message);
+        return res.status(500).json({ error: mirrorErr.message });
+      }
+
+      return res.json(buildOutwardResponse(updatedDoc, "mongodb"));
+    });
   }
 
   db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
@@ -722,6 +845,28 @@ router.delete("/:id", (req, res) => {
   }
 
   const id = req.params.id;
+
+  if (mongoReady() && mongoose.Types.ObjectId.isValid(id)) {
+    MongoOutward.findByIdAndDelete(id)
+      .lean()
+      .then((deletedDoc) => {
+        if (!deletedDoc) {
+          return res.status(404).json({ error: "Outward not found" });
+        }
+
+        const voucherNo = deletedDoc.outward_no || deletedDoc.voucher_no || "";
+        if (!voucherNo) {
+          return res.json({ deleted: 1, deleted_from: "mongodb" });
+        }
+
+        return db.run(`DELETE FROM outward WHERE voucher_no=?`, [voucherNo], function (err2) {
+          if (err2) return res.status(500).json({ error: err2.message });
+          return res.json({ deleted: 1, deleted_from: "mongodb" });
+        });
+      })
+      .catch((mongoErr) => res.status(500).json({ error: mongoErr.message }));
+    return;
+  }
 
   db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [id], (findErr, outwardRow) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
