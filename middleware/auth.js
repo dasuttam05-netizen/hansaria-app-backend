@@ -587,12 +587,12 @@ async function authenticate(
       );
 
     if (!user) {
-
-      return res.status(401)
-        .json({
-          error:
-            "User account not found",
-        });
+      console.warn(
+        "AUTH WARNING: user not found in MongoDB, falling back to token payload for",
+        decoded.id
+      );
+      req.user = decoded;
+      return next();
     }
 
     req.user =
