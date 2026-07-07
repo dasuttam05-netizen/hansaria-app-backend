@@ -8,6 +8,8 @@ const {
   Product: MongoProduct,
   Company: MongoCompany,
   CompanyAccount: MongoCompanyAccount,
+  Outward: MongoOutward,
+  isMongoMirrorReady,
 } = require("../db-mongodb");
 const { userHasPermission } = require("../middleware/auth");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
@@ -16,7 +18,7 @@ const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqlit
 const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
 const safeText = (v) => (v ? v : null);
 const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
-const mongoReady = () => false;
+const mongoReady = () => isMongoMirrorReady();
 
 function buildMongoOutwardPayload(reqBody, resolvedIds, normalizedWarehouseId) {
   const qty = safeNumber(reqBody.quantity) || safeNumber(reqBody.weight);
