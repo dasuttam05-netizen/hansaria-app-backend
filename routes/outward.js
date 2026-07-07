@@ -20,6 +20,118 @@ const safeText = (v) => (v ? v : null);
 const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
 const mongoReady = () => isMongoMirrorReady();
 
+function normalizeId(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "object") {
+    if (typeof value.toString === "function" && value.toString() !== "[object Object]") {
+      return String(value.toString());
+    }
+    return String(value._id || value.id || "");
+  }
+  return String(value);
+}
+
+async function querySqliteLookupMap(table, idField, nameField, ids) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return new Map();
+  }
+
+  const numericIds = ids
+    .map((id) => (typeof id === "string" ? Number(id) : Number(id)))
+    .filter((id) => Number.isFinite(id));
+  if (numericIds.length === 0) {
+    return new Map();
+  }
+
+  const placeholders = numericIds.map(() => "?").join(",");
+  const sql = `SELECT ${idField} AS id, ${nameField} AS name FROM ${table} WHERE ${idField} IN (${placeholders})`;
+
+  return new Promise((resolve) => {
+    db.all(sql, numericIds, (err, rows) => {
+      if (err || !Array.isArray(rows)) {
+        return resolve(new Map());
+      }
+      const map = new Map();
+      rows.forEach((row) => {
+        const key = normalizeId(row?.id);
+        if (key) map.set(key, row?.name || "");
+      });
+      resolve(map);
+    });
+  });
+}
+
+async function buildSqliteLookupMaps(docs) {
+  const employeeIds = new Set();
+  const locationIds = new Set();
+  const warehouseIds = new Set();
+  const productIds = new Set();
+  const companyIds = new Set();
+  const accountIds = new Set();
+
+  for (const doc of docs || []) {
+    if (!doc) continue;
+    if (doc.employee_id != null) employeeIds.add(normalizeId(doc.employee_id));
+    if (doc.location_id != null) locationIds.add(normalizeId(doc.location_id));
+    if (doc.warehouse_id != null) warehouseIds.add(normalizeId(doc.warehouse_id));
+    if (doc.product_id != null) productIds.add(normalizeId(doc.product_id));
+    if (doc.company_id != null) companyIds.add(normalizeId(doc.company_id));
+    if (doc.company_account_id != null) accountIds.add(normalizeId(doc.company_account_id));
+  }
+
+  const [employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames] = await Promise.all([
+    querySqliteLookupMap("employees", "id", "name", Array.from(employeeIds)),
+    querySqliteLookupMap("locations", "id", "name", Array.from(locationIds)),
+    querySqliteLookupMap("warehouses", "id", "name", Array.from(warehouseIds)),
+    querySqliteLookupMap("products", "id", "name", Array.from(productIds)),
+    querySqliteLookupMap("companies", "id", "name", Array.from(companyIds)),
+    querySqliteLookupMap("company_accounts", "id", "account_name", Array.from(accountIds)),
+  ]);
+
+  return { employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames };
+}
+
+async function buildMongoLookupMaps(docs) {
+  const employeeIds = new Set();
+  const locationIds = new Set();
+  const warehouseIds = new Set();
+  const productIds = new Set();
+  const companyIds = new Set();
+  const accountIds = new Set();
+
+  for (const doc of docs || []) {
+    if (!doc) continue;
+    if (doc.employee_id != null) employeeIds.add(normalizeId(doc.employee_id));
+    if (doc.location_id != null) locationIds.add(normalizeId(doc.location_id));
+    if (doc.warehouse_id != null) warehouseIds.add(normalizeId(doc.warehouse_id));
+    if (doc.product_id != null) productIds.add(normalizeId(doc.product_id));
+    if (doc.company_id != null) companyIds.add(normalizeId(doc.company_id));
+    if (doc.company_account_id != null) accountIds.add(normalizeId(doc.company_account_id));
+  }
+
+  const [employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames] = await Promise.all([
+    MongoEmployee.find({ _id: { $in: Array.from(employeeIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoLocation.find({ _id: { $in: Array.from(locationIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoWarehouse.find({ _id: { $in: Array.from(warehouseIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoProduct.find({ _id: { $in: Array.from(productIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoCompany.find({ _id: { $in: Array.from(companyIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoCompanyAccount.find({ _id: { $in: Array.from(accountIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.account_name || ""]))),
+  ]);
+
+  return { employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames };
+}
+
+function mergeLookupMaps(mongoMaps, sqliteMaps) {
+  return {
+    employeeNames: new Map([...sqliteMaps.employeeNames, ...mongoMaps.employeeNames]),
+    locationNames: new Map([...sqliteMaps.locationNames, ...mongoMaps.locationNames]),
+    warehouseNames: new Map([...sqliteMaps.warehouseNames, ...mongoMaps.warehouseNames]),
+    productNames: new Map([...sqliteMaps.productNames, ...mongoMaps.productNames]),
+    companyNames: new Map([...sqliteMaps.companyNames, ...mongoMaps.companyNames]),
+    accountNames: new Map([...sqliteMaps.accountNames, ...mongoMaps.accountNames]),
+  };
+}
+
 function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normalizedWarehouseId, callback) {
   const cleanedVoucherNo = safeText(voucherNo);
   if (!cleanedVoucherNo) {
