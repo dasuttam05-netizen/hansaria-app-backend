@@ -1,4 +1,5 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 const db = require("../db");
 const {
@@ -9,6 +10,7 @@ const {
   Company: MongoCompany,
   CompanyAccount: MongoCompanyAccount,
   Outward: MongoOutward,
+  SqliteMirrorRow,
   isMongoMirrorReady,
 } = require("../db-mongodb");
 const { userHasPermission } = require("../middleware/auth");
@@ -132,12 +134,8 @@ function mergeLookupMaps(mongoMaps, sqliteMaps) {
   };
 }
 
-function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normalizedWarehouseId, callback) {
-  const cleanedVoucherNo = safeText(voucherNo);
-  if (!cleanedVoucherNo) {
-    return callback(new Error("Missing voucher number for outward mirror sync"));
-  }
-
+function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normalizedWarehouseId, callback, existingRowId = null) {
+  const cleanedVoucherNo = safeText(voucherNo || payload?.voucher_no || payload?.outward_no || payload?.inv_no);
   const qty = safeNumber(payload.quantity) || safeNumber(payload.weight);
   const rateVal = safeNumber(payload.rate);
   const amount = qty * rateVal;
@@ -211,15 +209,76 @@ function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normali
 
     db.run(sql, params, function onSync(err) {
       if (err) return callback(err);
-      return callback(null, { id: rowId || this.lastID, voucher_no: cleanedVoucherNo });
+      const savedId = rowId || this.lastID;
+      const mirrorRow = {
+        id: savedId,
+        sl_no: null,
+        voucher_no: cleanedVoucherNo,
+        date: safeText(payload.date),
+        employee_id: resolvedIds.employee_id || null,
+        location_id: resolvedIds.location_id || null,
+        warehouse_id: normalizedWarehouseId,
+        product_id: resolvedIds.product_id || null,
+        company_id: resolvedIds.company_id || null,
+        company_account_id: resolvedIds.company_account_id || null,
+        buyer_name: safeText(payload.buyer_name),
+        consignee_name: safeText(payload.consignee_name),
+        lorry_no: safeText(payload.lorry_no),
+        weight: safeNumber(payload.weight),
+        quantity: qty,
+        rate: rateVal,
+        amount,
+        inv_no: safeText(payload.inv_no),
+        self_loading: selfLoading,
+        status: "Pending",
+      };
+
+      syncOutwardRowToMirror(savedId, mirrorRow).catch((mirrorErr) => {
+        console.error("Outward mirror row sync failed:", mirrorErr?.message || mirrorErr);
+      });
+
+      return callback(null, { id: savedId, voucher_no: cleanedVoucherNo });
     });
   };
 
-  db.get(`SELECT id FROM outward WHERE voucher_no = ?`, [cleanedVoucherNo], (findErr, existing) => {
+  const lookupId = safeNumber(existingRowId);
+  const lookupSql = lookupId > 0
+    ? `SELECT id FROM outward WHERE id = ? OR voucher_no = ? ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, id ASC LIMIT 1`
+    : `SELECT id FROM outward WHERE voucher_no = ? ORDER BY id ASC LIMIT 1`;
+  const lookupParams = lookupId > 0 ? [lookupId, cleanedVoucherNo, lookupId] : [cleanedVoucherNo];
+
+  db.get(lookupSql, lookupParams, (findErr, existing) => {
     if (findErr) return callback(findErr);
     if (existing?.id) return saveRow(existing.id);
     return saveRow(null);
   });
+}
+
+async function syncOutwardRowToMirror(rowId, rowData) {
+  if (!rowId || !SqliteMirrorRow || typeof SqliteMirrorRow.updateOne !== "function") {
+    return null;
+  }
+
+  const safeRowId = Number(rowId);
+  if (!Number.isFinite(safeRowId) || safeRowId <= 0) {
+    return null;
+  }
+
+  const payload = {
+    ...(rowData || {}),
+    id: safeRowId,
+  };
+
+  return SqliteMirrorRow.updateOne(
+    { table: "outward", row_id: safeRowId },
+    {
+      $set: {
+        data: payload,
+        updated_at: new Date(),
+      },
+    },
+    { upsert: true }
+  ).exec();
 }
 
 function buildMongoOutwardPayload(reqBody, resolvedIds, normalizedWarehouseId) {
@@ -299,7 +358,35 @@ function insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, 
       ],
       function onInsert(insertErr) {
         if (insertErr) return callback(insertErr);
-        return callback(null, { id: this.lastID, voucher_no });
+        const savedId = this.lastID;
+        const mirrorRow = {
+          id: savedId,
+          sl_no,
+          voucher_no,
+          date: safeText(payload.date),
+          employee_id: resolvedIds.employee_id || null,
+          location_id: resolvedIds.location_id || null,
+          warehouse_id: normalizedWarehouseId,
+          product_id: resolvedIds.product_id || null,
+          company_id: resolvedIds.company_id || null,
+          company_account_id: resolvedIds.company_account_id || null,
+          buyer_name: safeText(payload.buyer_name),
+          consignee_name: safeText(payload.consignee_name),
+          lorry_no: safeText(payload.lorry_no),
+          weight: safeNumber(payload.weight),
+          quantity: qty,
+          rate: rateVal,
+          amount,
+          inv_no: safeText(payload.inv_no),
+          self_loading: safeText(payload.self_loading) || "No",
+          status: "Pending",
+        };
+
+        syncOutwardRowToMirror(savedId, mirrorRow).catch((mirrorErr) => {
+          console.error("Outward mirror row sync failed:", mirrorErr?.message || mirrorErr);
+        });
+
+        return callback(null, { id: savedId, voucher_no });
       }
     );
   });
@@ -873,14 +960,21 @@ router.put("/:id", async (req, res) => {
     const updatedDoc = await MongoOutward.findByIdAndUpdate(req.params.id, mongoPayload, { new: true }).lean();
     const mirrorVoucherNo = currentDoc.outward_no || currentDoc.voucher_no || mongoPayload.outward_no || safeText(inv_no);
 
-    return upsertOutwardMirrorByVoucherNo(mirrorVoucherNo, payload, resolvedIds, normalizedWarehouseId, (mirrorErr) => {
-      if (mirrorErr) {
-        console.error("Mongo outward mirror sync failed:", mirrorErr.message);
-        return res.status(500).json({ error: mirrorErr.message });
-      }
+    return upsertOutwardMirrorByVoucherNo(
+      mirrorVoucherNo,
+      payload,
+      resolvedIds,
+      normalizedWarehouseId,
+      (mirrorErr) => {
+        if (mirrorErr) {
+          console.error("Mongo outward mirror sync failed:", mirrorErr.message);
+          return res.status(500).json({ error: mirrorErr.message });
+        }
 
-      return res.json(buildOutwardResponse(updatedDoc, "mongodb"));
-    });
+        return res.json(buildOutwardResponse(updatedDoc, "mongodb"));
+      },
+      null
+    );
   }
 
   db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
