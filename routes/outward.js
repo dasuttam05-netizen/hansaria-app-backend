@@ -803,8 +803,6 @@ router.post("/", async (req, res) => {
   } = req.body;
 
   const qty = safeNumber(quantity) || safeNumber(weight);
-  const rateVal = safeNumber(rate);
-  const amount = qty * rateVal;
   const isSelfLoading = String(self_loading || "No").trim().toLowerCase() === "yes";
   let resolvedIds;
   try {
@@ -852,89 +850,43 @@ router.post("/", async (req, res) => {
     });
   };
 
-  const saveToSQLiteCache = (mongoDoc, callback) => {
-    insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
-      if (sqliteErr) {
-        console.error("Outward SQLite cache save failed:", sqliteErr.message);
-        if (typeof callback === "function") return callback(sqliteErr);
-        return;
-      }
-
-      const mirrorPayload = buildOutwardMirrorRowData(
-        sqliteRow?.id,
-        {
-          ...payload,
-          ...mongoDoc,
-          outward_no: mongoDoc?.outward_no || sqliteRow?.voucher_no || null,
-          voucher_no: sqliteRow?.voucher_no || mongoDoc?.outward_no || null,
-          status: mongoDoc?.status || "Pending",
-        },
-        resolvedIds,
-        normalizedWarehouseId,
-        {
-          sl_no: sqliteRow?.sl_no || null,
-          voucher_no: sqliteRow?.voucher_no || null,
-          outward_no: mongoDoc?.outward_no || sqliteRow?.voucher_no || null,
-          status: mongoDoc?.status || "Pending",
-        }
-      );
-
-      syncOutwardRowToMirror(sqliteRow?.id, mirrorPayload).catch((mirrorErr) => {
-        console.error("Outward mirror row sync failed:", mirrorErr?.message || mirrorErr);
-      });
-
-      if (mongoDoc?._id && !mongoDoc.outward_no && sqliteRow?.voucher_no) {
-        MongoOutward.findByIdAndUpdate(
-          mongoDoc._id,
-          { outward_no: sqliteRow.voucher_no },
-          { new: true }
-        )
-          .lean()
-          .then((updatedDoc) => {
-            if (typeof callback === "function") return callback(null, updatedDoc || mongoDoc, sqliteRow);
-            return;
-          })
-          .catch((updateErr) => {
-            console.error("Failed to update Mongo outward_no after SQLite cache save:", updateErr.message);
-            if (typeof callback === "function") return callback(null, mongoDoc, sqliteRow);
-          });
-        return;
-      }
-
-      if (typeof callback === "function") return callback(null, mongoDoc, sqliteRow);
-    });
-  };
-
-  const saveToMongoFirst = () => {
-    if (!mongoReady()) {
-      return insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
-        if (sqliteErr) return res.status(500).json({ error: sqliteErr.message });
-        return finalizeResponse("sqlite", null, sqliteRow);
-      });
+  const saveToMongoMirror = async (sqliteRow) => {
+    if (!mongoReady() || !sqliteRow?.voucher_no) {
+      return { ok: false, reason: "mongo_not_ready" };
     }
 
     const mongoPayload = buildMongoOutwardPayload(payload, resolvedIds, normalizedWarehouseId);
-    MongoOutward.create(mongoPayload)
-      .then((doc) => {
-        saveToSQLiteCache(doc, (cacheErr, cachedDoc, sqliteRow) => {
-          if (cacheErr) {
-            console.error("Outward SQLite cache save failed:", cacheErr.message);
-            return res.status(500).json({ error: cacheErr.message });
-          }
-          return finalizeResponse("mongodb", cachedDoc || doc, sqliteRow);
-        });
-      })
-      .catch((mongoErr) => {
-        console.error("Mongo outward save failed:", mongoErr.message);
-        insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
-          if (sqliteErr) return res.status(500).json({ error: mongoErr.message || sqliteErr.message });
-          return finalizeResponse("sqlite_fallback", null, sqliteRow, { mongo_error: mongoErr.message });
-        });
-      });
+    mongoPayload.outward_no = sqliteRow.voucher_no;
+
+    try {
+      const updated = await MongoOutward.findOneAndUpdate(
+        { outward_no: sqliteRow.voucher_no },
+        { $set: mongoPayload, $setOnInsert: { created_at: new Date() } },
+        { upsert: true, new: true }
+      ).lean();
+      return { ok: true, doc: updated };
+    } catch (err) {
+      console.error("Mongo outward mirror save failed:", err?.message || err);
+      return { ok: false, reason: "mongo_error", error: err?.message || String(err) };
+    }
   };
 
+  const saveSQLiteFirst = () =>
+    insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, async (sqliteErr, sqliteRow) => {
+      if (sqliteErr) return res.status(500).json({ error: sqliteErr.message });
+
+      const mongoResult = await saveToMongoMirror(sqliteRow);
+      if (mongoResult.ok) {
+        return finalizeResponse("sqlite+mongodb", mongoResult.doc, sqliteRow);
+      }
+      if (mongoResult.reason === "mongo_error") {
+        return finalizeResponse("sqlite+mongodb_fallback", null, sqliteRow, { mongo_error: mongoResult.error });
+      }
+      return finalizeResponse("sqlite", null, sqliteRow);
+    });
+
   if (isSelfLoading) {
-    return saveToMongoFirst();
+    return saveSQLiteFirst();
   }
 
   validateOutwardStock({ warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty }, (stockErr, validation) => {
@@ -944,7 +896,7 @@ router.post("/", async (req, res) => {
     if (!validation?.ok) {
       return res.status(400).json({ error: validation.error });
     }
-    return saveToMongoFirst();
+    return saveSQLiteFirst();
   });
 });
 
