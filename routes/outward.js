@@ -17,6 +17,16 @@ const { userHasPermission } = require("../middleware/auth");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
 const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
 
+function isSelfLoadingOutward(row) {
+  return String(row?.self_loading || "").trim().toLowerCase() === "yes";
+}
+
+function canAccessOutwardRow(user, row) {
+  if (!row) return false;
+  if (isSelfLoadingOutward(row)) return true;
+  return canAccessWarehouse(user, row.warehouse_id);
+}
+
 const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
 const safeText = (v) => (v ? v : null);
 const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
@@ -531,7 +541,7 @@ router.get("/pending", async (req, res) => {
       const docs = await MongoOutward.find({ status: { $in: ["Pending", "Partial"] } }).lean();
       const lookup = mergeLookupMaps(await buildMongoLookupMaps(docs), await buildSqliteLookupMaps(docs));
       const rows = (docs || [])
-        .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
+        .filter((row) => canAccessOutwardRow(req.user, row))
         .map((row) => ({
           ...row,
           id: String(row._id),
@@ -555,10 +565,10 @@ router.get("/pending", async (req, res) => {
   const warehouseScope = rawWarehouseScope.clause
     ? resolvedWarehouseIds.length > 0
       ? {
-          clause: ` AND o.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")})`,
+          clause: ` AND (o.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")}) OR LOWER(COALESCE(o.self_loading, 'No')) = 'yes')`,
           params: resolvedWarehouseIds,
         }
-      : { clause: " AND 1 = 0", params: [] }
+      : { clause: " AND LOWER(COALESCE(o.self_loading, 'No')) = 'yes'", params: [] }
     : rawWarehouseScope;
   const sql = `
     SELECT o.*, 
@@ -593,7 +603,7 @@ router.put("/complete/:id", (req, res) => {
     if (err || !row) {
       return res.status(404).json({ error: "Outward not found" });
     }
-    if (!canAccessWarehouse(req.user, row.warehouse_id)) {
+    if (!canAccessOutwardRow(req.user, row)) {
       return res.status(403).json({ error: "You can only update entries for your assigned warehouse" });
     }
 
@@ -688,7 +698,7 @@ router.get("/", async (req, res) => {
       const docs = await MongoOutward.find({}).sort({ created_at: -1, _id: -1 }).lean();
       const lookup = mergeLookupMaps(await buildMongoLookupMaps(docs), await buildSqliteLookupMaps(docs));
       const rows = (docs || [])
-        .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
+        .filter((row) => canAccessOutwardRow(req.user, row))
         .map((row) => ({
           ...row,
           id: String(row._id),
@@ -712,10 +722,10 @@ router.get("/", async (req, res) => {
   const warehouseScope = rawWarehouseScope.clause
     ? resolvedWarehouseIds.length > 0
       ? {
-          clause: ` AND o.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")})`,
+          clause: ` AND (o.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")}) OR LOWER(COALESCE(o.self_loading, 'No')) = 'yes')`,
           params: resolvedWarehouseIds,
         }
-      : { clause: " AND 1 = 0", params: [] }
+      : { clause: " AND LOWER(COALESCE(o.self_loading, 'No')) = 'yes'", params: [] }
     : rawWarehouseScope;
   const sql = `
     SELECT o.*, 
