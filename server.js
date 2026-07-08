@@ -438,7 +438,7 @@ app.use(
 app.use(
   "/api/outward",
   authenticate,
-  authorize(["outward.view", "outward.create", "outward.edit", "outward.delete"]),
+  authorize("outward.view"),
   outwardRoute
 );
 
