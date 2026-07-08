@@ -580,7 +580,9 @@ router.get("/pending", async (req, res) => {
           party_name: lookup.accountNames.get(normalizeId(row.company_account_id)) || row.party_name || row.company_account_name || "",
           saved_from: "mongodb",
         }));
-      return res.json(rows);
+      if (rows.length > 0) {
+        return res.json(rows);
+      }
     } catch (err) {
       console.error("Mongo outward pending fetch failed, falling back to SQLite:", err.message);
     }
@@ -737,7 +739,9 @@ router.get("/", async (req, res) => {
           party_name: lookup.accountNames.get(normalizeId(row.company_account_id)) || row.party_name || row.company_account_name || "",
           saved_from: "mongodb",
         }));
-      return res.json(rows);
+      if (rows.length > 0) {
+        return res.json(rows);
+      }
     } catch (err) {
       console.error("Mongo outward fetch failed, falling back to SQLite:", err.message);
     }
@@ -852,6 +856,11 @@ router.post("/", async (req, res) => {
 
   const saveToMongoMirror = async (sqliteRow) => {
     if (!mongoReady() || !sqliteRow?.voucher_no) {
+      console.warn("Mongo outward upsert skipped", {
+        mongoReady: mongoReady(),
+        readyState: mongoose.connection?.readyState,
+        voucher_no: sqliteRow?.voucher_no || null,
+      });
       return { ok: false, reason: "mongo_not_ready" };
     }
 
