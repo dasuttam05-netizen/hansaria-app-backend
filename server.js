@@ -208,6 +208,8 @@ app.use((req, res, next) => {
   if (origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
     res.setHeader("Vary", "Origin");
   }
   return next();
@@ -215,6 +217,13 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
+    if (req.headers.origin) {
+      res.setHeader("Access-Control-Allow-Origin", req.headers.origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+      res.setHeader("Vary", "Origin");
+    }
     return res.sendStatus(204);
   }
   return next();
@@ -582,6 +591,15 @@ app.use(
       "Server Error:",
       err.stack
     );
+
+    const origin = req.headers.origin;
+    if (origin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+      res.setHeader("Vary", "Origin");
+    }
 
     res.status(500).json({
       error:
