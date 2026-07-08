@@ -13,6 +13,10 @@ const {
   SqliteMirrorRow,
   isMongoMirrorReady,
 } = require("../db-mongodb");
+
+const wrapAsync = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
 const { userHasPermission } = require("../middleware/auth");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
 const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
@@ -783,7 +787,7 @@ router.get("/", async (req, res) => {
   });
 });
 
-router.post("/", async (req, res) => {
+router.post("/", wrapAsync(async (req, res) => {
   if (!userHasPermission(req.user, "outward.create")) {
     return res.status(403).json({ error: "You do not have permission to create outward entries" });
   }
@@ -808,12 +812,7 @@ router.post("/", async (req, res) => {
 
   const qty = safeNumber(quantity) || safeNumber(weight);
   const isSelfLoading = String(self_loading || "No").trim().toLowerCase() === "yes";
-  let resolvedIds;
-  try {
-    resolvedIds = await resolveEntryMasterIds(db, req.body);
-  } catch (resolveErr) {
-    return res.status(500).json({ error: resolveErr.message });
-  }
+  const resolvedIds = await resolveEntryMasterIds(db, req.body);
 
   const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
   if (!isSelfLoading && !normalizedWarehouseId) {
@@ -854,42 +853,20 @@ router.post("/", async (req, res) => {
     });
   };
 
-  const saveToMongoMirror = async (sqliteRow) => {
-    if (!mongoReady() || !sqliteRow?.voucher_no) {
-      console.warn("Mongo outward upsert skipped", {
-        mongoReady: mongoReady(),
-        readyState: mongoose.connection?.readyState,
-        voucher_no: sqliteRow?.voucher_no || null,
-      });
-      return { ok: false, reason: "mongo_not_ready" };
-    }
-
-    const mongoPayload = buildMongoOutwardPayload(payload, resolvedIds, normalizedWarehouseId);
-    mongoPayload.outward_no = sqliteRow.voucher_no;
-
-    try {
-      const updated = await MongoOutward.findOneAndUpdate(
-        { outward_no: sqliteRow.voucher_no },
-        { $set: mongoPayload, $setOnInsert: { created_at: new Date() } },
-        { upsert: true, new: true }
-      ).lean();
-      return { ok: true, doc: updated };
-    } catch (err) {
-      console.error("Mongo outward mirror save failed:", err?.message || err);
-      return { ok: false, reason: "mongo_error", error: err?.message || String(err) };
-    }
-  };
-
   const saveSQLiteFirst = () =>
     insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, async (sqliteErr, sqliteRow) => {
-      if (sqliteErr) return res.status(500).json({ error: sqliteErr.message });
-
-      const mongoResult = await saveToMongoMirror(sqliteRow);
-      if (mongoResult.ok) {
-        return finalizeResponse("sqlite+mongodb", mongoResult.doc, sqliteRow);
+      if (sqliteErr) {
+        return res.status(500).json({ error: sqliteErr.message });
       }
-      if (mongoResult.reason === "mongo_error") {
-        return finalizeResponse("sqlite+mongodb_fallback", null, sqliteRow, { mongo_error: mongoResult.error });
+
+      if (mongoReady() && sqliteRow?.voucher_no) {
+        const mongoResult = await saveToMongoMirror(sqliteRow);
+        if (mongoResult.ok) {
+          return finalizeResponse("sqlite+mongodb", mongoResult.doc, sqliteRow);
+        }
+        if (mongoResult.reason === "mongo_error") {
+          return finalizeResponse("sqlite+mongodb_fallback", null, sqliteRow, { mongo_error: mongoResult.error });
+        }
       }
       return finalizeResponse("sqlite", null, sqliteRow);
     });
@@ -898,16 +875,19 @@ router.post("/", async (req, res) => {
     return saveSQLiteFirst();
   }
 
-  validateOutwardStock({ warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty }, (stockErr, validation) => {
-    if (stockErr) {
-      return res.status(500).json({ error: stockErr.message });
-    }
-    if (!validation?.ok) {
-      return res.status(400).json({ error: validation.error });
-    }
-    return saveSQLiteFirst();
+  const stockValidation = await new Promise((resolve, reject) => {
+    validateOutwardStock({ warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty }, (stockErr, validation) => {
+      if (stockErr) return reject(stockErr);
+      resolve(validation);
+    });
   });
-});
+
+  if (!stockValidation.ok) {
+    return res.status(400).json({ error: stockValidation.error });
+  }
+
+  return saveSQLiteFirst();
+}));
 
 router.put("/:id", async (req, res) => {
   if (!userHasPermission(req.user, "outward.edit")) {
