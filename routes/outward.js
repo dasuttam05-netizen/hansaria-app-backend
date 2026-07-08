@@ -93,6 +93,19 @@ async function buildSqliteLookupMaps(docs) {
   return { employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames };
 }
 
+function extractValidObjectIds(values) {
+  return Array.from(values)
+    .filter((value) => {
+      if (!value) return false;
+      try {
+        return mongoose.Types.ObjectId.isValid(value);
+      } catch (error) {
+        return false;
+      }
+    })
+    .map((value) => new mongoose.Types.ObjectId(value));
+}
+
 async function buildMongoLookupMaps(docs) {
   const employeeIds = new Set();
   const locationIds = new Set();
@@ -111,13 +124,20 @@ async function buildMongoLookupMaps(docs) {
     if (doc.company_account_id != null) accountIds.add(normalizeId(doc.company_account_id));
   }
 
+  const mongoEmployeeIds = extractValidObjectIds(employeeIds);
+  const mongoLocationIds = extractValidObjectIds(locationIds);
+  const mongoWarehouseIds = extractValidObjectIds(warehouseIds);
+  const mongoProductIds = extractValidObjectIds(productIds);
+  const mongoCompanyIds = extractValidObjectIds(companyIds);
+  const mongoAccountIds = extractValidObjectIds(accountIds);
+
   const [employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames] = await Promise.all([
-    MongoEmployee.find({ _id: { $in: Array.from(employeeIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoLocation.find({ _id: { $in: Array.from(locationIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoWarehouse.find({ _id: { $in: Array.from(warehouseIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoProduct.find({ _id: { $in: Array.from(productIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoCompany.find({ _id: { $in: Array.from(companyIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoCompanyAccount.find({ _id: { $in: Array.from(accountIds).filter(Boolean) } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.account_name || ""]))),
+    MongoEmployee.find({ _id: { $in: mongoEmployeeIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoLocation.find({ _id: { $in: mongoLocationIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoWarehouse.find({ _id: { $in: mongoWarehouseIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoProduct.find({ _id: { $in: mongoProductIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoCompany.find({ _id: { $in: mongoCompanyIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
+    MongoCompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.account_name || ""]))),
   ]);
 
   return { employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames };
