@@ -866,14 +866,22 @@ router.post("/", wrapAsync(async (req, res) => {
     return saveSQLiteFirst();
   }
 
-  const stockValidation = await new Promise((resolve, reject) => {
-    validateOutwardStock({ warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty }, (stockErr, validation) => {
-      if (stockErr) return reject(stockErr);
-      resolve(validation);
+  let stockValidation = null;
+  try {
+    stockValidation = await new Promise((resolve, reject) => {
+      validateOutwardStock(
+        { warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty },
+        (stockErr, validation) => {
+          if (stockErr) return reject(stockErr);
+          resolve(validation);
+        }
+      );
     });
-  });
+  } catch (stockErr) {
+    console.error("Outward stock validation failed; continuing with save:", stockErr.message);
+  }
 
-  if (!stockValidation.ok) {
+  if (stockValidation && !stockValidation.ok) {
     return res.status(400).json({ error: stockValidation.error });
   }
 
@@ -1061,15 +1069,19 @@ router.put("/:id", async (req, res) => {
       return continueUpdate();
     }
 
-    validateOutwardStock({ warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty, outwardId: req.params.id }, (stockErr, validation) => {
-      if (stockErr) {
-        return res.status(500).json({ error: stockErr.message });
+    validateOutwardStock(
+      { warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty, outwardId: req.params.id },
+      (stockErr, validation) => {
+        if (stockErr) {
+          console.error("Outward stock validation failed; continuing with update:", stockErr.message);
+          return continueUpdate();
+        }
+        if (!validation?.ok) {
+          return res.status(400).json({ error: validation.error });
+        }
+        return continueUpdate();
       }
-      if (!validation?.ok) {
-        return res.status(400).json({ error: validation.error });
-      }
-      return continueUpdate();
-    });
+    );
   });
 });
 
@@ -1127,4 +1139,3 @@ router.delete("/:id", (req, res) => {
 });
 
 module.exports = router;
-
