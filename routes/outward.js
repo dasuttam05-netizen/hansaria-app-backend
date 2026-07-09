@@ -250,7 +250,7 @@ function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normali
           qty,
           rateVal,
           amount,
-          cleanedVoucherNo,
+          safeText(payload.inv_no),
           selfLoading,
           rowId,
         ]
@@ -988,7 +988,7 @@ router.put("/:id", async (req, res) => {
     );
   }
 
-  db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
+  db.get(`SELECT sl_no, voucher_no, warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!row) return res.status(404).json({ error: "Outward not found" });
 
@@ -1035,6 +1035,23 @@ router.put("/:id", async (req, res) => {
         ],
         function onUpdate(err) {
           if (err) return res.status(500).json({ error: err.message });
+
+          const mirrorRow = buildOutwardMirrorRowData(
+            req.params.id,
+            payload,
+            resolvedIds,
+            normalizedWarehouseId,
+            {
+              sl_no: row.sl_no,
+              voucher_no: row.voucher_no,
+              status: "Pending",
+            }
+          );
+
+          syncOutwardRowToMirror(req.params.id, mirrorRow).catch((mirrorErr) => {
+            console.error("Outward mirror row sync failed on update:", mirrorErr?.message || mirrorErr);
+          });
+
           return res.json({ message: "Updated & Reset to Pending" });
         }
       );
