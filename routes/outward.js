@@ -854,20 +854,11 @@ router.post("/", wrapAsync(async (req, res) => {
   };
 
   const saveSQLiteFirst = () =>
-    insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, async (sqliteErr, sqliteRow) => {
+    insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
       if (sqliteErr) {
         return res.status(500).json({ error: sqliteErr.message });
       }
 
-      if (mongoReady() && sqliteRow?.voucher_no) {
-        const mongoResult = await saveToMongoMirror(sqliteRow);
-        if (mongoResult.ok) {
-          return finalizeResponse("sqlite+mongodb", mongoResult.doc, sqliteRow);
-        }
-        if (mongoResult.reason === "mongo_error") {
-          return finalizeResponse("sqlite+mongodb_fallback", null, sqliteRow, { mongo_error: mongoResult.error });
-        }
-      }
       return finalizeResponse("sqlite", null, sqliteRow);
     });
 
