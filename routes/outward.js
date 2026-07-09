@@ -244,7 +244,7 @@ function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normali
           status
         ) VALUES (
           COALESCE((SELECT MAX(sl_no) + 1 FROM outward), 1),
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending'
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
       `;
 
@@ -286,6 +286,7 @@ function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normali
           safeText(payload.consignee_name),
           cleanedVoucherNo,
           selfLoading,
+          "Pending",
         ];
 
     db.run(sql, params, function onSync(err) {
