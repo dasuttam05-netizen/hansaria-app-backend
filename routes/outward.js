@@ -866,25 +866,6 @@ router.post("/", wrapAsync(async (req, res) => {
     return saveSQLiteFirst();
   }
 
-  let stockValidation = null;
-  try {
-    stockValidation = await new Promise((resolve, reject) => {
-      validateOutwardStock(
-        { warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty },
-        (stockErr, validation) => {
-          if (stockErr) return reject(stockErr);
-          resolve(validation);
-        }
-      );
-    });
-  } catch (stockErr) {
-    console.error("Outward stock validation failed; continuing with save:", stockErr.message);
-  }
-
-  if (stockValidation && !stockValidation.ok) {
-    return res.status(400).json({ error: stockValidation.error });
-  }
-
   return saveSQLiteFirst();
 }));
 
@@ -1069,19 +1050,7 @@ router.put("/:id", async (req, res) => {
       return continueUpdate();
     }
 
-    validateOutwardStock(
-      { warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty, outwardId: req.params.id },
-      (stockErr, validation) => {
-        if (stockErr) {
-          console.error("Outward stock validation failed; continuing with update:", stockErr.message);
-          return continueUpdate();
-        }
-        if (!validation?.ok) {
-          return res.status(400).json({ error: validation.error });
-        }
-        return continueUpdate();
-      }
-    );
+    return continueUpdate();
   });
 });
 
