@@ -441,24 +441,37 @@ async function resolveMongoMasterId(value, model, sqliteTable, nameField = "name
 }
 
 async function resolveExpenseMasterIds(values) {
-  const resolved = {
-    location_id: await resolveMongoMasterId(values.location_id, MongoLocation, "locations"),
-    employee_id: await resolveMongoMasterId(values.employee_id, MongoEmployee, "employees"),
-    product_id: await resolveMongoMasterId(values.product_id, MongoProduct, "products"),
-    company_id: await resolveMongoMasterId(values.company_id, MongoCompany, "companies"),
-    company_account_id: await resolveMongoMasterId(values.company_account_id, MongoCompanyAccount, "company_accounts"),
-    reg_from_company_id: await resolveMongoMasterId(values.reg_from_company_id, MongoCompany, "companies"),
-  };
+  const [
+    location_id,
+    employee_id,
+    product_id,
+    company_id,
+    company_account_id,
+    reg_from_company_id,
+    send_to_ref_id,
+  ] = await Promise.all([
+    resolveMongoMasterId(values.location_id, MongoLocation, "locations"),
+    resolveMongoMasterId(values.employee_id, MongoEmployee, "employees"),
+    resolveMongoMasterId(values.product_id, MongoProduct, "products"),
+    resolveMongoMasterId(values.company_id, MongoCompany, "companies"),
+    resolveMongoMasterId(values.company_account_id, MongoCompanyAccount, "company_accounts"),
+    resolveMongoMasterId(values.reg_from_company_id, MongoCompany, "companies"),
+    values.send_to_kind === "company"
+      ? resolveMongoMasterId(values.send_to_ref_id, MongoCompany, "companies")
+      : values.send_to_kind === "warehouse"
+        ? resolveMongoMasterId(values.send_to_ref_id, MongoWarehouse, "warehouses")
+        : Promise.resolve(isPositiveNumber(values.send_to_ref_id) ? Number(values.send_to_ref_id) : null),
+  ]);
 
-  if (values.send_to_kind === "company") {
-    resolved.send_to_ref_id = await resolveMongoMasterId(values.send_to_ref_id, MongoCompany, "companies");
-  } else if (values.send_to_kind === "warehouse") {
-    resolved.send_to_ref_id = await resolveMongoMasterId(values.send_to_ref_id, MongoWarehouse, "warehouses");
-  } else {
-    resolved.send_to_ref_id = isPositiveNumber(values.send_to_ref_id)
-      ? Number(values.send_to_ref_id)
-      : null;
-  }
+  const resolved = {
+    location_id,
+    employee_id,
+    product_id,
+    company_id,
+    company_account_id,
+    reg_from_company_id,
+    send_to_ref_id,
+  };
 
   return resolved;
 }
