@@ -35,6 +35,20 @@ const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Numbe
 const safeText = (v) => (v ? v : null);
 const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
 const mongoReady = () => isMongoMirrorReady();
+const coerceSqlId = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) && value > 0 ? value : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const num = Number(trimmed);
+    return Number.isFinite(num) && num > 0 ? num : trimmed;
+  }
+  if (typeof value === "object") {
+    return coerceSqlId(value.id || value._id || value.value);
+  }
+  return null;
+};
 
 function buildOutwardMirrorRowData(rowId, payload = {}, resolvedIds = {}, normalizedWarehouseId = null, extra = {}) {
   const qty = safeNumber(payload?.quantity ?? payload?.qty ?? payload?.weight);
@@ -812,7 +826,14 @@ router.post("/", wrapAsync(async (req, res) => {
 
   const qty = safeNumber(quantity) || safeNumber(weight);
   const isSelfLoading = String(self_loading || "No").trim().toLowerCase() === "yes";
-  const resolvedIds = await resolveEntryMasterIds(db, req.body);
+  const resolvedIds = {
+    employee_id: coerceSqlId(employee_id),
+    location_id: coerceSqlId(location_id),
+    warehouse_id: coerceSqlId(warehouse_id),
+    product_id: coerceSqlId(product_id),
+    company_id: coerceSqlId(company_id),
+    company_account_id: coerceSqlId(company_account_id),
+  };
 
   const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
   if (!isSelfLoading && !normalizedWarehouseId) {
@@ -914,12 +935,14 @@ router.put("/:id", async (req, res) => {
   const rateVal = safeNumber(rate);
   const amount = qty * rateVal;
   const isSelfLoading = String(self_loading || "No").trim().toLowerCase() === "yes";
-  let resolvedIds;
-  try {
-    resolvedIds = await resolveEntryMasterIds(db, req.body);
-  } catch (resolveErr) {
-    return res.status(500).json({ error: resolveErr.message });
-  }
+  const resolvedIds = {
+    employee_id: coerceSqlId(employee_id),
+    location_id: coerceSqlId(location_id),
+    warehouse_id: coerceSqlId(warehouse_id),
+    product_id: coerceSqlId(product_id),
+    company_id: coerceSqlId(company_id),
+    company_account_id: coerceSqlId(company_account_id),
+  };
 
   const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
 
