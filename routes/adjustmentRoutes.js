@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { resolveEntryMasterIds } = require("../helpers/sqliteMasterResolver");
 
 function calculateMonthSlab(inwardDateStr, outwardDateStr) {
   const inwardDate = new Date(inwardDateStr);
@@ -30,18 +31,22 @@ function addQty(...values) {
 
 router.get("/parties", (req, res) => {
   const { warehouse_id, location_id, product_id } = req.query;
-  const warehouseId = Number(warehouse_id) || null;
-  const locationId = Number(location_id) || null;
+  const resolvedIds = resolveEntryMasterIds(db, req.query).catch(() => null);
 
-  if (!warehouseId && !locationId) {
-    return res.status(400).json({ error: "warehouse_id or location_id required" });
-  }
+  resolvedIds
+    .then((ids) => {
+      const warehouseId = Number(ids?.warehouse_id) || null;
+      const locationId = Number(ids?.location_id) || null;
 
-  const productId = product_id ? Number(product_id) || null : null;
-  const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
-  const scopeValue = useWarehouse ? warehouseId : locationId;
+      if (!warehouseId && !locationId) {
+        return res.status(400).json({ error: "warehouse_id or location_id required" });
+      }
 
-  const sql = `
+      const productId = ids?.product_id ? Number(ids.product_id) || null : null;
+      const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
+      const scopeValue = useWarehouse ? warehouseId : locationId;
+
+      const sql = `
     SELECT DISTINCT id, name, source_type
     FROM (
       SELECT
@@ -77,27 +82,32 @@ router.get("/parties", (req, res) => {
     ORDER BY name ASC, source_type ASC
   `;
 
-  db.all(sql, [scopeValue, productId, productId, scopeValue, productId, productId], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows || []);
-  });
+      db.all(sql, [scopeValue, productId, productId, scopeValue, productId, productId], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
+      });
+    })
+    .catch((err) => res.status(500).json({ error: err.message }));
 });
 
 router.get("/inward/report", (req, res) => {
   const { warehouse_id, location_id, company_id, outward_date, source_type } = req.query;
-  const warehouseId = Number(warehouse_id) || null;
-  const locationId = Number(location_id) || null;
+  resolveEntryMasterIds(db, req.query)
+    .then((ids) => {
+      const warehouseId = Number(ids?.warehouse_id) || null;
+      const locationId = Number(ids?.location_id) || null;
+      const companyId = Number(ids?.company_id) || null;
 
-  if ((!warehouseId && !locationId) || !company_id || !outward_date) {
-    return res.status(400).json({
-      error: "warehouse_id or location_id, company_id and outward_date required",
-    });
-  }
+      if ((!warehouseId && !locationId) || !companyId || !outward_date) {
+        return res.status(400).json({
+          error: "warehouse_id or location_id, company_id and outward_date required",
+        });
+      }
 
-  if (source_type === "palti_lorry") {
-    const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
-    const scopeValue = useWarehouse ? warehouseId : locationId;
-    const paltiSql = `
+      if (source_type === "palti_lorry") {
+        const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
+        const scopeValue = useWarehouse ? warehouseId : locationId;
+        const paltiSql = `
       SELECT
         p.id,
         p.voucher_no,
@@ -123,10 +133,10 @@ router.get("/inward/report", (req, res) => {
       ORDER BY p.expense_date ASC, p.id ASC
     `;
 
-    return db.all(paltiSql, [company_id, scopeValue], (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
+        return db.all(paltiSql, [companyId, scopeValue], (err, rows) => {
+          if (err) return res.status(500).json({ error: err.message });
 
-      const result = (rows || [])
+          const result = (rows || [])
         .map((row) => {
           const slab = calculateMonthSlab(row.date, outward_date);
           const grossQty = Number(row.gross_qty) || 0;
@@ -148,13 +158,13 @@ router.get("/inward/report", (req, res) => {
         })
         .filter((row) => row.available_qty > 0);
 
-      return res.json(result);
-    });
-  }
+          return res.json(result);
+        });
+      }
 
-  const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
-  const scopeValue = useWarehouse ? warehouseId : locationId;
-  const sql = `
+      const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
+      const scopeValue = useWarehouse ? warehouseId : locationId;
+      const sql = `
     SELECT
       i.id,
       i.voucher_no,
@@ -178,10 +188,10 @@ router.get("/inward/report", (req, res) => {
     ORDER BY i.date ASC, i.id ASC
   `;
 
-  db.all(sql, [scopeValue, company_id], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+      db.all(sql, [scopeValue, companyId], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
 
-    const result = rows
+        const result = rows
       .map((row) => {
         const slab = calculateMonthSlab(row.date, outward_date);
         const grossQty = Number(row.gross_qty) || 0;
@@ -206,8 +216,10 @@ router.get("/inward/report", (req, res) => {
       })
       .filter((row) => row.available_qty > 0);
 
-    res.json(result);
-  });
+        res.json(result);
+      });
+    })
+    .catch((err) => res.status(500).json({ error: err.message }));
 });
 
 router.post("/final-save", async (req, res) => {
