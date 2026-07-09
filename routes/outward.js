@@ -848,47 +848,58 @@ router.post("/", wrapAsync(async (req, res) => {
     return res.status(403).json({ error: "You can only create entries for your assigned warehouse" });
   }
 
-  const payload = {
-    date,
-    employee_id,
-    location_id,
-    warehouse_id,
-    product_id,
-    company_id,
-    company_account_id,
-    buyer_name,
-    consignee_name,
-    lorry_no,
-    weight,
-    quantity,
-    rate,
-    inv_no,
-    self_loading,
-  };
+  const rateVal = safeNumber(rate);
+  const amount = qty * rateVal;
 
-  const finalizeResponse = (source, mongoDoc, sqliteRow, extra = {}) => {
-    return res.json({
-      id: mongoDoc?._id ? String(mongoDoc._id) : sqliteRow?.id,
-      voucher_no: mongoDoc?.outward_no || sqliteRow?.voucher_no || null,
-      saved_to: source,
-      ...extra,
-    });
-  };
+  db.get(`SELECT IFNULL(MAX(sl_no),0)+1 AS max_sl FROM outward`, [], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
 
-  const saveSQLiteFirst = () =>
-    insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, (sqliteErr, sqliteRow) => {
-      if (sqliteErr) {
-        return res.status(500).json({ error: sqliteErr.message });
+    const nextSl = row?.max_sl || 1;
+    const voucher_no = formatOutwardVoucher(nextSl);
+
+    db.run(
+      `
+      INSERT INTO outward (
+        sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
+        product_id, company_id, company_account_id,
+        lorry_no, weight, quantity, rate, amount,
+        buyer_name, consignee_name, inv_no, self_loading, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        nextSl,
+        voucher_no,
+        date,
+        resolvedIds.employee_id || null,
+        resolvedIds.location_id || null,
+        normalizedWarehouseId,
+        resolvedIds.product_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
+        lorry_no || null,
+        safeNumber(weight),
+        qty,
+        rateVal,
+        amount,
+        buyer_name || null,
+        consignee_name || null,
+        inv_no || null,
+        self_loading || "No",
+        "Pending",
+      ],
+      function onInsert(insertErr) {
+        if (insertErr) {
+          return res.status(500).json({ error: insertErr.message });
+        }
+
+        return res.json({
+          id: this.lastID,
+          sl_no: nextSl,
+          voucher_no,
+        });
       }
-
-      return finalizeResponse("sqlite", null, sqliteRow);
-    });
-
-  if (isSelfLoading) {
-    return saveSQLiteFirst();
-  }
-
-  return saveSQLiteFirst();
+    );
+  });
 }));
 
 router.put("/:id", async (req, res) => {
@@ -914,24 +925,6 @@ router.put("/:id", async (req, res) => {
     self_loading,
   } = req.body;
 
-  const payload = {
-    date,
-    employee_id,
-    location_id,
-    warehouse_id,
-    product_id,
-    company_id,
-    company_account_id,
-    buyer_name,
-    consignee_name,
-    lorry_no,
-    weight,
-    quantity,
-    rate,
-    inv_no,
-    self_loading,
-  };
-
   const qty = safeNumber(quantity) || safeNumber(weight);
   const rateVal = safeNumber(rate);
   const amount = qty * rateVal;
@@ -947,134 +940,48 @@ router.put("/:id", async (req, res) => {
 
   const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
 
-  if (mongoReady() && mongoose.Types.ObjectId.isValid(req.params.id)) {
-    const mongoPayload = buildMongoOutwardPayload(payload, resolvedIds, normalizedWarehouseId);
-
-    const currentDoc = await MongoOutward.findById(req.params.id).lean();
-    if (!currentDoc) {
-      return res.status(404).json({ error: "Outward not found" });
-    }
-
-    const canAccessExistingWarehouse = !currentDoc.warehouse_id || canAccessWarehouse(req.user, currentDoc.warehouse_id);
-    const canAccessNewWarehouse =
-      isSelfLoading ||
-      canAccessWarehouse(req.user, warehouse_id) ||
-      canAccessWarehouse(req.user, normalizedWarehouseId);
-
-    if (!canAccessExistingWarehouse || !canAccessNewWarehouse) {
-      return res.status(403).json({ error: "You can only edit entries for your assigned warehouse" });
-    }
-
-    if (!isSelfLoading && normalizedWarehouseId) {
-      const stockCheck = await new Promise((resolve, reject) => {
-        validateOutwardStock(
-          { warehouse_id: normalizedWarehouseId, product_id: resolvedIds.product_id, qty, outwardId: req.params.id },
-          (stockErr, validation) => {
-            if (stockErr) return reject(stockErr);
-            return resolve(validation);
-          }
-        );
-      }).catch((err) => ({ ok: false, error: err.message }));
-
-      if (!stockCheck?.ok) {
-        return res.status(400).json({ error: stockCheck.error || "Not enough stock in this warehouse." });
-      }
-    }
-
-    const updatedDoc = await MongoOutward.findByIdAndUpdate(req.params.id, mongoPayload, { new: true }).lean();
-    const mirrorVoucherNo = currentDoc.outward_no || currentDoc.voucher_no || mongoPayload.outward_no || safeText(inv_no);
-
-    return upsertOutwardMirrorByVoucherNo(
-      mirrorVoucherNo,
-      payload,
-      resolvedIds,
-      normalizedWarehouseId,
-      (mirrorErr) => {
-        if (mirrorErr) {
-          console.error("Mongo outward mirror sync failed:", mirrorErr.message);
-          return res.status(500).json({ error: mirrorErr.message });
-        }
-
-        return res.json(buildOutwardResponse(updatedDoc, "mongodb"));
-      },
-      null
-    );
-  }
-
-  db.get(`SELECT sl_no, voucher_no, warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
+  db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!row) return res.status(404).json({ error: "Outward not found" });
 
-    const canAccessExistingWarehouse = !row.warehouse_id || canAccessWarehouse(req.user, row.warehouse_id);
-    const canAccessNewWarehouse =
-      isSelfLoading ||
-      canAccessWarehouse(req.user, warehouse_id) ||
-      canAccessWarehouse(req.user, normalizedWarehouseId);
-
-    if (!canAccessExistingWarehouse || !canAccessNewWarehouse) {
+    if (!canAccessWarehouse(req.user, row.warehouse_id) && !canAccessWarehouse(req.user, normalizedWarehouseId)) {
       return res.status(403).json({ error: "You can only edit entries for your assigned warehouse" });
     }
 
-    const continueUpdate = () => {
-      db.run(
-        `
-        UPDATE outward SET
-          date=?, employee_id=?, location_id=?, warehouse_id=?,
-          product_id=?, company_id=?, company_account_id=?,
-          buyer_name=?, consignee_name=?,
-          lorry_no=?, weight=?, quantity=?, rate=?, amount=?,
-          inv_no=?, self_loading=?,
-          status='Pending'
-        WHERE id=?
-        `,
-        [
-          safeText(date),
-          resolvedIds.employee_id || null,
-          resolvedIds.location_id || null,
-          normalizedWarehouseId,
-          resolvedIds.product_id || null,
-          resolvedIds.company_id || null,
-          resolvedIds.company_account_id || null,
-          safeText(buyer_name),
-          safeText(consignee_name),
-          safeText(lorry_no),
-          safeNumber(weight),
-          qty,
-          rateVal,
-          amount,
-          safeText(inv_no),
-          safeText(self_loading) || "No",
-          req.params.id,
-        ],
-        function onUpdate(err) {
-          if (err) return res.status(500).json({ error: err.message });
-
-          const mirrorRow = buildOutwardMirrorRowData(
-            req.params.id,
-            payload,
-            resolvedIds,
-            normalizedWarehouseId,
-            {
-              sl_no: row.sl_no,
-              voucher_no: row.voucher_no,
-              status: "Pending",
-            }
-          );
-
-          syncOutwardRowToMirror(req.params.id, mirrorRow).catch((mirrorErr) => {
-            console.error("Outward mirror row sync failed on update:", mirrorErr?.message || mirrorErr);
-          });
-
-          return res.json({ message: "Updated & Reset to Pending" });
-        }
-      );
-    };
-
-    if (isSelfLoading) {
-      return continueUpdate();
-    }
-
-    return continueUpdate();
+    db.run(
+      `
+      UPDATE outward SET
+        date=?, employee_id=?, location_id=?, warehouse_id=?,
+        product_id=?, company_id=?, company_account_id=?,
+        buyer_name=?, consignee_name=?,
+        lorry_no=?, weight=?, quantity=?, rate=?, amount=?,
+        inv_no=?, self_loading=?, status='Pending'
+      WHERE id=?
+      `,
+      [
+        safeText(date),
+        resolvedIds.employee_id || null,
+        resolvedIds.location_id || null,
+        normalizedWarehouseId,
+        resolvedIds.product_id || null,
+        resolvedIds.company_id || null,
+        resolvedIds.company_account_id || null,
+        safeText(buyer_name),
+        safeText(consignee_name),
+        safeText(lorry_no),
+        safeNumber(weight),
+        qty,
+        rateVal,
+        amount,
+        safeText(inv_no),
+        safeText(self_loading) || "No",
+        req.params.id,
+      ],
+      function onUpdate(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        return res.json({ message: "Updated & Reset to Pending" });
+      }
+    );
   });
 });
 
