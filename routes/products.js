@@ -10,6 +10,7 @@ const {
 
 function canReadProducts(user) {
   return [
+    "products.view",
     "products.manage",
     "inward.view",
     "inward.create",
@@ -19,6 +20,7 @@ function canReadProducts(user) {
     "expense.entry",
     "expense.view",
     "expense.create",
+    "expense.edit",
     "transport.manage",
     "report.inward",
     "report.erp",
