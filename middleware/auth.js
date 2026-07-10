@@ -550,7 +550,7 @@ function isAdminUser(
 ) {
 
   return (
-    ["admin", "ho"].includes(
+    ["admin"].includes(
       normalizeRole(
         user?.role
       )
