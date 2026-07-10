@@ -502,20 +502,13 @@ function userHasPermission(
       user.role
     );
 
-  const legacyMatches =
-    (LEGACY_PERMISSION_MAP[permission] || [])
-      .some((item) =>
-        permissions.includes(item)
-      );
-
   return (
     permissions.includes(
       "all"
     ) ||
     permissions.includes(
       permission
-    ) ||
-    legacyMatches
+    )
   );
 }
 
