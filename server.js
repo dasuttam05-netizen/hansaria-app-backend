@@ -412,28 +412,28 @@ app.use(
 app.use(
   "/api/companies",
   authenticate,
-  authorize("companies.manage"),
+  authorize(["companies.view", "companies.manage", "expense.view", "expense.create", "expense.edit"]),
   companiesRoute
 );
 
 app.use(
   "/api/company-accounts",
   authenticate,
-  authorize("companyAccounts.manage"),
+  authorize(["companyAccounts.view", "companyAccounts.manage", "expense.view", "expense.create", "expense.edit"]),
   companyAccountsRoute
 );
 
 app.use(
   "/api/warehouses",
   authenticate,
-  authorize("warehouses.manage"),
+  authorize(["warehouses.view", "warehouses.manage", "expense.view", "expense.create", "expense.edit"]),
   warehouseRoutes
 );
 
 app.use(
   "/api/products",
   authenticate,
-  authorize("products.manage"),
+  authorize(["products.view", "products.manage", "expense.view", "expense.create", "expense.edit"]),
   productsRoute
 );
 
