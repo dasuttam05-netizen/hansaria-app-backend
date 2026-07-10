@@ -10,6 +10,7 @@ const {
 
 function canReadLocations(user) {
   return [
+    "locations.view",
     "locations.manage",
     "expense.entry",
     "expense.view",
@@ -65,10 +66,10 @@ router.post("/", async (req, res) => {
       });
     }
 
-    if (!isAdminUser(req.user)) {
+    if (!userHasPermission(req.user, "locations.manage")) {
       return res.status(403).json({
         error:
-          "Only admin can edit location master",
+          "You do not have permission to create locations",
       });
     }
 
@@ -107,10 +108,10 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    if (!isAdminUser(req.user)) {
+    if (!userHasPermission(req.user, "locations.manage")) {
       return res.status(403).json({
         error:
-          "Only admin can edit location master",
+          "You do not have permission to edit locations",
       });
     }
 
@@ -155,10 +156,10 @@ router.delete("/:id", async (req, res) => {
       });
     }
 
-    if (!isAdminUser(req.user)) {
+    if (!userHasPermission(req.user, "locations.manage")) {
       return res.status(403).json({
         error:
-          "Only admin can edit location master",
+          "You do not have permission to delete locations",
       });
     }
 
