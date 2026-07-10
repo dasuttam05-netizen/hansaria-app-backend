@@ -10,6 +10,7 @@ const {
 
 function canReadCompanies(user) {
   return [
+    "companies.view",
     "companies.manage",
     "inward.view",
     "inward.create",
@@ -19,6 +20,7 @@ function canReadCompanies(user) {
     "expense.entry",
     "expense.view",
     "expense.create",
+    "expense.edit",
     "cash.view",
     "settlement.view",
     "report.inward",
