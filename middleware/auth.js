@@ -1,43 +1,51 @@
-const jwt = require("jsonwebtoken");
+import axios from "axios";
 
-const db = require("../db");
-
-const { mongoose, Employee, Warehouse, Location } = require("../mongo");
-
-const SECRET =
-  process.env.JWT_SECRET ||
-  "supersecret";
-
-const REPORT_PERMISSION_KEYS = [
-  "report.inward",
-  "report.erp",
-  "report.partyLedger",
-  "report.partyStock",
-  "report.warehouseRentLedger",
-  "report.warehouseRentMonthEnd",
-  "report.outwardSettlement",
-  "report.expense",
-  "report.paltiLorryAdjustment",
-  "report.cash",
-];
-
-const ROLE_DEFAULT_PERMISSIONS = {
+export const ROLE_PERMISSION_PRESETS = {
   admin: ["all"],
-
   bm: [
     "dashboard.view",
+    "employees.view",
+    "employees.edit.non_admin",
+    "companies.view",
+    "companies.create",
+    "companies.edit",
+    "companies.delete",
+    "companyAccounts.view",
+    "companyAccounts.create",
+    "companyAccounts.edit",
+    "companyAccounts.delete",
+    "locations.view",
+    "locations.create",
+    "locations.edit",
+    "locations.delete",
+    "warehouses.view",
+    "warehouses.create",
+    "warehouses.edit",
+    "warehouses.delete",
+    "products.view",
+    "products.create",
+    "products.edit",
+    "products.delete",
+    "farmers.view",
+    "farmers.create",
+    "farmers.edit",
+    "farmers.delete",
     "inward.view",
     "inward.create",
     "inward.edit",
+    "inward.delete",
     "outward.view",
     "outward.create",
     "outward.edit",
+    "outward.delete",
     "adjustment.manage",
     "settlement.view",
+    "settlement.companyRate",
     "expense.entry",
     "expense.view",
     "expense.create",
     "expense.edit",
+    "expense.delete",
     "buyerNames.view",
     "buyerNames.create",
     "buyerNames.edit",
@@ -51,16 +59,147 @@ const ROLE_DEFAULT_PERMISSIONS = {
     "expense.selfLoading",
     "expense.localSale",
     "expense.pending",
+    "cash.view",
+    "cash.create",
+    "cash.edit",
+    "cash.delete",
     "cash.mainBook.view",
     "cash.mainBook.create",
+    "cash.mainBook.edit",
+    "cash.mainBook.delete",
+    "cash.partiesBook.view",
+    "cash.partiesBook.create",
+    "cash.partiesBook.edit",
+    "cash.partiesBook.delete",
     "cash.employeeBook.view",
     "cash.employeeBook.create",
+    "cash.employeeBook.edit",
+    "cash.employeeBook.delete",
+    "warehouse.trading.view",
+    "warehouse.trading.purchase.view",
+    "warehouse.trading.purchase.manage",
+    "warehouse.trading.sale.view",
+    "warehouse.trading.sale.manage",
+    "warehouse.trading.payment.view",
+    "warehouse.trading.payment.manage",
+    "warehouse.trading.receipt.view",
+    "warehouse.trading.receipt.manage",
+    "warehouse.trading.journal.view",
+    "warehouse.trading.journal.manage",
+    "warehouse.trading.report.sale",
+    "warehouse.trading.report.purchase",
+    "warehouse.trading.report.profitLoss",
     "report.inward",
+    "report.erp",
+    "report.partyLedger",
+    "report.partyStock",
+    "report.warehouseRentLedger",
+    "report.warehouseRentMonthEnd",
     "report.outwardSettlement",
     "report.expense",
+    "report.paltiLorryAdjustment",
     "report.cash",
+    "transport.manage",
   ],
-
+  ho: [
+    "dashboard.view",
+    "employees.view",
+    "employees.edit.non_admin",
+    "companies.view",
+    "companies.create",
+    "companies.edit",
+    "companies.delete",
+    "companyAccounts.view",
+    "companyAccounts.create",
+    "companyAccounts.edit",
+    "companyAccounts.delete",
+    "locations.view",
+    "locations.create",
+    "locations.edit",
+    "locations.delete",
+    "warehouses.view",
+    "warehouses.create",
+    "warehouses.edit",
+    "warehouses.delete",
+    "products.view",
+    "products.create",
+    "products.edit",
+    "products.delete",
+    "farmers.view",
+    "farmers.create",
+    "farmers.edit",
+    "farmers.delete",
+    "inward.view",
+    "inward.create",
+    "inward.edit",
+    "inward.delete",
+    "outward.view",
+    "outward.create",
+    "outward.edit",
+    "outward.delete",
+    "adjustment.manage",
+    "settlement.view",
+    "settlement.companyRate",
+    "expense.entry",
+    "expense.view",
+    "expense.create",
+    "expense.edit",
+    "expense.delete",
+    "buyerNames.view",
+    "buyerNames.create",
+    "buyerNames.edit",
+    "buyerNames.delete",
+    "consigneeNames.view",
+    "consigneeNames.create",
+    "consigneeNames.edit",
+    "consigneeNames.delete",
+    "expense.postedInward",
+    "expense.palti",
+    "expense.selfLoading",
+    "expense.localSale",
+    "expense.pending",
+    "cash.view",
+    "cash.create",
+    "cash.edit",
+    "cash.delete",
+    "cash.mainBook.view",
+    "cash.mainBook.create",
+    "cash.mainBook.edit",
+    "cash.mainBook.delete",
+    "cash.partiesBook.view",
+    "cash.partiesBook.create",
+    "cash.partiesBook.edit",
+    "cash.partiesBook.delete",
+    "cash.employeeBook.view",
+    "cash.employeeBook.create",
+    "cash.employeeBook.edit",
+    "cash.employeeBook.delete",
+    "warehouse.trading.view",
+    "warehouse.trading.purchase.view",
+    "warehouse.trading.purchase.manage",
+    "warehouse.trading.sale.view",
+    "warehouse.trading.sale.manage",
+    "warehouse.trading.payment.view",
+    "warehouse.trading.payment.manage",
+    "warehouse.trading.receipt.view",
+    "warehouse.trading.receipt.manage",
+    "warehouse.trading.journal.view",
+    "warehouse.trading.journal.manage",
+    "warehouse.trading.report.sale",
+    "warehouse.trading.report.purchase",
+    "warehouse.trading.report.profitLoss",
+    "report.inward",
+    "report.erp",
+    "report.partyLedger",
+    "report.partyStock",
+    "report.warehouseRentLedger",
+    "report.warehouseRentMonthEnd",
+    "report.outwardSettlement",
+    "report.expense",
+    "report.paltiLorryAdjustment",
+    "report.cash",
+    "transport.manage",
+  ],
   manager: [
     "dashboard.view",
     "employees.view",
@@ -99,6 +238,10 @@ const ROLE_DEFAULT_PERMISSIONS = {
     "expense.selfLoading",
     "expense.localSale",
     "expense.pending",
+    "cash.view",
+    "cash.create",
+    "cash.edit",
+    "cash.delete",
     "cash.mainBook.view",
     "cash.mainBook.create",
     "cash.mainBook.edit",
@@ -124,10 +267,18 @@ const ROLE_DEFAULT_PERMISSIONS = {
     "warehouse.trading.report.sale",
     "warehouse.trading.report.purchase",
     "warehouse.trading.report.profitLoss",
+    "report.inward",
+    "report.erp",
+    "report.partyLedger",
+    "report.partyStock",
+    "report.warehouseRentLedger",
+    "report.warehouseRentMonthEnd",
+    "report.outwardSettlement",
+    "report.expense",
+    "report.paltiLorryAdjustment",
+    "report.cash",
     "transport.manage",
-    ...REPORT_PERMISSION_KEYS,
   ],
-
   staff: [
     "dashboard.view",
     "inward.view",
@@ -141,37 +292,20 @@ const ROLE_DEFAULT_PERMISSIONS = {
     "report.inward",
     "report.outwardSettlement",
   ],
-
-  viewer: [
-    "dashboard.view",
-    "report.inward",
-  ],
+  viewer: ["dashboard.view", "report.inward"],
 };
+
+export function normalizeRole(role = "staff") {
+  const normalized = String(role || "").trim().toLowerCase();
+  return ROLE_PERMISSION_PRESETS[normalized] ? normalized : String(role || "staff").trim() || "staff";
+}
+
+const PERMISSION_DEPENDENCIES = {};
 
 const LEGACY_PERMISSION_MAP = {
   "employees.create": ["employees.manage"],
   "employees.edit": ["employees.manage"],
   "employees.delete": ["employees.manage"],
-  "locations.view": ["locations.manage"],
-  "locations.create": ["locations.manage"],
-  "locations.edit": ["locations.manage"],
-  "locations.delete": ["locations.manage"],
-  "warehouses.view": ["warehouses.manage"],
-  "warehouses.create": ["warehouses.manage"],
-  "warehouses.edit": ["warehouses.manage"],
-  "warehouses.delete": ["warehouses.manage"],
-  "companies.view": ["companies.manage"],
-  "companies.create": ["companies.manage"],
-  "companies.edit": ["companies.manage"],
-  "companies.delete": ["companies.manage"],
-  "companyAccounts.view": ["companyAccounts.manage"],
-  "companyAccounts.create": ["companyAccounts.manage"],
-  "companyAccounts.edit": ["companyAccounts.manage"],
-  "companyAccounts.delete": ["companyAccounts.manage"],
-  "products.view": ["products.manage"],
-  "products.create": ["products.manage"],
-  "products.edit": ["products.manage"],
-  "products.delete": ["products.manage"],
   "inward.view": ["inward.manage"],
   "inward.create": ["inward.manage"],
   "inward.edit": ["inward.manage"],
@@ -197,21 +331,7 @@ const LEGACY_PERMISSION_MAP = {
   "expense.palti": ["expense.view", "report.expense"],
   "expense.selfLoading": ["expense.view", "report.expense", "outward.view"],
   "expense.localSale": ["expense.view", "report.expense"],
-  "expense.pending": ["cash.mainBook.view"],
-  "settlement.view": ["reports.view"],
-  "settlement.companyRate": ["settlement.view"],
-  "report.inward": ["reports.view"],
-  "report.erp": ["reports.view"],
-  "report.partyLedger": ["reports.view"],
-  "report.partyStock": ["reports.view"],
-  "report.warehouseRentLedger": ["reports.view"],
-  "report.warehouseRentMonthEnd": ["reports.view"],
-  "report.outwardSettlement": ["reports.view"],
-  "report.expense": ["reports.view"],
-  "report.paltiLorryAdjustment": ["report.expense", "reports.view"],
-  "report.cash": ["reports.view"],
-  "warehouses.view": ["warehouses.manage"],
-  // Backward compatibility for old cash permissions
+  "expense.pending": ["cash.view"],
   "cash.view": ["cash.mainBook.view", "cash.partiesBook.view", "cash.employeeBook.view"],
   "cash.create": ["cash.mainBook.create", "cash.partiesBook.create", "cash.employeeBook.create"],
   "cash.edit": ["cash.mainBook.edit", "cash.partiesBook.edit", "cash.employeeBook.edit"],
@@ -228,6 +348,19 @@ const LEGACY_PERMISSION_MAP = {
   "cash.employeeBook.create": ["cash.create"],
   "cash.employeeBook.edit": ["cash.edit"],
   "cash.employeeBook.delete": ["cash.delete"],
+  "settlement.view": ["reports.view"],
+  "settlement.companyRate": ["settlement.view"],
+  "report.inward": ["reports.view"],
+  "report.erp": ["reports.view"],
+  "report.partyLedger": ["reports.view"],
+  "report.partyStock": ["reports.view"],
+  "report.warehouseRentLedger": ["reports.view"],
+  "report.warehouseRentMonthEnd": ["reports.view"],
+  "report.outwardSettlement": ["reports.view"],
+  "report.expense": ["reports.view"],
+  "report.paltiLorryAdjustment": ["report.expense", "reports.view"],
+  "report.cash": ["reports.view"],
+  "warehouses.view": ["warehouses.manage"],
   "farmers.view": ["farmers.manage"],
   "farmers.create": ["farmers.manage"],
   "farmers.edit": ["farmers.manage"],
@@ -265,490 +398,138 @@ const LEGACY_PERMISSION_MAP = {
   "warehouse.trading.journal.manage": ["warehouse.trading.manage"],
 };
 
-function normalizeRole(
-  role = "staff"
-) {
+function expandPermissions(permissions = []) {
+  const expanded = new Set(permissions || []);
 
-  const normalized =
-    String(role || "")
-      .trim()
-      .toLowerCase();
+  const addDependencies = (permission) => {
+    const deps = PERMISSION_DEPENDENCIES[permission] || [];
+    deps.forEach((dep) => {
+      if (!expanded.has(dep)) {
+        expanded.add(dep);
+        addDependencies(dep);
+      }
+    });
+  };
 
-  if (ROLE_DEFAULT_PERMISSIONS[normalized]) {
-    return normalized;
-  }
-
-  return String(role || "staff").trim() || "staff";
+  [...expanded].forEach(addDependencies);
+  return [...expanded];
 }
 
-function parsePermissions(
-  permissions = [],
-  role = "staff"
-) {
+function sanitizePermissionList(list = []) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+}
 
-  if (
-    role === "admin"
-  ) {
-    return ["all"];
-  }
-
+function parsePermissionInput(permissions) {
   if (Array.isArray(permissions)) {
-    return permissions
-      .map((item) =>
-        String(item || "")
-          .trim()
-      )
-      .filter((item) => item);
+    return sanitizePermissionList(permissions);
   }
 
   if (typeof permissions === "string") {
     const raw = permissions.trim();
-    if (!raw) {
-      return [];
-    }
+    if (!raw) return [];
 
     try {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        return parsed
-          .map((item) =>
-            String(item || "")
-              .trim()
-          )
-          .filter((item) => item);
+        return sanitizePermissionList(parsed);
       }
     } catch (_err) {
-      // Fall back to comma-separated parsing.
+      // Fall back to comma-separated values.
     }
 
-    return raw
-      .split(",")
-      .map((item) =>
-        String(item || "")
-          .trim()
-      )
-      .filter((item) => item);
+    return sanitizePermissionList(raw.split(","));
   }
 
-  return [];
+  return null;
 }
 
-function normalizeObjectIdArray(input) {
-  if (!Array.isArray(input)) return [];
-  return Array.from(
-    new Set(
-      input
-        .map((item) => {
-          if (!item) return "";
-          if (item._id) return String(item._id);
-          return String(item);
-        })
-        .filter((item) => item)
-    )
-  );
+const TOKEN_KEY = "token";
+const USER_KEY = "authUser";
+
+export function normalizePermissions(role = "staff", permissions = []) {
+  const normalizedRole = normalizeRole(role);
+
+  if (normalizedRole === "admin") {
+    return ["all"];
+  }
+
+  const parsedPermissions = parsePermissionInput(permissions);
+  if (parsedPermissions !== null) {
+    return [...new Set(parsedPermissions)];
+  }
+
+  return [...new Set(ROLE_PERMISSION_PRESETS[normalizedRole] || ROLE_PERMISSION_PRESETS.staff)];
 }
 
-async function loadAssignedWarehouseAccess(user) {
-  const userId = user?._id ? String(user._id) : String(user?.id || "");
-
-  if (!userId) {
-    return {
-      assigned_warehouse_ids: [],
-      assigned_sqlite_warehouse_ids: [],
-      location_ids: [],
-    };
+export function applyAuthToken(token) {
+  if (token) {
+    axios.defaults.headers.common.Authorization = `Bearer ${token}`;
+  } else {
+    delete axios.defaults.headers.common.Authorization;
   }
+}
 
-  let assignedWarehouseIds =
-    normalizeObjectIdArray(
-      user?.assigned_warehouse_ids
-    );
-
-  let warehouses = [];
-
-  if (user?.all_warehouse_access) {
-    warehouses = await Warehouse.find(
-      {},
-      { _id: 1, name: 1, location_id: 1 }
-    ).lean();
-
-    assignedWarehouseIds = (warehouses || [])
-      .map((row) => (row?._id ? String(row._id) : ""))
-      .filter((item) => item);
-  } else if (!assignedWarehouseIds.length) {
-    const legacyRows = await Warehouse.find(
-      {
-        $or: [
-          { employee_id: userId },
-          { employee_ids: userId },
-        ],
-      },
-      { _id: 1 }
-    ).lean();
-
-    assignedWarehouseIds = (legacyRows || [])
-      .map((row) => (row?._id ? String(row._id) : ""))
-      .filter((item) => item);
-  }
-
-  if (!assignedWarehouseIds.length && !user?.all_location_access) {
-    return {
-      assigned_warehouse_ids: [],
-      assigned_sqlite_warehouse_ids: [],
-      location_ids: [],
-    };
-  }
-
-  if (!warehouses.length && assignedWarehouseIds.length) {
-    warehouses = await Warehouse.find(
-      { _id: { $in: assignedWarehouseIds } },
-      { _id: 1, name: 1, location_id: 1 }
-    ).lean();
-  }
-
-  assignedWarehouseIds = (warehouses || [])
-    .map((row) => (row?._id ? String(row._id) : ""))
-    .filter((item) => item);
-
-  const assignedSqliteWarehouseIds = [];
-  for (const row of warehouses || []) {
-    const warehouseName = String(row?.name || "").trim();
-    if (!warehouseName) continue;
-
-    const sqliteRow = await new Promise((resolve) => {
-      db.get(
-        "SELECT id FROM warehouses WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) ORDER BY id ASC LIMIT 1",
-        [warehouseName],
-        (err, result) => resolve(err ? null : result || null)
-      );
-    });
-
-    if (sqliteRow?.id) {
-      assignedSqliteWarehouseIds.push(Number(sqliteRow.id));
-    }
-  }
-
-  let locationIds = Array.from(
-    new Set(
-      (warehouses || [])
-        .map((row) => {
-          const location = row?.location_id;
-          if (!location) return "";
-          return location._id ? String(location._id) : String(location);
-        })
-        .filter((item) => item)
-    )
-  );
-
-  if (user?.all_location_access) {
-    const allLocations = await Location.find({}, { _id: 1 }).lean();
-    locationIds = Array.from(
-      new Set([
-        ...locationIds,
-        ...(allLocations || [])
-          .map((row) => (row?._id ? String(row._id) : ""))
-          .filter((item) => item),
-      ])
-    );
-  }
-
-  return {
-    assigned_warehouse_ids: assignedWarehouseIds,
-    assigned_sqlite_warehouse_ids: Array.from(new Set(assignedSqliteWarehouseIds)),
-    location_ids: locationIds,
+export function saveSession(token, user) {
+  const normalizedUser = {
+    ...user,
+    role: normalizeRole(user?.role || "staff"),
+    permissions: normalizePermissions(user?.role, user?.permissions),
   };
+
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(USER_KEY, JSON.stringify(normalizedUser));
+  applyAuthToken(token);
+
+  return normalizedUser;
 }
 
-function buildUserPayload(
-  user
-) {
+export function loadSession() {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const rawUser = localStorage.getItem(USER_KEY);
 
-  return {
-    id:
-      user._id ||
-      user.id,
+  if (!token || !rawUser) {
+    applyAuthToken(null);
+    return { token: null, user: null };
+  }
 
-    username:
-      user.username,
+  try {
+    const parsedUser = JSON.parse(rawUser);
+    const user = {
+      ...parsedUser,
+      role: normalizeRole(parsedUser?.role || "staff"),
+      permissions: normalizePermissions(parsedUser?.role, parsedUser?.permissions),
+    };
 
-    name: user.name,
-
-    role:
-      normalizeRole(
-        user.role
-      ),
-
-    permissions:
-      parsePermissions(
-        user.permissions,
-        user.role
-      ),
-
-    location_id:
-      user.location_id?._id
-        ? String(user.location_id._id)
-        : user.location_id
-        ? String(user.location_id)
-        : null,
-
-    assigned_warehouse_ids:
-      normalizeObjectIdArray(
-        user.assigned_warehouse_ids
-      ),
-
-    all_location_access:
-      !!user.all_location_access,
-
-    all_warehouse_access:
-      !!user.all_warehouse_access,
-  };
+    applyAuthToken(token);
+    return { token, user };
+  } catch (error) {
+    clearSession();
+    return { token: null, user: null };
+  }
 }
 
-function userHasPermission(
-  user,
-  permission
-) {
+export function clearSession() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  applyAuthToken(null);
+}
 
-  if (
-    !user ||
-    !permission
-  ) {
+export function hasPermission(user, permission) {
+  if (!user || !permission) {
     return false;
   }
 
-  const permissions =
-    parsePermissions(
-      user.permissions,
-      user.role
-    );
-
+  const permissions = normalizePermissions(user.role, user.permissions);
   return (
-    permissions.includes(
-      "all"
-    ) ||
-    permissions.includes(
-      permission
-    )
+    ["admin"].includes(normalizeRole(user.role)) ||
+    permissions.includes("all") ||
+    permissions.includes(permission)
   );
 }
 
-async function buildAuthenticatedUserPayload(user) {
-  const payload = buildUserPayload(user);
-  const access =
-    await loadAssignedWarehouseAccess(user);
-
-  // Merge warehouse location IDs with employee's own location_ids
-  const employeeLocationIds = Array.isArray(user.location_ids)
-    ? user.location_ids
-      .map((id) => (id?._id ? String(id._id) : String(id)))
-      .filter((id) => id)
-    : [];
-
-  const mergedLocationIds = Array.from(
-    new Set([
-      ...access.location_ids,
-      ...employeeLocationIds,
-    ])
-  );
-
-  payload.assigned_warehouse_ids =
-    access.assigned_warehouse_ids;
-  payload.assigned_sqlite_warehouse_ids =
-    access.assigned_sqlite_warehouse_ids;
-  payload.location_ids =
-    mergedLocationIds;
-
-  if (!payload.location_id && mergedLocationIds.length) {
-    payload.location_id = mergedLocationIds[0];
-  }
-
-  return payload;
+export function hasAnyPermission(user, permissions = []) {
+  return (permissions || []).some((permission) => hasPermission(user, permission));
 }
-
-function isAdminUser(
-  user
-) {
-
-  return (
-    ["admin"].includes(
-      normalizeRole(
-        user?.role
-      )
-    )
-  );
-}
-
-function signUserToken(
-  user
-) {
-
-  return jwt.sign(
-    buildUserPayload(
-      user
-    ),
-    SECRET,
-    {
-      expiresIn: "8h",
-    }
-  );
-}
-
-async function authenticate(
-  req,
-  res,
-  next
-) {
-
-  try {
-
-    const authHeader =
-      req.headers
-        .authorization || "";
-
-    const token =
-      authHeader.startsWith(
-        "Bearer "
-      )
-        ? authHeader.slice(
-            7
-          )
-        : authHeader;
-
-    if (!token) {
-
-      return res.status(401)
-        .json({
-          error:
-            "Authentication required",
-        });
-    }
-
-    const decoded =
-      jwt.verify(
-        token,
-        SECRET
-      );
-
-    if (
-      !decoded?.id
-    ) {
-
-      return res.status(401)
-        .json({
-          error:
-            "Invalid token",
-      });
-    }
-
-    // If MongoDB is unavailable, fall back to the token payload so the app can
-    // keep serving read-only requests instead of timing out at the gateway.
-    if (mongoose.connection.readyState !== 1) {
-      req.user = decoded;
-      return next();
-    }
-
-    const user =
-      await Employee.findById(
-        decoded.id
-      );
-
-    if (!user) {
-      console.warn(
-        "AUTH WARNING: user not found in MongoDB, falling back to token payload for",
-        decoded.id
-      );
-      req.user = decoded;
-      return next();
-    }
-
-    req.user =
-      await buildAuthenticatedUserPayload(
-        user
-      );
-
-    next();
-
-  } catch (err) {
-
-    console.error(
-      "AUTH ERROR:",
-      err.message
-    );
-
-    return res.status(401)
-      .json({
-        error:
-          "Invalid or expired token",
-      });
-  }
-}
-
-function authorize(
-  permissions = []
-) {
-
-  const required =
-    Array.isArray(
-      permissions
-    )
-      ? permissions
-      : [permissions];
-
-  return (
-    req,
-    res,
-    next
-  ) => {
-
-    if (!req.user) {
-
-      return res.status(401)
-        .json({
-          error:
-            "Authentication required",
-        });
-    }
-
-    const allowed =
-      required.every(
-        (
-          permission
-        ) =>
-          userHasPermission(
-            req.user,
-            permission
-          )
-      );
-
-    if (!allowed) {
-
-      return res.status(403)
-        .json({
-          error:
-            "Permission denied",
-        });
-    }
-
-    next();
-  };
-}
-
-module.exports = {
-  SECRET,
-
-  normalizeRole,
-
-  parsePermissions,
-
-  buildUserPayload,
-
-  userHasPermission,
-
-  isAdminUser,
-
-  signUserToken,
-
-  authenticate,
-
-  authorize,
-};
