@@ -454,7 +454,7 @@ app.use(
 app.use(
   "/api/consignee-names",
   authenticate,
-  authorize(["outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.view", "expense.create", "expense.edit"]),
+  authorize(["consigneeNames.view", "consigneeNames.create", "consigneeNames.edit", "consigneeNames.delete", "outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.view", "expense.create", "expense.edit"]),
   authorizeConsigneeOrExpense,
   consigneeNamesRoutes
 );
@@ -462,7 +462,7 @@ app.use(
 app.use(
   "/api/buyer-names",
   authenticate,
-  authorize(["outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.view", "expense.create", "expense.edit"]),
+  authorize(["buyerNames.view", "buyerNames.create", "buyerNames.edit", "buyerNames.delete", "outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.view", "expense.create", "expense.edit"]),
   authorizeConsigneeOrExpense,
   buyerNamesRoutes
 );
