@@ -20,6 +20,7 @@ const upload = multer({
 
 function canReadCompanyAccounts(user) {
   return [
+    "companyAccounts.view",
     "companyAccounts.manage",
     "inward.view",
     "inward.create",
@@ -29,6 +30,7 @@ function canReadCompanyAccounts(user) {
     "expense.entry",
     "expense.view",
     "expense.create",
+    "expense.edit",
     "cash.view",
     "settlement.view",
     "report.inward",
