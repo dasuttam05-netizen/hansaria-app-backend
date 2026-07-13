@@ -60,7 +60,7 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
 
-    if (!userHasPermission(req.user, "products.manage")) {
+    if (!userHasPermission(req.user, "products.create")) {
       return res.status(403).json({
         error:
           "You do not have permission to create products",
@@ -95,7 +95,7 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   try {
 
-    if (!userHasPermission(req.user, "products.manage")) {
+    if (!userHasPermission(req.user, "products.edit")) {
       return res.status(403).json({
         error:
           "You do not have permission to edit products",
@@ -136,7 +136,7 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
 
-    if (!userHasPermission(req.user, "products.manage")) {
+    if (!userHasPermission(req.user, "products.delete")) {
       return res.status(403).json({
         error:
           "You do not have permission to delete products",
