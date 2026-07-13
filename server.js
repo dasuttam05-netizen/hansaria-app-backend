@@ -412,28 +412,28 @@ app.use(
 app.use(
   "/api/companies",
   authenticate,
-  authorize(["companies.view", "companies.manage", "expense.view", "expense.create", "expense.edit"]),
+  authorize(["companies.view", "companies.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   companiesRoute
 );
 
 app.use(
   "/api/company-accounts",
   authenticate,
-  authorize(["companyAccounts.view", "companyAccounts.manage", "expense.view", "expense.create", "expense.edit"]),
+  authorize(["companyAccounts.view", "companyAccounts.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   companyAccountsRoute
 );
 
 app.use(
   "/api/warehouses",
   authenticate,
-  authorize(["warehouses.view", "warehouses.manage", "expense.view", "expense.create", "expense.edit"]),
+  authorize(["warehouses.view", "warehouses.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   warehouseRoutes
 );
 
 app.use(
   "/api/products",
   authenticate,
-  authorize(["products.view", "products.manage", "expense.view", "expense.create", "expense.edit"]),
+  authorize(["products.view", "products.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   productsRoute
 );
 
@@ -454,7 +454,7 @@ app.use(
 app.use(
   "/api/consignee-names",
   authenticate,
-  authorize(["consigneeNames.view", "consigneeNames.create", "consigneeNames.edit", "consigneeNames.delete", "outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.view", "expense.create", "expense.edit"]),
+  authorize(["consigneeNames.view", "consigneeNames.create", "consigneeNames.edit", "consigneeNames.delete", "outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   authorizeConsigneeOrExpense,
   consigneeNamesRoutes
 );
@@ -462,7 +462,7 @@ app.use(
 app.use(
   "/api/buyer-names",
   authenticate,
-  authorize(["buyerNames.view", "buyerNames.create", "buyerNames.edit", "buyerNames.delete", "outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.view", "expense.create", "expense.edit"]),
+  authorize(["buyerNames.view", "buyerNames.create", "buyerNames.edit", "buyerNames.delete", "outward.view", "outward.create", "outward.edit", "adjustment.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   authorizeConsigneeOrExpense,
   buyerNamesRoutes
 );
@@ -470,7 +470,7 @@ app.use(
 app.use(
   "/api/farmers",
   authenticate,
-  authorize(["farmers.view", "farmers.create", "farmers.edit", "farmers.delete"]),
+  authorize(["farmers.view", "farmers.manage", "expense.view", "expense.create", "expense.edit"]),
   farmersRoutes
 );
 
