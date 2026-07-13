@@ -1,8 +1,7 @@
 const express = require("express");
 const db = require("../db");
 const dbMongo = require("../db-mongodb");
-const { mongoose, Employee } = require("../mongo");
-const { isAdminUser, ROLE_DEFAULT_PERMISSIONS } = require("../middleware/auth");
+const { isAdminUser } = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -10,12 +9,104 @@ const DEFAULT_ROLES = [
   {
     name: "HO",
     is_admin: 0,
-    permissions: ROLE_DEFAULT_PERMISSIONS.ho,
+    permissions: [
+      "dashboard.view",
+      "employees.view",
+      "employees.edit.non_admin",
+      "companies.manage",
+      "companyAccounts.manage",
+      "locations.manage",
+      "warehouses.manage",
+      "products.manage",
+      "inward.view",
+      "inward.create",
+      "inward.edit",
+      "inward.delete",
+      "outward.view",
+      "outward.create",
+      "outward.edit",
+      "outward.delete",
+      "adjustment.manage",
+      "settlement.view",
+      "expense.entry",
+      "expense.view",
+      "expense.create",
+      "expense.edit",
+      "expense.delete",
+      "expense.postedInward",
+      "expense.palti",
+      "expense.selfLoading",
+      "expense.localSale",
+      "expense.pending",
+      "cash.mainBook.view",
+      "cash.mainBook.create",
+      "cash.mainBook.edit",
+      "cash.mainBook.delete",
+      "cash.partiesBook.view",
+      "cash.partiesBook.create",
+      "cash.partiesBook.edit",
+      "cash.partiesBook.delete",
+      "cash.employeeBook.view",
+      "cash.employeeBook.create",
+      "cash.employeeBook.edit",
+      "cash.employeeBook.delete",
+      "warehouse.trading.purchase.view",
+      "warehouse.trading.purchase.manage",
+      "warehouse.trading.sale.view",
+      "warehouse.trading.sale.manage",
+      "warehouse.trading.payment.view",
+      "warehouse.trading.payment.manage",
+      "warehouse.trading.receipt.view",
+      "warehouse.trading.receipt.manage",
+      "warehouse.trading.journal.view",
+      "warehouse.trading.journal.manage",
+      "warehouse.trading.report.sale",
+      "warehouse.trading.report.purchase",
+      "warehouse.trading.report.profitLoss",
+      "report.inward",
+      "report.erp",
+      "report.partyLedger",
+      "report.partyStock",
+      "report.warehouseRentLedger",
+      "report.warehouseRentMonthEnd",
+      "report.outwardSettlement",
+      "report.expense",
+      "report.paltiLorryAdjustment",
+      "report.cash",
+      "transport.manage",
+    ],
   },
   {
     name: "BM",
     is_admin: 0,
-    permissions: ROLE_DEFAULT_PERMISSIONS.bm,
+    permissions: [
+      "dashboard.view",
+      "inward.view",
+      "inward.create",
+      "inward.edit",
+      "outward.view",
+      "outward.create",
+      "outward.edit",
+      "adjustment.manage",
+      "settlement.view",
+      "expense.entry",
+      "expense.view",
+      "expense.create",
+      "expense.edit",
+      "expense.postedInward",
+      "expense.palti",
+      "expense.selfLoading",
+      "expense.localSale",
+      "expense.pending",
+      "cash.mainBook.view",
+      "cash.mainBook.create",
+      "cash.employeeBook.view",
+      "cash.employeeBook.create",
+      "report.inward",
+      "report.outwardSettlement",
+      "report.expense",
+      "report.cash",
+    ],
   },
 ];
 
@@ -44,54 +135,6 @@ function getDefaultRoleRows() {
 function normalizePermissions(permissions) {
   const raw = Array.isArray(permissions) ? permissions : [];
   return Array.from(new Set(raw.filter(Boolean).map((item) => String(item).trim()).filter(Boolean)));
-}
-
-function roleKey(name) {
-  return String(name || "").trim().toLowerCase();
-}
-
-function isSeniorRole(name) {
-  return ["ho", "bm"].includes(roleKey(name));
-}
-
-function escapeRegex(value) {
-  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function getSqliteRoleById(id) {
-  return new Promise((resolve, reject) => {
-    db.get("SELECT * FROM roles WHERE id = ?", [id], (err, row) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(row || null);
-    });
-  });
-}
-
-async function updateAssignedEmployees(previousName, nextName, permissions) {
-  // Role permissions are copied to the employee record at login. Keeping the
-  // assigned users in sync means an HO/BM access tick takes effect immediately
-  // for every user on that role, rather than only for new users.
-  if (mongoose.connection.readyState !== 1) {
-    return 0;
-  }
-
-  const previousRole = roleKey(previousName);
-  if (!previousRole) return 0;
-
-  const result = await Employee.updateMany(
-    { role: { $regex: new RegExp(`^${escapeRegex(previousRole)}$`, "i") } },
-    {
-      $set: {
-        role: roleKey(nextName) || previousRole,
-        permissions: normalizePermissions(permissions),
-      },
-    }
-  );
-
-  return Number(result?.modifiedCount || result?.nModified || 0);
 }
 
 async function ensureDefaultRoles() {
@@ -197,7 +240,7 @@ router.get("/", async (req, res) => {
   }
 });
 
-router.post("/", async (req, res) => {
+router.post("/", (req, res) => {
   if (!isAdminUser(req.user)) {
     return res.status(403).json({ error: "Only admin can manage roles" });
   }
@@ -210,33 +253,17 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: "Role name is required" });
   }
 
-  if (isSeniorRole(name)) {
-    return res.status(400).json({ error: "HO and BM already exist as protected senior roles. Please edit their access instead." });
-  }
-
-  try {
-    const savedPermissions = is_admin ? ["all"] : permissions;
-    const result = await new Promise((resolve, reject) => {
-      db.run(
-        "INSERT INTO roles (name, permissions, is_admin) VALUES (?, ?, ?)",
-        [name, JSON.stringify(savedPermissions), is_admin],
-        function onInsert(err) {
-          if (err) {
-            reject(err);
-            return;
-          }
-          resolve(this.lastID);
-        }
-      );
-    });
-
-    return res.json({ id: result, name, permissions: savedPermissions, is_admin });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
+  db.run(
+    "INSERT INTO roles (name, permissions, is_admin) VALUES (?, ?, ?)",
+    [name, JSON.stringify(is_admin ? ["all"] : permissions), is_admin],
+    function onInsert(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      return res.json({ id: this.lastID, name, permissions: is_admin ? ["all"] : permissions, is_admin });
+    }
+  );
 });
 
-router.put("/:id", async (req, res) => {
+router.put("/:id", (req, res) => {
   if (!isAdminUser(req.user)) {
     return res.status(403).json({ error: "Only admin can manage roles" });
   }
@@ -249,75 +276,25 @@ router.put("/:id", async (req, res) => {
     return res.status(400).json({ error: "Role name is required" });
   }
 
-  try {
-    const existing = await getSqliteRoleById(req.params.id);
-    if (!existing) {
-      return res.status(404).json({ error: "Role not found" });
+  db.run(
+    "UPDATE roles SET name = ?, permissions = ?, is_admin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    [name, JSON.stringify(is_admin ? ["all"] : permissions), is_admin, req.params.id],
+    function onUpdate(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      return res.json({ updated: this.changes });
     }
-
-    if (isSeniorRole(existing.name) && roleKey(name) !== roleKey(existing.name)) {
-      return res.status(400).json({ error: "HO and BM labels are fixed. You can change their access, but not rename them." });
-    }
-
-    const savedPermissions = is_admin ? ["all"] : permissions;
-    const updated = await new Promise((resolve, reject) => {
-      db.run(
-        "UPDATE roles SET name = ?, permissions = ?, is_admin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        [name, JSON.stringify(savedPermissions), is_admin, req.params.id],
-        function onUpdate(err) {
-          if (err) {
-            reject(err);
-            return;
-          }
-          resolve(this.changes);
-        }
-      );
-    });
-
-    const employeesUpdated = await updateAssignedEmployees(existing.name, name, savedPermissions);
-    return res.json({ updated, employees_updated: employeesUpdated });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
+  );
 });
 
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", (req, res) => {
   if (!isAdminUser(req.user)) {
     return res.status(403).json({ error: "Only admin can manage roles" });
   }
 
-  try {
-    const existing = await getSqliteRoleById(req.params.id);
-    if (!existing) {
-      return res.status(404).json({ error: "Role not found" });
-    }
-
-    if (isSeniorRole(existing.name)) {
-      return res.status(400).json({ error: "HO and BM are protected senior roles and cannot be deleted." });
-    }
-
-    if (mongoose.connection.readyState === 1) {
-      const assignedCount = await Employee.countDocuments({
-        role: { $regex: new RegExp(`^${escapeRegex(roleKey(existing.name))}$`, "i") },
-      });
-      if (assignedCount > 0) {
-        return res.status(400).json({ error: "This role is assigned to users. Reassign those users before deleting it." });
-      }
-    }
-
-    const deleted = await new Promise((resolve, reject) => {
-      db.run("DELETE FROM roles WHERE id = ?", [req.params.id], function onDelete(err) {
-        if (err) {
-          reject(err);
-          return;
-        }
-        resolve(this.changes);
-      });
-    });
-    return res.json({ deleted });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
+  db.run("DELETE FROM roles WHERE id = ?", [req.params.id], function onDelete(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    return res.json({ deleted: this.changes });
+  });
 });
 
 module.exports = router;
