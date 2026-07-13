@@ -66,7 +66,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    if (!userHasPermission(req.user, "locations.manage")) {
+    if (!userHasPermission(req.user, "locations.create")) {
       return res.status(403).json({
         error:
           "You do not have permission to create locations",
@@ -108,7 +108,7 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    if (!userHasPermission(req.user, "locations.manage")) {
+    if (!userHasPermission(req.user, "locations.edit")) {
       return res.status(403).json({
         error:
           "You do not have permission to edit locations",
@@ -156,7 +156,7 @@ router.delete("/:id", async (req, res) => {
       });
     }
 
-    if (!userHasPermission(req.user, "locations.manage")) {
+    if (!userHasPermission(req.user, "locations.delete")) {
       return res.status(403).json({
         error:
           "You do not have permission to delete locations",
