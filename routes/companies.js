@@ -71,7 +71,7 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
 
-    if (!userHasPermission(req.user, "companies.manage")) {
+    if (!userHasPermission(req.user, "companies.create")) {
       return res.status(403).json({
         error:
           "You do not have permission to create companies",
@@ -123,7 +123,7 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   try {
 
-    if (!userHasPermission(req.user, "companies.manage")) {
+    if (!userHasPermission(req.user, "companies.edit")) {
       return res.status(403).json({
         error:
           "You do not have permission to edit companies",
@@ -181,7 +181,7 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
 
-    if (!userHasPermission(req.user, "companies.manage")) {
+    if (!userHasPermission(req.user, "companies.delete")) {
       return res.status(403).json({
         error:
           "You do not have permission to delete companies",
