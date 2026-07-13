@@ -50,7 +50,7 @@ router.get("/", (req, res) => {
 });
 
 router.post("/", (req, res) => {
-  if (!canAccessBuyerNames(req.user)) {
+  if (!userHasPermission(req.user, "buyerNames.create")) {
     return res.status(403).json({ error: "You do not have permission to create buyer names" });
   }
 
@@ -173,7 +173,7 @@ router.post("/import-xlsx", upload.single("file"), (req, res) => {
 });
 
 router.put("/:id", (req, res) => {
-  if (!canAccessBuyerNames(req.user)) {
+  if (!userHasPermission(req.user, "buyerNames.edit")) {
     return res.status(403).json({ error: "You do not have permission to update buyer names" });
   }
 
@@ -201,7 +201,7 @@ router.put("/:id", (req, res) => {
 });
 
 router.delete("/:id", (req, res) => {
-  if (!canAccessBuyerNames(req.user)) {
+  if (!userHasPermission(req.user, "buyerNames.delete")) {
     return res.status(403).json({ error: "You do not have permission to delete buyer names" });
   }
 
