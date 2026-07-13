@@ -239,10 +239,7 @@ function isPositiveNumber(value) {
 }
 
 function shouldRestrictToOwnEmployee(user) {
-  const normalizedRole = String(user?.role || "").trim().toLowerCase();
-  const hasGlobalExpenseViewRole = ["admin", "ho", "bm"].includes(normalizedRole);
   return (
-    !hasGlobalExpenseViewRole &&
     !userHasPermission(user, "employees.view") &&
     !userHasPermission(user, "cash.create")
   );
@@ -1157,9 +1154,7 @@ router.get("/:id", (req, res) => {
 });
 
 router.post("/:id/approve-cash-book", (req, res) => {
-  const roleName = String(req.user?.role || "").trim().toLowerCase();
-  const canApproveAsRole = roleName === "ho" || roleName === "bm";
-  if (!userHasPermission(req.user, "expense.edit") || (!userHasPermission(req.user, "cash.create") && !canApproveAsRole)) {
+  if (!userHasPermission(req.user, "expense.edit") || !userHasPermission(req.user, "cash.create")) {
     return res.status(403).json({ error: "You need both expense edit and cash create permission to approve to cash book" });
   }
   const { id } = req.params;
