@@ -315,6 +315,11 @@ function authorizeConsigneeOrExpense(
 
     userHasPermission(
       req.user,
+      "expense.entry"
+    ) ||
+
+    userHasPermission(
+      req.user,
       "expense.view"
     ) ||
 
