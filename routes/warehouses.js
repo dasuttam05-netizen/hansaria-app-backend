@@ -271,9 +271,7 @@ router.post("/", async (req, res) => {
 
   try {
 
-    if (
-      !isAdminUser(req.user)
-    ) {
+    if (!userHasPermission(req.user, "warehouses.create")) {
 
       return res.status(403).json({
         error:
@@ -377,9 +375,7 @@ router.put("/:id", async (req, res) => {
 
   try {
 
-    if (
-      !isAdminUser(req.user)
-    ) {
+    if (!userHasPermission(req.user, "warehouses.edit")) {
 
       return res.status(403).json({
         error:
@@ -486,9 +482,7 @@ router.delete("/:id", async (req, res) => {
 
   try {
 
-    if (
-      !isAdminUser(req.user)
-    ) {
+    if (!userHasPermission(req.user, "warehouses.delete")) {
 
       return res.status(403).json({
         error:
