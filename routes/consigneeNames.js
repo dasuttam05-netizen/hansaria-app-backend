@@ -61,7 +61,7 @@ router.get("/", (req, res) => {
 });
 
 router.post("/", (req, res) => {
-  if (!canAccessConsigneeNames(req.user)) {
+  if (!userHasPermission(req.user, "consigneeNames.create")) {
     return res.status(403).json({ error: "You do not have permission to create consignee names" });
   }
 
@@ -215,7 +215,7 @@ router.post("/import-xlsx", upload.single("file"), (req, res) => {
 });
 
 router.put("/:id", (req, res) => {
-  if (!canAccessConsigneeNames(req.user)) {
+  if (!userHasPermission(req.user, "consigneeNames.edit")) {
     return res.status(403).json({ error: "You do not have permission to update consignee names" });
   }
 
@@ -254,7 +254,7 @@ router.put("/:id", (req, res) => {
 });
 
 router.delete("/:id", (req, res) => {
-  if (!canAccessConsigneeNames(req.user)) {
+  if (!userHasPermission(req.user, "consigneeNames.delete")) {
     return res.status(403).json({ error: "You do not have permission to delete consignee names" });
   }
 
