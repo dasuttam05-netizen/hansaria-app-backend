@@ -88,11 +88,32 @@ function buildEmployeeResponse(employee) {
 // =========================
 // GET ALL EMPLOYEES
 // =========================
+function canReadEmployees(user) {
+  return [
+    "employees.view",
+    "employees.manage",
+    "expense.entry",
+    "expense.view",
+    "expense.create",
+    "expense.edit",
+    "inward.view",
+    "outward.view",
+    "cash.view",
+    "report.erp",
+  ].some((permission) => userHasPermission(user, permission));
+}
+
 router.get("/", async (req, res) => {
 
   try {
     if (mongoose.connection.readyState !== 1) {
       return res.json([]);
+    }
+
+    if (!canReadEmployees(req.user)) {
+      return res.status(403).json({
+        error: "You do not have permission to view employees",
+      });
     }
 
     const employees =
@@ -164,6 +185,12 @@ router.get("/:id", async (req, res) => {
     if (mongoose.connection.readyState !== 1) {
       return res.status(503).json({
         error: "Database is temporarily unavailable",
+      });
+    }
+
+    if (!canReadEmployees(req.user)) {
+      return res.status(403).json({
+        error: "You do not have permission to view employees",
       });
     }
 
