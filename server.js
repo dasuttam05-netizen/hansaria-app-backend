@@ -403,14 +403,14 @@ app.use(
 app.use(
   "/api/employees",
   authenticate,
-  authorize("employees.view"),
+  authorize(["employees.view", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   employeeRoutes
 );
 
 app.use(
   "/api/roles",
   authenticate,
-  authorize("employees.view"),
+  authorize(["employees.view", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   roleRoutes
 );
 
