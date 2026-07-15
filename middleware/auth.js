@@ -889,7 +889,7 @@ function authorize(
     }
 
     const allowed =
-      required.every(
+      required.some(
         (
           permission
         ) =>
