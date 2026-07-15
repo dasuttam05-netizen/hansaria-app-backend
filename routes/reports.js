@@ -4,16 +4,13 @@ const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 
 function parseIdList(input) {
-  const raw = Array.isArray(input)
-    ? input
-    : String(input || "")
-        .split(",");
+  const raw = Array.isArray(input) ? input : String(input || "").split(",");
 
   return Array.from(
     new Set(
       raw
-        .map((item) => Number(item))
-        .filter((item) => Number.isFinite(item) && item > 0)
+        .map((item) => String(item || "").trim())
+        .filter((item) => item !== "")
     )
   );
 }
@@ -21,7 +18,8 @@ function parseIdList(input) {
 function appendMultiIdFilter(where, params, columnName, singleValue, multiValue) {
   const ids = parseIdList(multiValue || singleValue);
   if (!ids.length) return;
-  where.push(`${columnName} IN (${ids.map(() => "?").join(",")})`);
+  // Ensure we compare as text to avoid type-mismatch and support string IDs
+  where.push(`CAST(${columnName} AS TEXT) IN (${ids.map(() => "?").join(",")})`);
   params.push(...ids);
 }
 
