@@ -96,7 +96,7 @@ router.get("/", async (req, res) => {
 
     const restrictToAssigned =
       req.user &&
-      req.user.role !== "admin" &&
+      !userHasPermission(req.user, "all") &&
       !userHasPermission(
         req.user,
         "warehouses.manage"
