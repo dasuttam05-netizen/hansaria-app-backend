@@ -38,6 +38,11 @@ if (!hasMongoUri) {
     .connect(mongodbUri, {
       serverSelectionTimeoutMS: 8000,
       socketTimeoutMS: 45000,
+      maxPoolSize: 20,
+      minPoolSize: 5,
+      maxIdleTimeMS: 45000,
+      retryWrites: true,
+      retryReads: true,
     })
     .then(() => console.log("Connected to MongoDB"))
     .catch((err) => {
