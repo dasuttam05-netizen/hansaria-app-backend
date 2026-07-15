@@ -1016,9 +1016,9 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   const pageW = doc.page.width;
   const contentW = pageW - 56;
-  const primary = "#0f2f63";
-  const accent = "#ea580c";
-  const muted = "#64748b";
+  const primary = "#0f766e";
+  const accent = "#2563eb";
+  const muted = "#475569";
   const border = "#cbd5e1";
   const light = "#f8fafc";
   const x = 28;
@@ -1040,19 +1040,19 @@ function sendPurchaseVoucherPdf(res, row, id) {
     doc.fillColor("#111827").text(value || "-", tx + width * 0.52, ty, { width: width * 0.48 });
   };
 
-  doc.rect(x - 10, y - 10, contentW + 20, 760).lineWidth(2).stroke(primary);
+  doc.lineWidth(1).strokeColor(border).rect(x - 10, y - 10, contentW + 20, 760).stroke();
 
-  doc.circle(x + 28, y + 28, 24).lineWidth(2).stroke(accent);
+  doc.lineWidth(1).strokeColor(accent).circle(x + 28, y + 28, 24).stroke();
   doc.fillColor(primary).fontSize(25).text(accountName, x + 66, y + 13, { width: 285 });
-  doc.fillColor(accent).fontSize(7.8).text("GRAIN MERCHANT & COMMISSION AGENT", x + 70, y + 50);
+  doc.fillColor(muted).fontSize(8).text("GRAIN MERCHANT & COMMISSION AGENT", x + 70, y + 50);
   doc.fillColor(primary).fontSize(8.5).text("Phone", x + 340, y + 15);
   doc.fillColor("#111827").text(row.company_account_mobile || "9064348416 / 9304251749", x + 370, y + 15);
   doc.fillColor(primary).text("Mobile", x + 448, y + 15);
   doc.fillColor("#111827").text(row.farmer_mobile || "7004862400", x + 485, y + 15);
-  doc.polygon([x + 382, y + 46], [x + contentW, y + 46], [x + contentW, y + 86], [x + 348, y + 86]).fill(primary);
+  doc.fillColor(primary).polygon([x + 382, y + 46], [x + contentW, y + 46], [x + contentW, y + 86], [x + 348, y + 86]).fill();
   doc.fillColor("#fff").fontSize(14).text("PURCHASE MEMO", x + 388, y + 58, { width: 178, align: "center" });
   doc.fillColor("#111827").fontSize(9).text(`Location: ${warehouseLine || "-"}`, x, y + 94, { width: contentW });
-  doc.moveTo(x, y + 116).lineTo(x + contentW, y + 116).stroke(border);
+  doc.lineWidth(0.7).strokeColor(border).moveTo(x, y + 116).lineTo(x + contentW, y + 116).stroke();
   y += 132;
 
   doc.fillColor("#111827").fontSize(10).text("Serial No.", x + 10, y);
@@ -1063,14 +1063,12 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   const leftW = (contentW - 14) / 2;
   const rightX = x + leftW + 14;
-  doc.roundedRect(x, y + 14, leftW, 96, 4).stroke(border);
-  doc.roundedRect(rightX, y + 14, leftW, 96, 4).stroke(border);
-  doc.rect(x, y, 210, 28).fill(primary);
-  doc.polygon([x + 210, y], [x + 236, y], [x + 216, y + 28], [x + 210, y + 28]).fill(primary);
-  doc.rect(rightX, y, 220, 28).fill(accent);
-  doc.polygon([rightX + 220, y], [rightX + 246, y], [rightX + 226, y + 28], [rightX + 220, y + 28]).fill(accent);
+  doc.lineWidth(1).strokeColor(border).roundedRect(x, y + 14, leftW, 96, 4).stroke();
+  doc.lineWidth(1).strokeColor(border).roundedRect(rightX, y + 14, leftW, 96, 4).stroke();
+  doc.fillColor(primary).roundedRect(x, y, 210, 28, 4).fill();
+  doc.fillColor(accent).roundedRect(rightX, y, 220, 28, 4).fill();
   doc.fillColor("#fff").fontSize(10).text("PARTY INFORMATION", x + 55, y + 9);
-  doc.text("DOCUMENT INFORMATION", rightX + 65, y + 9);
+  doc.fillColor("#fff").fontSize(10).text("DOCUMENT INFORMATION", rightX + 65, y + 9);
 
   const pStart = y + 38;
   labelValue("Name of Party", row.farmer_name, x + 10, pStart, leftW - 20);
@@ -1090,16 +1088,15 @@ function sendPurchaseVoucherPdf(res, row, id) {
   const col1 = 42;
   const col2 = tableW - 180 - col1;
   const tableY = y;
-  doc.roundedRect(x, tableY, remarksW, 244, 4).stroke(border);
-  doc.rect(x, tableY, remarksW, 24).fill(primary);
-  doc.fillColor("#fff").fontSize(10).text("REMARKS", x, tableY + 7, { width: remarksW, align: "center" });
+  doc.lineWidth(1).strokeColor(border).roundedRect(x, tableY, remarksW, 244, 4).stroke();
+  doc.fillColor(light).roundedRect(x, tableY, remarksW, 24, 4).fill();
+  doc.fillColor(primary).fontSize(10).text("REMARKS", x, tableY + 7, { width: remarksW, align: "center" });
   doc.fillColor("#111827").fontSize(9).text(row.description || "", x + 10, tableY + 36, { width: remarksW - 20, height: 190 });
 
-  doc.roundedRect(tableX, tableY, tableW, 244, 4).stroke(border);
-  doc.rect(tableX, tableY, tableW, 24).fill(primary);
-  doc.fillColor("#fff").fontSize(10).text("", tableX + 10, tableY + 7);
-  doc.text("PARTICULARS", tableX + col1 + 10, tableY + 7);
-  doc.text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, tableY + 7, { width: 160, align: "right" });
+  doc.lineWidth(1).strokeColor(border).roundedRect(tableX, tableY, tableW, 244, 4).stroke();
+  doc.fillColor(light).roundedRect(tableX, tableY, tableW, 24, 4).fill();
+  doc.fillColor(primary).fontSize(10).text("PARTICULARS", tableX + col1 + 10, tableY + 7);
+  doc.fillColor(primary).fontSize(10).text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, tableY + 7, { width: 160, align: "right" });
   y = tableY + 24;
 
   [
@@ -1117,7 +1114,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
     ["12", "Labour", fmt4(row.labour)],
     ["13", "Round Off", fmt4(row.round_off)],
   ].forEach((ln) => {
-    doc.rect(tableX, y, tableW, 18).stroke(border);
+    doc.lineWidth(0.7).strokeColor(border).rect(tableX, y, tableW, 18).stroke();
     doc.fillColor("#111827").fontSize(8.8).text(ln[0], tableX + 14, y + 5);
     doc.text(ln[1], tableX + col1 + 10, y + 5);
     doc.text(ln[2], tableX + col1 + col2 + 10, y + 5, { width: 160, align: "right" });
@@ -1136,23 +1133,22 @@ function sendPurchaseVoucherPdf(res, row, id) {
     ["TOTAL", fmt4(grossAmount || netPayable)],
   ].forEach((item, index) => {
     const bx = x + index * boxW;
-    doc.rect(bx, y, boxW, 52).stroke(border);
+    doc.roundedRect(bx, y, boxW, 52, 4).fillAndStroke(light, border);
     doc.fillColor(primary).fontSize(7.2).text(item[0], bx + 4, y + 10, { width: boxW - 8, align: "center" });
     doc.fillColor(accent).fontSize(10).text(item[1], bx + 4, y + 32, { width: boxW - 8, align: "center" });
   });
 
-  doc.roundedRect(totalX, y, contentW - summaryW - 10, 52, 4).stroke(border);
+  doc.roundedRect(totalX, y, contentW - summaryW - 10, 52, 4).fillAndStroke(light, border);
   labelValue("Total Qty.", fmt4(netQty), totalX + 12, y + 8, contentW - summaryW - 34);
   labelValue("Total Deductions", fmt4(row.total_deduction || row.total_deduct_amount), totalX + 12, y + 25, contentW - summaryW - 34);
-  doc.rect(totalX, y + 36, contentW - summaryW - 10, 16).fill(primary);
+  doc.roundedRect(totalX, y + 36, contentW - summaryW - 10, 16, 3).fill(primary);
   doc.fillColor("#fff").fontSize(8.5).text("Net Amount Payable", totalX + 12, y + 41);
   doc.fillColor("#fff").fontSize(8.5).text(fmt4(netPayable), totalX + 100, y + 41, { width: contentW - summaryW - 124, align: "right" });
 
   y += 68;
-  doc.roundedRect(x, y, contentW, 76, 4).stroke(border);
-  doc.rect(x + 58, y, 190, 22).fill(primary);
-  doc.polygon([x + 248, y], [x + 270, y], [x + 252, y + 22], [x + 248, y + 22]).fill(primary);
-  doc.fillColor("#fff").fontSize(10).text("ADDITIONAL DETAILS", x + 80, y + 7);
+  doc.lineWidth(1).strokeColor(border).roundedRect(x, y, contentW, 76, 4).stroke();
+  doc.fillColor(light).roundedRect(x + 58, y, 190, 22, 4).fill();
+  doc.fillColor(primary).fontSize(10).text("ADDITIONAL DETAILS", x + 80, y + 7);
   labelValue("Bank", row.farmer_bank_name || "-", x + 12, y + 38, 160);
   labelValue("IFSC Code", row.farmer_ifsc_code || "-", x + 12, y + 58, 160);
   labelValue("Name of Party", row.farmer_account_holder_name || row.farmer_name, x + 205, y + 38, 160);
