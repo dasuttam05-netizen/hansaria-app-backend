@@ -739,13 +739,21 @@ async function buildAuthenticatedUserPayload(user) {
 function isAdminUser(
   user
 ) {
+  if (!user) {
+    return false;
+  }
+
+  const permissions = parsePermissions(
+    user?.permissions,
+    user?.role
+  );
 
   return (
     ["admin"].includes(
       normalizeRole(
         user?.role
       )
-    )
+    ) || permissions.includes("all")
   );
 }
 
