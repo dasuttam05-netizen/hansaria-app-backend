@@ -1154,8 +1154,12 @@ router.get("/:id", (req, res) => {
 });
 
 router.post("/:id/approve-cash-book", (req, res) => {
-  if (!userHasPermission(req.user, "expense.edit") || !userHasPermission(req.user, "cash.create")) {
-    return res.status(403).json({ error: "You need both expense edit and cash create permission to approve to cash book" });
+  const canApproveCashPost =
+    userHasPermission(req.user, "cash.pending.post") ||
+    userHasPermission(req.user, "cash.create");
+
+  if (!userHasPermission(req.user, "expense.edit") || !canApproveCashPost) {
+    return res.status(403).json({ error: "You need expense edit and cash post permission to approve to cash book" });
   }
   const { id } = req.params;
 
