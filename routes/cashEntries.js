@@ -1838,7 +1838,11 @@ router.get("/aging/company/:companyId", async (req, res) => {
 });
 
 router.patch("/:id(\\d+)", (req, res) => {
-  if (!userHasPermission(req.user, "cash.edit")) {
+  const canUpdateCashStatus =
+    userHasPermission(req.user, "cash.edit") ||
+    userHasPermission(req.user, "cash.pending.post");
+
+  if (!canUpdateCashStatus) {
     return res.status(403).json({ error: "You do not have permission to update cash entry status" });
   }
 
