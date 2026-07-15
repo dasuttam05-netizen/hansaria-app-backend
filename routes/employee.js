@@ -107,7 +107,9 @@ router.get("/", async (req, res) => {
 
   try {
     if (mongoose.connection.readyState !== 1) {
-      return res.json([]);
+      return res.status(503).json({
+        error: "Database service is temporarily unavailable. Please try again in a moment.",
+      });
     }
 
     if (!canReadEmployees(req.user)) {
