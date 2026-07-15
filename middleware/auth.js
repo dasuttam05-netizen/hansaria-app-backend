@@ -307,6 +307,15 @@ const ROLE_DEFAULT_PERMISSIONS = {
   viewer: [
     "dashboard.view",
     "report.inward",
+    "dropdown.view",
+    "employees.view",
+    "companies.view",
+    "companyAccounts.view",
+    "warehouses.view",
+    "products.view",
+    "consigneeNames.view",
+    "buyerNames.view",
+    "farmers.view",
   ],
 };
 
