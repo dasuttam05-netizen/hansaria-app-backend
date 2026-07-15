@@ -356,7 +356,16 @@ function calculateAvailableQty(weight, inwardDate, alreadyAdjusted, refDate = ne
 }
 
 router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) => {
-  const { from_date, to_date } = req.query;
+  const {
+    from_date,
+    to_date,
+    company_id,
+    warehouse_id,
+    warehouse_ids,
+    location_id,
+    location_ids,
+    product_id,
+  } = req.query;
   const where = ["1=1"];
   const params = [];
 
@@ -368,10 +377,25 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) 
     where.push("i.date <= ?");
     params.push(to_date);
   }
+  if (company_id) {
+    where.push("i.company_id = ?");
+    params.push(company_id);
+  }
+  appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
+  appendMultiIdFilter(where, params, "i.warehouse_id", warehouse_id, warehouse_ids);
+  if (product_id) {
+    where.push("i.product_id = ?");
+    params.push(product_id);
+  }
 
   const sql = `
     SELECT
       i.id,
+      i.company_id,
+      i.location_id,
+      i.warehouse_id,
+      c.name AS party_name,
+      lo.name AS location_name,
       COALESCE(w.name, 'Unknown') AS warehouse,
       i.weight,
       i.date AS inward_date,
@@ -381,6 +405,8 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) 
         WHERE a.inward_id = i.id
       ), 0) AS already_adjusted
     FROM inward i
+    LEFT JOIN companies c ON c.id = i.company_id
+    LEFT JOIN locations lo ON lo.id = i.location_id
     LEFT JOIN warehouses w ON w.id = i.warehouse_id
     WHERE ${where.join(" AND ")}
   `;
@@ -392,29 +418,51 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) 
     rows.forEach((row) => {
       const availableQty = calculateAvailableQty(row.weight, row.inward_date, row.already_adjusted, to_date || new Date().toISOString().split("T")[0]);
       const warehouseName = row.warehouse || "Unknown";
+      const partyName = row.party_name || "Unknown";
+      const locationName = row.location_name || "Unknown";
+      const key = `${warehouseName}::${partyName}::${locationName}`;
 
-      if (!warehouseMap[warehouseName]) {
-        warehouseMap[warehouseName] = {
+      if (!warehouseMap[key]) {
+        warehouseMap[key] = {
           warehouse: warehouseName,
+          party: partyName,
+          location: locationName,
           stock: 0,
         };
       }
 
-      warehouseMap[warehouseName].stock += availableQty;
+      warehouseMap[key].stock += availableQty;
     });
 
     const result = Object.values(warehouseMap).map((item) => ({
       warehouse: item.warehouse,
+      party: item.party,
+      location: item.location,
       stock: Number(item.stock.toFixed(4)),
     }));
 
-    result.sort((a, b) => a.warehouse.localeCompare(b.warehouse));
+    result.sort((a, b) => {
+      const warehouseSort = String(a.warehouse).localeCompare(String(b.warehouse));
+      if (warehouseSort) return warehouseSort;
+      const partySort = String(a.party).localeCompare(String(b.party));
+      if (partySort) return partySort;
+      return String(a.location).localeCompare(String(b.location));
+    });
     res.json(result);
   });
 });
 
 router.get("/total-stock", authorizeReport("report.partyStock"), (req, res) => {
-  const { from_date, to_date } = req.query;
+  const {
+    from_date,
+    to_date,
+    company_id,
+    warehouse_id,
+    warehouse_ids,
+    location_id,
+    location_ids,
+    product_id,
+  } = req.query;
   const where = ["1=1"];
   const params = [];
 
@@ -425,6 +473,16 @@ router.get("/total-stock", authorizeReport("report.partyStock"), (req, res) => {
   if (to_date) {
     where.push("i.date <= ?");
     params.push(to_date);
+  }
+  if (company_id) {
+    where.push("i.company_id = ?");
+    params.push(company_id);
+  }
+  appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
+  appendMultiIdFilter(where, params, "i.warehouse_id", warehouse_id, warehouse_ids);
+  if (product_id) {
+    where.push("i.product_id = ?");
+    params.push(product_id);
   }
 
   const sql = `
