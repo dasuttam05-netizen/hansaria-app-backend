@@ -1042,15 +1042,11 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   doc.lineWidth(1).strokeColor(border).rect(x - 10, y - 10, contentW + 20, 760).stroke();
 
-  doc.lineWidth(1).strokeColor(accent).circle(x + 28, y + 28, 24).stroke();
   doc.fillColor(primary).fontSize(25).text(accountName, x + 66, y + 13, { width: 285 });
-  doc.fillColor(muted).fontSize(8).text("GRAIN MERCHANT & COMMISSION AGENT", x + 70, y + 50);
   doc.fillColor(primary).fontSize(8.5).text("Phone", x + 340, y + 15);
   doc.fillColor("#111827").text(row.company_account_mobile || "9064348416 / 9304251749", x + 370, y + 15);
   doc.fillColor(primary).text("Mobile", x + 448, y + 15);
   doc.fillColor("#111827").text(row.farmer_mobile || "7004862400", x + 485, y + 15);
-  doc.fillColor(primary).polygon([x + 382, y + 46], [x + contentW, y + 46], [x + contentW, y + 86], [x + 348, y + 86]).fill();
-  doc.fillColor("#fff").fontSize(14).text("PURCHASE MEMO", x + 388, y + 58, { width: 178, align: "center" });
   doc.fillColor("#111827").fontSize(9).text(`Location: ${warehouseLine || "-"}`, x, y + 94, { width: contentW });
   doc.lineWidth(0.7).strokeColor(border).moveTo(x, y + 116).lineTo(x + contentW, y + 116).stroke();
   y += 132;
@@ -1065,7 +1061,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
   const rightX = x + leftW + 14;
   doc.lineWidth(1).strokeColor(border).roundedRect(x, y + 14, leftW, 96, 4).stroke();
   doc.lineWidth(1).strokeColor(border).roundedRect(rightX, y + 14, leftW, 96, 4).stroke();
-  doc.fillColor(primary).roundedRect(x, y, 210, 28, 4).fill();
+  doc.fillColor(accent).roundedRect(x, y, 210, 28, 4).fill();
   doc.fillColor(accent).roundedRect(rightX, y, 220, 28, 4).fill();
   doc.fillColor("#fff").fontSize(10).text("PARTY INFORMATION", x + 55, y + 9);
   doc.fillColor("#fff").fontSize(10).text("DOCUMENT INFORMATION", rightX + 65, y + 9);
