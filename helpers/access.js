@@ -10,7 +10,7 @@ function canAccessWarehouse(user, warehouseId) {
     return false;
   }
 
-  if (user.role === "admin" || userHasPermission(user, "warehouses.manage")) {
+  if (userHasPermission(user, "all") || userHasPermission(user, "warehouses.manage")) {
     return true;
   }
 
@@ -20,7 +20,7 @@ function canAccessWarehouse(user, warehouseId) {
 }
 
 function assignedWarehouseFilter(user, columnName = "warehouse_id") {
-  if (!user || user.role === "admin" || userHasPermission(user, "warehouses.manage")) {
+  if (!user || userHasPermission(user, "all") || userHasPermission(user, "warehouses.manage")) {
     return { clause: "", params: [] };
   }
 
