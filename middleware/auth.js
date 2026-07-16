@@ -468,12 +468,18 @@ function parsePermissions(
   }
 
   if (Array.isArray(permissions)) {
-    return permissions
+    const parsed = permissions
       .map((item) =>
         String(item || "")
           .trim()
       )
       .filter((item) => item);
+
+    if (parsed.length > 0) {
+      return parsed;
+    }
+
+    return [...(ROLE_DEFAULT_PERMISSIONS[normalizeRole(role)] || ROLE_DEFAULT_PERMISSIONS.staff)];
   }
 
   if (typeof permissions === "string") {
