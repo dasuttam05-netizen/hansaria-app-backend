@@ -1111,33 +1111,30 @@ function sendPurchaseVoucherPdf(res, row, id) {
   const col2 = tableW - 180 - col1;
   const tableY = y;
   doc.lineWidth(1).strokeColor(border).roundedRect(x, tableY, remarksW, 244, 4).stroke();
-  doc.fillColor(light).roundedRect(x, tableY, remarksW, 24, 4).fill();
-  doc.fillColor(primary).fontSize(10).text("REMARKS", x, tableY + 7, { width: remarksW, align: "center" });
-  doc.fillColor("#111827").fontSize(9).text(row.description || "", x + 10, tableY + 36, { width: remarksW - 20, height: 190 });
+  doc.fillColor(light).roundedRect(x, tableY, remarksW, 20, 4).fill();
+  doc.fillColor(primary).fontSize(10).text("REMARKS", x, tableY + 6, { width: remarksW, align: "center" });
+  doc.fillColor("#111827").fontSize(9).text(row.description || "", x + 10, tableY + 30, { width: remarksW - 20, height: 186 });
 
   doc.lineWidth(1).strokeColor(border).roundedRect(tableX, tableY, tableW, 244, 4).stroke();
-  doc.fillColor(light).roundedRect(tableX, tableY, tableW, 24, 4).fill();
-  doc.fillColor(primary).fontSize(10).text("PARTICULARS", tableX + col1 + 10, tableY + 7);
-  doc.fillColor(primary).fontSize(10).text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, tableY + 7, { width: 160, align: "right" });
-  y = tableY + 24;
+  doc.fillColor(light).roundedRect(tableX, tableY, tableW, 20, 4).fill();
+  doc.fillColor(primary).fontSize(10).text("PARTICULARS", tableX + col1 + 10, tableY + 6);
+  doc.fillColor(primary).fontSize(10).text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, tableY + 6, { width: 160, align: "right" });
+  y = tableY + 20;
 
   const particulars = [
-    ["1", "Product", row.product_name || row.product_id || "-"],
-    ["2", "Packet", fmt4(row.packet)],
-    ["3", "Gross Weight", fmt4(row.gross_weight)],
-    ["4", "Tare Weight", fmt4(row.tare_weight)],
-    ["5", "New Weight", fmt4(Math.max(Number(row.gross_weight || 0) - Number(row.tare_weight || 0), 0))],
-    ["6", "Dhalta", fmt4(row.dhalta)],
-    ["7", "Less Bags Weight", fmt4(row.less_bags_weight)],
-    ["8", "Moisture", fmt4(row.moisture)],
-    ["9", "Dunki / Fungus", fmt4(Number(row.dunki || 0) + Number(row.fungus || 0))],
-    ["10", "Discolour / Others", fmt4(Number(row.discolour || 0) + Number(row.others || 0))],
-    ["11", "Bags Claim", fmt4(row.bags_claim)],
-    ["12", "Labour", fmt4(row.labour)],
-    ["13", "Round Off", fmt4(row.round_off)],
+    ["1", "Packet", fmt4(row.packet)],
+    ["2", "Gross Weight", fmt4(row.gross_weight)],
+    ["3", "Tare Weight", fmt4(row.tare_weight)],
+    ["4", "New Weight", fmt4(Math.max(Number(row.gross_weight || 0) - Number(row.tare_weight || 0), 0))],
+    ["5", "Dhalta", fmt4(row.dhalta)],
+    ["6", "Less Bags Weight", fmt4(row.less_bags_weight)],
+    ["7", "Moisture", fmt4(row.moisture)],
+    ["8", "Dunki / Fungus", fmt4(Number(row.dunki || 0) + Number(row.fungus || 0))],
+    ["9", "Discolour / Others", fmt4(Number(row.discolour || 0) + Number(row.others || 0))],
+    ["10", "Bags Claim", fmt4(row.bags_claim)],
+    ["11", "Round Off", fmt4(row.round_off)],
   ].filter(([_, label]) => {
     if (label === "Bags Claim") return Number(row.bags_claim || 0) !== 0;
-    if (label === "Labour") return Number(row.labour || 0) !== 0;
     return true;
   });
 
