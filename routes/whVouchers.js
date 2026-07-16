@@ -989,9 +989,25 @@ async function getMongoPurchaseVoucherForPdf(id) {
 async function enrichPurchaseVoucherPdfRow(row) {
   if (!row || !mongoReady()) return row;
   const farmerId = String(row.farmer_id || "");
-  if (!mongoose.Types.ObjectId.isValid(farmerId)) return row;
+  const farmerName = String(row.farmer_name || "").trim();
+  const farmerMobile = String(row.farmer_mobile || "").trim();
 
-  const farmer = await Farmer.findById(farmerId).lean();
+  let farmer = null;
+  if (mongoose.Types.ObjectId.isValid(farmerId)) {
+    farmer = await Farmer.findById(farmerId).lean();
+  }
+  if (!farmer && farmerName) {
+    const nameFilter = { name: farmerName };
+    if (farmerMobile) {
+      farmer = await Farmer.findOne({ ...nameFilter, mobile: farmerMobile }).lean();
+    }
+    if (!farmer) {
+      farmer = await Farmer.findOne(nameFilter).lean();
+    }
+  }
+  if (!farmer && farmerMobile) {
+    farmer = await Farmer.findOne({ mobile: farmerMobile }).lean();
+  }
   if (!farmer) return row;
 
   return {
@@ -1003,6 +1019,8 @@ async function enrichPurchaseVoucherPdfRow(row) {
     farmer_gst: row.farmer_gst || farmer.gst_no,
     farmer_pan: row.farmer_pan || farmer.pan_no,
     farmer_state: row.farmer_state || farmer.state,
+    farmer_district: row.farmer_district || farmer.district || farmer.city || farmer.location,
+    farmer_pincode: row.farmer_pincode || farmer.pincode,
     farmer_bank_name: row.farmer_bank_name || farmer.bank_name,
     farmer_bank_account_no: row.farmer_bank_account_no || farmer.bank_account_no,
     farmer_ifsc_code: row.farmer_ifsc_code || farmer.ifsc_code,
@@ -1206,6 +1224,28 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.text("Authorised Signature", x + contentW - 178, y);
   doc.moveTo(x + contentW - 190, y + 16).lineTo(x + contentW - 52, y + 16).stroke(border);
 
+  doc.end();
+}
+
+function sendMinimalPurchaseVoucherPdf(res, row, id) {
+  const doc = new PDFDocument({ size: "A4", margin: 30 });
+  res.setHeader("Content-Type", "application/pdf");
+  const safeName = String(row.voucher_no || id).replace(/[/\\?%*:|"<>]/g, "-");
+  res.setHeader("Content-Disposition", `attachment; filename="purchase_${safeName}.pdf"`);
+  doc.pipe(res);
+  const fmt4 = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(4) : "0.0000";
+  };
+  doc.fontSize(18).fillColor("#0f766e").text("PURCHASE MEMO", { align: "center" });
+  doc.moveDown(1);
+  doc.fontSize(11).fillColor("#111827").text(`Voucher No: ${row.voucher_no || id}`);
+  doc.text(`Date: ${fmtDate(row.date)}`);
+  doc.text(`Party: ${row.farmer_name || "-"}`);
+  doc.text(`Warehouse: ${row.warehouse_name || "-"}`);
+  doc.text(`Amount: ${fmt4(row.net_amount_payable || row.amount || 0)}`);
+  doc.moveDown(1);
+  doc.fontSize(9).text("Full memo layout could not be rendered, so this compact version was generated instead.");
   doc.end();
 }
 
@@ -4244,7 +4284,12 @@ router.get("/purchase/:id/pdf", (req, res) => {
       sendPurchaseVoucherPdf(res, row, id);
     } catch (pdfErr) {
       console.error("Purchase PDF render failed:", pdfErr.stack || pdfErr.message || pdfErr);
-      return res.status(500).json({ error: "Failed to render purchase PDF" });
+      try {
+        return sendMinimalPurchaseVoucherPdf(res, row, id);
+      } catch (fallbackErr) {
+        console.error("Purchase PDF fallback failed:", fallbackErr.stack || fallbackErr.message || fallbackErr);
+        return res.status(500).json({ error: "Failed to render purchase PDF" });
+      }
     }
   });
 });
