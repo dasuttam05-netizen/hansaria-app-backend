@@ -962,6 +962,10 @@ async function getMongoPurchaseVoucherForPdf(id) {
     warehouse_name: warehouse?.name || row.warehouse_name,
     warehouse_address: warehouse?.address || row.warehouse_address,
     warehouse_location: warehouse?.location || row.warehouse_location,
+    warehouse_pincode: warehouse?.pincode || row.warehouse_pincode,
+    warehouse_state: warehouse?.state || row.warehouse_state,
+    warehouse_city: warehouse?.city || row.warehouse_city,
+    warehouse_district: warehouse?.district || row.warehouse_district,
     farmer_name: farmer?.name || row.farmer_name,
     farmer_mobile: farmer?.mobile || row.farmer_mobile,
     farmer_address: farmer?.address || row.farmer_address,
@@ -1025,9 +1029,13 @@ function sendPurchaseVoucherPdf(res, row, id) {
   let y = 28;
   const accountName = row.company_account_name || "SHIVANSH";
   const accountAddress = row.company_account_address || row.warehouse_address || "-";
-  const warehouseLine = [row.warehouse_name, row.warehouse_address, row.warehouse_location]
+  const warehouseNameLine = row.warehouse_name || "-";
+  const warehouseAddressLine = row.warehouse_address || "-";
+  const warehouseCityDistrictLine = [row.warehouse_location, row.warehouse_city, row.warehouse_district]
     .filter(Boolean)
-    .join(" - ");
+    .join(", ");
+  const warehouseStateLine = row.warehouse_state ? `State: ${row.warehouse_state}` : "";
+  const warehousePincodeLine = row.warehouse_pincode ? `Pin: ${row.warehouse_pincode}` : "";
   const netQty = row.total_qty || row.net_weight || row.quantity || 0;
   const grossAmount = Number(netQty || 0) * Number(row.rate || 0);
   const netPayable = row.net_amount_payable || row.amount || 0;
@@ -1051,9 +1059,23 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.fillColor("#111827").text(row.farmer_mobile || "7004862400", x + 485, y + 15);
   doc.fillColor(primary).polygon([x + 382, y + 46], [x + contentW, y + 46], [x + contentW, y + 86], [x + 348, y + 86]).fill();
   doc.fillColor("#fff").fontSize(14).text("PURCHASE MEMO", x + 388, y + 58, { width: 178, align: "center" });
-  doc.fillColor("#111827").fontSize(9).text(`Location: ${warehouseLine || "-"}`, x, y + 94, { width: contentW });
-  doc.lineWidth(0.7).strokeColor(border).moveTo(x, y + 116).lineTo(x + contentW, y + 116).stroke();
-  y += 132;
+  doc.fillColor("#111827").fontSize(9).text("Location:", x, y + 94);
+  doc.fillColor("#111827").fontSize(9).text(warehouseNameLine, x + 34, y + 94, { width: contentW - 34 });
+  doc.fillColor("#111827").fontSize(9).text(warehouseAddressLine, x, y + 108, { width: contentW });
+  if (warehouseCityDistrictLine) {
+    doc.fillColor("#111827").fontSize(9).text(warehouseCityDistrictLine, x, y + 122, { width: contentW });
+  }
+  if (warehouseStateLine || warehousePincodeLine) {
+    const rightTextX = x + 100;
+    if (warehouseStateLine) {
+      doc.fillColor("#111827").fontSize(9).text(warehouseStateLine, x, y + 136, { width: contentW - 100 });
+    }
+    if (warehousePincodeLine) {
+      doc.fillColor("#111827").fontSize(9).text(warehousePincodeLine, rightTextX, y + 136, { width: contentW - (rightTextX - x) });
+    }
+  }
+  doc.lineWidth(0.7).strokeColor(border).moveTo(x, y + 158).lineTo(x + contentW, y + 158).stroke();
+  y += 174;
 
   doc.fillColor("#111827").fontSize(10).text("Serial No.", x + 10, y);
   doc.fillColor(accent).fontSize(12).text(row.voucher_no || id, x + 85, y - 1);
