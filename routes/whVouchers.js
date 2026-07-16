@@ -1085,8 +1085,8 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   const leftW = (contentW - 14) / 2;
   const rightX = x + leftW + 14;
-  doc.lineWidth(1).strokeColor(border).roundedRect(x, y + 14, leftW, 96, 4).stroke();
-  doc.lineWidth(1).strokeColor(border).roundedRect(rightX, y + 14, leftW, 96, 4).stroke();
+  doc.lineWidth(1).strokeColor(border).roundedRect(x, y + 14, leftW, 120, 4).stroke();
+  doc.lineWidth(1).strokeColor(border).roundedRect(rightX, y + 14, leftW, 120, 4).stroke();
   doc.fillColor(primary).roundedRect(x, y, 210, 28, 4).fill();
   doc.fillColor(accent).roundedRect(rightX, y, 220, 28, 4).fill();
   doc.fillColor("#fff").fontSize(10).text("PARTY INFORMATION", x + 55, y + 9);
@@ -1102,7 +1102,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
   labelValue("R.S.T. No.", row.reference_id || "-", rightX + 10, pStart + 8, leftW - 20);
   labelValue("Transport No.", "-", rightX + 10, pStart + 34, leftW - 20);
   labelValue("Warehouse", row.warehouse_name || row.warehouse_id, rightX + 10, pStart + 60, leftW - 20);
-  y += 100;
+  y += 130;
 
   const remarksW = 150;
   const tableX = x + remarksW + 10;
