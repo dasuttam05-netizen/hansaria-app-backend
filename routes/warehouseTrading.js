@@ -9,7 +9,33 @@ function canManageWarehouseTrading(user) {
 }
 
 function canViewWarehouseTrading(user) {
-  return userHasPermission(user, "warehouse.trading.view") || canManageWarehouseTrading(user);
+  return (
+    userHasPermission(user, "warehouse.trading.view") ||
+    canManageWarehouseTrading(user) ||
+    userHasPermission(user, "warehouse.trading.purchase.view") ||
+    userHasPermission(user, "warehouse.trading.purchase.create") ||
+    userHasPermission(user, "warehouse.trading.purchase.edit") ||
+    userHasPermission(user, "warehouse.trading.purchase.delete") ||
+    userHasPermission(user, "warehouse.trading.sale.view") ||
+    userHasPermission(user, "warehouse.trading.sale.create") ||
+    userHasPermission(user, "warehouse.trading.sale.edit") ||
+    userHasPermission(user, "warehouse.trading.sale.delete") ||
+    userHasPermission(user, "warehouse.trading.payment.view") ||
+    userHasPermission(user, "warehouse.trading.payment.create") ||
+    userHasPermission(user, "warehouse.trading.payment.edit") ||
+    userHasPermission(user, "warehouse.trading.payment.delete") ||
+    userHasPermission(user, "warehouse.trading.receipt.view") ||
+    userHasPermission(user, "warehouse.trading.receipt.create") ||
+    userHasPermission(user, "warehouse.trading.receipt.edit") ||
+    userHasPermission(user, "warehouse.trading.receipt.delete") ||
+    userHasPermission(user, "warehouse.trading.journal.view") ||
+    userHasPermission(user, "warehouse.trading.journal.create") ||
+    userHasPermission(user, "warehouse.trading.journal.edit") ||
+    userHasPermission(user, "warehouse.trading.journal.delete") ||
+    userHasPermission(user, "warehouse.trading.report.sale") ||
+    userHasPermission(user, "warehouse.trading.report.purchase") ||
+    userHasPermission(user, "warehouse.trading.report.profitLoss")
+  );
 }
 
 router.get("/", (req, res) => {
