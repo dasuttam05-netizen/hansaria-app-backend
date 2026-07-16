@@ -4203,13 +4203,13 @@ router.get("/purchase/:id/pdf", (req, res) => {
       f.gst_no AS farmer_gst,
       f.pan_no AS farmer_pan,
       f.state AS farmer_state,
-      f.city AS farmer_district,
+      f.location AS farmer_district,
       f.pincode AS farmer_pincode,
-      f.bank_name AS farmer_bank_name,
-      f.bank_account_no AS farmer_bank_account_no,
-      f.ifsc_code AS farmer_ifsc_code,
-      f.branch_name AS farmer_branch_name,
-      f.account_holder_name AS farmer_account_holder_name,
+      NULL AS farmer_bank_name,
+      NULL AS farmer_bank_account_no,
+      NULL AS farmer_ifsc_code,
+      NULL AS farmer_branch_name,
+      NULL AS farmer_account_holder_name,
       pr.name AS product_name
     FROM wh_purchase_vouchers p
     LEFT JOIN warehouses w ON w.id = p.warehouse_id
