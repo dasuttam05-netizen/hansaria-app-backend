@@ -1102,7 +1102,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
   labelValue("R.S.T. No.", row.reference_id || "-", rightX + 10, pStart + 8, leftW - 20);
   labelValue("Transport No.", "-", rightX + 10, pStart + 34, leftW - 20);
   labelValue("Warehouse", row.warehouse_name || row.warehouse_id, rightX + 10, pStart + 60, leftW - 20);
-  y += 120;
+  y += 100;
 
   const remarksW = 150;
   const tableX = x + remarksW + 10;
@@ -1110,11 +1110,6 @@ function sendPurchaseVoucherPdf(res, row, id) {
   const col1 = 42;
   const col2 = tableW - 180 - col1;
   const tableY = y;
-  const remarkHeight = 88;
-  doc.lineWidth(1).strokeColor(border).roundedRect(x, tableY, remarksW, remarkHeight, 4).stroke();
-  doc.fillColor(light).roundedRect(x, tableY, remarksW, 20, 4).fill();
-  doc.fillColor(primary).fontSize(10).text("REMARKS", x, tableY + 6, { width: remarksW, align: "center" });
-  doc.fillColor("#111827").fontSize(8.5).text(row.description || "", x + 10, tableY + 28, { width: remarksW - 20, height: remarkHeight - 34 });
 
   const particulars = [
     ["1", "Packet", fmt4(row.packet)],
@@ -1134,7 +1129,14 @@ function sendPurchaseVoucherPdf(res, row, id) {
   });
 
   const particularsHeight = 20 + particulars.length * 14;
-  doc.lineWidth(1).strokeColor(border).roundedRect(tableX, tableY, tableW, particularsHeight, 4).stroke();
+  const boxHeight = Math.max(120, particularsHeight);
+
+  doc.lineWidth(1).strokeColor(border).roundedRect(x, tableY, remarksW, boxHeight, 4).stroke();
+  doc.fillColor(light).roundedRect(x, tableY, remarksW, 20, 4).fill();
+  doc.fillColor(primary).fontSize(10).text("REMARKS", x, tableY + 6, { width: remarksW, align: "center" });
+  doc.fillColor("#111827").fontSize(8.5).text(row.description || "", x + 10, tableY + 28, { width: remarksW - 20, height: boxHeight - 34 });
+
+  doc.lineWidth(1).strokeColor(border).roundedRect(tableX, tableY, tableW, boxHeight, 4).stroke();
   doc.fillColor(light).roundedRect(tableX, tableY, tableW, 20, 4).fill();
   doc.fillColor(primary).fontSize(10).text("PARTICULARS", tableX + col1 + 10, tableY + 6);
   doc.fillColor(primary).fontSize(10).text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, tableY + 6, { width: 160, align: "right" });
@@ -1148,7 +1150,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
     y += 14;
   });
 
-  y = tableY + remarkHeight + particularsHeight + 6;
+  y = tableY + boxHeight + 8;
   const summaryW = 330;
   const totalX = x + summaryW + 10;
   const boxW = summaryW / 5;
