@@ -1062,7 +1062,10 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.fillColor("#111827").text(row.farmer_mobile || "7004862400", x + 485, y + 14);
   doc.fillColor(primary).polygon([x + 384, y + 38], [x + contentW, y + 38], [x + contentW, y + 75], [x + 350, y + 75]).fill();
   doc.fillColor("#fff").fontSize(12).text("PURCHASE MEMO", x + 392, y + 48, { width: 170, align: "center" });
-  doc.circle(x + contentW - 22, y + 16, 11).fill("#ef4444");
+  doc.save();
+  doc.fillColor("#ef4444");
+  doc.circle(x + contentW - 22, y + 16, 11).fill();
+  doc.restore();
   doc.fillColor("#fff").fontSize(12).text("x", x + contentW - 26, y + 10, { width: 8, align: "center" });
   doc.roundedRect(x + contentW - 180, y + 8, 140, 18, 3).stroke("#ef4444");
   doc.fillColor("#ef4444").fontSize(7.2).text("SEARCH", x + contentW - 172, y + 13);
@@ -4240,7 +4243,12 @@ router.get("/purchase/:id/pdf", (req, res) => {
       console.error("Purchase PDF enrichment failed:", enrichErr.message);
     }
 
-    sendPurchaseVoucherPdf(res, row, id);
+    try {
+      sendPurchaseVoucherPdf(res, row, id);
+    } catch (pdfErr) {
+      console.error("Purchase PDF render failed:", pdfErr.stack || pdfErr.message || pdfErr);
+      return res.status(500).json({ error: "Failed to render purchase PDF" });
+    }
   });
 });
 
