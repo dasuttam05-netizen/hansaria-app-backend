@@ -1110,16 +1110,11 @@ function sendPurchaseVoucherPdf(res, row, id) {
   const col1 = 42;
   const col2 = tableW - 180 - col1;
   const tableY = y;
-  doc.lineWidth(1).strokeColor(border).roundedRect(x, tableY, remarksW, 244, 4).stroke();
+  const remarkHeight = 150;
+  doc.lineWidth(1).strokeColor(border).roundedRect(x, tableY, remarksW, remarkHeight, 4).stroke();
   doc.fillColor(light).roundedRect(x, tableY, remarksW, 20, 4).fill();
   doc.fillColor(primary).fontSize(10).text("REMARKS", x, tableY + 6, { width: remarksW, align: "center" });
-  doc.fillColor("#111827").fontSize(9).text(row.description || "", x + 10, tableY + 30, { width: remarksW - 20, height: 186 });
-
-  doc.lineWidth(1).strokeColor(border).roundedRect(tableX, tableY, tableW, 244, 4).stroke();
-  doc.fillColor(light).roundedRect(tableX, tableY, tableW, 20, 4).fill();
-  doc.fillColor(primary).fontSize(10).text("PARTICULARS", tableX + col1 + 10, tableY + 6);
-  doc.fillColor(primary).fontSize(10).text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, tableY + 6, { width: 160, align: "right" });
-  y = tableY + 20;
+  doc.fillColor("#111827").fontSize(9).text(row.description || "", x + 10, tableY + 30, { width: remarksW - 20, height: remarkHeight - 32 });
 
   const particulars = [
     ["1", "Packet", fmt4(row.packet)],
@@ -1138,6 +1133,13 @@ function sendPurchaseVoucherPdf(res, row, id) {
     return true;
   });
 
+  const particularsHeight = 20 + particulars.length * 18;
+  doc.lineWidth(1).strokeColor(border).roundedRect(tableX, tableY, tableW, particularsHeight, 4).stroke();
+  doc.fillColor(light).roundedRect(tableX, tableY, tableW, 20, 4).fill();
+  doc.fillColor(primary).fontSize(10).text("PARTICULARS", tableX + col1 + 10, tableY + 6);
+  doc.fillColor(primary).fontSize(10).text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, tableY + 6, { width: 160, align: "right" });
+  y = tableY + 20;
+
   particulars.forEach((ln) => {
     doc.lineWidth(0.7).strokeColor(border).rect(tableX, y, tableW, 18).stroke();
     doc.fillColor("#111827").fontSize(8.8).text(ln[0], tableX + 14, y + 5);
@@ -1146,7 +1148,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
     y += 18;
   });
 
-  y = tableY + 258;
+  y = tableY + remarkHeight + particularsHeight + 8;
   const summaryW = 330;
   const totalX = x + summaryW + 10;
   const boxW = summaryW / 5;
