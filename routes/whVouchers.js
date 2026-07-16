@@ -1080,11 +1080,6 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.fillColor("#111827").text(row.farmer_mobile || "7004862400", x + 485, y + 14);
   doc.rect(x + 348, y + 38, contentW - 348, 36).fill(primary);
   doc.fillColor("#fff").fontSize(12).text("PURCHASE MEMO", x + 392, y + 48, { width: 170, align: "center" });
-  doc.fillColor("#ef4444").circle(x + contentW - 22, y + 16, 11).fill();
-  doc.fillColor("#fff").fontSize(12).text("x", x + contentW - 26, y + 10, { width: 8, align: "center" });
-  doc.strokeColor("#ef4444").rect(x + contentW - 180, y + 8, 140, 18).stroke();
-  doc.fillColor("#ef4444").fontSize(7.2).text("SEARCH", x + contentW - 172, y + 13);
-  doc.fillColor("#111827").fontSize(7.2).text("Memo / Party / No.", x + contentW - 134, y + 13);
   doc.fillColor("#111827").fontSize(8).text("Location:", x, y + 82);
   doc.fillColor("#111827").fontSize(8).text(warehouseNameLine, x + 34, y + 82, { width: contentW - 34 });
   doc.fillColor("#111827").fontSize(8).text(warehouseAddressLine, x, y + 94, { width: contentW });
