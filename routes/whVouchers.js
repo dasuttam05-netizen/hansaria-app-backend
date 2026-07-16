@@ -1102,7 +1102,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
   labelValue("R.S.T. No.", row.reference_id || "-", rightX + 10, pStart + 8, leftW - 20);
   labelValue("Transport No.", "-", rightX + 10, pStart + 34, leftW - 20);
   labelValue("Warehouse", row.warehouse_name || row.warehouse_id, rightX + 10, pStart + 60, leftW - 20);
-  y += 130;
+  y += 120;
 
   const remarksW = 150;
   const tableX = x + remarksW + 10;
@@ -1110,11 +1110,11 @@ function sendPurchaseVoucherPdf(res, row, id) {
   const col1 = 42;
   const col2 = tableW - 180 - col1;
   const tableY = y;
-  const remarkHeight = 150;
+  const remarkHeight = 88;
   doc.lineWidth(1).strokeColor(border).roundedRect(x, tableY, remarksW, remarkHeight, 4).stroke();
   doc.fillColor(light).roundedRect(x, tableY, remarksW, 20, 4).fill();
   doc.fillColor(primary).fontSize(10).text("REMARKS", x, tableY + 6, { width: remarksW, align: "center" });
-  doc.fillColor("#111827").fontSize(9).text(row.description || "", x + 10, tableY + 30, { width: remarksW - 20, height: remarkHeight - 32 });
+  doc.fillColor("#111827").fontSize(8.5).text(row.description || "", x + 10, tableY + 28, { width: remarksW - 20, height: remarkHeight - 34 });
 
   const particulars = [
     ["1", "Packet", fmt4(row.packet)],
@@ -1133,7 +1133,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
     return true;
   });
 
-  const particularsHeight = 20 + particulars.length * 18;
+  const particularsHeight = 20 + particulars.length * 14;
   doc.lineWidth(1).strokeColor(border).roundedRect(tableX, tableY, tableW, particularsHeight, 4).stroke();
   doc.fillColor(light).roundedRect(tableX, tableY, tableW, 20, 4).fill();
   doc.fillColor(primary).fontSize(10).text("PARTICULARS", tableX + col1 + 10, tableY + 6);
@@ -1141,14 +1141,14 @@ function sendPurchaseVoucherPdf(res, row, id) {
   y = tableY + 20;
 
   particulars.forEach((ln) => {
-    doc.lineWidth(0.7).strokeColor(border).rect(tableX, y, tableW, 18).stroke();
-    doc.fillColor("#111827").fontSize(8.8).text(ln[0], tableX + 14, y + 5);
-    doc.text(ln[1], tableX + col1 + 10, y + 5);
-    doc.text(ln[2], tableX + col1 + col2 + 10, y + 5, { width: 160, align: "right" });
-    y += 18;
+    doc.lineWidth(0.7).strokeColor(border).rect(tableX, y, tableW, 14).stroke();
+    doc.fillColor("#111827").fontSize(8).text(ln[0], tableX + 14, y + 3);
+    doc.text(ln[1], tableX + col1 + 10, y + 3);
+    doc.text(ln[2], tableX + col1 + col2 + 10, y + 3, { width: 160, align: "right" });
+    y += 14;
   });
 
-  y = tableY + remarkHeight + particularsHeight + 8;
+  y = tableY + remarkHeight + particularsHeight + 6;
   const summaryW = 330;
   const totalX = x + summaryW + 10;
   const boxW = summaryW / 5;
@@ -1172,10 +1172,10 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.fillColor("#fff").fontSize(8.5).text("Net Amount Payable", totalX + 12, y + 41);
   doc.fillColor("#fff").fontSize(8.5).text(fmt4(netPayable), totalX + 100, y + 41, { width: contentW - summaryW - 124, align: "right" });
 
-  y += 68;
-  doc.lineWidth(1).strokeColor(border).roundedRect(x, y, contentW, 76, 4).stroke();
-  doc.fillColor(light).roundedRect(x + 58, y, 190, 22, 4).fill();
-  doc.fillColor(primary).fontSize(10).text("ADDITIONAL DETAILS", x + 80, y + 7);
+  y += 52;
+  doc.lineWidth(1).strokeColor(border).roundedRect(x, y, contentW, 66, 4).stroke();
+  doc.fillColor(light).roundedRect(x + 58, y, 190, 18, 4).fill();
+  doc.fillColor(primary).fontSize(10).text("ADDITIONAL DETAILS", x + 80, y + 6);
   labelValue("Bank", row.farmer_bank_name || "-", x + 12, y + 38, 160);
   labelValue("IFSC Code", row.farmer_ifsc_code || "-", x + 12, y + 58, 160);
   labelValue("Name of Party", row.farmer_account_holder_name || row.farmer_name, x + 205, y + 38, 160);
@@ -1183,8 +1183,8 @@ function sendPurchaseVoucherPdf(res, row, id) {
   labelValue("Account Number", row.farmer_bank_account_no || "-", x + 395, y + 38, 150);
   labelValue("Transport No.", "-", x + 395, y + 58, 150);
 
-  y += 94;
-  doc.roundedRect(x + 110, y, contentW - 220, 34, 3).stroke(accent);
+  y += 84;
+  doc.roundedRect(x + 110, y, contentW - 220, 30, 3).stroke(accent);
   doc.fillColor(accent).fontSize(8).text("NOTE", x + 255, y - 6);
   doc.fillColor("#111827").fontSize(8.5).text("Buyer and Seller disputes will be resolved at village level.", x + 130, y + 11, { width: contentW - 260, align: "center" });
   y += 58;
