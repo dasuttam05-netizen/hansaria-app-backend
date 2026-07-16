@@ -1834,7 +1834,7 @@ router.get("/purchase/import-template", (req, res) => {
 });
 
 router.post("/purchase/import-xlsx", upload.single("file"), async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.purchase.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
   if (!mongoReady()) {
@@ -1968,7 +1968,7 @@ router.post("/purchase/import-xlsx", upload.single("file"), async (req, res) => 
 });
 
 router.post("/purchase", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.purchase.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -2474,7 +2474,7 @@ router.get("/sale", (req, res) => {
 });
 
 router.post("/sale", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.sale.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -2526,7 +2526,7 @@ router.post("/sale", (req, res) => {
 });
 
 router.put("/sale/:id", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.sale.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.edit")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -2743,7 +2743,7 @@ router.put("/sale/:id", (req, res) => {
 });
 
 router.delete("/sale/:id", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.sale.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.delete")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -2785,7 +2785,7 @@ router.get("/payment", (req, res) => {
 });
 
 router.post("/payment", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.payment.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -2871,7 +2871,7 @@ router.post("/payment", (req, res) => {
 });
 
 router.put("/payment/:id", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.payment.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.edit")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -2942,7 +2942,7 @@ router.put("/payment/:id", (req, res) => {
 });
 
 router.delete("/payment/:id", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.payment.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.delete")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -3018,7 +3018,7 @@ router.get("/receipt/:id", (req, res) => {
 });
 
 router.post("/receipt", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.receipt.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -3104,7 +3104,7 @@ router.post("/receipt", (req, res) => {
 });
 
 router.put("/receipt/:id", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.receipt.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.edit")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -3175,7 +3175,7 @@ router.put("/receipt/:id", (req, res) => {
 });
 
 router.delete("/receipt/:id", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.receipt.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.delete")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -3225,7 +3225,7 @@ router.get("/journal", (req, res) => {
 });
 
 router.post("/journal", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.journal.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.journal.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -4313,7 +4313,7 @@ router.get("/sale/:id/pdf", async (req, res) => {
 
 // Update purchase voucher
 router.put("/purchase/:id", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.purchase.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.edit")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
@@ -4365,7 +4365,7 @@ router.put("/purchase/:id", (req, res) => {
 
 // Delete purchase voucher
 router.delete("/purchase/:id", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.purchase.manage")) {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.delete")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
