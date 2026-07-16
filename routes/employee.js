@@ -49,6 +49,17 @@ function getIncomingMobile(body = {}) {
   return String(body.mobile ?? body.mobile_no ?? body.phone ?? "").trim();
 }
 
+function logEmployeeRouteError(stage, err, req) {
+  console.error(`[employees:${stage}]`, {
+    message: err?.message,
+    stack: err?.stack,
+    userId: req?.user?.id || req?.user?._id || null,
+    role: req?.user?.role || null,
+    path: req?.originalUrl || req?.url || null,
+    method: req?.method || null,
+  });
+}
+
 function normalizeIdArray(input) {
   return Array.isArray(input)
     ? Array.from(
@@ -169,10 +180,10 @@ router.get("/", async (req, res) => {
 
   } catch (err) {
 
-    console.error(err);
+    logEmployeeRouteError("list", err, req);
 
     return res.status(500).json({
-      error: err.message,
+      error: "Failed to load employees",
     });
   }
 });
@@ -249,10 +260,10 @@ router.get("/:id", async (req, res) => {
 
   } catch (err) {
 
-    console.error(err);
+    logEmployeeRouteError("single", err, req);
 
     return res.status(500).json({
-      error: err.message,
+      error: "Failed to load employee",
     });
   }
 });
@@ -483,10 +494,10 @@ router.post("/", async (req, res) => {
 
   } catch (err) {
 
-    console.error(err);
+    logEmployeeRouteError("create", err, req);
 
     return res.status(500).json({
-      error: err.message,
+      error: "Failed to create employee",
     });
   }
 });
@@ -701,10 +712,10 @@ router.put("/:id", async (req, res) => {
 
   } catch (err) {
 
-    console.error(err);
+    logEmployeeRouteError("update", err, req);
 
     return res.status(500).json({
-      error: err.message,
+      error: "Failed to update employee",
     });
   }
 });
@@ -760,10 +771,10 @@ router.delete("/:id", async (req, res) => {
 
   } catch (err) {
 
-    console.error(err);
+    logEmployeeRouteError("delete", err, req);
 
     return res.status(500).json({
-      error: err.message,
+      error: "Failed to delete employee",
     });
   }
 });
