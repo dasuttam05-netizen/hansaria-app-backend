@@ -476,10 +476,10 @@ function parsePermissions(
       .filter((item) => item);
 
     if (parsed.length > 0) {
-      return parsed;
+      return expandPermissions(parsed);
     }
 
-    return [...(ROLE_DEFAULT_PERMISSIONS[normalizeRole(role)] || ROLE_DEFAULT_PERMISSIONS.staff)];
+    return expandPermissions(ROLE_DEFAULT_PERMISSIONS[normalizeRole(role)] || ROLE_DEFAULT_PERMISSIONS.staff);
   }
 
   if (typeof permissions === "string") {
@@ -491,24 +491,24 @@ function parsePermissions(
     try {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        return parsed
+        return expandPermissions(parsed
           .map((item) =>
             String(item || "")
               .trim()
           )
-          .filter((item) => item);
+          .filter((item) => item));
       }
     } catch (_err) {
       // Fall back to comma-separated parsing.
     }
 
-    return raw
+    return expandPermissions(raw
       .split(",")
       .map((item) =>
         String(item || "")
           .trim()
       )
-      .filter((item) => item);
+      .filter((item) => item));
   }
 
   return [];
