@@ -1025,7 +1025,9 @@ function sendPurchaseVoucherPdf(res, row, id) {
   let y = 28;
   const accountName = row.company_account_name || "SHIVANSH";
   const accountAddress = row.company_account_address || row.warehouse_address || "-";
-  const warehouseLine = [row.warehouse_name, row.warehouse_location].filter(Boolean).join(" - ");
+  const warehouseLine = [row.warehouse_name, row.warehouse_address, row.warehouse_location]
+    .filter(Boolean)
+    .join(" - ");
   const netQty = row.total_qty || row.net_weight || row.quantity || 0;
   const grossAmount = Number(netQty || 0) * Number(row.rate || 0);
   const netPayable = row.net_amount_payable || row.amount || 0;
@@ -1042,9 +1044,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   doc.lineWidth(1).strokeColor(border).rect(x - 10, y - 10, contentW + 20, 760).stroke();
 
-  doc.lineWidth(1).strokeColor(accent).circle(x + 28, y + 28, 24).stroke();
-  doc.fillColor(primary).fontSize(25).text(accountName, x + 66, y + 13, { width: 285 });
-  doc.fillColor(muted).fontSize(8).text("GRAIN MERCHANT & COMMISSION AGENT", x + 70, y + 50);
+  doc.fillColor(primary).fontSize(25).text(accountName, x, y + 13, { width: 285 });
   doc.fillColor(primary).fontSize(8.5).text("Phone", x + 340, y + 15);
   doc.fillColor("#111827").text(row.company_account_mobile || "9064348416 / 9304251749", x + 370, y + 15);
   doc.fillColor(primary).text("Mobile", x + 448, y + 15);
