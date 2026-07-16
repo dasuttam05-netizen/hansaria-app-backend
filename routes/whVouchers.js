@@ -1036,6 +1036,9 @@ function sendPurchaseVoucherPdf(res, row, id) {
     .join(", ");
   const warehouseStateLine = row.warehouse_state ? `State: ${row.warehouse_state}` : "";
   const warehousePincodeLine = row.warehouse_pincode ? `Pin: ${row.warehouse_pincode}` : "";
+  const farmerStateLine = row.farmer_state ? `State: ${row.farmer_state}` : "";
+  const farmerDistrictLine = row.farmer_district ? `District: ${row.farmer_district}` : "";
+  const farmerPinLine = row.farmer_pincode ? `PIN No.: ${row.farmer_pincode}` : "";
   const netQty = row.total_qty || row.net_weight || row.quantity || 0;
   const grossAmount = Number(netQty || 0) * Number(row.rate || 0);
   const netPayable = row.net_amount_payable || row.amount || 0;
@@ -1059,6 +1062,11 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.fillColor("#111827").text(row.farmer_mobile || "7004862400", x + 485, y + 14);
   doc.fillColor(primary).polygon([x + 384, y + 38], [x + contentW, y + 38], [x + contentW, y + 75], [x + 350, y + 75]).fill();
   doc.fillColor("#fff").fontSize(12).text("PURCHASE MEMO", x + 392, y + 48, { width: 170, align: "center" });
+  doc.circle(x + contentW - 22, y + 16, 11).fill("#ef4444");
+  doc.fillColor("#fff").fontSize(12).text("x", x + contentW - 26, y + 10, { width: 8, align: "center" });
+  doc.roundedRect(x + contentW - 180, y + 8, 140, 18, 3).stroke("#ef4444");
+  doc.fillColor("#ef4444").fontSize(7.2).text("SEARCH", x + contentW - 172, y + 13);
+  doc.fillColor("#111827").fontSize(7.2).text("Memo / Party / No.", x + contentW - 134, y + 13);
   doc.fillColor("#111827").fontSize(8).text("Location:", x, y + 82);
   doc.fillColor("#111827").fontSize(8).text(warehouseNameLine, x + 34, y + 82, { width: contentW - 34 });
   doc.fillColor("#111827").fontSize(8).text(warehouseAddressLine, x, y + 94, { width: contentW });
@@ -1097,7 +1105,9 @@ function sendPurchaseVoucherPdf(res, row, id) {
   labelValue("PAN", row.farmer_pan, x + 10, pStart + 16, leftW - 20);
   labelValue("GSTIN", row.farmer_gst, x + 10, pStart + 32, leftW - 20);
   labelValue("Phone", row.farmer_mobile, x + 10, pStart + 48, leftW - 20);
-  labelValue("Village", row.farmer_village || row.farmer_address, x + 10, pStart + 64, leftW - 20);
+  labelValue("State", row.farmer_state, x + 10, pStart + 64, leftW - 20);
+  labelValue("District", row.farmer_district, x + 10, pStart + 80, leftW - 20);
+  labelValue("PIN No.", row.farmer_pincode, x + 10, pStart + 96, leftW - 20);
 
   labelValue("R.S.T. No.", row.reference_id || "-", rightX + 10, pStart + 4, leftW - 20);
   labelValue("Transport No.", "-", rightX + 10, pStart + 24, leftW - 20);
@@ -4193,11 +4203,13 @@ router.get("/purchase/:id/pdf", (req, res) => {
       f.gst_no AS farmer_gst,
       f.pan_no AS farmer_pan,
       f.state AS farmer_state,
-      NULL AS farmer_bank_name,
-      NULL AS farmer_bank_account_no,
-      NULL AS farmer_ifsc_code,
-      NULL AS farmer_branch_name,
-      NULL AS farmer_account_holder_name,
+      f.district AS farmer_district,
+      f.pincode AS farmer_pincode,
+      f.bank_name AS farmer_bank_name,
+      f.bank_account_no AS farmer_bank_account_no,
+      f.ifsc_code AS farmer_ifsc_code,
+      f.branch_name AS farmer_branch_name,
+      f.account_holder_name AS farmer_account_holder_name,
       pr.name AS product_name
     FROM wh_purchase_vouchers p
     LEFT JOIN warehouses w ON w.id = p.warehouse_id
