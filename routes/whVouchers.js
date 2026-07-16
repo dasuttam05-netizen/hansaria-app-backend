@@ -1121,7 +1121,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.fillColor(primary).fontSize(10).text("AMOUNT (Rs.)", tableX + col1 + col2 + 10, tableY + 7, { width: 160, align: "right" });
   y = tableY + 24;
 
-  [
+  const particulars = [
     ["1", "Product", row.product_name || row.product_id || "-"],
     ["2", "Packet", fmt4(row.packet)],
     ["3", "Gross Weight", fmt4(row.gross_weight)],
@@ -1135,7 +1135,13 @@ function sendPurchaseVoucherPdf(res, row, id) {
     ["11", "Bags Claim", fmt4(row.bags_claim)],
     ["12", "Labour", fmt4(row.labour)],
     ["13", "Round Off", fmt4(row.round_off)],
-  ].forEach((ln) => {
+  ].filter(([_, label]) => {
+    if (label === "Bags Claim") return Number(row.bags_claim || 0) !== 0;
+    if (label === "Labour") return Number(row.labour || 0) !== 0;
+    return true;
+  });
+
+  particulars.forEach((ln) => {
     doc.lineWidth(0.7).strokeColor(border).rect(tableX, y, tableW, 18).stroke();
     doc.fillColor("#111827").fontSize(8.8).text(ln[0], tableX + 14, y + 5);
     doc.text(ln[1], tableX + col1 + 10, y + 5);
