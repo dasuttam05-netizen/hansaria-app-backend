@@ -4244,7 +4244,7 @@ router.get("/purchase/:id/pdf", (req, res) => {
       f.pan_no AS farmer_pan,
       f.state AS farmer_state,
       f.location AS farmer_district,
-      f.pincode AS farmer_pincode,
+      NULL AS farmer_pincode,
       NULL AS farmer_bank_name,
       NULL AS farmer_bank_account_no,
       NULL AS farmer_ifsc_code,
