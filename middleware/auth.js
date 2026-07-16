@@ -440,6 +440,23 @@ const LEGACY_PERMISSION_MAP = {
   "warehouse.trading.journal.manage": ["warehouse.trading.manage"],
 };
 
+function expandPermissions(permissions = []) {
+  const expanded = new Set(permissions || []);
+
+  const addDependencies = (permission) => {
+    const deps = LEGACY_PERMISSION_MAP[permission] || [];
+    deps.forEach((dep) => {
+      if (!expanded.has(dep)) {
+        expanded.add(dep);
+        addDependencies(dep);
+      }
+    });
+  };
+
+  [...expanded].forEach(addDependencies);
+  return [...expanded];
+}
+
 function normalizeRole(
   role = "staff"
 ) {
