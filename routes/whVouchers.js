@@ -1080,37 +1080,41 @@ function sendPurchaseVoucherPdf(res, row, id) {
   doc.rect(10, 10, pageW - 20, pageH - 20).lineWidth(0.8).strokeColor(border).stroke();
 
   // Header area
-  doc.roundedRect(x, y, 180, 52, 8).fillAndStroke("#fff", border);
-  doc.fillColor(navy).fontSize(21).text(accountName, x + 14, y + 10, { width: 150 });
-  doc.fillColor(green).fontSize(9).text("PVT LTD", x + 92, y + 30);
-  doc.moveTo(x + 14, y + 36).lineTo(x + 76, y + 36).stroke(green);
-  doc.fillColor(muted).fontSize(8).text("Location:", x + 14, y + 40);
-  doc.fillColor(text).text(warehouseNameLine, x + 56, y + 40, { width: 108 });
+  const leftHeaderW = 165;
+  const titleW = 235;
+  const midHeaderW = contentW - leftHeaderW - titleW - 12;
 
-  doc.roundedRect(x + 188, y, contentW - 188, 52, 8).fillAndStroke("#fff", border);
-  doc.fillColor(navy).fontSize(8).text("Phone", x + 204, y + 13);
-  doc.fillColor(text).text(row.company_account_mobile || "9064348416", x + 235, y + 13);
-  doc.fillColor(navy).text("|", x + 292, y + 13);
-  doc.fillColor(navy).text("Mobile", x + 304, y + 13);
-  doc.fillColor(text).text(row.farmer_mobile || "9088370854", x + 342, y + 13);
-  doc.roundedRect(x + contentW - 250, y + 14, 250, 28, 6).fillAndStroke(navy, navy);
-  doc.fillColor("#fff").fontSize(13).text("PURCHASE MEMO", x + contentW - 220, y + 22, { width: 190, align: "center" });
-  doc.moveTo(x + contentW - 44, y + 14).lineTo(x + contentW - 20, y + 42).stroke(green);
-  doc.moveTo(x + contentW - 58, y + 14).lineTo(x + contentW - 34, y + 42).stroke("#c7d2fe");
+  doc.roundedRect(x, y, leftHeaderW, 58, 8).fillAndStroke("#fff", border);
+  doc.fillColor(navy).fontSize(18).text(accountName, x + 14, y + 11, { width: leftHeaderW - 28 });
+  doc.fillColor(green).fontSize(9).text("PVT LTD", x + 14, y + 32);
+  doc.moveTo(x + 14, y + 39).lineTo(x + leftHeaderW - 18, y + 39).stroke(green);
+  doc.fillColor(muted).fontSize(7.5).text("Location:", x + 14, y + 42);
+  doc.fillColor(text).fontSize(7.5).text(warehouseNameLine, x + 53, y + 42, { width: leftHeaderW - 67 });
+
+  doc.roundedRect(x + leftHeaderW + 6, y, midHeaderW, 58, 8).fillAndStroke("#fff", border);
+  doc.fillColor(navy).fontSize(8).text("Phone", x + leftHeaderW + 18, y + 17);
+  doc.fillColor(text).fontSize(8).text(row.company_account_mobile || "9064348416", x + leftHeaderW + 46, y + 17);
+  doc.fillColor(navy).text("Mobile", x + leftHeaderW + 18, y + 33);
+  doc.fillColor(text).text(row.farmer_mobile || "9088370854", x + leftHeaderW + 60, y + 33);
+
+  doc.roundedRect(x + contentW - titleW, y, titleW, 58, 8).fillAndStroke(navy, navy);
+  doc.fillColor("#fff").fontSize(15).text("PURCHASE MEMO", x + contentW - titleW + 20, y + 20, {
+    width: titleW - 40,
+    align: "center",
+  });
+  doc.moveTo(x + contentW - 48, y + 10).lineTo(x + contentW - 20, y + 48).stroke(green);
+  doc.moveTo(x + contentW - 62, y + 10).lineTo(x + contentW - 34, y + 48).stroke("#c7d2fe");
 
   y += 68;
-  doc.fillColor(navy).fontSize(8).text("Location:", x + 4, y);
-  doc.fillColor(text).fontSize(8).text(warehouseNameLine, x + 48, y, { width: contentW - 52 });
-  y += 12;
-  if (warehouseAddressLine) {
-    doc.fillColor(text).fontSize(8).text(warehouseAddressLine, x + 48, y, { width: contentW - 52 });
-    y += 11;
-  }
-  if (warehouseCityDistrictLine) {
-    doc.fillColor(text).fontSize(8).text(warehouseCityDistrictLine, x + 48, y, { width: contentW - 52 });
-    y += 11;
-  }
-  y += 4;
+  doc.roundedRect(x, y, contentW, 24, 6).fillAndStroke("#fff", border);
+  doc.fillColor(navy).fontSize(8.2).text("Location:", x + 12, y + 8);
+  doc.fillColor(text).fontSize(8.2).text(
+    [warehouseNameLine, warehouseAddressLine, warehouseCityDistrictLine].filter(Boolean).join(" | "),
+    x + 58,
+    y + 8,
+    { width: contentW - 70 }
+  );
+  y += 32;
   doc.roundedRect(x, y, contentW, 22, 6).fillAndStroke("#fff", border);
   doc.fontSize(8.2).fillColor(text).text("Serial No.", x + 12, y + 7);
   doc.fillColor(navy).fontSize(10).text(row.voucher_no || id, x + 72, y + 5);
@@ -1120,14 +1124,14 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   const leftW = (contentW - 10) / 2;
   const rightX = x + leftW + 10;
-  box(x, y, leftW, 114, "#fff");
-  box(rightX, y, leftW, 114, "#fff");
+  box(x, y, leftW, 116, "#fff");
+  box(rightX, y, leftW, 116, "#fff");
   doc.roundedRect(x, y, leftW, 20, 6).fillAndStroke(navy, navy);
   doc.roundedRect(rightX, y, leftW, 20, 6).fillAndStroke(green, green);
   doc.fillColor("#fff").fontSize(9).text("PARTY INFORMATION", x + 12, y + 6);
   doc.fillColor("#fff").text("DOCUMENT INFORMATION", rightX + 12, y + 6);
 
-  const pStart = y + 26;
+  const pStart = y + 25;
   labelValue("Name of Party", row.farmer_name, x + 10, pStart, leftW - 20);
   labelValue("PAN", row.farmer_pan, x + 10, pStart + 15, leftW - 20);
   labelValue("GSTIN", row.farmer_gst, x + 10, pStart + 30, leftW - 20);
@@ -1142,7 +1146,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
   labelValue("Remarks", row.description || "-", rightX + 10, pStart + 48, leftW - 20);
   labelValue("Location", warehouseNameLine, rightX + 10, pStart + 63, leftW - 20);
 
-  y += 122;
+  y += 126;
 
   const particulars = [
     ["1", "Packet", fmt4(row.packet)],
@@ -1161,8 +1165,8 @@ function sendPurchaseVoucherPdf(res, row, id) {
     return true;
   });
 
-  const particularsHeight = 17 + particulars.length * 12;
-  const tableHeight = Math.max(126, particularsHeight + 18);
+  const particularsHeight = 17 + particulars.length * 11;
+  const tableHeight = Math.max(122, particularsHeight + 18);
 
   box(x, y, contentW, tableHeight, "#fff");
   doc.roundedRect(x, y, contentW, 18, 6).fillAndStroke(navy, navy);
@@ -1175,12 +1179,12 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   particulars.forEach((ln, index) => {
     const fill = index % 2 === 0 ? "#fbfdff" : "#f8fafc";
-    doc.rect(x + 1, rowY, contentW - 2, 12).fill(fill);
+    doc.rect(x + 1, rowY, contentW - 2, 11).fill(fill);
     doc.moveTo(x, rowY + 12).lineTo(x + contentW, rowY + 12).stroke(border);
-    doc.fillColor(text).fontSize(7.4).text(ln[0], x + 10, rowY + 2);
-    doc.text(ln[1], x + col1 + 10, rowY + 2);
-    doc.text(ln[2], x + col1 + col2 + 10, rowY + 2, { width: 80, align: "right" });
-    rowY += 12;
+    doc.fillColor(text).fontSize(7.1).text(ln[0], x + 10, rowY + 1.5);
+    doc.text(ln[1], x + col1 + 10, rowY + 1.5);
+    doc.text(ln[2], x + col1 + col2 + 10, rowY + 1.5, { width: 80, align: "right" });
+    rowY += 11;
   });
 
   const summaryY = rowY + 8;
@@ -1197,39 +1201,39 @@ function sendPurchaseVoucherPdf(res, row, id) {
     const bx = x + index * boxW;
     const fill = index === 4 ? greenLight : soft;
     const stroke = index === 4 ? green : border;
-    doc.roundedRect(bx, summaryY, boxW - 2, 40, 4).fillAndStroke(fill, stroke);
-    doc.fillColor(index === 4 ? green : navy).fontSize(6.8).text(item[0], bx + 2, summaryY + 7, { width: boxW - 6, align: "center" });
-    doc.fillColor(text).fontSize(9).text(item[1], bx + 2, summaryY + 22, { width: boxW - 6, align: "center" });
+    doc.roundedRect(bx, summaryY, boxW - 2, 38, 4).fillAndStroke(fill, stroke);
+    doc.fillColor(index === 4 ? green : navy).fontSize(6.6).text(item[0], bx + 2, summaryY + 6, { width: boxW - 6, align: "center" });
+    doc.fillColor(text).fontSize(8.8).text(item[1], bx + 2, summaryY + 20, { width: boxW - 6, align: "center" });
   });
 
   const totalPanelW = contentW - summaryW - 8;
-  doc.roundedRect(totalX, summaryY, totalPanelW, 40, 4).fillAndStroke("#fff", border);
+  doc.roundedRect(totalX, summaryY, totalPanelW, 38, 4).fillAndStroke("#fff", border);
   labelValue("Total Qty.", fmt4(netQty), totalX + 8, summaryY + 5, totalPanelW - 16);
-  labelValue("Total Deductions", fmt2(row.total_deduction || row.total_deduct_amount), totalX + 8, summaryY + 18, totalPanelW - 16);
-  doc.roundedRect(totalX, summaryY + 28, totalPanelW, 12, 4).fillAndStroke(navy, navy);
-  doc.fillColor("#fff").fontSize(7.8).text("Net Amount Payable", totalX + 8, summaryY + 31);
-  doc.fillColor("#fff").fontSize(8.1).text(fmt2(netPayable), totalX + 82, summaryY + 31, { width: totalPanelW - 90, align: "right" });
+  labelValue("Total Deductions", fmt2(row.total_deduction || row.total_deduct_amount), totalX + 8, summaryY + 17, totalPanelW - 16);
+  doc.roundedRect(totalX, summaryY + 27, totalPanelW, 11, 4).fillAndStroke(navy, navy);
+  doc.fillColor("#fff").fontSize(7.4).text("Net Amount Payable", totalX + 8, summaryY + 30);
+  doc.fillColor("#fff").fontSize(8).text(fmt2(netPayable), totalX + 82, summaryY + 30, { width: totalPanelW - 90, align: "right" });
 
-  y = summaryY + 50;
-  doc.roundedRect(x, y, contentW, 52, 6).fillAndStroke("#fff", border);
+  y = summaryY + 46;
+  doc.roundedRect(x, y, contentW, 50, 6).fillAndStroke("#fff", border);
   doc.roundedRect(x + 10, y - 8, 160, 16, 5).fillAndStroke(green, green);
   doc.fillColor("#fff").fontSize(9).text("ADDITIONAL DETAILS", x + 27, y - 4);
-  labelValue("Bank", row.farmer_bank_name || "-", x + 12, y + 16, 150);
-  labelValue("IFSC Code", row.farmer_ifsc_code || "-", x + 12, y + 30, 150);
-  labelValue("Name of Party", row.farmer_account_holder_name || row.farmer_name, x + 195, y + 16, 150);
-  labelValue("Branch", row.farmer_branch_name || "-", x + 195, y + 30, 150);
-  labelValue("Account Number", row.farmer_bank_account_no || "-", x + 380, y + 16, 145);
-  labelValue("Transport No.", "-", x + 380, y + 30, 145);
+  labelValue("Bank", row.farmer_bank_name || "-", x + 12, y + 15, 150);
+  labelValue("IFSC Code", row.farmer_ifsc_code || "-", x + 12, y + 29, 150);
+  labelValue("Name of Party", row.farmer_account_holder_name || row.farmer_name, x + 195, y + 15, 150);
+  labelValue("Branch", row.farmer_branch_name || "-", x + 195, y + 29, 150);
+  labelValue("Account Number", row.farmer_bank_account_no || "-", x + 380, y + 15, 145);
+  labelValue("Transport No.", "-", x + 380, y + 29, 145);
 
-  y += 62;
-  doc.roundedRect(x + 120, y, contentW - 240, 22, 6).fillAndStroke(greenLight, green);
-  doc.fillColor(green).fontSize(7.5).text("NOTE", x + 128, y + 6);
-  doc.fillColor(text).fontSize(7.5).text("Buyer and Seller disputes will be resolved at village level.", x + 160, y + 6, { width: contentW - 305, align: "center" });
-  y += 30;
-  doc.fillColor(text).fontSize(8).text("Customer Signature", x + 54, y);
-  doc.moveTo(x + 42, y + 16).lineTo(x + 170, y + 16).stroke(border);
-  doc.text("Authorised Signature", x + contentW - 190, y);
-  doc.moveTo(x + contentW - 202, y + 16).lineTo(x + contentW - 52, y + 16).stroke(border);
+  y += 60;
+  doc.roundedRect(x + 135, y, contentW - 270, 20, 6).fillAndStroke(greenLight, green);
+  doc.fillColor(green).fontSize(7.3).text("NOTE", x + 145, y + 5);
+  doc.fillColor(text).fontSize(7.3).text("Buyer and Seller disputes will be resolved at village level.", x + 175, y + 5, { width: contentW - 340, align: "center" });
+  y += 28;
+  doc.fillColor(text).fontSize(8).text("Customer Signature", x + 48, y);
+  doc.moveTo(x + 42, y + 15).lineTo(x + 160, y + 15).stroke(border);
+  doc.text("Authorised Signature", x + contentW - 170, y);
+  doc.moveTo(x + contentW - 182, y + 15).lineTo(x + contentW - 54, y + 15).stroke(border);
   doc.moveTo(x, pageH - 14).lineTo(x + contentW, pageH - 14).stroke(navy);
   doc.moveTo(x + contentW - 28, pageH - 14).lineTo(x + contentW, pageH - 42).stroke(green);
 
