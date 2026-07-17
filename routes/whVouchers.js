@@ -1184,8 +1184,9 @@ function sendPurchaseVoucherPdf(res, row, id) {
   });
 
   const summaryY = y + tableHeight + 8;
-  const summaryW = 330;
-  const totalX = x + contentW - summaryW;
+  const summaryW = 260;
+  const statsPanelW = 220;
+  const statsPanelX = x + contentW - statsPanelW;
   const boxW = summaryW / 5;
   [
     ["PURCHASED KG.", fmt4(row.gross_weight)],
@@ -1202,13 +1203,12 @@ function sendPurchaseVoucherPdf(res, row, id) {
     doc.fillColor(text).fontSize(8.0).text(item[1], bx + 2, summaryY + 17, { width: boxW - 6, align: "center" });
   });
 
-  const totalPanelW = contentW - summaryW - 8;
-  doc.roundedRect(totalX, summaryY, totalPanelW, 34, 4).fillAndStroke("#fff", border);
-  labelValue("Total Qty.", fmt4(netQty), totalX + 8, summaryY + 3, totalPanelW - 16);
-  labelValue("Total Deductions", fmt2(row.total_deduction || row.total_deduct_amount), totalX + 8, summaryY + 14, totalPanelW - 16);
-  doc.roundedRect(totalX, summaryY + 24, totalPanelW, 10, 4).fillAndStroke(navy, navy);
-  doc.fillColor("#fff").fontSize(6.8).text("Net Amount Payable", totalX + 8, summaryY + 27);
-  doc.fillColor("#fff").fontSize(7.2).text(fmt2(netPayable), totalX + 82, summaryY + 27, { width: totalPanelW - 90, align: "right" });
+  doc.roundedRect(statsPanelX, summaryY, statsPanelW, 34, 4).fillAndStroke("#fff", border);
+  labelValue("Total Qty.", fmt4(netQty), statsPanelX + 8, summaryY + 3, statsPanelW - 16);
+  labelValue("Total Deductions", fmt2(row.total_deduction || row.total_deduct_amount), statsPanelX + 8, summaryY + 14, statsPanelW - 16);
+  doc.roundedRect(statsPanelX, summaryY + 24, statsPanelW, 10, 4).fillAndStroke(navy, navy);
+  doc.fillColor("#fff").fontSize(6.8).text("Net Amount Payable", statsPanelX + 8, summaryY + 27);
+  doc.fillColor("#fff").fontSize(7.2).text(fmt2(netPayable), statsPanelX + 82, summaryY + 27, { width: statsPanelW - 90, align: "right" });
 
   y = summaryY + 44;
   doc.roundedRect(x, y, contentW, 54, 6).fillAndStroke("#fff", border);
