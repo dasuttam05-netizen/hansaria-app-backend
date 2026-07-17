@@ -1121,28 +1121,28 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   const leftW = (contentW - 10) / 2;
   const rightX = x + leftW + 10;
-  box(x, y, leftW, 106, "#fff");
-  box(rightX, y, leftW, 106, "#fff");
+  box(x, y, leftW, 102, "#fff");
+  box(rightX, y, leftW, 102, "#fff");
   doc.roundedRect(x, y, leftW, 20, 6).fillAndStroke(navy, navy);
   doc.roundedRect(rightX, y, leftW, 20, 6).fillAndStroke(green, green);
   doc.fillColor("#fff").fontSize(9).text("PARTY INFORMATION", x + 12, y + 6);
   doc.fillColor("#fff").text("DOCUMENT INFORMATION", rightX + 12, y + 6);
 
-  const pStart = y + 25;
+  const pStart = y + 23;
   labelValue("Name of Party", row.farmer_name, x + 10, pStart, leftW - 20);
-  labelValue("PAN", row.farmer_pan, x + 10, pStart + 15, leftW - 20);
-  labelValue("GSTIN", row.farmer_gst, x + 10, pStart + 30, leftW - 20);
-  labelValue("Phone", row.farmer_mobile, x + 10, pStart + 45, leftW - 20);
-  labelValue("State", row.farmer_state, x + 10, pStart + 60, leftW - 20);
-  labelValue("PIN No.", row.farmer_pincode, x + 10, pStart + 75, leftW - 20);
+  labelValue("PAN", row.farmer_pan, x + 10, pStart + 14, leftW - 20);
+  labelValue("GSTIN", row.farmer_gst, x + 10, pStart + 28, leftW - 20);
+  labelValue("Phone", row.farmer_mobile, x + 10, pStart + 42, leftW - 20);
+  labelValue("State", row.farmer_state, x + 10, pStart + 56, leftW - 20);
+  labelValue("PIN No.", row.farmer_pincode, x + 10, pStart + 70, leftW - 20);
 
   labelValue("R.S.T. No.", row.reference_id || "-", rightX + 10, pStart + 3, leftW - 20);
-  labelValue("Transport No.", "-", rightX + 10, pStart + 18, leftW - 20);
-  labelValue("Warehouse", row.warehouse_name || row.warehouse_id, rightX + 10, pStart + 33, leftW - 20);
-  labelValue("Remarks", row.description || "-", rightX + 10, pStart + 48, leftW - 20);
-  labelValue("Location", warehouseNameLine, rightX + 10, pStart + 63, leftW - 20);
+  labelValue("Transport No.", "-", rightX + 10, pStart + 17, leftW - 20);
+  labelValue("Warehouse", row.warehouse_name || row.warehouse_id, rightX + 10, pStart + 31, leftW - 20);
+  labelValue("Remarks", row.description || "-", rightX + 10, pStart + 45, leftW - 20);
+  labelValue("Location", warehouseNameLine, rightX + 10, pStart + 59, leftW - 20);
 
-  y += 114;
+  y += 110;
 
   const particulars = [
     ["1", "Packet", fmt4(row.packet)],
@@ -1161,8 +1161,8 @@ function sendPurchaseVoucherPdf(res, row, id) {
     return true;
   });
 
-  const particularsHeight = 17 + particulars.length * 10.5;
-  const tableHeight = Math.max(118, particularsHeight + 18);
+  const particularsHeight = 17 + particulars.length * 10;
+  const tableHeight = Math.max(116, particularsHeight + 18);
 
   box(x, y, contentW, tableHeight, "#fff");
   doc.roundedRect(x, y, contentW, 18, 6).fillAndStroke(navy, navy);
@@ -1175,16 +1175,16 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   particulars.forEach((ln, index) => {
     const fill = index % 2 === 0 ? "#fbfdff" : "#f8fafc";
-    doc.rect(x + 1, rowY, contentW - 2, 10.5).fill(fill);
-    doc.moveTo(x, rowY + 10.5).lineTo(x + contentW, rowY + 10.5).stroke(border);
-    doc.fillColor(text).fontSize(7.0).text(ln[0], x + 10, rowY + 1.2);
-    doc.text(ln[1], x + col1 + 10, rowY + 1.2);
-    doc.text(ln[2], x + col1 + col2 + 10, rowY + 1.2, { width: 80, align: "right" });
-    rowY += 10.5;
+    doc.rect(x + 1, rowY, contentW - 2, 10).fill(fill);
+    doc.moveTo(x, rowY + 10).lineTo(x + contentW, rowY + 10).stroke(border);
+    doc.fillColor(text).fontSize(6.8).text(ln[0], x + 10, rowY + 1);
+    doc.text(ln[1], x + col1 + 10, rowY + 1);
+    doc.text(ln[2], x + col1 + col2 + 10, rowY + 1, { width: 80, align: "right" });
+    rowY += 10;
   });
 
   const summaryY = rowY + 8;
-  const summaryW = 345;
+  const summaryW = 360;
   const totalX = x + contentW - summaryW;
   const boxW = summaryW / 5;
   [
@@ -1197,36 +1197,36 @@ function sendPurchaseVoucherPdf(res, row, id) {
     const bx = x + index * boxW;
     const fill = index === 4 ? greenLight : soft;
     const stroke = index === 4 ? green : border;
-    doc.roundedRect(bx, summaryY, boxW - 2, 38, 4).fillAndStroke(fill, stroke);
-    doc.fillColor(index === 4 ? green : navy).fontSize(6.6).text(item[0], bx + 2, summaryY + 6, { width: boxW - 6, align: "center" });
-    doc.fillColor(text).fontSize(8.8).text(item[1], bx + 2, summaryY + 20, { width: boxW - 6, align: "center" });
+    doc.roundedRect(bx, summaryY, boxW - 2, 36, 4).fillAndStroke(fill, stroke);
+    doc.fillColor(index === 4 ? green : navy).fontSize(6.4).text(item[0], bx + 2, summaryY + 5, { width: boxW - 6, align: "center" });
+    doc.fillColor(text).fontSize(8.5).text(item[1], bx + 2, summaryY + 19, { width: boxW - 6, align: "center" });
   });
 
   const totalPanelW = contentW - summaryW - 8;
-  doc.roundedRect(totalX, summaryY, totalPanelW, 38, 4).fillAndStroke("#fff", border);
-  labelValue("Total Qty.", fmt4(netQty), totalX + 8, summaryY + 5, totalPanelW - 16);
-  labelValue("Total Deductions", fmt2(row.total_deduction || row.total_deduct_amount), totalX + 8, summaryY + 17, totalPanelW - 16);
-  doc.roundedRect(totalX, summaryY + 27, totalPanelW, 11, 4).fillAndStroke(navy, navy);
-  doc.fillColor("#fff").fontSize(7.4).text("Net Amount Payable", totalX + 8, summaryY + 30);
-  doc.fillColor("#fff").fontSize(8).text(fmt2(netPayable), totalX + 82, summaryY + 30, { width: totalPanelW - 90, align: "right" });
+  doc.roundedRect(totalX, summaryY, totalPanelW, 36, 4).fillAndStroke("#fff", border);
+  labelValue("Total Qty.", fmt4(netQty), totalX + 8, summaryY + 4, totalPanelW - 16);
+  labelValue("Total Deductions", fmt2(row.total_deduction || row.total_deduct_amount), totalX + 8, summaryY + 16, totalPanelW - 16);
+  doc.roundedRect(totalX, summaryY + 26, totalPanelW, 10, 4).fillAndStroke(navy, navy);
+  doc.fillColor("#fff").fontSize(7.0).text("Net Amount Payable", totalX + 8, summaryY + 28);
+  doc.fillColor("#fff").fontSize(7.6).text(fmt2(netPayable), totalX + 82, summaryY + 28, { width: totalPanelW - 90, align: "right" });
 
-  y = summaryY + 48;
-  doc.roundedRect(x, y, contentW, 58, 6).fillAndStroke("#fff", border);
+  y = summaryY + 46;
+  doc.roundedRect(x, y, contentW, 56, 6).fillAndStroke("#fff", border);
   doc.roundedRect(x + 10, y - 8, 160, 16, 5).fillAndStroke(green, green);
   doc.fillColor("#fff").fontSize(9).text("ADDITIONAL DETAILS", x + 27, y - 4);
-  labelValue("Bank", row.farmer_bank_name || "-", x + 12, y + 16, 168);
-  labelValue("IFSC Code", row.farmer_ifsc_code || "-", x + 12, y + 31, 168);
-  labelValue("Name of Party", row.farmer_account_holder_name || row.farmer_name, x + 220, y + 16, 168);
-  labelValue("Branch", row.farmer_branch_name || "-", x + 220, y + 31, 168);
-  labelValue("Account Number", row.farmer_bank_account_no || "-", x + 430, y + 16, 160);
-  labelValue("Transport No.", "-", x + 430, y + 31, 160);
+  labelValue("Bank", row.farmer_bank_name || "-", x + 12, y + 15, 175);
+  labelValue("IFSC Code", row.farmer_ifsc_code || "-", x + 12, y + 29, 175);
+  labelValue("Name of Party", row.farmer_account_holder_name || row.farmer_name, x + 232, y + 15, 175);
+  labelValue("Branch", row.farmer_branch_name || "-", x + 232, y + 29, 175);
+  labelValue("Account Number", row.farmer_bank_account_no || "-", x + 450, y + 15, 160);
+  labelValue("Transport No.", "-", x + 450, y + 29, 160);
 
-  y += 68;
-  doc.roundedRect(x + 150, y, contentW - 300, 20, 6).fillAndStroke(greenLight, green);
-  doc.fillColor(green).fontSize(7.3).text("NOTE", x + 160, y + 5);
-  doc.fillColor(text).fontSize(7.3).text("Buyer and Seller disputes will be resolved at village level.", x + 190, y + 5, { width: contentW - 390, align: "center" });
+  y += 64;
+  doc.roundedRect(x + 135, y, contentW - 270, 18, 6).fillAndStroke(greenLight, green);
+  doc.fillColor(green).fontSize(7.0).text("NOTE", x + 145, y + 5);
+  doc.fillColor(text).fontSize(7.0).text("Buyer and Seller disputes will be resolved at village level.", x + 175, y + 5, { width: contentW - 340, align: "center" });
   y += 28;
-  doc.fillColor(text).fontSize(8).text("Customer Signature", x + 48, y);
+  doc.fillColor(text).fontSize(7.5).text("Customer Signature", x + 48, y);
   doc.moveTo(x + 42, y + 15).lineTo(x + 160, y + 15).stroke(border);
   doc.text("Authorised Signature", x + contentW - 170, y);
   doc.moveTo(x + contentW - 182, y + 15).lineTo(x + contentW - 54, y + 15).stroke(border);
