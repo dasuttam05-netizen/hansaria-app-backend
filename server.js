@@ -2,6 +2,20 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+
+function assertCoreFile(fileName) {
+  const filePath = path.join(__dirname, fileName);
+  if (!fs.existsSync(filePath)) {
+    throw new Error(
+      `Startup check failed: missing required file "${fileName}" at ${filePath}. ` +
+      "This usually means the deploy is running an older or incomplete source snapshot."
+    );
+  }
+}
+
+["db.js", "db-mongodb.js", "sqliteMongoSync.js", "mongo.js"].forEach(assertCoreFile);
 
 const {
   authenticate,
