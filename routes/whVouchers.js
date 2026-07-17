@@ -1183,7 +1183,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
     rowY += 9.5;
   });
 
-  const summaryY = rowY + 8;
+  const summaryY = y + tableHeight + 8;
   const summaryW = 330;
   const totalX = x + contentW - summaryW;
   const boxW = summaryW / 5;
