@@ -1038,11 +1038,11 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   const pageW = doc.page.width;
   const contentW = pageW - 44;
-  const primary = "#0f766e";
-  const accent = "#2563eb";
-  const muted = "#475569";
-  const border = "#cbd5e1";
-  const light = "#f8fafc";
+  const primary = "#111827";
+  const accent = "#374151";
+  const muted = "#4b5563";
+  const border = "#9ca3af";
+  const light = "#f3f4f6";
   const x = 22;
   let y = 18;
   const accountName = row.company_account_name || "SHIVANSH";
