@@ -1185,7 +1185,7 @@ function sendPurchaseVoucherPdf(res, row, id) {
 
   const summaryY = y + tableHeight + 8;
   const summaryW = 260;
-  const statsPanelW = 220;
+  const statsPanelW = 170;
   const statsPanelX = x + contentW - statsPanelW;
   const boxW = summaryW / 5;
   [
@@ -1203,12 +1203,14 @@ function sendPurchaseVoucherPdf(res, row, id) {
     doc.fillColor(text).fontSize(8.0).text(item[1], bx + 2, summaryY + 17, { width: boxW - 6, align: "center" });
   });
 
-  doc.roundedRect(statsPanelX, summaryY, statsPanelW, 34, 4).fillAndStroke("#fff", border);
-  labelValue("Total Qty.", fmt4(netQty), statsPanelX + 8, summaryY + 3, statsPanelW - 16);
-  labelValue("Total Deductions", fmt2(row.total_deduction || row.total_deduct_amount), statsPanelX + 8, summaryY + 14, statsPanelW - 16);
-  doc.roundedRect(statsPanelX, summaryY + 24, statsPanelW, 10, 4).fillAndStroke(navy, navy);
-  doc.fillColor("#fff").fontSize(6.8).text("Net Amount Payable", statsPanelX + 8, summaryY + 27);
-  doc.fillColor("#fff").fontSize(7.2).text(fmt2(netPayable), statsPanelX + 82, summaryY + 27, { width: statsPanelW - 90, align: "right" });
+  doc.roundedRect(statsPanelX, summaryY, statsPanelW, 34, 4).fillAndStroke("#f8fafc", border);
+  doc.fillColor(navy).fontSize(6.5).text("Total Qty.", statsPanelX + 8, summaryY + 3);
+  doc.fillColor(text).fontSize(8.0).text(fmt4(netQty), statsPanelX + 8, summaryY + 13);
+  doc.fillColor(navy).fontSize(6.5).text("Total Deductions", statsPanelX + 8, summaryY + 22);
+  doc.fillColor(text).fontSize(8.0).text(fmt2(row.total_deduction || row.total_deduct_amount), statsPanelX + 8, summaryY + 31);
+  doc.roundedRect(statsPanelX, summaryY + 43, statsPanelW, 12, 4).fillAndStroke(navy, navy);
+  doc.fillColor("#fff").fontSize(6.8).text("Net Amount Payable", statsPanelX + 8, summaryY + 45);
+  doc.fillColor("#fff").fontSize(8.2).text(fmt2(netPayable), statsPanelX + 8, summaryY + 55, { width: statsPanelW - 16, align: "right" });
 
   y = summaryY + 44;
   doc.roundedRect(x, y, contentW, 54, 6).fillAndStroke("#fff", border);
