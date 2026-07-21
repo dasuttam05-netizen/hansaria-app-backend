@@ -48,7 +48,15 @@ function normalizeInwardImportRow(row) {
     company_id: pick("company_id", "CompanyID", "CompanyId", "Company ID"),
     company_name: pick("company_name", "CompanyName", "Company Name", "Company"),
     company_account_id: pick("company_account_id", "CompanyAccountID", "CompanyAccountId", "Company Account ID"),
-    company_account_name: pick("company_account_name", "CompanyAccountName", "Company Account Name", "CompanyAccount", "Company Account"),
+    company_account_name: pick(
+      "company_account_name",
+      "CompanyAccountName",
+      "Company Account Name",
+      "CompanyAccount",
+      "Company Account",
+      "Account Name",
+      "Account"
+    ),
     lorry_no: pick("lorry_no", "LorryNo", "Lorry No"),
     weight: pick("weight", "Weight"),
   };
@@ -201,11 +209,23 @@ async function importInwardRows(rows, res) {
     );
 
     const missing = [];
+    let resolvedCompanyAccountId = companyAccountId;
+    if (!resolvedCompanyAccountId && companyId) {
+      const match = Array.from(lookupMaps.companyAccountById.entries()).find(([, accountName]) => {
+        const rowCompanyName = String(lookupMaps.companyById.get(String(companyId)) || "").trim().toLowerCase();
+        const accountText = String(accountName || "").trim().toLowerCase();
+        return rowCompanyName && accountText && accountText.includes(rowCompanyName);
+      });
+      if (match) {
+        resolvedCompanyAccountId = match[0];
+      }
+    }
+
     if (!date) missing.push("date");
     if (!warehouseId) missing.push("warehouse");
     if (!productId) missing.push("product");
     if (!companyId) missing.push("company");
-    if (!companyAccountId) missing.push("company account");
+    if (!resolvedCompanyAccountId) missing.push("company account");
 
     if (missing.length > 0) {
       skipped += 1;
@@ -223,7 +243,7 @@ async function importInwardRows(rows, res) {
       warehouse_id: warehouseId,
       product_id: productId,
       company_id: companyId,
-      company_account_id: companyAccountId,
+      company_account_id: resolvedCompanyAccountId,
     };
     const weight = Number(row.weight || 0) || 0;
     const lorryNo = String(row.lorry_no || "").trim() || null;
@@ -342,7 +362,10 @@ router.get("/", async (req, res) => {
       p.name AS product_name,
       w.name AS warehouse_name,
       c.name AS company_name,
-      ca.account_name AS company_account_name
+      COALESCE(
+        ca.account_name,
+        (SELECT account_name FROM company_accounts WHERE company_id = i.company_id ORDER BY id ASC LIMIT 1)
+      ) AS company_account_name
     FROM inward i
     LEFT JOIN locations l ON i.location_id = l.id
     LEFT JOIN employees e ON i.employee_id = e.id
@@ -390,6 +413,22 @@ router.post("/", async (req, res) => {
     resolvedIds = await resolveEntryMasterIds(db, req.body);
   } catch (resolveErr) {
     return res.status(500).json({ error: resolveErr.message });
+  }
+
+  if (!resolvedIds.company_account_id && resolvedIds.company_id) {
+    const accountRow = await new Promise((resolve, reject) => {
+      db.get(
+        `SELECT id FROM company_accounts WHERE company_id = ? ORDER BY id ASC LIMIT 1`,
+        [resolvedIds.company_id],
+        (err, row) => {
+          if (err) return reject(err);
+          resolve(row || null);
+        }
+      );
+    }).catch(() => null);
+    if (accountRow?.id) {
+      resolvedIds.company_account_id = accountRow.id;
+    }
   }
 
   if (!canAccessWarehouse(req.user, warehouse_id) && !canAccessWarehouse(req.user, resolvedIds.warehouse_id)) {
@@ -467,6 +506,22 @@ router.put("/:id", async (req, res) => {
     return res.status(500).json({ error: resolveErr.message });
   }
 
+  if (!resolvedIds.company_account_id && resolvedIds.company_id) {
+    const accountRow = await new Promise((resolve, reject) => {
+      db.get(
+        `SELECT id FROM company_accounts WHERE company_id = ? ORDER BY id ASC LIMIT 1`,
+        [resolvedIds.company_id],
+        (err, row) => {
+          if (err) return reject(err);
+          resolve(row || null);
+        }
+      );
+    }).catch(() => null);
+    if (accountRow?.id) {
+      resolvedIds.company_account_id = accountRow.id;
+    }
+  }
+
   db.get(`SELECT warehouse_id FROM inward WHERE id = ?`, [id], (findErr, inwardRow) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!inwardRow) return res.status(404).json({ error: "Inward not found" });
@@ -542,12 +597,17 @@ router.get("/report", (req, res) => {
            c.name AS company_name,
            w.name AS warehouse_name,
            e.name AS employee_name,
-           p.name AS product_name
+           p.name AS product_name,
+           COALESCE(
+             ca.account_name,
+             (SELECT account_name FROM company_accounts WHERE company_id = i.company_id ORDER BY id ASC LIMIT 1)
+           ) AS company_account_name
     FROM inward i
     LEFT JOIN companies c ON i.company_id = c.id
     LEFT JOIN warehouses w ON i.warehouse_id = w.id
     LEFT JOIN employees e ON i.employee_id = e.id
     LEFT JOIN products p ON i.product_id = p.id
+    LEFT JOIN company_accounts ca ON i.company_account_id = ca.id
     WHERE 1=1
   `;
 
