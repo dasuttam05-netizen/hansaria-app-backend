@@ -152,6 +152,62 @@ function resolveIdFromLookup(row, idValue, nameValue, idMap, nameMap) {
   return null;
 }
 
+function resolveCompanyAccountId(row, lookupMaps, companyId) {
+  const directAccountId = String(row?.company_account_id || "").trim();
+  if (directAccountId && lookupMaps.companyAccountById.has(directAccountId)) {
+    return directAccountId;
+  }
+
+  const accountName = String(row?.company_account_name || "").trim().toLowerCase();
+  if (accountName && lookupMaps.companyAccount.has(accountName)) {
+    return lookupMaps.companyAccount.get(accountName);
+  }
+
+  const companyName = String(row?.company_name || "").trim().toLowerCase();
+  if (companyName && lookupMaps.companyByName.has(companyName)) {
+    const matchedCompanyId = lookupMaps.companyByName.get(companyName);
+    const accountByCompany = Array.from(lookupMaps.companyAccountById.entries()).find(([id, accountNameValue]) => {
+      if (!id || !accountNameValue) return false;
+      const normalizedAccount = String(accountNameValue || "").trim().toLowerCase();
+      return normalizedAccount === companyName || normalizedAccount.includes(companyName);
+    });
+    if (accountByCompany) return accountByCompany[0];
+    if (matchedCompanyId && companyId) {
+      const companyNameValue = String(lookupMaps.companyById.get(String(companyId)) || "").trim().toLowerCase();
+      const accountByMatchedCompany = Array.from(lookupMaps.companyAccountById.entries()).find(([, accountNameValue]) => {
+        const normalizedAccount = String(accountNameValue || "").trim().toLowerCase();
+        return companyNameValue && normalizedAccount && (normalizedAccount === companyNameValue || normalizedAccount.includes(companyNameValue));
+      });
+      if (accountByMatchedCompany) return accountByMatchedCompany[0];
+    }
+  }
+
+  if (companyId) {
+    const companyNameValue = String(lookupMaps.companyById.get(String(companyId)) || "").trim().toLowerCase();
+    const accountByCompanyId = Array.from(lookupMaps.companyAccountById.entries()).find(([, accountNameValue]) => {
+      const normalizedAccount = String(accountNameValue || "").trim().toLowerCase();
+      return companyNameValue && normalizedAccount && (normalizedAccount === companyNameValue || normalizedAccount.includes(companyNameValue));
+    });
+    if (accountByCompanyId) return accountByCompanyId[0];
+  }
+
+  return null;
+}
+
+function buildSampleRow(row) {
+  return {
+    date: String(row?.date || "").trim(),
+    employee_name: String(row?.employee_name || "").trim(),
+    location_name: String(row?.location_name || "").trim(),
+    warehouse_name: String(row?.warehouse_name || "").trim(),
+    product_name: String(row?.product_name || "").trim(),
+    company_name: String(row?.company_name || "").trim(),
+    company_account_name: String(row?.company_account_name || "").trim(),
+    lorry_no: String(row?.lorry_no || "").trim(),
+    weight: String(row?.weight || "").trim(),
+  };
+}
+
 async function importInwardRows(rows, res) {
   const lookupMaps = await buildInwardLookupMaps(db, rows);
   let inserted = 0;
@@ -186,13 +242,7 @@ async function importInwardRows(rows, res) {
       lookupMaps.companyById,
       lookupMaps.company
     );
-    const companyAccountId = resolveIdFromLookup(
-      row,
-      row.company_account_id,
-      row.company_account_name,
-      lookupMaps.companyAccountById,
-      lookupMaps.companyAccount
-    );
+    const companyAccountId = resolveCompanyAccountId(row, lookupMaps, companyId);
     const employeeId = resolveIdFromLookup(
       row,
       row.employee_id,
@@ -232,6 +282,7 @@ async function importInwardRows(rows, res) {
       errors.push({
         row: index + 2,
         error: `Missing or unmatched required field(s): ${missing.join(", ")}`,
+        sample_row: buildSampleRow(row),
       });
       return processRow(index + 1);
     }
@@ -251,7 +302,7 @@ async function importInwardRows(rows, res) {
     db.get(`SELECT COALESCE(MAX(sl_no), 0) AS max_sl FROM inward`, [], (slErr, slRow) => {
       if (slErr) {
         skipped += 1;
-        errors.push({ row: index + 2, error: slErr.message });
+        errors.push({ row: index + 2, error: slErr.message, sample_row: buildSampleRow(row) });
         return processRow(index + 1);
       }
 
@@ -282,7 +333,7 @@ async function importInwardRows(rows, res) {
         (insertErr) => {
           if (insertErr) {
             skipped += 1;
-            errors.push({ row: index + 2, error: insertErr.message });
+            errors.push({ row: index + 2, error: insertErr.message, sample_row: buildSampleRow(row) });
           } else {
             inserted += 1;
           }
