@@ -9,6 +9,16 @@ const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqlit
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+router.options("/template-xlsx", (req, res) => res.sendStatus(204));
+router.options("/import-xlsx", (req, res) => {
+  console.log("[inward.import] preflight", {
+    origin: req.headers.origin || "",
+    method: req.method,
+    contentType: req.headers["content-type"] || "",
+  });
+  return res.sendStatus(204);
+});
+
 function buildInwardTemplateRows() {
   return [
     {
@@ -362,6 +372,14 @@ router.get("/template-xlsx", async (req, res) => {
 });
 
 router.post("/import-xlsx", upload.single("file"), async (req, res) => {
+  console.log("[inward.import] request", {
+    origin: req.headers.origin || "",
+    method: req.method,
+    contentType: req.headers["content-type"] || "",
+    hasFile: !!req.file?.buffer,
+    fileName: req.file?.originalname || "",
+    fileSize: req.file?.size || 0,
+  });
   if (!userHasPermission(req.user, "inward.import")) {
     return res.status(403).json({ error: "You do not have permission to import inward entries" });
   }
