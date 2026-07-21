@@ -26,23 +26,31 @@ function buildInwardTemplateRows() {
 }
 
 function normalizeInwardImportRow(row) {
+  const pick = (...keys) => {
+    for (const key of keys) {
+      if (row?.[key] !== undefined && row?.[key] !== null && String(row?.[key]).trim() !== "") {
+        return row[key];
+      }
+    }
+    return "";
+  };
+
   return {
-    date: row.date ?? row.Date ?? "",
-    employee_id: row.employee_id ?? row.EmployeeID ?? row.EmployeeId ?? "",
-    employee_name: row.employee_name ?? row.EmployeeName ?? row.Employee ?? "",
-    location_id: row.location_id ?? row.LocationID ?? row.LocationId ?? "",
-    location_name: row.location_name ?? row.LocationName ?? row.Location ?? "",
-    warehouse_id: row.warehouse_id ?? row.WarehouseID ?? row.WarehouseId ?? "",
-    warehouse_name: row.warehouse_name ?? row.WarehouseName ?? row.Warehouse ?? "",
-    product_id: row.product_id ?? row.ProductID ?? row.ProductId ?? "",
-    product_name: row.product_name ?? row.ProductName ?? row.Product ?? "",
-    company_id: row.company_id ?? row.CompanyID ?? row.CompanyId ?? "",
-    company_name: row.company_name ?? row.CompanyName ?? row.Company ?? "",
-    company_account_id: row.company_account_id ?? row.CompanyAccountID ?? row.CompanyAccountId ?? "",
-    company_account_name:
-      row.company_account_name ?? row.CompanyAccountName ?? row.CompanyAccount ?? "",
-    lorry_no: row.lorry_no ?? row.LorryNo ?? "",
-    weight: row.weight ?? row.Weight ?? "",
+    date: pick("date", "Date", "DATE"),
+    employee_id: pick("employee_id", "EmployeeID", "EmployeeId", "Employee ID"),
+    employee_name: pick("employee_name", "EmployeeName", "Employee Name", "Employee"),
+    location_id: pick("location_id", "LocationID", "LocationId", "Location ID"),
+    location_name: pick("location_name", "LocationName", "Location Name", "Location"),
+    warehouse_id: pick("warehouse_id", "WarehouseID", "WarehouseId", "Warehouse ID"),
+    warehouse_name: pick("warehouse_name", "WarehouseName", "Warehouse Name", "Warehouse"),
+    product_id: pick("product_id", "ProductID", "ProductId", "Product ID"),
+    product_name: pick("product_name", "ProductName", "Product Name", "Product"),
+    company_id: pick("company_id", "CompanyID", "CompanyId", "Company ID"),
+    company_name: pick("company_name", "CompanyName", "Company Name", "Company"),
+    company_account_id: pick("company_account_id", "CompanyAccountID", "CompanyAccountId", "Company Account ID"),
+    company_account_name: pick("company_account_name", "CompanyAccountName", "Company Account Name", "CompanyAccount", "Company Account"),
+    lorry_no: pick("lorry_no", "LorryNo", "Lorry No"),
+    weight: pick("weight", "Weight"),
   };
 }
 
@@ -192,9 +200,19 @@ async function importInwardRows(rows, res) {
       lookupMaps.location
     );
 
-    if (!date || !warehouseId || !productId || !companyId || !companyAccountId) {
+    const missing = [];
+    if (!date) missing.push("date");
+    if (!warehouseId) missing.push("warehouse");
+    if (!productId) missing.push("product");
+    if (!companyId) missing.push("company");
+    if (!companyAccountId) missing.push("company account");
+
+    if (missing.length > 0) {
       skipped += 1;
-      errors.push({ row: index + 2, error: "Missing required inward fields" });
+      errors.push({
+        row: index + 2,
+        error: `Missing or unmatched required field(s): ${missing.join(", ")}`,
+      });
       return processRow(index + 1);
     }
 
