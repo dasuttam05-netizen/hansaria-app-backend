@@ -2,6 +2,8 @@ const express = require("express");
 const mongoose = require("mongoose");
 const router = express.Router();
 const db = require("../db");
+const multer = require("multer");
+const XLSX = require("xlsx");
 const {
   Location: MongoLocation,
   Employee: MongoEmployee,
@@ -21,6 +23,8 @@ const { userHasPermission } = require("../middleware/auth");
 const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
 const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
 
+const upload = multer({ storage: multer.memoryStorage() });
+
 function isSelfLoadingOutward(row) {
   return String(row?.self_loading || "").trim().toLowerCase() === "yes";
 }
@@ -30,6 +34,263 @@ function canAccessOutwardRow(user, row) {
   if (isSelfLoadingOutward(row)) return true;
   return canAccessWarehouse(user, row.warehouse_id);
 }
+
+function buildOutwardTemplateRows() {
+  return [
+    {
+      date: "2026-07-21",
+      employee_name: "Employee Name",
+      location_name: "Location Name",
+      warehouse_name: "Warehouse Name",
+      product_name: "Product Name",
+      company_name: "Company Name",
+      company_account_name: "Company Account Name",
+      lorry_no: "WB00A0000",
+      weight: 0,
+      rate: 0,
+      inv_no: "INV-001",
+      buyer_name: "Buyer Name",
+      consignee_name: "Consignee Name",
+      self_loading: "No",
+    },
+  ];
+}
+
+function normalizeOutwardImportRow(row) {
+  return {
+    date: row.date ?? row.Date ?? "",
+    employee_id: row.employee_id ?? row.EmployeeID ?? row.EmployeeId ?? "",
+    employee_name: row.employee_name ?? row.EmployeeName ?? row.Employee ?? "",
+    location_id: row.location_id ?? row.LocationID ?? row.LocationId ?? "",
+    location_name: row.location_name ?? row.LocationName ?? row.Location ?? "",
+    warehouse_id: row.warehouse_id ?? row.WarehouseID ?? row.WarehouseId ?? "",
+    warehouse_name: row.warehouse_name ?? row.WarehouseName ?? row.Warehouse ?? "",
+    product_id: row.product_id ?? row.ProductID ?? row.ProductId ?? "",
+    product_name: row.product_name ?? row.ProductName ?? row.Product ?? "",
+    company_id: row.company_id ?? row.CompanyID ?? row.CompanyId ?? "",
+    company_name: row.company_name ?? row.CompanyName ?? row.Company ?? "",
+    company_account_id: row.company_account_id ?? row.CompanyAccountID ?? row.CompanyAccountId ?? "",
+    company_account_name:
+      row.company_account_name ?? row.CompanyAccountName ?? row.CompanyAccount ?? "",
+    lorry_no: row.lorry_no ?? row.LorryNo ?? "",
+    weight: row.weight ?? row.Weight ?? "",
+    rate: row.rate ?? row.Rate ?? "",
+    inv_no: row.inv_no ?? row.InvNo ?? row.InvoiceNo ?? "",
+    buyer_name: row.buyer_name ?? row.BuyerName ?? row.Buyer ?? "",
+    consignee_name: row.consignee_name ?? row.ConsigneeName ?? row.Consignee ?? "",
+    self_loading: row.self_loading ?? row.SelfLoading ?? "No",
+  };
+}
+
+function createNameLookup(rows, keyField, valueField) {
+  const map = new Map();
+  for (const row of rows || []) {
+    const key = String(row?.[keyField] || "").trim().toLowerCase();
+    const value = String(row?.[valueField] || "").trim();
+    if (key && value && !map.has(key)) {
+      map.set(key, value);
+    }
+  }
+  return map;
+}
+
+function createIdLookup(rows, keyField, valueField) {
+  const map = new Map();
+  for (const row of rows || []) {
+    const key = String(row?.[keyField] || "").trim();
+    const value = String(row?.[valueField] || "").trim();
+    if (key && value && !map.has(key)) {
+      map.set(key, value);
+    }
+  }
+  return map;
+}
+
+async function buildOutwardLookupMaps(rows) {
+  const makeSqlMap = (table, field) =>
+    new Promise((resolve) => {
+      db.all(
+        `SELECT id, ${field} AS label FROM ${table}`,
+        [],
+        (err, rowsOut) => {
+          if (err || !Array.isArray(rowsOut)) return resolve(new Map());
+          resolve(new Map(rowsOut.map((r) => [String(r.id), String(r.label || "").trim()]).filter(([k, v]) => k && v)));
+        }
+      );
+    });
+
+  const [employeeById, locationById, warehouseById, productById, companyById, companyAccountById] =
+    await Promise.all([
+      makeSqlMap("employees", "name"),
+      makeSqlMap("locations", "name"),
+      makeSqlMap("warehouses", "name"),
+      makeSqlMap("products", "name"),
+      makeSqlMap("companies", "name"),
+      makeSqlMap("company_accounts", "account_name"),
+    ]);
+
+  return {
+    employeeById,
+    locationById,
+    warehouseById,
+    productById,
+    companyById,
+    companyAccountById,
+    employeeByName: createNameLookup(Array.from(employeeById, ([id, name]) => ({ id, name })), "name", "id"),
+    locationByName: createNameLookup(Array.from(locationById, ([id, name]) => ({ id, name })), "name", "id"),
+    warehouseByName: createNameLookup(Array.from(warehouseById, ([id, name]) => ({ id, name })), "name", "id"),
+    productByName: createNameLookup(Array.from(productById, ([id, name]) => ({ id, name })), "name", "id"),
+    companyByName: createNameLookup(Array.from(companyById, ([id, name]) => ({ id, name })), "name", "id"),
+    companyAccountByName: createNameLookup(
+      Array.from(companyAccountById, ([id, account_name]) => ({ id, account_name })),
+      "account_name",
+      "id"
+    ),
+  };
+}
+
+function resolveIdFromLookup(row, idValue, nameValue, idMap, nameMap) {
+  const directId = String(idValue || "").trim();
+  if (directId && idMap.has(directId)) return directId;
+  const directName = String(nameValue || "").trim().toLowerCase();
+  if (directName && nameMap.has(directName)) return nameMap.get(directName);
+  return null;
+}
+
+async function importOutwardRows(rows, res) {
+  const lookupMaps = await buildOutwardLookupMaps(rows);
+  let inserted = 0;
+  let skipped = 0;
+  const errors = [];
+
+  const processRow = (index) => {
+    if (index >= rows.length) {
+      return res.json({ total: rows.length, inserted, skipped, errors });
+    }
+
+    const row = rows[index] || {};
+    const date = String(row.date || "").trim();
+    const employeeId = resolveIdFromLookup(row, row.employee_id, row.employee_name, lookupMaps.employeeById, lookupMaps.employeeByName);
+    const locationId = resolveIdFromLookup(row, row.location_id, row.location_name, lookupMaps.locationById, lookupMaps.locationByName);
+    const warehouseId = resolveIdFromLookup(row, row.warehouse_id, row.warehouse_name, lookupMaps.warehouseById, lookupMaps.warehouseByName);
+    const productId = resolveIdFromLookup(row, row.product_id, row.product_name, lookupMaps.productById, lookupMaps.productByName);
+    const companyId = resolveIdFromLookup(row, row.company_id, row.company_name, lookupMaps.companyById, lookupMaps.companyByName);
+    const companyAccountId = resolveIdFromLookup(
+      row,
+      row.company_account_id,
+      row.company_account_name,
+      lookupMaps.companyAccountById,
+      lookupMaps.companyAccountByName
+    );
+    const selfLoading = String(row.self_loading || "No").trim() || "No";
+    const qty = Number(row.quantity ?? row.weight ?? 0) || 0;
+    const rateVal = Number(row.rate || 0) || 0;
+
+    if (!date || !productId || !companyId) {
+      skipped += 1;
+      errors.push({ row: index + 2, error: "Missing required outward fields" });
+      return processRow(index + 1);
+    }
+
+    const isSelfLoading = selfLoading.toLowerCase() === "yes";
+    const normalizedWarehouseId = isSelfLoading ? null : warehouseId;
+
+    db.get(`SELECT COALESCE(MAX(sl_no), 0) AS max_sl FROM outward`, [], (slErr, slRow) => {
+      if (slErr) {
+        skipped += 1;
+        errors.push({ row: index + 2, error: slErr.message });
+        return processRow(index + 1);
+      }
+
+      const nextSl = Number(slRow?.max_sl || 0) + 1;
+      const voucherNo = `OUT-${String(nextSl).padStart(4, "0")}`;
+
+      db.run(
+        `
+        INSERT INTO outward (
+          sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
+          product_id, company_id, company_account_id,
+          lorry_no, weight, quantity, rate, amount,
+          buyer_name, consignee_name, inv_no, self_loading, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          nextSl,
+          voucherNo,
+          date,
+          employeeId || null,
+          locationId || null,
+          normalizedWarehouseId,
+          productId || null,
+          companyId || null,
+          companyAccountId || null,
+          String(row.lorry_no || "").trim() || null,
+          qty,
+          qty,
+          rateVal,
+          qty * rateVal,
+          String(row.buyer_name || "").trim() || null,
+          String(row.consignee_name || "").trim() || null,
+          String(row.inv_no || "").trim() || null,
+          selfLoading,
+          "Pending",
+        ],
+        (insertErr) => {
+          if (insertErr) {
+            skipped += 1;
+            errors.push({ row: index + 2, error: insertErr.message });
+          } else {
+            inserted += 1;
+          }
+          return processRow(index + 1);
+        }
+      );
+    });
+  };
+
+  return processRow(0);
+}
+
+router.get("/template-xlsx", (req, res) => {
+  if (!userHasPermission(req.user, "outward.export")) {
+    return res.status(403).json({ error: "You do not have permission to download outward template" });
+  }
+
+  const workbook = XLSX.utils.book_new();
+  const ws = XLSX.utils.json_to_sheet(buildOutwardTemplateRows());
+  XLSX.utils.book_append_sheet(workbook, ws, "Outward Template");
+  const buffer = XLSX.write(workbook, { bookType: "xlsx", type: "buffer" });
+
+  res.setHeader("Content-Disposition", 'attachment; filename="outward-template.xlsx"');
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  return res.send(buffer);
+});
+
+router.post("/import-xlsx", upload.single("file"), async (req, res) => {
+  if (!userHasPermission(req.user, "outward.import")) {
+    return res.status(403).json({ error: "You do not have permission to import outward entries" });
+  }
+  if (!req.file?.buffer) {
+    return res.status(400).json({ error: "XLSX file is required" });
+  }
+
+  let rows = [];
+  try {
+    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+    const firstSheet = workbook.SheetNames?.[0];
+    if (!firstSheet) return res.status(400).json({ error: "No sheet found in file" });
+    rows = XLSX.utils.sheet_to_json(workbook.Sheets[firstSheet], { defval: "" });
+  } catch (err) {
+    return res.status(400).json({ error: "Invalid XLSX file" });
+  }
+
+  const normalized = (Array.isArray(rows) ? rows : []).map(normalizeOutwardImportRow);
+  if (normalized.length === 0) {
+    return res.status(400).json({ error: "No rows found in XLSX" });
+  }
+
+  return importOutwardRows(normalized, res);
+});
 
 const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
 const safeText = (v) => (v ? v : null);
