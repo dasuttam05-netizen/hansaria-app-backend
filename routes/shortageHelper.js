@@ -26,14 +26,17 @@ function resolveShortageRate(rawValue) {
   return normalized === null ? null : normalized;
 }
 
-function calculateShortageQty(grossQty, monthsDiff, rawValue) {
-  const qty = Number(grossQty) || 0;
-  const slabMonths = Math.max(1, Number(monthsDiff) || 1);
+function calculateAppliedShortageRate(rawValue, monthsDiff) {
   const baseRate =
     rawValue === null || rawValue === undefined || String(rawValue).trim() === ""
       ? DEFAULT_SHORTAGE_SLAB_PERCENT / 100
       : resolveShortageRate(rawValue);
-  const rate = (baseRate || 0) * slabMonths;
+  return Number((baseRate || 0).toFixed(4));
+}
+
+function calculateShortageQty(grossQty, monthsDiff, rawValue) {
+  const qty = Number(grossQty) || 0;
+  const rate = calculateAppliedShortageRate(rawValue, monthsDiff);
   return Number((qty * rate).toFixed(4));
 }
 
@@ -43,5 +46,6 @@ module.exports = {
   normalizeShortagePercent,
   getAutoShortageRate,
   resolveShortageRate,
+  calculateAppliedShortageRate,
   calculateShortageQty,
 };
