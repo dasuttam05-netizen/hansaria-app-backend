@@ -82,6 +82,7 @@ router.post("/", async (req, res) => {
       name,
       address,
       mobile,
+      shortage_percent,
       opening_balance,
       opening_balance_type,
     } = req.body;
@@ -135,6 +136,7 @@ router.put("/:id", async (req, res) => {
       name,
       address,
       mobile,
+      shortage_percent,
       opening_balance,
       opening_balance_type,
     } = req.body;
