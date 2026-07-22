@@ -353,6 +353,7 @@ router.post("/final-save", async (req, res) => {
             SELECT
               p.id,
               p.balance,
+              p.new_weight,
               p.warehouse_id,
               p.company_id,
               w.location_id,
