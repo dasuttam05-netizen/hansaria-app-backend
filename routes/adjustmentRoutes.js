@@ -120,6 +120,10 @@ router.get("/inward/report", (req, res) => {
         p.id,
         p.voucher_no,
         p.expense_date AS date,
+        p.reg_lorry_no,
+        p.new_lorry_no,
+        p.new_weight,
+        COALESCE(NULLIF(TRIM(p.new_lorry_no), ''), NULLIF(TRIM(p.reg_lorry_no), ''), '-') AS display_lorry_no,
         COALESCE(NULLIF(TRIM(p.reg_lorry_no), ''), NULLIF(TRIM(p.new_lorry_no), ''), '-') AS lorry_no,
         p.balance AS gross_qty,
         p.balance AS remaining_qty,
@@ -488,7 +492,8 @@ const handleAdjustmentLogUpdate = (req, res) => {
       const grossQty = normalizeQty(isPalti ? row.palti_balance : row.inward_weight || 0);
 
       const slab = isPalti ? { monthsDiff: 1 } : calculateMonthSlab(row.inward_date, row.outward_date);
-        const shortageQty = isPalti ? 0 : calculateShortageQty(grossQty, slab.monthsDiff, row.shortage_percent);
+      const shortageQty = isPalti ? 0 : calculateShortageQty(grossQty, slab.monthsDiff, row.shortage_percent);
+      const netOpeningQty = normalizeQty(grossQty - shortageQty);
 
       db.get(
         `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id=? AND id<>?`,
