@@ -60,7 +60,8 @@ let db = null;
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       address TEXT,
-      mobile TEXT
+      mobile TEXT,
+      shortage_percent REAL DEFAULT NULL
     )
   `);
 
@@ -72,6 +73,7 @@ let db = null;
       company_id INTEGER NOT NULL,
       pan_no TEXT,
       mobile TEXT,
+      shortage_percent REAL DEFAULT NULL,
       FOREIGN KEY(company_id) REFERENCES companies(id)
     )
   `);
