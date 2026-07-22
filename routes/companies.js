@@ -74,6 +74,14 @@ async function syncCompanyShortageToSqlite(companyId, shortagePercent) {
   ]);
 }
 
+async function forceCompanyShortageToMongo(companyId, shortagePercent) {
+  const normalized = normalizeShortagePercent(shortagePercent);
+  await Company.collection.updateOne(
+    { _id: companyId },
+    { $set: { shortage_percent: normalized } }
+  );
+}
+
 async function syncCompanyToSqlite(companyDoc) {
   const doc = companyDoc && typeof companyDoc.toObject === "function"
     ? companyDoc.toObject()
@@ -194,6 +202,7 @@ router.post("/", async (req, res) => {
       opening_balance_type: String(opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
     });
     await company.save();
+    await forceCompanyShortageToMongo(company._id, normalizedShortagePercent);
 
     await syncCompanyToSqlite(company);
     await syncCompanyShortageToSqlite(company._id, company.shortage_percent);
@@ -248,6 +257,7 @@ router.put("/:id", async (req, res) => {
     updated.opening_balance = Number(opening_balance || 0);
     updated.opening_balance_type = String(opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr";
     await updated.save();
+    await forceCompanyShortageToMongo(updated._id, updated.shortage_percent);
 
     await syncCompanyToSqlite(updated);
     await syncCompanyShortageToSqlite(updated._id, updated.shortage_percent);
