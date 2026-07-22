@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const { resolveEntryMasterIds } = require("../helpers/sqliteMasterResolver");
 const { calculateShortageQty } = require("./shortageHelper");
+const { Company, CompanyAccount } = require("../mongo");
 
 function calculateMonthSlab(inwardDateStr, outwardDateStr) {
   const inwardDate = new Date(inwardDateStr);
@@ -28,6 +29,12 @@ function normalizeQty(value) {
 
 function addQty(...values) {
   return normalizeQty(values.reduce((sum, value) => sum + normalizeQty(value), 0));
+}
+
+function pickShortagePercent(row) {
+  const mongoCompanyPercent = null;
+  const sqlitePercent = row?.shortage_percent;
+  return sqlitePercent;
 }
 
 router.get("/parties", (req, res) => {
@@ -195,32 +202,42 @@ router.get("/inward/report", (req, res) => {
       db.all(sql, [scopeValue, companyId], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
 
-        const result = rows
-      .map((row) => {
-        const slab = calculateMonthSlab(row.date, outward_date);
-        const grossQty = Number(row.gross_qty) || 0;
-        const alreadyAdjusted = Number(row.already_adjusted) || 0;
-        const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, row.shortage_percent);
-        const netOpeningQty = grossQty - shortageQty;
-        const availableQty = netOpeningQty - alreadyAdjusted;
+        Promise.all(
+          (rows || []).map(async (row) => {
+            let shortagePercent = row.shortage_percent;
+            if (shortagePercent === null || shortagePercent === undefined || shortagePercent === "") {
+              const mongoCompany = row.company_name
+                ? await Company.findOne({ name: row.company_name }).lean().catch(() => null)
+                : null;
+              const mongoAccount = row.account_name
+                ? await CompanyAccount.findOne({ account_name: row.account_name }).lean().catch(() => null)
+                : null;
+              shortagePercent = mongoCompany?.shortage_percent ?? mongoAccount?.shortage_percent ?? shortagePercent;
+            }
 
-        return {
-          ...row,
-          source_type: "inward",
-          outward_date,
-          days_diff: slab.daysDiff,
-          months_diff: slab.monthsDiff,
-          gross_qty: Number(grossQty.toFixed(4)),
-          shortage_qty: Number(shortageQty.toFixed(4)),
-          warehouse_chgs: Number(shortageQty.toFixed(4)),
-          net_opening_qty: Number(netOpeningQty.toFixed(4)),
-          already_adjusted: Number(alreadyAdjusted.toFixed(4)),
-          available_qty: Number(Math.max(availableQty, 0).toFixed(4)),
-        };
-      })
-      .filter((row) => row.available_qty > 0);
+            const slab = calculateMonthSlab(row.date, outward_date);
+            const grossQty = Number(row.gross_qty) || 0;
+            const alreadyAdjusted = Number(row.already_adjusted) || 0;
+            const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, shortagePercent);
+            const netOpeningQty = grossQty - shortageQty;
+            const availableQty = netOpeningQty - alreadyAdjusted;
 
-        res.json(result);
+            return {
+              ...row,
+              shortage_percent: shortagePercent,
+              source_type: "inward",
+              outward_date,
+              days_diff: slab.daysDiff,
+              months_diff: slab.monthsDiff,
+              gross_qty: Number(grossQty.toFixed(4)),
+              shortage_qty: Number(shortageQty.toFixed(4)),
+              warehouse_chgs: Number(shortageQty.toFixed(4)),
+              net_opening_qty: Number(netOpeningQty.toFixed(4)),
+              already_adjusted: Number(alreadyAdjusted.toFixed(4)),
+              available_qty: Number(Math.max(availableQty, 0).toFixed(4)),
+            };
+          })
+        ).then((result) => res.json(result.filter((row) => row.available_qty > 0)));
       });
     })
     .catch((err) => res.status(500).json({ error: err.message }));
