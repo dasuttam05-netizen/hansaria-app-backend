@@ -97,6 +97,7 @@ router.post("/", async (req, res) => {
       name,
       address,
       mobile,
+      shortage_percent: shortage_percent === "" || shortage_percent === undefined || shortage_percent === null ? null : Number(shortage_percent),
       opening_balance: Number(
         opening_balance || 0
       ),
@@ -145,6 +146,7 @@ router.put("/:id", async (req, res) => {
           name,
           address,
           mobile,
+          shortage_percent: shortage_percent === "" || shortage_percent === undefined || shortage_percent === null ? null : Number(shortage_percent),
           opening_balance: Number(
             opening_balance || 0
           ),
