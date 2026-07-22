@@ -1,7 +1,9 @@
 const express = require("express");
 const router = express.Router();
+const db = require("../db");
 
 const { Company } = require("../mongo");
+const { resolveMongoMasterId } = require("../helpers/sqliteMasterResolver");
 
 const {
   userHasPermission,
@@ -33,6 +35,80 @@ function canReadCompanies(user) {
     "report.expense",
   ].some((permission) =>
     userHasPermission(user, permission)
+  );
+}
+
+function dbGetAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) return reject(err);
+      resolve(row || null);
+    });
+  });
+}
+
+function dbRunAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) return reject(err);
+      resolve({
+        lastID: Number(this?.lastID),
+        changes: Number(this?.changes || 0),
+      });
+    });
+  });
+}
+
+async function syncCompanyToSqlite(companyDoc) {
+  const doc = companyDoc && typeof companyDoc.toObject === "function"
+    ? companyDoc.toObject()
+    : (companyDoc || {});
+
+  const mongoCompanyId = doc._id || doc.id;
+  if (!mongoCompanyId) return;
+
+  const sqliteCompanyId = await resolveMongoMasterId(db, mongoCompanyId, Company, "companies");
+  if (!sqliteCompanyId) return;
+
+  const normalizedShortagePercent = doc.shortage_percent === "" || doc.shortage_percent === undefined || doc.shortage_percent === null
+    ? null
+    : Number(doc.shortage_percent);
+
+  const openingBalance = Number(doc.opening_balance ?? 0);
+  const openingBalanceType = String(doc.opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr";
+
+  const existing = await dbGetAsync("SELECT id FROM companies WHERE id = ?", [sqliteCompanyId]);
+
+  if (existing) {
+    await dbRunAsync(
+      `UPDATE companies
+       SET name = ?, address = ?, mobile = ?, shortage_percent = ?, opening_balance = ?, opening_balance_type = ?
+       WHERE id = ?`,
+      [
+        doc.name || "",
+        doc.address || "",
+        doc.mobile || "",
+        normalizedShortagePercent,
+        openingBalance,
+        openingBalanceType,
+        sqliteCompanyId,
+      ]
+    );
+    return;
+  }
+
+  await dbRunAsync(
+    `INSERT INTO companies (id, name, address, mobile, shortage_percent, opening_balance, opening_balance_type)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      sqliteCompanyId,
+      doc.name || "",
+      doc.address || "",
+      doc.mobile || "",
+      normalizedShortagePercent,
+      openingBalance,
+      openingBalanceType,
+    ]
   );
 }
 
@@ -110,6 +186,8 @@ router.post("/", async (req, res) => {
           : "dr",
     });
 
+    await syncCompanyToSqlite(company);
+
     res.json(company);
 
   } catch (err) {
@@ -169,6 +247,8 @@ router.put("/:id", async (req, res) => {
         error: "Company not found",
       });
     }
+
+    await syncCompanyToSqlite(updated);
 
     res.json(updated);
 
