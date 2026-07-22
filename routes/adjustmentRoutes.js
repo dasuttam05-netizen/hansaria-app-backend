@@ -33,6 +33,12 @@ function addQty(...values) {
 
 const EPS = 0.0001;
 
+function getPaltiQty(row) {
+  const balance = normalizeQty(row?.balance);
+  if (balance > 0) return balance;
+  return normalizeQty(row?.new_weight);
+}
+
 function pickShortagePercent(row) {
   const mongoCompanyPercent = null;
   const sqlitePercent = row?.shortage_percent;
@@ -81,7 +87,7 @@ router.get("/parties", (req, res) => {
       LEFT JOIN companies c ON c.id = p.company_id
       WHERE c.id IS NOT NULL
         AND ${useWarehouse ? 'p.warehouse_id = ?' : 'w.location_id = ?'}
-        AND (IFNULL(p.balance, 0) - IFNULL((
+        AND (CASE WHEN IFNULL(p.balance, 0) > 0 THEN IFNULL(p.balance, 0) ELSE IFNULL(p.new_weight, 0) END - IFNULL((
           SELECT SUM(a.qty)
           FROM adjustment a
           WHERE a.palti_lorry_id = p.id
@@ -118,7 +124,7 @@ router.get("/inward/report", (req, res) => {
         const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
         const scopeValue = useWarehouse ? warehouseId : locationId;
         const paltiSql = `
-      SELECT
+        SELECT
         p.id,
         p.voucher_no,
         p.expense_date AS date,
@@ -127,8 +133,8 @@ router.get("/inward/report", (req, res) => {
         p.new_weight,
         COALESCE(NULLIF(TRIM(p.new_lorry_no), ''), NULLIF(TRIM(p.reg_lorry_no), ''), '-') AS display_lorry_no,
         COALESCE(NULLIF(TRIM(p.reg_lorry_no), ''), NULLIF(TRIM(p.new_lorry_no), ''), '-') AS lorry_no,
-        p.balance AS gross_qty,
-        p.balance AS remaining_qty,
+        CASE WHEN IFNULL(p.balance, 0) > 0 THEN p.balance ELSE p.new_weight END AS gross_qty,
+        CASE WHEN IFNULL(p.balance, 0) > 0 THEN p.balance ELSE p.new_weight END AS remaining_qty,
         w.name AS warehouse_name,
         c.name AS company_name,
         loc.name AS location_name,
@@ -153,7 +159,7 @@ router.get("/inward/report", (req, res) => {
           const result = (rows || [])
         .map((row) => {
           const slab = calculateMonthSlab(row.date, outward_date);
-          const grossQty = Number(row.gross_qty) || 0;
+          const grossQty = getPaltiQty(row);
           const alreadyAdjusted = Number(row.already_adjusted) || 0;
           const availableQty = grossQty - alreadyAdjusted;
 
@@ -347,7 +353,7 @@ router.post("/final-save", async (req, res) => {
             }
           }
 
-          const availableQty = normalizeQty(normalizeQty(paltiRow.balance) - normalizeQty(paltiRow.already_adjusted));
+          const availableQty = normalizeQty(getPaltiQty(paltiRow) - normalizeQty(paltiRow.already_adjusted));
           if (adjQty - availableQty > EPS) {
             throw Object.assign(new Error(`Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
           }
@@ -491,7 +497,7 @@ const handleAdjustmentLogUpdate = (req, res) => {
         String(row.source_type || "").trim().toLowerCase() === "palti_lorry" ||
         Number(row.palti_lorry_id) > 0;
       const currentRemaining = normalizeQty(row.remaining_qty || 0);
-      const grossQty = normalizeQty(isPalti ? row.palti_balance : row.inward_weight || 0);
+      const grossQty = normalizeQty(isPalti ? getPaltiQty(row) : row.inward_weight || 0);
 
       const slab = isPalti ? { monthsDiff: 1 } : calculateMonthSlab(row.inward_date, row.outward_date);
       const shortageQty = isPalti ? 0 : calculateShortageQty(grossQty, slab.monthsDiff, row.shortage_percent);
