@@ -28,7 +28,7 @@ router.get("/party-stock", (req, res) => {
     SELECT
       i.id,
       COALESCE(c.name, ca.account_name, 'Unknown') AS party,
-      COALESCE(ca.shortage_percent, c.shortage_percent) AS shortage_percent,
+      COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
       i.weight,
       i.date AS inward_date,
       IFNULL((
@@ -78,7 +78,7 @@ router.get("/warehouse-stock", (req, res) => {
       i.id,
       i.warehouse_id,
       COALESCE(w.name, 'Unknown') AS warehouse,
-      COALESCE(ca.shortage_percent, c.shortage_percent) AS shortage_percent,
+      COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
       i.weight,
       i.date AS inward_date,
       IFNULL((
