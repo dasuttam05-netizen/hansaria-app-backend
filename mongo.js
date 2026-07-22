@@ -229,6 +229,11 @@ const companyAccountSchema =
     pan_no: String,
 
     mobile: String,
+
+    shortage_percent: {
+      type: Number,
+      default: null,
+    },
   });
 
 
