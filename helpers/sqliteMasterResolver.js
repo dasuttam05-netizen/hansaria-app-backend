@@ -174,6 +174,7 @@ async function resolveWarehouseIds(db, values = []) {
 }
 
 module.exports = {
+  resolveMongoMasterId,
   resolveEntryMasterIds,
   resolveWarehouseIds,
 };
