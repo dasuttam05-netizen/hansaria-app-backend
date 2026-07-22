@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { calculateShortageQty } = require("./shortageHelper");
 
 function calculateMonthSlab(inwardDateStr, currentDateStr) {
   const inwardDate = new Date(inwardDateStr);
@@ -15,10 +16,10 @@ function calculateMonthSlab(inwardDateStr, currentDateStr) {
   };
 }
 
-function getAvailableQty(weight, inwardDate, alreadyAdjusted) {
+function getAvailableQty(weight, inwardDate, alreadyAdjusted, shortagePercent = null) {
   const slab = calculateMonthSlab(inwardDate, new Date().toISOString());
   const grossQty = Number(weight) || 0;
-  const shortageQty = grossQty * 0.02 * slab.monthsDiff;
+  const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, shortagePercent);
   return grossQty - shortageQty - Number(alreadyAdjusted || 0);
 }
 
@@ -27,6 +28,7 @@ router.get("/party-stock", (req, res) => {
     SELECT
       i.id,
       COALESCE(c.name, ca.account_name, 'Unknown') AS party,
+      COALESCE(ca.shortage_percent, c.shortage_percent) AS shortage_percent,
       i.weight,
       i.date AS inward_date,
       IFNULL((
@@ -47,7 +49,7 @@ router.get("/party-stock", (req, res) => {
 
     const companyMap = {};
     rows.forEach((row) => {
-      const availableQty = getAvailableQty(row.weight, row.inward_date, row.already_adjusted);
+      const availableQty = getAvailableQty(row.weight, row.inward_date, row.already_adjusted, row.shortage_percent);
       const partyName = row.party || "Unknown";
 
       if (!companyMap[partyName]) {
@@ -76,6 +78,7 @@ router.get("/warehouse-stock", (req, res) => {
       i.id,
       i.warehouse_id,
       COALESCE(w.name, 'Unknown') AS warehouse,
+      COALESCE(ca.shortage_percent, c.shortage_percent) AS shortage_percent,
       i.weight,
       i.date AS inward_date,
       IFNULL((
@@ -85,6 +88,8 @@ router.get("/warehouse-stock", (req, res) => {
       ), 0) AS already_adjusted
     FROM inward i
     LEFT JOIN warehouses w ON w.id = i.warehouse_id
+    LEFT JOIN companies c ON c.id = i.company_id
+    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
     WHERE i.warehouse_id IS NOT NULL
   `;
 
@@ -96,7 +101,7 @@ router.get("/warehouse-stock", (req, res) => {
 
     const warehouseMap = {};
     rows.forEach((row) => {
-      const availableQty = getAvailableQty(row.weight, row.inward_date, row.already_adjusted);
+      const availableQty = getAvailableQty(row.weight, row.inward_date, row.already_adjusted, row.shortage_percent);
       const warehouseName = row.warehouse || "Unknown";
 
       if (!warehouseMap[warehouseName]) {
