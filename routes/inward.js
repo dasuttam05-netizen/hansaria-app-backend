@@ -409,6 +409,12 @@ function formatVoucher(slNo) {
   return `INV${String(slNo).padStart(3, "0")}`;
 }
 
+function normalizeShortagePercent(value) {
+  if (value === "" || value === undefined || value === null) return null;
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
 router.get("/", async (req, res) => {
   if (!userHasPermission(req.user, "inward.view")) {
     return res.status(403).json({ error: "You do not have permission to view inward entries" });
@@ -471,6 +477,7 @@ router.post("/", async (req, res) => {
     company_account_id,
     lorry_no,
     weight,
+    shortage_percent,
   } = req.body;
 
   if (!date) {
@@ -514,9 +521,9 @@ router.post("/", async (req, res) => {
 
     const sql = `
       INSERT INTO inward
-      (sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, remaining_qty)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
+      (sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, remaining_qty, shortage_percent)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
 
     db.run(
       sql,
@@ -533,6 +540,7 @@ router.post("/", async (req, res) => {
         lorry_no || null,
         w,
         w,
+        normalizeShortagePercent(shortage_percent),
       ],
       function onInsert(insertErr) {
         if (insertErr) {
@@ -565,6 +573,7 @@ router.put("/:id", async (req, res) => {
     company_account_id,
     lorry_no,
     weight,
+    shortage_percent,
   } = req.body;
 
   const w = Number(weight) || 0;
@@ -604,7 +613,7 @@ router.put("/:id", async (req, res) => {
 
     const sql = `
       UPDATE inward SET
-        date=?, employee_id=?, location_id=?, warehouse_id=?, product_id=?, company_id=?, company_account_id=?, lorry_no=?, weight=?, remaining_qty=?
+        date=?, employee_id=?, location_id=?, warehouse_id=?, product_id=?, company_id=?, company_account_id=?, lorry_no=?, weight=?, remaining_qty=?, shortage_percent=?
       WHERE id=?
     `;
 
@@ -621,6 +630,7 @@ router.put("/:id", async (req, res) => {
         lorry_no || null,
         w,
         w,
+        normalizeShortagePercent(shortage_percent),
         id,
       ],
       function onUpdate(updateErr) {
