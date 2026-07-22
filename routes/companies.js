@@ -65,6 +65,15 @@ function normalizeShortagePercent(value) {
   return Number.isFinite(numericValue) ? numericValue : null;
 }
 
+async function syncCompanyShortageToSqlite(companyId, shortagePercent) {
+  const sqliteCompanyId = await resolveMongoMasterId(db, companyId, Company, "companies");
+  if (!sqliteCompanyId) return;
+  await dbRunAsync("UPDATE companies SET shortage_percent = ? WHERE id = ?", [
+    normalizeShortagePercent(shortagePercent),
+    sqliteCompanyId,
+  ]);
+}
+
 async function syncCompanyToSqlite(companyDoc) {
   const doc = companyDoc && typeof companyDoc.toObject === "function"
     ? companyDoc.toObject()
@@ -175,23 +184,19 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const company = await Company.create({
+    const normalizedShortagePercent = normalizeShortagePercent(shortage_percent);
+    const company = new Company({
       name,
       address,
       mobile,
-      shortage_percent: normalizeShortagePercent(shortage_percent),
-      opening_balance: Number(
-        opening_balance || 0
-      ),
-      opening_balance_type:
-        String(
-          opening_balance_type || "dr"
-        ).toLowerCase() === "cr"
-          ? "cr"
-          : "dr",
+      shortage_percent: normalizedShortagePercent,
+      opening_balance: Number(opening_balance || 0),
+      opening_balance_type: String(opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
     });
+    await company.save();
 
     await syncCompanyToSqlite(company);
+    await syncCompanyShortageToSqlite(company._id, company.shortage_percent);
 
     const freshCompany = await Company.findById(company._id).lean();
     res.json({
@@ -228,28 +233,7 @@ router.put("/:id", async (req, res) => {
       opening_balance_type,
     } = req.body;
 
-    const updated =
-      await Company.findByIdAndUpdate(
-        req.params.id,
-        {
-          name,
-          address,
-          mobile,
-          shortage_percent: normalizeShortagePercent(shortage_percent),
-          opening_balance: Number(
-            opening_balance || 0
-          ),
-          opening_balance_type:
-            String(
-              opening_balance_type || "dr"
-            ).toLowerCase() === "cr"
-              ? "cr"
-              : "dr",
-        },
-        {
-          new: true,
-        }
-      );
+    const updated = await Company.findById(req.params.id);
 
     if (!updated) {
       return res.status(404).json({
@@ -257,7 +241,16 @@ router.put("/:id", async (req, res) => {
       });
     }
 
+    updated.name = name;
+    updated.address = address;
+    updated.mobile = mobile;
+    updated.shortage_percent = normalizeShortagePercent(shortage_percent);
+    updated.opening_balance = Number(opening_balance || 0);
+    updated.opening_balance_type = String(opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr";
+    await updated.save();
+
     await syncCompanyToSqlite(updated);
+    await syncCompanyShortageToSqlite(updated._id, updated.shortage_percent);
 
     const freshUpdated = await Company.findById(updated._id).lean();
     res.json({
