@@ -141,6 +141,11 @@ const alterQueries = [
   `,
 
   `
+  ALTER TABLE companies
+  ADD COLUMN shortage_percent REAL DEFAULT NULL
+  `,
+
+  `
   ALTER TABLE expenses
   ADD COLUMN created_at TEXT
   `,
