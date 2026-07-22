@@ -367,7 +367,7 @@ router.post("/final-save", async (req, res) => {
             i.warehouse_id,
             i.location_id,
             i.company_id,
-            COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
+            COALESCE(i.shortage_percent, c.shortage_percent) AS shortage_percent,
             w.location_id AS warehouse_location_id,
             IFNULL((
               SELECT SUM(a.qty)
