@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const { resolveEntryMasterIds } = require("../helpers/sqliteMasterResolver");
-const { calculateShortageQty } = require("./shortageHelper");
+const { calculateAppliedShortageRate, calculateShortageQty } = require("./shortageHelper");
 const { Company, CompanyAccount } = require("../mongo");
 
 function calculateMonthSlab(inwardDateStr, outwardDateStr) {
@@ -176,6 +176,7 @@ router.get("/inward/report", (req, res) => {
             outward_date,
             days_diff: slab.daysDiff,
             months_diff: slab.monthsDiff,
+            applied_shortage_percent: 0,
             shortage_qty: 0,
             warehouse_chgs: 0,
             net_opening_qty: Number(grossQty.toFixed(4)),
@@ -238,6 +239,7 @@ router.get("/inward/report", (req, res) => {
             const grossQty = Number(row.gross_qty) || 0;
             const alreadyAdjusted = Number(row.already_adjusted) || 0;
             const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, shortagePercent);
+            const appliedShortagePercent = calculateAppliedShortageRate(shortagePercent, slab.monthsDiff);
             const netOpeningQty = grossQty - shortageQty;
             const availableQty = netOpeningQty - alreadyAdjusted;
 
@@ -248,6 +250,7 @@ router.get("/inward/report", (req, res) => {
               outward_date,
               days_diff: slab.daysDiff,
               months_diff: slab.monthsDiff,
+              applied_shortage_percent: Number((appliedShortagePercent * 100).toFixed(2)),
               gross_qty: Number(grossQty.toFixed(4)),
               shortage_qty: Number(shortageQty.toFixed(4)),
               warehouse_chgs: Number(shortageQty.toFixed(4)),
