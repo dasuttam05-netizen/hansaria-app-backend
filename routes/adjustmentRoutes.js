@@ -52,6 +52,15 @@ function pickShortagePercent(row) {
   return sqlitePercent;
 }
 
+function pickEffectiveShortagePercent(...values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && String(value).trim() !== "") {
+      return value;
+    }
+  }
+  return null;
+}
+
 router.get("/parties", (req, res) => {
   const { warehouse_id, location_id, product_id } = req.query;
   const resolvedIds = resolveEntryMasterIds(db, req.query).catch(() => null);
@@ -224,16 +233,20 @@ router.get("/inward/report", (req, res) => {
 
         Promise.all(
           (rows || []).map(async (row) => {
-            let shortagePercent = row.shortage_percent;
-            if (shortagePercent === null || shortagePercent === undefined || shortagePercent === "") {
+            let shortagePercent = pickEffectiveShortagePercent(row.shortage_percent);
+            if (shortagePercent === null) {
               const mongoCompany = row.company_name
                 ? await Company.findOne({ name: row.company_name }).lean().catch(() => null)
                 : null;
               const mongoAccount = row.account_name
                 ? await CompanyAccount.findOne({ account_name: row.account_name }).lean().catch(() => null)
                 : null;
-              shortagePercent = mongoCompany?.shortage_percent ?? mongoAccount?.shortage_percent ?? shortagePercent;
+              shortagePercent = pickEffectiveShortagePercent(
+                mongoCompany?.shortage_percent,
+                mongoAccount?.shortage_percent
+              );
             }
+            if (shortagePercent === null) shortagePercent = 2;
 
             const slab = calculateMonthSlab(row.date, outward_date);
             const grossQty = Number(row.gross_qty) || 0;
