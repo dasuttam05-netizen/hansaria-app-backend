@@ -12,6 +12,12 @@ function isPositiveNumber(value) {
   return Number.isFinite(numericValue) && numericValue > 0;
 }
 
+function normalizeOptionalNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
 function dbGet(db, sql, params = []) {
   return new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => {
@@ -80,11 +86,18 @@ async function createSqliteMasterFromMongo(db, model, sqliteTable, doc) {
   }
 
   if (sqliteTable === "companies") {
-    const result = await dbRun(db, "INSERT INTO companies (name, address, mobile) VALUES (?, ?, ?)", [
-      doc.name || "",
-      doc.address || "",
-      doc.mobile || "",
-    ]);
+    const result = await dbRun(
+      db,
+      "INSERT INTO companies (name, address, mobile, shortage_percent, opening_balance, opening_balance_type) VALUES (?, ?, ?, ?, ?, ?)",
+      [
+        doc.name || "",
+        doc.address || "",
+        doc.mobile || "",
+        normalizeOptionalNumber(doc.shortage_percent),
+        Number(doc.opening_balance ?? 0),
+        String(doc.opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
+      ]
+    );
     return result.lastID || null;
   }
 
@@ -93,8 +106,8 @@ async function createSqliteMasterFromMongo(db, model, sqliteTable, doc) {
     if (!companyId) return null;
     const result = await dbRun(
       db,
-      "INSERT INTO company_accounts (account_name, address, company_id, pan_no, mobile) VALUES (?, ?, ?, ?, ?)",
-      [doc.account_name || "", doc.address || "", companyId, doc.pan_no || "", doc.mobile || ""]
+      "INSERT INTO company_accounts (account_name, address, company_id, pan_no, mobile, shortage_percent) VALUES (?, ?, ?, ?, ?, ?)",
+      [doc.account_name || "", doc.address || "", companyId, doc.pan_no || "", doc.mobile || "", normalizeOptionalNumber(doc.shortage_percent)]
     );
     return result.lastID || null;
   }
