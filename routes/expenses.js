@@ -386,8 +386,15 @@ async function createSqliteMasterFromMongo(model, sqliteTable, doc) {
 
   if (sqliteTable === "companies") {
     const result = await dbRun(
-      "INSERT INTO companies (name, address, mobile) VALUES (?, ?, ?)",
-      [doc.name || "", doc.address || "", doc.mobile || ""]
+      "INSERT INTO companies (name, address, mobile, shortage_percent, opening_balance, opening_balance_type) VALUES (?, ?, ?, ?, ?, ?)",
+      [
+        doc.name || "",
+        doc.address || "",
+        doc.mobile || "",
+        doc.shortage_percent === undefined || doc.shortage_percent === null || doc.shortage_percent === "" ? null : Number(doc.shortage_percent),
+        Number(doc.opening_balance ?? 0),
+        String(doc.opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
+      ]
     );
     return result.lastID || null;
   }
