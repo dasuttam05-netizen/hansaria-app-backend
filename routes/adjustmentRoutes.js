@@ -422,10 +422,6 @@ router.post("/final-save", async (req, res) => {
           throw Object.assign(new Error(`Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`), { status: 400 });
         }
 
-        if (adjQty - normalizeQty(inwardRow.remaining_qty || 0) > EPS) {
-          throw Object.assign(new Error(`Adjusted qty exceeds physical remaining qty for inward_id ${adj.inward_id}`), { status: 400 });
-        }
-
         await dbRunAsync(`UPDATE inward SET remaining_qty = remaining_qty - ? WHERE id=?`, [
           adj.qty,
           adj.inward_id,
@@ -528,10 +524,6 @@ const handleAdjustmentLogUpdate = (req, res) => {
 
               if (newQty - availableQty > EPS) {
                 return res.status(400).json({ error: "Updated qty exceeds available qty" });
-              }
-
-              if (!isPalti && newQty - normalizeQty(currentRemaining + oldQty) > EPS) {
-                return res.status(400).json({ error: "Not enough physical stock available" });
               }
 
               db.serialize(() => {
