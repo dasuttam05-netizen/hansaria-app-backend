@@ -39,6 +39,13 @@ function getPaltiQty(row) {
   return normalizeQty(row?.new_weight);
 }
 
+function makeAdjustmentError(message, details = {}, status = 400) {
+  const err = new Error(message);
+  err.status = status;
+  err.details = details;
+  return err;
+}
+
 function pickShortagePercent(row) {
   const mongoCompanyPercent = null;
   const sqlitePercent = row?.shortage_percent;
@@ -309,12 +316,20 @@ router.post("/final-save", async (req, res) => {
         const companyId = Number(adj.company_id) || null;
 
         if (!companyId || adjQty <= 0) {
-          throw Object.assign(new Error("Invalid adjustment row"), { status: 400 });
+          throw makeAdjustmentError("Invalid adjustment row", {
+            source_type: sourceType,
+            company_id: companyId || null,
+            qty: adjQty,
+          });
         }
 
         if (sourceType === "palti_lorry") {
           if (!adj.palti_lorry_id) {
-            throw Object.assign(new Error("Invalid Palti Lorry adjustment row"), { status: 400 });
+            throw makeAdjustmentError("Invalid Palti Lorry adjustment row", {
+              source_type: sourceType,
+              palti_lorry_id: adj.palti_lorry_id || null,
+              qty: adjQty,
+            });
           }
 
           const paltiRow = await dbGetAsync(
@@ -338,24 +353,58 @@ router.post("/final-save", async (req, res) => {
             [adj.palti_lorry_id]
           );
 
-          if (!paltiRow) throw Object.assign(new Error(`Invalid palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
+          if (!paltiRow) {
+            throw makeAdjustmentError(`Invalid palti_lorry_id ${adj.palti_lorry_id}`, {
+              source_type: sourceType,
+              palti_lorry_id: adj.palti_lorry_id || null,
+              qty: adjQty,
+            });
+          }
           if (Number(paltiRow.company_id) !== companyId) {
-            throw Object.assign(new Error(`Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
+            throw makeAdjustmentError(`Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`, {
+              source_type: sourceType,
+              palti_lorry_id: adj.palti_lorry_id || null,
+              company_id: companyId,
+              row_company_id: Number(paltiRow.company_id) || null,
+              qty: adjQty,
+            });
           }
 
           if (outwardWarehouseId) {
             if (Number(paltiRow.warehouse_id) !== outwardWarehouseId) {
-              throw Object.assign(new Error(`Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
+              throw makeAdjustmentError(`Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`, {
+                source_type: sourceType,
+                palti_lorry_id: adj.palti_lorry_id || null,
+                outward_warehouse_id: outwardWarehouseId,
+                row_warehouse_id: Number(paltiRow.warehouse_id) || null,
+                qty: adjQty,
+              });
             }
           } else if (outwardLocationId) {
             if (Number(paltiRow.location_id || 0) !== outwardLocationId) {
-              throw Object.assign(new Error(`Location mismatch for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
+              throw makeAdjustmentError(`Location mismatch for palti_lorry_id ${adj.palti_lorry_id}`, {
+                source_type: sourceType,
+                palti_lorry_id: adj.palti_lorry_id || null,
+                outward_location_id: outwardLocationId,
+                row_location_id: Number(paltiRow.location_id) || null,
+                qty: adjQty,
+              });
             }
           }
 
           const availableQty = normalizeQty(getPaltiQty(paltiRow) - normalizeQty(paltiRow.already_adjusted));
           if (adjQty - availableQty > EPS) {
-            throw Object.assign(new Error(`Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
+            throw makeAdjustmentError(`Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`, {
+              source_type: sourceType,
+              palti_lorry_id: adj.palti_lorry_id || null,
+              voucher_no: paltiRow.voucher_no || null,
+              lorry_no: paltiRow.reg_lorry_no || paltiRow.new_lorry_no || null,
+              requested_qty: Number(adjQty.toFixed(4)),
+              available_qty: Number(availableQty.toFixed(4)),
+              difference: Number((adjQty - availableQty).toFixed(4)),
+              already_adjusted: Number(normalizeQty(paltiRow.already_adjusted).toFixed(4)),
+              gross_qty: Number(getPaltiQty(paltiRow).toFixed(4)),
+            });
           }
 
           await dbRunAsync(
@@ -366,7 +415,11 @@ router.post("/final-save", async (req, res) => {
         }
 
         if (!adj.inward_id) {
-          throw Object.assign(new Error("Invalid inward adjustment row"), { status: 400 });
+          throw makeAdjustmentError("Invalid inward adjustment row", {
+            source_type: sourceType,
+            inward_id: adj.inward_id || null,
+            qty: adjQty,
+          });
         }
 
         const inwardRow = await dbGetAsync(
@@ -394,21 +447,45 @@ router.post("/final-save", async (req, res) => {
           [adj.inward_id]
         );
 
-        if (!inwardRow) throw Object.assign(new Error(`Invalid inward_id ${adj.inward_id}`), { status: 400 });
+        if (!inwardRow) {
+          throw makeAdjustmentError(`Invalid inward_id ${adj.inward_id}`, {
+            source_type: sourceType,
+            inward_id: adj.inward_id || null,
+            qty: adjQty,
+          });
+        }
 
         if (outwardWarehouseId) {
           if (Number(inwardRow.warehouse_id) !== outwardWarehouseId) {
-            throw Object.assign(new Error(`Warehouse mismatch for inward_id ${adj.inward_id}`), { status: 400 });
+            throw makeAdjustmentError(`Warehouse mismatch for inward_id ${adj.inward_id}`, {
+              source_type: sourceType,
+              inward_id: adj.inward_id || null,
+              outward_warehouse_id: outwardWarehouseId,
+              row_warehouse_id: Number(inwardRow.warehouse_id) || null,
+              qty: adjQty,
+            });
           }
         } else if (outwardLocationId) {
           const inwardLocationId = inwardRow.location_id || inwardRow.warehouse_location_id;
           if (Number(inwardLocationId || 0) !== outwardLocationId) {
-            throw Object.assign(new Error(`Location mismatch for inward_id ${adj.inward_id}`), { status: 400 });
+            throw makeAdjustmentError(`Location mismatch for inward_id ${adj.inward_id}`, {
+              source_type: sourceType,
+              inward_id: adj.inward_id || null,
+              outward_location_id: outwardLocationId,
+              row_location_id: Number(inwardLocationId) || null,
+              qty: adjQty,
+            });
           }
         }
 
         if (Number(inwardRow.company_id) !== companyId) {
-          throw Object.assign(new Error(`Company mismatch for inward_id ${adj.inward_id}`), { status: 400 });
+          throw makeAdjustmentError(`Company mismatch for inward_id ${adj.inward_id}`, {
+            source_type: sourceType,
+            inward_id: adj.inward_id || null,
+            company_id: companyId,
+            row_company_id: Number(inwardRow.company_id) || null,
+            qty: adjQty,
+          });
         }
 
         const slab = calculateMonthSlab(inwardRow.date, outward.date);
@@ -419,7 +496,19 @@ router.post("/final-save", async (req, res) => {
         const availableQty = normalizeQty(netOpeningQty - alreadyAdjustedForThisInward);
 
         if (adjQty - availableQty > EPS) {
-          throw Object.assign(new Error(`Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`), { status: 400 });
+          throw makeAdjustmentError(`Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`, {
+            source_type: sourceType,
+            inward_id: adj.inward_id || null,
+            voucher_no: inwardRow.voucher_no || null,
+            lorry_no: inwardRow.lorry_no || null,
+            requested_qty: Number(adjQty.toFixed(4)),
+            available_qty: Number(availableQty.toFixed(4)),
+            difference: Number((adjQty - availableQty).toFixed(4)),
+            already_adjusted: Number(alreadyAdjustedForThisInward.toFixed(4)),
+            gross_qty: Number(grossQty.toFixed(4)),
+            shortage_qty: Number(shortageQty.toFixed(4)),
+            net_opening_qty: Number(netOpeningQty.toFixed(4)),
+          });
         }
 
         await dbRunAsync(`UPDATE inward SET remaining_qty = remaining_qty - ? WHERE id=?`, [
@@ -448,7 +537,10 @@ router.post("/final-save", async (req, res) => {
   } catch (err) {
     console.error("[adjustment final-save] error:", err);
     const status = Number(err?.status) || 500;
-    return res.status(status).json({ error: err?.message || "Adjustment save failed" });
+    return res.status(status).json({
+      error: err?.message || "Adjustment save failed",
+      details: err?.details || null,
+    });
   }
 });
 
