@@ -177,7 +177,7 @@ router.get("/inward/report", (req, res) => {
       i.company_account_id,
       w.name AS warehouse_name,
       c.name AS company_name,
-      c.shortage_percent AS shortage_percent,
+      COALESCE(ca.shortage_percent, c.shortage_percent) AS shortage_percent,
       IFNULL((
         SELECT SUM(a.qty)
         FROM adjustment a
@@ -350,7 +350,7 @@ router.post("/final-save", async (req, res) => {
             i.warehouse_id,
             i.location_id,
             i.company_id,
-            c.shortage_percent AS shortage_percent,
+            COALESCE(ca.shortage_percent, c.shortage_percent) AS shortage_percent,
             w.location_id AS warehouse_location_id,
             IFNULL((
               SELECT SUM(a.qty)
