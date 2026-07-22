@@ -114,6 +114,7 @@ router.post("/", async (req, res) => {
       company_id,
       pan_no,
       mobile,
+      shortage_percent,
     } = req.body;
 
     if (
@@ -257,6 +258,7 @@ async function importCompanyAccountsRows(
           company_id: companyId,
           pan_no: panNo,
           mobile,
+          shortage_percent: shortagePercent,
         });
 
         inserted += 1;
@@ -435,6 +437,7 @@ router.put("/:id", async (req, res) => {
       company_id,
       pan_no,
       mobile,
+      shortage_percent,
     } = req.body;
 
     // Validate company_id is a valid ObjectId
