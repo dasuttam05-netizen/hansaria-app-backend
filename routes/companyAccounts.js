@@ -142,6 +142,10 @@ router.post("/", async (req, res) => {
         company_id,
         pan_no,
         mobile,
+        shortage_percent:
+          shortage_percent === "" || shortage_percent === undefined || shortage_percent === null
+            ? null
+            : Number(shortage_percent),
       });
 
     res.json(account);
@@ -202,6 +206,10 @@ async function importCompanyAccountsRows(
       const mobile = String(
         r.mobile || ""
       ).trim();
+      const shortagePercent =
+        r.shortage_percent === "" || r.shortage_percent === undefined || r.shortage_percent === null
+          ? null
+          : Number(r.shortage_percent);
 
       const companyName = String(
         r.company_name || ""
@@ -456,6 +464,10 @@ router.put("/:id", async (req, res) => {
           company_id,
           pan_no,
           mobile,
+          shortage_percent:
+            shortage_percent === "" || shortage_percent === undefined || shortage_percent === null
+              ? null
+              : Number(shortage_percent),
         },
         {
           new: true,
