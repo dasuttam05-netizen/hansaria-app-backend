@@ -152,6 +152,11 @@ const companySchema =
 
     mobile: String,
 
+    shortage_percent: {
+      type: Number,
+      default: null,
+    },
+
     opening_balance: {
       type: Number,
       default: 0,
