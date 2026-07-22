@@ -31,6 +31,8 @@ function addQty(...values) {
   return normalizeQty(values.reduce((sum, value) => sum + normalizeQty(value), 0));
 }
 
+const EPS = 0.0001;
+
 function pickShortagePercent(row) {
   const mongoCompanyPercent = null;
   const sqlitePercent = row?.shortage_percent;
@@ -346,7 +348,7 @@ router.post("/final-save", async (req, res) => {
           }
 
           const availableQty = normalizeQty(normalizeQty(paltiRow.balance) - normalizeQty(paltiRow.already_adjusted));
-          if (adjQty > availableQty) {
+          if (adjQty - availableQty > EPS) {
             throw Object.assign(new Error(`Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`), { status: 400 });
           }
 
@@ -410,11 +412,11 @@ router.post("/final-save", async (req, res) => {
         const netOpeningQty = normalizeQty(grossQty - shortageQty);
         const availableQty = normalizeQty(netOpeningQty - alreadyAdjustedForThisInward);
 
-        if (adjQty > availableQty) {
+        if (adjQty - availableQty > EPS) {
           throw Object.assign(new Error(`Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`), { status: 400 });
         }
 
-        if (adjQty > normalizeQty(inwardRow.remaining_qty || 0)) {
+        if (adjQty - normalizeQty(inwardRow.remaining_qty || 0) > EPS) {
           throw Object.assign(new Error(`Adjusted qty exceeds physical remaining qty for inward_id ${adj.inward_id}`), { status: 400 });
         }
 
@@ -503,7 +505,7 @@ const handleAdjustmentLogUpdate = (req, res) => {
 
           const otherOutwardAdjusted = normalizeQty(outwardSumRow?.totalAdj || 0);
           const outwardQty = normalizeQty(row.outward_qty || 0);
-          if (normalizeQty(otherOutwardAdjusted + newQty) > outwardQty) {
+          if (normalizeQty(otherOutwardAdjusted + newQty - outwardQty) > EPS) {
             return res.status(400).json({ error: "Updated qty exceeds outward qty" });
           }
 
@@ -518,11 +520,11 @@ const handleAdjustmentLogUpdate = (req, res) => {
               const otherInwardAdjusted = normalizeQty(inwardSumRow?.totalAdj || 0);
               const availableQty = normalizeQty(netOpeningQty - otherInwardAdjusted);
 
-              if (newQty > availableQty) {
+              if (newQty - availableQty > EPS) {
                 return res.status(400).json({ error: "Updated qty exceeds available qty" });
               }
 
-              if (!isPalti && newQty > normalizeQty(currentRemaining + oldQty)) {
+              if (!isPalti && newQty - normalizeQty(currentRemaining + oldQty) > EPS) {
                 return res.status(400).json({ error: "Not enough physical stock available" });
               }
 
