@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
+const { calculateShortageQty } = require("./shortageHelper");
 
 function parseIdList(input) {
   const raw = Array.isArray(input) ? input : String(input || "").split(",");
@@ -100,6 +101,7 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) =>
       c.address AS company_address,
       c.mobile AS company_mobile,
       ca.account_name AS account_name,
+      ca.shortage_percent AS shortage_percent,
       w.name AS warehouse_name,
       p.name AS product_name,
       IFNULL(SUM(a.qty), 0) AS adjusted_qty
@@ -122,7 +124,7 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) =>
     const details = rows.map((row) => {
       const slab = calculateMonthSlab(row.date, refDate);
       const gross = Number(row.weight) || 0;
-      const shortage = gross * 0.02 * slab.monthsDiff;
+      const shortage = calculateShortageQty(gross, slab.monthsDiff, row.shortage_percent);
       const net = gross - shortage;
       const adjusted = Number(row.adjusted_qty) || 0;
       const balance = net - adjusted;
@@ -251,6 +253,7 @@ router.get("/party-stock", authorizeReport("report.partyStock"), (req, res) => {
       c.mobile AS company_mobile,
       i.company_account_id,
       ca.account_name AS account_name,
+      ca.shortage_percent AS shortage_percent,
       i.lorry_no,
       IFNULL(i.weight, 0) AS gross_weight,
       IFNULL(SUM(a.qty), 0) AS adjusted_qty,
@@ -277,7 +280,7 @@ router.get("/party-stock", authorizeReport("report.partyStock"), (req, res) => {
     const details = rows.map((row) => {
       const slab = calculateMonthSlab(row.inward_date, refDate);
       const gross = Number(row.gross_weight) || 0;
-      const shortage = gross * 0.02 * slab.monthsDiff;
+      const shortage = calculateShortageQty(gross, slab.monthsDiff, row.shortage_percent);
       const netOpening = gross - shortage;
       const adjusted = Number(row.adjusted_qty) || 0;
       const balance = netOpening - adjusted;
@@ -346,10 +349,10 @@ router.get("/party-stock", authorizeReport("report.partyStock"), (req, res) => {
   });
 });
 
-function calculateAvailableQty(weight, inwardDate, alreadyAdjusted, refDate = new Date().toISOString().split("T")[0]) {
+function calculateAvailableQty(weight, inwardDate, alreadyAdjusted, refDate = new Date().toISOString().split("T")[0], shortagePercent = null) {
   const gross = Number(weight) || 0;
   const slab = calculateMonthSlab(inwardDate, refDate);
-  const shortage = gross * 0.02 * slab.monthsDiff;
+  const shortage = calculateShortageQty(gross, slab.monthsDiff, shortagePercent);
   return gross - shortage - Number(alreadyAdjusted || 0);
 }
 
@@ -392,8 +395,10 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) 
       i.company_id,
       i.location_id,
       i.warehouse_id,
+      i.company_account_id,
       c.name AS party_name,
       lo.name AS location_name,
+      ca.shortage_percent AS shortage_percent,
       COALESCE(w.name, 'Unknown') AS warehouse,
       i.weight,
       i.date AS inward_date,
@@ -404,6 +409,7 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) 
       ), 0) AS already_adjusted
     FROM inward i
     LEFT JOIN companies c ON c.id = i.company_id
+    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
     LEFT JOIN locations lo ON lo.id = i.location_id
     LEFT JOIN warehouses w ON w.id = i.warehouse_id
     WHERE ${where.join(" AND ")}
@@ -414,7 +420,7 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) 
 
     const warehouseMap = {};
     rows.forEach((row) => {
-      const availableQty = calculateAvailableQty(row.weight, row.inward_date, row.already_adjusted, to_date || new Date().toISOString().split("T")[0]);
+      const availableQty = calculateAvailableQty(row.weight, row.inward_date, row.already_adjusted, to_date || new Date().toISOString().split("T")[0], row.shortage_percent);
       const warehouseName = row.warehouse || "Unknown";
       const partyName = row.party_name || "Unknown";
       const locationName = row.location_name || "Unknown";
@@ -500,8 +506,7 @@ router.get("/total-stock", authorizeReport("report.partyStock"), (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
 
     const refDate = to_date || new Date().toISOString().split("T")[0];
-    const total = rows.reduce((acc, row) => acc + calculateAvailableQty(row.weight, row.inward_date, row.already_adjusted, refDate), 0);
-
+      const total = rows.reduce((acc, row) => acc + calculateAvailableQty(row.weight, row.inward_date, row.already_adjusted, refDate, row.shortage_percent), 0);
     res.json({ total: Number(total.toFixed(4)) });
   });
 });
@@ -682,7 +687,7 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
           adjustedRentAmount += adjustmentQty * rentRate * adjustmentSlab.monthsDiff;
         });
 
-        const shortageQty = originalWeight * 0.02 * monthEndSlab.monthsDiff;
+        const shortageQty = calculateShortageQty(originalWeight, monthEndSlab.monthsDiff, row.shortage_percent);
         const balanceQty = originalWeight - shortageQty - adjustedQty;
         const balanceRentAmount = Math.max(balanceQty, 0) * rentRate * monthEndSlab.monthsDiff;
         const rentAmount = adjustedRentAmount + balanceRentAmount;
