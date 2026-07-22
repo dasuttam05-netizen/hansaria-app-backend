@@ -352,6 +352,7 @@ let db = null;
       lorry_no TEXT,
       weight REAL DEFAULT 0,
       remaining_qty REAL DEFAULT 0,
+      shortage_percent REAL DEFAULT NULL,
       labour_charges REAL DEFAULT 0,
       rent REAL DEFAULT 0,
       shortage REAL DEFAULT 0,
@@ -1150,6 +1151,15 @@ let db = null;
     (err) => {
       if (err && !err.message.includes("duplicate column")) {
         console.log("remaining_qty add error:", err.message);
+      }
+    }
+  );
+
+  db.run(
+    `ALTER TABLE inward ADD COLUMN shortage_percent REAL DEFAULT NULL`,
+    (err) => {
+      if (err && !err.message.includes("duplicate column")) {
+        console.log("inward shortage_percent add error:", err.message);
       }
     }
   );
