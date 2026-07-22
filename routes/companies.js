@@ -59,6 +59,12 @@ function dbRunAsync(sql, params = []) {
   });
 }
 
+function normalizeShortagePercent(value) {
+  if (value === "" || value === undefined || value === null) return null;
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
 async function syncCompanyToSqlite(companyDoc) {
   const doc = companyDoc && typeof companyDoc.toObject === "function"
     ? companyDoc.toObject()
@@ -70,9 +76,7 @@ async function syncCompanyToSqlite(companyDoc) {
   const sqliteCompanyId = await resolveMongoMasterId(db, mongoCompanyId, Company, "companies");
   if (!sqliteCompanyId) return;
 
-  const normalizedShortagePercent = doc.shortage_percent === "" || doc.shortage_percent === undefined || doc.shortage_percent === null
-    ? null
-    : Number(doc.shortage_percent);
+  const normalizedShortagePercent = normalizeShortagePercent(doc.shortage_percent);
 
   const openingBalance = Number(doc.opening_balance ?? 0);
   const openingBalanceType = String(doc.opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr";
@@ -175,7 +179,7 @@ router.post("/", async (req, res) => {
       name,
       address,
       mobile,
-      shortage_percent: shortage_percent === "" || shortage_percent === undefined || shortage_percent === null ? null : Number(shortage_percent),
+      shortage_percent: normalizeShortagePercent(shortage_percent),
       opening_balance: Number(
         opening_balance || 0
       ),
@@ -189,7 +193,11 @@ router.post("/", async (req, res) => {
 
     await syncCompanyToSqlite(company);
 
-    res.json(company);
+    const freshCompany = await Company.findById(company._id).lean();
+    res.json({
+      ...(freshCompany || company.toObject()),
+      shortage_percent: normalizeShortagePercent(freshCompany?.shortage_percent ?? company.shortage_percent),
+    });
 
   } catch (err) {
 
@@ -227,7 +235,7 @@ router.put("/:id", async (req, res) => {
           name,
           address,
           mobile,
-          shortage_percent: shortage_percent === "" || shortage_percent === undefined || shortage_percent === null ? null : Number(shortage_percent),
+          shortage_percent: normalizeShortagePercent(shortage_percent),
           opening_balance: Number(
             opening_balance || 0
           ),
@@ -251,7 +259,11 @@ router.put("/:id", async (req, res) => {
 
     await syncCompanyToSqlite(updated);
 
-    res.json(updated);
+    const freshUpdated = await Company.findById(updated._id).lean();
+    res.json({
+      ...(freshUpdated || updated.toObject()),
+      shortage_percent: normalizeShortagePercent(freshUpdated?.shortage_percent ?? updated.shortage_percent),
+    });
 
   } catch (err) {
 
