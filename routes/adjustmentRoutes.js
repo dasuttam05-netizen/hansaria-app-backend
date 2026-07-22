@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const { resolveEntryMasterIds } = require("../helpers/sqliteMasterResolver");
+const { calculateShortageQty } = require("./shortageHelper");
 
 function calculateMonthSlab(inwardDateStr, outwardDateStr) {
   const inwardDate = new Date(inwardDateStr);
@@ -173,8 +174,10 @@ router.get("/inward/report", (req, res) => {
       i.weight AS inward_qty,
       i.weight AS gross_qty,
       i.remaining_qty,
+      i.company_account_id,
       w.name AS warehouse_name,
       c.name AS company_name,
+      ca.shortage_percent AS shortage_percent,
       IFNULL((
         SELECT SUM(a.qty)
         FROM adjustment a
@@ -183,6 +186,7 @@ router.get("/inward/report", (req, res) => {
     FROM inward i
     LEFT JOIN warehouses w ON w.id = i.warehouse_id
     LEFT JOIN companies c ON c.id = i.company_id
+    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
     WHERE ${useWarehouse ? 'i.warehouse_id = ?' : 'i.location_id = ?'}
       AND i.company_id = ?
     ORDER BY i.date ASC, i.id ASC
@@ -196,7 +200,7 @@ router.get("/inward/report", (req, res) => {
         const slab = calculateMonthSlab(row.date, outward_date);
         const grossQty = Number(row.gross_qty) || 0;
         const alreadyAdjusted = Number(row.already_adjusted) || 0;
-        const shortageQty = grossQty * 0.02 * slab.monthsDiff;
+        const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, row.shortage_percent);
         const netOpeningQty = grossQty - shortageQty;
         const availableQty = netOpeningQty - alreadyAdjusted;
 
@@ -346,6 +350,7 @@ router.post("/final-save", async (req, res) => {
             i.warehouse_id,
             i.location_id,
             i.company_id,
+            ca.shortage_percent AS shortage_percent,
             w.location_id AS warehouse_location_id,
             IFNULL((
               SELECT SUM(a.qty)
@@ -354,6 +359,7 @@ router.post("/final-save", async (req, res) => {
             ), 0) AS already_adjusted
           FROM inward i
           LEFT JOIN warehouses w ON w.id = i.warehouse_id
+          LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
           WHERE i.id=?
           `,
           [adj.inward_id]
@@ -379,7 +385,7 @@ router.post("/final-save", async (req, res) => {
         const slab = calculateMonthSlab(inwardRow.date, outward.date);
         const grossQty = normalizeQty(inwardRow.weight);
         const alreadyAdjustedForThisInward = normalizeQty(inwardRow.already_adjusted);
-        const shortageQty = normalizeQty(grossQty * 0.02 * slab.monthsDiff);
+        const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, inwardRow.shortage_percent);
         const netOpeningQty = normalizeQty(grossQty - shortageQty);
         const availableQty = normalizeQty(netOpeningQty - alreadyAdjustedForThisInward);
 
@@ -465,8 +471,7 @@ const handleAdjustmentLogUpdate = (req, res) => {
       const grossQty = normalizeQty(isPalti ? row.palti_balance : row.inward_weight || 0);
 
       const slab = isPalti ? { monthsDiff: 1 } : calculateMonthSlab(row.inward_date, row.outward_date);
-      const shortageQty = isPalti ? 0 : normalizeQty(grossQty * 0.02 * slab.monthsDiff);
-      const netOpeningQty = normalizeQty(grossQty - shortageQty);
+        const shortageQty = isPalti ? 0 : calculateShortageQty(grossQty, slab.monthsDiff, row.shortage_percent);
 
       db.get(
         `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id=? AND id<>?`,
