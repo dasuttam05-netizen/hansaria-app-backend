@@ -128,6 +128,7 @@ router.get("/", async (req, res) => {
 
     const enrichedRows = rows.map(row => ({
       ...row.toObject(),
+      shortage_percent: row.shortage_percent ?? null,
       opening_balance: row.opening_balance ?? 0,
       opening_balance_type: row.opening_balance_type || "dr",
     }));
