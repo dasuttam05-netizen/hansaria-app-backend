@@ -28,11 +28,13 @@ function resolveShortageRate(rawValue) {
 
 function calculateShortageQty(grossQty, monthsDiff, rawValue) {
   const qty = Number(grossQty) || 0;
-  const rate =
+  const slabMonths = Math.max(1, Number(monthsDiff) || 1);
+  const baseRate =
     rawValue === null || rawValue === undefined || String(rawValue).trim() === ""
-      ? getAutoShortageRate(monthsDiff)
+      ? DEFAULT_SHORTAGE_SLAB_PERCENT / 100
       : resolveShortageRate(rawValue);
-  return Number((qty * (rate || 0)).toFixed(4));
+  const rate = (baseRate || 0) * slabMonths;
+  return Number((qty * rate).toFixed(4));
 }
 
 module.exports = {
