@@ -99,7 +99,7 @@ function getAdjustmentDetails(outwardId) {
         COALESCE(c.name, cp.name) AS company_name,
         COALESCE(ca.account_name, cpa.account_name) AS company_account_name,
         COALESCE(w.name, wp.name) AS warehouse_name,
-        COALESCE(l.name, lp.name) AS location_name,
+        COALESCE(l.name, wl.name) AS location_name,
         COALESCE(pr.name, prp.name) AS product_name
       FROM adjustment a
       LEFT JOIN inward i ON i.id = a.inward_id
@@ -107,11 +107,11 @@ function getAdjustmentDetails(outwardId) {
       LEFT JOIN companies c ON c.id = i.company_id
       LEFT JOIN companies cp ON cp.id = p.company_id
       LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
-      LEFT JOIN company_accounts cpa ON cpa.id = p.company_account_id
+      LEFT JOIN company_accounts cpa ON cpa.company_id = p.company_id
       LEFT JOIN warehouses w ON w.id = i.warehouse_id
       LEFT JOIN warehouses wp ON wp.id = p.warehouse_id
       LEFT JOIN locations l ON l.id = i.location_id
-      LEFT JOIN locations lp ON lp.id = p.location_id
+      LEFT JOIN locations wl ON wl.id = wp.location_id
       LEFT JOIN products pr ON pr.id = i.product_id
       LEFT JOIN products prp ON prp.id = p.product_id
       WHERE a.outward_id = ?
