@@ -60,6 +60,22 @@ const normalizeDetailRows = (value, fallbackAmount = 0, fallbackLabel = "") => {
   ];
 };
 
+const normalizeRowAdjustments = (value) => {
+  const rows = safeJsonParse(value, []);
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map((item) => ({
+      adjustment_id: item?.adjustment_id ?? item?.id ?? null,
+      short_amt: num(item?.short_amt),
+      s_amount: num(item?.s_amount),
+      c_deduction: num(item?.c_deduction),
+      freight: num(item?.freight),
+      labour_chgs: num(item?.labour_chgs),
+      other_chgs: num(item?.other_chgs),
+    }))
+    .filter((item) => item.adjustment_id);
+};
+
 const stripEmptyDetailRows = (rows) =>
   (Array.isArray(rows) ? rows : []).filter((row) => String(row?.description || "").trim() || num(row?.amount) !== 0);
 
@@ -81,14 +97,23 @@ function getAdjustmentDetails(outwardId) {
         COALESCE(i.lorry_no, p.new_lorry_no, p.reg_lorry_no) AS lorry_no,
         COALESCE(i.date, p.expense_date) AS inward_date,
         COALESCE(c.name, cp.name) AS company_name,
-        COALESCE(w.name, wp.name) AS warehouse_name
+        COALESCE(ca.account_name, cpa.account_name) AS company_account_name,
+        COALESCE(w.name, wp.name) AS warehouse_name,
+        COALESCE(l.name, lp.name) AS location_name,
+        COALESCE(pr.name, prp.name) AS product_name
       FROM adjustment a
       LEFT JOIN inward i ON i.id = a.inward_id
       LEFT JOIN palti_lorry_entries p ON p.id = a.palti_lorry_id
       LEFT JOIN companies c ON c.id = i.company_id
       LEFT JOIN companies cp ON cp.id = p.company_id
+      LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
+      LEFT JOIN company_accounts cpa ON cpa.id = p.company_account_id
       LEFT JOIN warehouses w ON w.id = i.warehouse_id
       LEFT JOIN warehouses wp ON wp.id = p.warehouse_id
+      LEFT JOIN locations l ON l.id = i.location_id
+      LEFT JOIN locations lp ON lp.id = p.location_id
+      LEFT JOIN products pr ON pr.id = i.product_id
+      LEFT JOIN products prp ON prp.id = p.product_id
       WHERE a.outward_id = ?
       ORDER BY a.id ASC
       `,
@@ -118,6 +143,7 @@ function calculateSettlement(data) {
   const unloading_date = data.unloading_date || "";
   const claim_details = Array.isArray(data.claim_details) ? data.claim_details : [];
   const other_deduction_details = Array.isArray(data.other_deduction_details) ? data.other_deduction_details : [];
+  const row_adjustments = Array.isArray(data.row_adjustments) ? data.row_adjustments : [];
   const claim_amount = num(data.claim_amount) || sumDetailRows(claim_details);
   const other_deduction = num(data.other_deduction) || sumDetailRows(other_deduction_details);
   const charge_bearer = data.charge_bearer === "company" ? "company" : "self";
@@ -190,6 +216,7 @@ function calculateSettlement(data) {
     gross_profit: gross_amount,
     net_profit: receivable_amount,
     company_payable,
+    row_adjustments,
   };
 }
 
@@ -374,6 +401,7 @@ router.get("/:outward_id", async (req, res) => {
         row.other_deduction,
         "Deduction"
       );
+      const rowAdjustments = normalizeRowAdjustments(row.row_adjustments);
 
       const defaultDispatch = num(row.outward_quantity || row.outward_weight);
 
@@ -420,6 +448,7 @@ router.get("/:outward_id", async (req, res) => {
           other_deduction: row.other_deduction ?? 0,
           claim_details: claimDetails,
           other_deduction_details: otherDeductionDetails,
+          row_adjustments: rowAdjustments,
           charge_bearer: row.charge_bearer || "self",
           gross_profit: row.gross_profit ?? 0,
           net_profit: row.net_profit ?? 0,
@@ -455,6 +484,7 @@ router.post("/save", async (req, res) => {
     other_deduction,
     claim_details,
     other_deduction_details,
+    row_adjustments,
     unloading_date,
     charge_bearer,
     narration,
@@ -525,6 +555,7 @@ router.post("/save", async (req, res) => {
           "Deduction"
         )
       );
+      const normalizedRowAdjustments = normalizeRowAdjustments(row_adjustments);
 
       const settlement = calculateSettlement({
         dispatch_qty: dispatch_qty ?? num(outward.quantity || outward.weight),
@@ -541,6 +572,7 @@ router.post("/save", async (req, res) => {
         other_deduction,
         claim_details: normalizedClaimDetails,
         other_deduction_details: normalizedOtherDeductionDetails,
+        row_adjustments: normalizedRowAdjustments,
         charge_bearer,
       });
 
@@ -603,6 +635,7 @@ router.post("/save", async (req, res) => {
             settlement.other_deduction,
             JSON.stringify(settlement.claim_details || []),
             JSON.stringify(settlement.other_deduction_details || []),
+            JSON.stringify(settlement.row_adjustments || []),
             settlement.charge_bearer,
             settlement.gross_profit,
             settlement.net_profit,
@@ -633,6 +666,7 @@ router.post("/save", async (req, res) => {
                 other_deduction = ?,
                 claim_details = ?,
                 other_deduction_details = ?,
+                row_adjustments = ?,
                 charge_bearer = ?,
                 gross_profit = ?,
                 net_profit = ?,
@@ -673,12 +707,13 @@ router.post("/save", async (req, res) => {
                 other_deduction,
                 claim_details,
                 other_deduction_details,
+                row_adjustments,
                 charge_bearer,
                 gross_profit,
                 net_profit,
                 company_payable,
                 narration
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               `,
               [outward_id, ...params],
               (insertErr) => {
