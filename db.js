@@ -503,6 +503,7 @@ let db = null;
       charge_bearer TEXT DEFAULT 'self',
       claim_details TEXT DEFAULT '[]',
       other_deduction_details TEXT DEFAULT '[]',
+      row_adjustments TEXT DEFAULT '[]',
       gross_profit REAL DEFAULT 0,
       net_profit REAL DEFAULT 0,
       company_payable REAL DEFAULT 0,
@@ -512,6 +513,15 @@ let db = null;
       FOREIGN KEY(outward_id) REFERENCES outward(id)
     )
   `);
+
+  db.run(
+    `ALTER TABLE outward_settlement ADD COLUMN row_adjustments TEXT DEFAULT '[]'`,
+    (err) => {
+      if (err && !String(err.message || "").includes("duplicate column name")) {
+        console.log("outward_settlement row_adjustments add error:", err.message);
+      }
+    }
+  );
 
   db.run(`
     CREATE TABLE IF NOT EXISTS transporters (
