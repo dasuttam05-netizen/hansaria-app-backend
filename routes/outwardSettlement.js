@@ -364,20 +364,20 @@ router.get("/:outward_id", async (req, res) => {
       o.buyer_name,
       o.consignee_name,
       c.name AS company_name,
-      ca.account_name AS account_name,
-      w.name AS warehouse_name,
+      COALESCE(ca.account_name, '') AS account_name,
+      COALESCE(w.name, '') AS warehouse_name,
       COALESCE(o.location_id, w.location_id) AS effective_location_id,
-      COALESCE(l.name, wl.name) AS location_name,
-      p.name AS product_name
+      COALESCE(l.name, wl.name, '') AS location_name,
+      COALESCE(p.name, '') AS product_name
     FROM outward o
-    LEFT JOIN outward_settlement s ON s.outward_id = o.id
-    LEFT JOIN companies c ON o.company_id = c.id
-    LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-    LEFT JOIN warehouses w ON o.warehouse_id = w.id
-    LEFT JOIN locations l ON l.id = o.location_id
-    LEFT JOIN locations wl ON wl.id = w.location_id
-    LEFT JOIN products p ON o.product_id = p.id
-    WHERE o.id = ?
+    LEFT JOIN outward_settlement s ON CAST(s.outward_id AS TEXT) = CAST(o.id AS TEXT)
+    LEFT JOIN companies c ON CAST(o.company_id AS TEXT) = CAST(c.id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(o.company_account_id AS TEXT) = CAST(ca.id AS TEXT)
+    LEFT JOIN warehouses w ON CAST(o.warehouse_id AS TEXT) = CAST(w.id AS TEXT)
+    LEFT JOIN locations l ON CAST(o.location_id AS TEXT) = CAST(l.id AS TEXT)
+    LEFT JOIN locations wl ON CAST(w.location_id AS TEXT) = CAST(wl.id AS TEXT)
+    LEFT JOIN products p ON CAST(o.product_id AS TEXT) = CAST(p.id AS TEXT)
+    WHERE CAST(o.id AS TEXT) = ?
   `;
 
   db.get(sql, [outwardId], async (err, row) => {
@@ -819,11 +819,11 @@ router.get("/report/list", (req, res) => {
       o.lorry_no,
       o.quantity AS outward_qty,
       c.name AS company_name,
-      ca.account_name AS account_name,
-      w.name AS warehouse_name,
+      COALESCE(ca.account_name, '') AS account_name,
+      COALESCE(w.name, '') AS warehouse_name,
       COALESCE(o.location_id, w.location_id) AS effective_location_id,
-      COALESCE(l.name, wl.name) AS location_name,
-      p.name AS product_name,
+      COALESCE(l.name, wl.name, '') AS location_name,
+      COALESCE(p.name, '') AS product_name,
       o.buyer_name,
       o.consignee_name,
       s.dispatch_qty,
@@ -852,13 +852,13 @@ router.get("/report/list", (req, res) => {
       s.company_payable,
       s.narration
     FROM outward_settlement s
-    INNER JOIN outward o ON o.id = s.outward_id
-    LEFT JOIN companies c ON o.company_id = c.id
-    LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-    LEFT JOIN warehouses w ON o.warehouse_id = w.id
-    LEFT JOIN locations l ON l.id = o.location_id
-    LEFT JOIN locations wl ON wl.id = w.location_id
-    LEFT JOIN products p ON o.product_id = p.id
+    INNER JOIN outward o ON CAST(o.id AS TEXT) = CAST(s.outward_id AS TEXT)
+    LEFT JOIN companies c ON CAST(o.company_id AS TEXT) = CAST(c.id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(o.company_account_id AS TEXT) = CAST(ca.id AS TEXT)
+    LEFT JOIN warehouses w ON CAST(o.warehouse_id AS TEXT) = CAST(w.id AS TEXT)
+    LEFT JOIN locations l ON CAST(o.location_id AS TEXT) = CAST(l.id AS TEXT)
+    LEFT JOIN locations wl ON CAST(w.location_id AS TEXT) = CAST(wl.id AS TEXT)
+    LEFT JOIN products p ON CAST(o.product_id AS TEXT) = CAST(p.id AS TEXT)
     WHERE ${where.join(" AND ")}
     ORDER BY o.date DESC, s.id DESC
   `;
