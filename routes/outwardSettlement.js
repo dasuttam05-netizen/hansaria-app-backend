@@ -130,6 +130,26 @@ function getAdjustmentDetails(outwardId) {
   });
 }
 
+function getUnloadingDetails(outwardId) {
+  return new Promise((resolve, reject) => {
+    db.all(
+      `
+      SELECT ba.*
+      FROM buyer_adjustments ba
+      WHERE ba.outward_id = ?
+        AND TRIM(COALESCE(ba.consignee_name, '')) <> ''
+        AND IFNULL(ba.rate, 0) > 0
+      ORDER BY ba.created_at DESC
+      `,
+      [outwardId],
+      (err, rows) => {
+        if (err) return reject(err);
+        return resolve(Array.isArray(rows) ? rows : []);
+      }
+    );
+  });
+}
+
 function calculateSettlement(data) {
   const dispatch_qty = num(data.dispatch_qty);
   const unloading_qty = num(data.unloading_qty);
@@ -148,7 +168,10 @@ function calculateSettlement(data) {
   const other_deduction = num(data.other_deduction) || sumDetailRows(other_deduction_details);
   const charge_bearer = data.charge_bearer === "company" ? "company" : "self";
 
-  const shortage_qty = Math.max(dispatch_qty - unloading_qty, 0);
+  const shortage_qty = Math.max(
+    num(data.shortage_qty) || Math.max(dispatch_qty - unloading_qty, 0),
+    0
+  );
   const sale_amount = dispatch_qty * sale_rate;
   const average_rate = settlement_weight > 0
     ? adjustment_details.reduce((sum, item) => {
@@ -212,6 +235,7 @@ function calculateSettlement(data) {
     other_deduction,
     claim_details,
     other_deduction_details,
+    shortage_qty,
     charge_bearer,
     gross_profit: gross_amount,
     net_profit: receivable_amount,
@@ -420,7 +444,7 @@ router.get("/:outward_id", async (req, res) => {
         product_name: row.product_name,
         outward_quantity: defaultDispatch,
         labour_expense: labourExpense,
-        unloading_details: unloadingDetails,
+          unloading_details: unloadingDetails,
         adjustment_details: adjustment_details.map((item) => ({
           ...item,
           company_rate: num(item.adjustment_company_rate) || num(row.company_rate ?? 0),
@@ -431,7 +455,9 @@ router.get("/:outward_id", async (req, res) => {
           dispatch_qty: row.dispatch_qty ?? defaultDispatch,
           unloading_qty: row.unloading_qty ?? totalSettlementWeight,
           settlement_weight: totalSettlementWeight,
-          billable_qty: row.billable_qty ?? 0,
+          billable_qty:
+            row.billable_qty ??
+            (unloadingDetails.reduce((sum, item) => sum + num(item.shortage), 0) || 0),
           sale_rate: row.sale_rate ?? num(row.outward_rate),
           company_rate: row.company_rate ?? 0,
           average_rate: row.average_rate ?? 0,
@@ -484,6 +510,7 @@ router.post("/save", async (req, res) => {
     other_deduction,
     claim_details,
     other_deduction_details,
+    shortage_qty,
     row_adjustments,
     unloading_date,
     charge_bearer,
@@ -521,6 +548,15 @@ router.post("/save", async (req, res) => {
       }
 
       const adjustment_details = await getAdjustmentDetails(outward_id);
+      const unloadingDetails = await getUnloadingDetails(outward_id);
+      const unloadingShortageQty = unloadingDetails.reduce(
+        (sum, item) => sum + num(item.shortage),
+        0
+      );
+      const unloadingClaimAmount = unloadingDetails.reduce(
+        (sum, item) => sum + num(item.claim),
+        0
+      );
       const adjustmentRateMap = new Map(
         (Array.isArray(adjustment_rates) ? adjustment_rates : [])
           .map((item) => [String(item.adjustment_id || item.id || ""), num(item.company_rate)])
@@ -560,6 +596,7 @@ router.post("/save", async (req, res) => {
       const settlement = calculateSettlement({
         dispatch_qty: dispatch_qty ?? num(outward.quantity || outward.weight),
         unloading_qty,
+        shortage_qty: unloadingShortageQty,
         settlement_weight: settlementWeight,
         sale_rate,
         company_rate: canEditCompanyRate ? company_rate : existingCompanyRate,
@@ -805,6 +842,7 @@ router.get("/report/list", (req, res) => {
       s.other_deduction,
       s.claim_details,
       s.other_deduction_details,
+      s.row_adjustments,
       s.charge_bearer,
       s.gross_profit,
       s.net_profit,
@@ -831,17 +869,25 @@ router.get("/report/list", (req, res) => {
       const enrichedRows = await Promise.all(
         (rows || []).map(async (row) => {
           const adjustment_details = await getAdjustmentDetails(row.outward_id);
+          const unloadingDetails = await getUnloadingDetails(row.outward_id);
           const settlement_weight = adjustment_details.reduce(
             (sum, item) => sum + num(item.settlement_weight),
             0
           );
           const dispatchQty = num(row.dispatch_qty);
-          const shortage_qty = num(row.billable_qty);
+          const unloadingShortageQty = unloadingDetails.reduce(
+            (sum, item) => sum + num(item.shortage),
+            0
+          );
+          const shortage_qty =
+            unloadingShortageQty || num(row.billable_qty) || Math.max(dispatchQty - num(row.unloading_qty), 0);
           const gross_amount = num(row.gross_amount || row.gross_profit);
           const average_rate = num(row.average_rate);
           const average_amount = num(row.average_amount);
-          const claim_amount = num(row.claim_amount);
-          const other_deduction = num(row.other_deduction);
+          const claim_amount =
+            num(row.claim_amount) || unloadingDetails.reduce((sum, item) => sum + num(item.claim), 0);
+          const other_deduction =
+            num(row.other_deduction) || unloadingDetails.reduce((sum, item) => sum + num(item.other_deduction), 0);
           const unloadingDate = row.unloading_date || "";
           const claim_details = normalizeDetailRows(row.claim_details, claim_amount, "Claim");
           const other_deduction_details = normalizeDetailRows(
@@ -869,6 +915,13 @@ router.get("/report/list", (req, res) => {
               ...item,
               sr_no: index + 1,
               company_rate: rowCompanyRate,
+              shortQtyPerLine: dispatchQty > 0
+                ? (num(item.settlement_weight) / dispatchQty) * shortage_qty
+                : 0,
+              shortAmount: short_amount,
+              claim_per_line: dispatchQty > 0
+                ? (num(item.settlement_weight) / dispatchQty) * claim_amount
+                : 0,
               short_amount,
               freight,
               labour_charges,
@@ -897,6 +950,7 @@ router.get("/report/list", (req, res) => {
             unloading_date: unloadingDate,
             claim_details,
             other_deduction_details,
+            row_adjustments: normalizeRowAdjustments(row.row_adjustments),
             adjustment_details: mappedAdjustmentDetails,
           };
         })
