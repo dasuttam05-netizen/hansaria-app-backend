@@ -29,184 +29,39 @@ const db = require("./db");
 
 /*
 ========================================
-AUTO SQLITE COLUMN FIXES
+SQLITE MIGRATION NOTE
 ========================================
+Schema migrations are centralized in db.js, so this bootstrap file
+no longer re-runs ALTER TABLE statements here. This avoids duplicate
+column startup failures on older databases.
 */
-
-const alterQueries = [
-
-  `
-  ALTER TABLE cash_entries
-  ADD COLUMN journal_group_no TEXT
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN location_id INTEGER
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN warehouse_id INTEGER
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN posted_to_inward INTEGER DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN inward_id INTEGER
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN inward_posted_at TEXT
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN posted_to_outward INTEGER DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN outward_id INTEGER
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN outward_posted_at TEXT
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN posted_to_palti INTEGER DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN palti_posted_at TEXT
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN send_to_kind TEXT
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN send_to_ref_id INTEGER
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN shortage REAL DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN excess REAL DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN shortage_excess REAL DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN balance REAL DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN work_description TEXT
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN receive_cash_from_party REAL DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN receive_cash_from_driver REAL DEFAULT 0
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN updated_at TEXT
-  `,
-
-  `
-  ALTER TABLE companies
-  ADD COLUMN shortage_percent REAL DEFAULT NULL
-  `,
-
-  `
-  ALTER TABLE expenses
-  ADD COLUMN created_at TEXT
-  `,
-
-  `
-  ALTER TABLE cash_entries
-  ADD COLUMN source_expense_id INTEGER
-  `,
-
-  `
-  ALTER TABLE cash_entries
-  ADD COLUMN status TEXT DEFAULT 'pending'
-  `,
-
-  `
-  ALTER TABLE outward
-  ADD COLUMN self_loading TEXT DEFAULT 'No'
-  `,
-
-  `
-  ALTER TABLE outward
-  ADD COLUMN narration TEXT
-  `,
-
-  `
-  ALTER TABLE inward
-  ADD COLUMN narration TEXT
-  `
-
-];
-
-// Only run SQLite queries in development mode
-if (db && process.env.NODE_ENV !== "production") {
-  alterQueries.forEach((query) => {
-
-    db.run(query, (err) => {
-
-      if (err) {
-
-        console.log(
-          "ALTER TABLE SKIPPED:",
-          err.message
-        );
-
-      } else {
-
-        console.log(
-          "ALTER TABLE SUCCESS"
-        );
-
-      }
-
-    });
-
-  });
-}
 
 const app = express();
 
+const allowedOrigins = new Set(
+  [
+    process.env.FRONTEND_URL,
+    process.env.FRONTEND_ORIGIN,
+    "https://hansaria-app-frontend.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+  ].filter(Boolean).map((origin) => origin.replace(/\/+$/, ""))
+);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  const normalizedOrigin = origin.replace(/\/+$/, "");
+  return (
+    allowedOrigins.has(normalizedOrigin) ||
+    /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(normalizedOrigin)
+  );
+};
+
 const corsOptions = {
-  origin: true,
+  origin: (origin, callback) => {
+    if (isAllowedOrigin(origin)) return callback(null, true);
+    return callback(new Error(`CORS origin not allowed: ${origin}`));
+  },
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
@@ -224,7 +79,7 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin) {
+  if (origin && isAllowedOrigin(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
@@ -236,7 +91,7 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
-    if (req.headers.origin) {
+    if (req.headers.origin && isAllowedOrigin(req.headers.origin)) {
       res.setHeader("Access-Control-Allow-Origin", req.headers.origin);
       res.setHeader("Access-Control-Allow-Credentials", "true");
       res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
