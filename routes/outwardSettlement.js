@@ -82,6 +82,40 @@ const stripEmptyDetailRows = (rows) =>
 const sumDetailRows = (rows) =>
   (Array.isArray(rows) ? rows : []).reduce((sum, row) => sum + num(row?.amount), 0);
 
+function getOutwardMasterMeta(outwardId) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `
+      SELECT
+        o.id,
+        o.company_id,
+        o.company_account_id,
+        o.warehouse_id,
+        o.location_id,
+        o.product_id,
+        c.name AS company_name,
+        ca.account_name AS account_name,
+        w.name AS warehouse_name,
+        l.name AS location_name,
+        p.name AS product_name
+      FROM outward o
+      LEFT JOIN companies c ON CAST(o.company_id AS TEXT) = CAST(c.id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(o.company_account_id AS TEXT) = CAST(ca.id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(o.warehouse_id AS TEXT) = CAST(w.id AS TEXT)
+      LEFT JOIN locations l ON CAST(o.location_id AS TEXT) = CAST(l.id AS TEXT)
+      LEFT JOIN products p ON CAST(o.product_id AS TEXT) = CAST(p.id AS TEXT)
+      WHERE CAST(o.id AS TEXT) = ?
+      LIMIT 1
+      `,
+      [outwardId],
+      (err, row) => {
+        if (err) return reject(err);
+        return resolve(row || null);
+      }
+    );
+  });
+}
+
 function getAdjustmentDetails(outwardId) {
   return new Promise((resolve, reject) => {
     db.all(
@@ -876,6 +910,7 @@ router.get("/report/list", (req, res) => {
     try {
       const enrichedRows = await Promise.all(
         (rows || []).map(async (row) => {
+          const outwardMeta = await getOutwardMasterMeta(row.outward_id);
           const adjustment_details = await getAdjustmentDetails(row.outward_id);
           const unloadingDetails = await getUnloadingDetails(row.outward_id);
           const settlement_weight = adjustment_details.reduce(
@@ -946,18 +981,18 @@ router.get("/report/list", (req, res) => {
 
           return {
             ...row,
-            account_name: row.account_name || null,
-            company_account_name: row.account_name || null,
-            accountName: row.account_name || null,
-            warehouse_name: row.warehouse_name || null,
-            warehouseName: row.warehouse_name || null,
-            outward_warehouse_name: row.warehouse_name || null,
-            location_name: row.location_name || null,
-            locationName: row.location_name || null,
-            outward_location_name: row.location_name || null,
-            product_name: row.product_name || null,
-            productName: row.product_name || null,
-            outward_product_name: row.product_name || null,
+            account_name: row.account_name || outwardMeta?.account_name || null,
+            company_account_name: row.account_name || outwardMeta?.account_name || null,
+            accountName: row.account_name || outwardMeta?.account_name || null,
+            warehouse_name: row.warehouse_name || outwardMeta?.warehouse_name || null,
+            warehouseName: row.warehouse_name || outwardMeta?.warehouse_name || null,
+            outward_warehouse_name: row.warehouse_name || outwardMeta?.warehouse_name || null,
+            location_name: row.location_name || outwardMeta?.location_name || null,
+            locationName: row.location_name || outwardMeta?.location_name || null,
+            outward_location_name: row.location_name || outwardMeta?.location_name || null,
+            product_name: row.product_name || outwardMeta?.product_name || null,
+            productName: row.product_name || outwardMeta?.product_name || null,
+            outward_product_name: row.product_name || outwardMeta?.product_name || null,
             shortage_qty,
             settlement_weight,
             gross_amount,
