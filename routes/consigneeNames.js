@@ -24,12 +24,26 @@ function canAccessConsigneeNames(user) {
   ].some((permission) => userHasPermission(user, permission));
 }
 
+function parseBuyerIds(body) {
+  let raw = [];
+  if (Array.isArray(body?.buyer_ids)) {
+    raw = body.buyer_ids;
+  } else if (body?.buyer_ids != null && String(body.buyer_ids).trim() !== "") {
+    raw = String(body.buyer_ids).split(/[,|]/);
+  } else if (body?.buyer_id != null && body.buyer_id !== "") {
+    raw = [body.buyer_id];
+  }
+  return [...new Set(raw.map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0))];
+}
+
 function rowBody(body) {
   const name = (body.name || "").trim();
-  const buyer_id = body.buyer_id != null && body.buyer_id !== "" ? Number(body.buyer_id) : null;
+  const buyer_ids = parseBuyerIds(body);
+  const buyer_id = buyer_ids.length ? buyer_ids[0] : null;
   return {
     name,
-    buyer_id: Number.isFinite(buyer_id) ? buyer_id : null,
+    buyer_id,
+    buyer_ids,
     mobile: (body.mobile || "").trim() || null,
     email: (body.email || "").trim() || null,
     address: (body.address || "").trim() || null,
@@ -40,6 +54,42 @@ function rowBody(body) {
   };
 }
 
+function replaceConsigneeBuyers(consigneeId, buyerIds, done) {
+  db.run("DELETE FROM consignee_buyers WHERE consignee_id = ?", [consigneeId], (delErr) => {
+    if (delErr) return done(delErr);
+    if (!buyerIds.length) return done(null);
+
+    let pending = buyerIds.length;
+    let failed = null;
+    buyerIds.forEach((buyerId) => {
+      db.run(
+        "INSERT OR IGNORE INTO consignee_buyers (consignee_id, buyer_id) VALUES (?, ?)",
+        [consigneeId, buyerId],
+        (insErr) => {
+          if (insErr && !failed) failed = insErr;
+          pending -= 1;
+          if (pending === 0) done(failed);
+        }
+      );
+    });
+  });
+}
+
+function mapConsigneeRow(row) {
+  const buyer_ids = String(row.buyer_ids_csv || "")
+    .split(",")
+    .map((v) => Number(v))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const uniqueIds = [...new Set(buyer_ids.length ? buyer_ids : row.buyer_id ? [Number(row.buyer_id)] : [])];
+  return {
+    ...row,
+    buyer_ids: uniqueIds,
+    buyer_id: uniqueIds[0] || row.buyer_id || null,
+    buyer_name: row.buyer_name || null,
+    buyer_ids_csv: undefined,
+  };
+}
+
 router.get("/", (req, res) => {
   if (!canAccessConsigneeNames(req.user)) {
     return res.status(403).json({ error: "You do not have permission to view consignee names" });
@@ -47,15 +97,34 @@ router.get("/", (req, res) => {
 
   db.all(
     `
-    SELECT c.*, b.name AS buyer_name
+    SELECT
+      c.*,
+      COALESCE(
+        (
+          SELECT GROUP_CONCAT(cb.buyer_id)
+          FROM consignee_buyers cb
+          WHERE cb.consignee_id = c.id
+        ),
+        CASE WHEN c.buyer_id IS NOT NULL THEN CAST(c.buyer_id AS TEXT) ELSE NULL END
+      ) AS buyer_ids_csv,
+      COALESCE(
+        (
+          SELECT GROUP_CONCAT(b.name, ', ')
+          FROM consignee_buyers cb
+          JOIN buyer_names b ON b.id = cb.buyer_id
+          WHERE cb.consignee_id = c.id
+        ),
+        (
+          SELECT b2.name FROM buyer_names b2 WHERE b2.id = c.buyer_id
+        )
+      ) AS buyer_name
     FROM consignee_names c
-    LEFT JOIN buyer_names b ON b.id = c.buyer_id
     ORDER BY c.name COLLATE NOCASE
     `,
     [],
     (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
-      res.json(rows);
+      res.json((rows || []).map(mapConsigneeRow));
     }
   );
 });
@@ -91,7 +160,11 @@ router.post("/", (req, res) => {
           return res.status(400).json({ error: "This consignee name already exists" });
         return res.status(500).json({ error: err.message });
       }
-      res.json({ id: this.lastID, ...r });
+      const id = this.lastID;
+      replaceConsigneeBuyers(id, r.buyer_ids, (linkErr) => {
+        if (linkErr) return res.status(500).json({ error: linkErr.message });
+        res.json({ id, ...r });
+      });
     }
   );
 });
@@ -118,11 +191,21 @@ function importConsigneeRows(rows, res) {
 
       const raw = rows[index] || {};
       const r = rowBody(raw);
-      const buyerNameKey = String(raw.buyer_name || raw.BuyerName || "").trim().toLowerCase();
-      const buyerIdFromName = buyerByName.get(buyerNameKey);
+      const buyerNameRaw = String(raw.buyer_name || raw.BuyerName || "").trim();
+      if (!r.buyer_ids.length && buyerNameRaw) {
+        const names = buyerNameRaw.split(/[,|;]/).map((n) => n.trim()).filter(Boolean);
+        const ids = names
+          .map((n) => buyerByName.get(n.toLowerCase()))
+          .filter((id) => Number.isFinite(id));
+        if (ids.length) {
+          r.buyer_ids = [...new Set(ids)];
+          r.buyer_id = r.buyer_ids[0];
+        }
+      }
       const buyerIdFromField = Number(raw.buyer_id || raw.BuyerId || raw.buyerId) || null;
-      if (!r.buyer_id && (buyerIdFromName || buyerIdFromField)) {
-        r.buyer_id = buyerIdFromName || buyerIdFromField;
+      if (!r.buyer_ids.length && buyerIdFromField) {
+        r.buyer_ids = [buyerIdFromField];
+        r.buyer_id = buyerIdFromField;
       }
 
       if (!r.name) {
@@ -148,14 +231,22 @@ function importConsigneeRows(rows, res) {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
           [r.buyer_id, r.name, r.mobile, r.email, r.address, r.gst_no, r.pan_no, r.state, r.location],
-          (insertErr) => {
+          function (insertErr) {
             if (insertErr) {
               skipped += 1;
               errors.push({ row: index + 2, error: insertErr.message });
-            } else {
-              inserted += 1;
+              return processRow(index + 1);
             }
-            return processRow(index + 1);
+            const id = this.lastID;
+            replaceConsigneeBuyers(id, r.buyer_ids, (linkErr) => {
+              if (linkErr) {
+                skipped += 1;
+                errors.push({ row: index + 2, error: linkErr.message });
+              } else {
+                inserted += 1;
+              }
+              return processRow(index + 1);
+            });
           }
         );
       });
@@ -200,6 +291,7 @@ router.post("/import-xlsx", upload.single("file"), (req, res) => {
 
   const normalized = rows.map((r) => ({
     buyer_id: r.buyer_id ?? r.BuyerId ?? r.buyerId ?? "",
+    buyer_ids: r.buyer_ids ?? r.BuyerIds ?? "",
     buyer_name: r.buyer_name ?? r.BuyerName ?? "",
     name: r.name ?? r.Name ?? r.consignee_name ?? r.ConsigneeName ?? "",
     mobile: r.mobile ?? r.Mobile ?? "",
@@ -248,7 +340,10 @@ router.put("/:id", (req, res) => {
         return res.status(500).json({ error: err.message });
       }
       if (this.changes === 0) return res.status(404).json({ error: "Not found" });
-      res.json({ id: Number(id), ...r });
+      replaceConsigneeBuyers(Number(id), r.buyer_ids, (linkErr) => {
+        if (linkErr) return res.status(500).json({ error: linkErr.message });
+        res.json({ id: Number(id), ...r });
+      });
     }
   );
 });
@@ -259,10 +354,13 @@ router.delete("/:id", (req, res) => {
   }
 
   const { id } = req.params;
-  db.run("DELETE FROM consignee_names WHERE id = ?", [id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (this.changes === 0) return res.status(404).json({ error: "Not found" });
-    res.json({ message: "Deleted", id: Number(id) });
+  db.run("DELETE FROM consignee_buyers WHERE consignee_id = ?", [id], (linkErr) => {
+    if (linkErr) return res.status(500).json({ error: linkErr.message });
+    db.run("DELETE FROM consignee_names WHERE id = ?", [id], function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(404).json({ error: "Not found" });
+      res.json({ message: "Deleted", id: Number(id) });
+    });
   });
 });
 
