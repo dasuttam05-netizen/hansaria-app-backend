@@ -3,12 +3,19 @@ const router = express.Router();
 const db = require("../db");
 const { calculateShortageQty } = require("./shortageHelper");
 
+function formatLocalDate(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function calculateMonthSlab(inwardDateStr, currentDateStr) {
   const inwardDate = new Date(inwardDateStr);
   const currentDate = new Date(currentDateStr);
   const msPerDay = 1000 * 60 * 60 * 24;
   const daysDiff = Math.floor((currentDate - inwardDate) / msPerDay);
-  let monthsDiff = Math.floor(daysDiff / 30) + 1;
+  let monthsDiff = Math.floor((daysDiff <= 0 ? 0 : daysDiff - 1) / 30) + 1;
   if (monthsDiff < 1) monthsDiff = 1;
   return {
     daysDiff: daysDiff < 0 ? 0 : daysDiff,
@@ -16,8 +23,8 @@ function calculateMonthSlab(inwardDateStr, currentDateStr) {
   };
 }
 
-function getAvailableQty(weight, inwardDate, alreadyAdjusted, shortagePercent = null) {
-  const slab = calculateMonthSlab(inwardDate, new Date().toISOString());
+function getAvailableQty(weight, inwardDate, alreadyAdjusted, shortagePercent = null, refDate = formatLocalDate()) {
+  const slab = calculateMonthSlab(inwardDate, refDate);
   const grossQty = Number(weight) || 0;
   const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, shortagePercent);
   return grossQty - shortageQty - Number(alreadyAdjusted || 0);
@@ -34,11 +41,11 @@ router.get("/party-stock", (req, res) => {
       IFNULL((
         SELECT SUM(a.qty)
         FROM adjustment a
-        WHERE a.inward_id = i.id
+        WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
       ), 0) AS already_adjusted
     FROM inward i
-    LEFT JOIN companies c ON c.id = i.company_id
-    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
+    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
   `;
 
   db.all(sql, [], (err, rows) => {
@@ -84,12 +91,12 @@ router.get("/warehouse-stock", (req, res) => {
       IFNULL((
         SELECT SUM(a.qty)
         FROM adjustment a
-        WHERE a.inward_id = i.id
+        WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
       ), 0) AS already_adjusted
     FROM inward i
-    LEFT JOIN warehouses w ON w.id = i.warehouse_id
-    LEFT JOIN companies c ON c.id = i.company_id
-    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
+    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
+    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
     WHERE i.warehouse_id IS NOT NULL
   `;
 
@@ -129,12 +136,15 @@ router.get("/total-stock", (req, res) => {
     SELECT
       i.weight,
       i.date AS inward_date,
+      COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
       IFNULL((
         SELECT SUM(a.qty)
         FROM adjustment a
-        WHERE a.inward_id = i.id
+        WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
       ), 0) AS already_adjusted
     FROM inward i
+    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
   `;
 
   db.all(sql, [], (err, rows) => {
@@ -144,7 +154,7 @@ router.get("/total-stock", (req, res) => {
     }
 
     const total = rows.reduce((sum, row) => {
-      return sum + getAvailableQty(row.weight, row.inward_date, row.already_adjusted);
+      return sum + getAvailableQty(row.weight, row.inward_date, row.already_adjusted, row.shortage_percent);
     }, 0);
 
     res.json({ total: Number(total.toFixed(4)) });
@@ -164,9 +174,12 @@ router.get("/fifo-stock", (req, res) => {
       i.id,
       i.date AS inward_date,
       i.weight,
-      IFNULL((SELECT SUM(a.qty) FROM adjustment a WHERE a.inward_id = i.id), 0) AS already_adjusted,
+      COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
+      IFNULL((SELECT SUM(a.qty) FROM adjustment a WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)), 0) AS already_adjusted,
       i.warehouse_id
     FROM inward i
+    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
     WHERE i.product_id = ?
   `;
 
@@ -181,7 +194,7 @@ router.get("/fifo-stock", (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
 
     const batches = rows.map((r) => {
-      const avail = getAvailableQty(r.weight, r.inward_date, r.already_adjusted);
+      const avail = getAvailableQty(r.weight, r.inward_date, r.already_adjusted, r.shortage_percent);
       return {
         inward_id: r.id,
         warehouse_id: r.warehouse_id,
