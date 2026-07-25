@@ -938,7 +938,6 @@ router.get("/report/list", (req, res) => {
           );
           const shortage_qty =
             unloadingShortageQty || num(row.billable_qty) || Math.max(dispatchQty - num(row.unloading_qty), 0);
-          const gross_amount = num(row.gross_amount || row.gross_profit);
           const average_rate = num(row.average_rate);
           const average_amount = num(row.average_amount);
           const claim_amount =
@@ -953,33 +952,47 @@ router.get("/report/list", (req, res) => {
             "Deduction"
           );
 
+          const rowAdjustments = normalizeRowAdjustments(row.row_adjustments);
+          const rowAdjById = rowAdjustments.reduce((acc, item) => {
+            acc[String(item.adjustment_id)] = item;
+            return acc;
+          }, {});
+
           const mappedAdjustmentDetails = adjustment_details.map((item, index) => {
             const rowCompanyRate = num(item.adjustment_company_rate) || num(row.company_rate);
-            const amount = num(item.settlement_weight) * rowCompanyRate;
+            const weight = num(item.settlement_weight);
+            const amount = weight * rowCompanyRate;
             const perMtFreight = dispatchQty > 0 ? num(row.freight) / dispatchQty : 0;
             const perMtLabour = dispatchQty > 0 ? num(row.outward_labour_charges) / dispatchQty : 0;
             const perMtOther = dispatchQty > 0 ? num(row.other_charges) / dispatchQty : 0;
-            const short_amount =
-              dispatchQty > 0
-                ? (num(item.settlement_weight) / dispatchQty) * shortage_qty * rowCompanyRate
-                : 0;
-            const freight = num(item.settlement_weight) * perMtFreight;
-            const labour_charges = num(item.settlement_weight) * perMtLabour;
-            const other_charges = num(item.settlement_weight) * perMtOther;
-            const net_payable = amount - freight - labour_charges - other_charges - short_amount;
+            const shortQtyPerLine =
+              dispatchQty > 0 ? (weight / dispatchQty) * shortage_qty : 0;
+            const autoShortAmount = shortQtyPerLine * rowCompanyRate;
+            const autoClaim =
+              dispatchQty > 0 ? (weight / dispatchQty) * claim_amount : 0;
+            const autoFreight = weight * perMtFreight;
+            const autoLabour = weight * perMtLabour;
+            const autoOther = weight * perMtOther;
+            const manual = rowAdjById[String(item.id)] || {};
+
+            const short_amount = hasOwn(manual, "short_amt") ? num(manual.short_amt) : autoShortAmount;
+            const claim_per_line = hasOwn(manual, "s_amount") ? num(manual.s_amount) : autoClaim;
+            const deduction_per_line = hasOwn(manual, "c_deduction") ? num(manual.c_deduction) : 0;
+            const freight = hasOwn(manual, "freight") ? num(manual.freight) : autoFreight;
+            const labour_charges = hasOwn(manual, "labour_chgs") ? num(manual.labour_chgs) : autoLabour;
+            const other_charges = hasOwn(manual, "other_chgs") ? num(manual.other_chgs) : autoOther;
+            const net_payable =
+              amount - short_amount - claim_per_line - deduction_per_line - freight - labour_charges - other_charges;
 
             return {
               ...item,
               sr_no: index + 1,
               company_rate: rowCompanyRate,
-              shortQtyPerLine: dispatchQty > 0
-                ? (num(item.settlement_weight) / dispatchQty) * shortage_qty
-                : 0,
+              shortQtyPerLine,
               shortAmount: short_amount,
-              claim_per_line: dispatchQty > 0
-                ? (num(item.settlement_weight) / dispatchQty) * claim_amount
-                : 0,
               short_amount,
+              claim_per_line,
+              deduction_per_line,
               freight,
               labour_charges,
               other_charges,
@@ -992,6 +1005,21 @@ router.get("/report/list", (req, res) => {
             (sum, item) => sum + num(item.net_payable),
             0
           );
+
+          const saleAmount = num(row.sale_amount) || dispatchQty * num(row.sale_rate);
+          const saleShortageAmount = mappedAdjustmentDetails.reduce((sum, item) => {
+            return sum + num(item.shortQtyPerLine) * num(row.sale_rate);
+          }, 0);
+          const net_sale =
+            saleAmount -
+            saleShortageAmount -
+            claim_amount -
+            num(row.outward_labour_charges) -
+            num(row.freight) -
+            other_deduction -
+            num(row.other_charges);
+          const purchase_amount = mappedAdjustmentDetails.reduce((sum, item) => sum + num(item.amount), 0);
+          const receivable_amount = net_sale - company_payable;
 
           return {
             ...row,
@@ -1009,9 +1037,11 @@ router.get("/report/list", (req, res) => {
             outward_product_name: row.product_name || outwardMeta?.product_name || null,
             shortage_qty,
             settlement_weight,
-            gross_amount,
+            sale_amount: saleAmount,
+            company_amount: purchase_amount || num(row.company_amount),
+            gross_amount: net_sale,
             company_payable,
-            receivable_amount: gross_amount - company_payable - claim_amount - other_deduction,
+            receivable_amount,
             average_rate,
             average_amount,
             claim_amount,
@@ -1019,7 +1049,7 @@ router.get("/report/list", (req, res) => {
             unloading_date: unloadingDate,
             claim_details,
             other_deduction_details,
-            row_adjustments: normalizeRowAdjustments(row.row_adjustments),
+            row_adjustments: rowAdjustments,
             adjustment_details: mappedAdjustmentDetails,
           };
         })
