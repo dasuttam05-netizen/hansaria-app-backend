@@ -338,6 +338,16 @@ let db = null;
   `);
 
   db.run(`
+    CREATE TABLE IF NOT EXISTS consignee_buyers (
+      consignee_id INTEGER NOT NULL,
+      buyer_id INTEGER NOT NULL,
+      PRIMARY KEY (consignee_id, buyer_id),
+      FOREIGN KEY(consignee_id) REFERENCES consignee_names(id) ON DELETE CASCADE,
+      FOREIGN KEY(buyer_id) REFERENCES buyer_names(id)
+    )
+  `);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS inward (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       sl_no INTEGER NOT NULL,
@@ -843,6 +853,18 @@ let db = null;
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN pan_no TEXT`, "consignee_names pan_no");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN state TEXT`, "consignee_names state");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN location TEXT`, "consignee_names location");
+
+  // Backfill consignee_buyers from legacy single buyer_id
+  db.run(
+    `
+    INSERT OR IGNORE INTO consignee_buyers (consignee_id, buyer_id)
+    SELECT id, buyer_id FROM consignee_names
+    WHERE buyer_id IS NOT NULL
+    `,
+    (err) => {
+      if (err) console.log("consignee_buyers backfill error:", err.message);
+    }
+  );
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN gst_no TEXT`, "transporters gst_no");
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN aadhar_no TEXT`, "transporters aadhar_no");
   addColIgnoreDup(`ALTER TABLE outward ADD COLUMN sl_no INTEGER`, "outward sl_no");
