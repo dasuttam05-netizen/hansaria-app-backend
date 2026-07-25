@@ -108,15 +108,16 @@ function getOutwardMasterMeta(outwardId) {
         o.location_id,
         o.product_id,
         c.name AS company_name,
-        ca.account_name AS account_name,
-        w.name AS warehouse_name,
-        l.name AS location_name,
-        p.name AS product_name
+        COALESCE(ca.account_name, '') AS account_name,
+        COALESCE(w.name, '') AS warehouse_name,
+        COALESCE(l.name, wl.name, '') AS location_name,
+        COALESCE(p.name, '') AS product_name
       FROM outward o
       LEFT JOIN companies c ON CAST(o.company_id AS TEXT) = CAST(c.id AS TEXT)
       LEFT JOIN company_accounts ca ON CAST(o.company_account_id AS TEXT) = CAST(ca.id AS TEXT)
       LEFT JOIN warehouses w ON CAST(o.warehouse_id AS TEXT) = CAST(w.id AS TEXT)
       LEFT JOIN locations l ON CAST(o.location_id AS TEXT) = CAST(l.id AS TEXT)
+      LEFT JOIN locations wl ON CAST(w.location_id AS TEXT) = CAST(wl.id AS TEXT)
       LEFT JOIN products p ON CAST(o.product_id AS TEXT) = CAST(p.id AS TEXT)
       WHERE CAST(o.id AS TEXT) = ?
       LIMIT 1
@@ -128,6 +129,17 @@ function getOutwardMasterMeta(outwardId) {
       }
     );
   });
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text && text !== "-" && text.toLowerCase() !== "null" && text.toLowerCase() !== "undefined") {
+      return text;
+    }
+  }
+  return null;
 }
 
 function getAdjustmentDetails(outwardId) {
@@ -150,19 +162,19 @@ function getAdjustmentDetails(outwardId) {
         COALESCE(l.name, wl.name) AS location_name,
         COALESCE(pr.name, prp.name) AS product_name
       FROM adjustment a
-      LEFT JOIN inward i ON i.id = a.inward_id
-      LEFT JOIN palti_lorry_entries p ON p.id = a.palti_lorry_id
-      LEFT JOIN companies c ON c.id = i.company_id
-      LEFT JOIN companies cp ON cp.id = p.company_id
-      LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
-      LEFT JOIN company_accounts cpa ON cpa.company_id = p.company_id
-      LEFT JOIN warehouses w ON w.id = i.warehouse_id
-      LEFT JOIN warehouses wp ON wp.id = p.warehouse_id
-      LEFT JOIN locations l ON l.id = i.location_id
-      LEFT JOIN locations wl ON wl.id = wp.location_id
-      LEFT JOIN products pr ON pr.id = i.product_id
-      LEFT JOIN products prp ON prp.id = p.product_id
-      WHERE a.outward_id = ?
+      LEFT JOIN inward i ON CAST(i.id AS TEXT) = CAST(a.inward_id AS TEXT)
+      LEFT JOIN palti_lorry_entries p ON CAST(p.id AS TEXT) = CAST(a.palti_lorry_id AS TEXT)
+      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+      LEFT JOIN companies cp ON CAST(cp.id AS TEXT) = CAST(p.company_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
+      LEFT JOIN company_accounts cpa ON CAST(cpa.company_id AS TEXT) = CAST(p.company_id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
+      LEFT JOIN warehouses wp ON CAST(wp.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
+      LEFT JOIN locations l ON CAST(l.id AS TEXT) = CAST(i.location_id AS TEXT)
+      LEFT JOIN locations wl ON CAST(wl.id AS TEXT) = CAST(wp.location_id AS TEXT)
+      LEFT JOIN products pr ON CAST(pr.id AS TEXT) = CAST(i.product_id AS TEXT)
+      LEFT JOIN products prp ON CAST(prp.id AS TEXT) = CAST(p.product_id AS TEXT)
+      WHERE CAST(a.outward_id AS TEXT) = CAST(? AS TEXT)
       ORDER BY a.id ASC
       `,
       [outwardId],
@@ -871,6 +883,11 @@ router.get("/report/list", (req, res) => {
       o.inv_no,
       o.lorry_no,
       o.quantity AS outward_qty,
+      o.company_id,
+      o.company_account_id,
+      o.warehouse_id,
+      o.location_id,
+      o.product_id,
       c.name AS company_name,
       COALESCE(ca.account_name, '') AS account_name,
       COALESCE(w.name, '') AS warehouse_name,
@@ -1021,20 +1038,46 @@ router.get("/report/list", (req, res) => {
           const purchase_amount = mappedAdjustmentDetails.reduce((sum, item) => sum + num(item.amount), 0);
           const receivable_amount = net_sale - company_payable;
 
+          const firstAdj = mappedAdjustmentDetails[0] || {};
+          const firstUnload = unloadingDetails[0] || {};
+          const accountName = firstNonEmpty(
+            row.account_name,
+            outwardMeta?.account_name,
+            firstAdj.company_account_name,
+            row.company_name,
+            outwardMeta?.company_name
+          );
+          const warehouseName = firstNonEmpty(
+            row.warehouse_name,
+            outwardMeta?.warehouse_name,
+            firstAdj.warehouse_name
+          );
+          const locationName = firstNonEmpty(
+            row.location_name,
+            outwardMeta?.location_name,
+            firstAdj.location_name
+          );
+          const productName = firstNonEmpty(
+            row.product_name,
+            outwardMeta?.product_name,
+            firstAdj.product_name,
+            firstUnload.product_name
+          );
+
           return {
             ...row,
-            account_name: row.account_name || outwardMeta?.account_name || null,
-            company_account_name: row.account_name || outwardMeta?.account_name || null,
-            accountName: row.account_name || outwardMeta?.account_name || null,
-            warehouse_name: row.warehouse_name || outwardMeta?.warehouse_name || null,
-            warehouseName: row.warehouse_name || outwardMeta?.warehouse_name || null,
-            outward_warehouse_name: row.warehouse_name || outwardMeta?.warehouse_name || null,
-            location_name: row.location_name || outwardMeta?.location_name || null,
-            locationName: row.location_name || outwardMeta?.location_name || null,
-            outward_location_name: row.location_name || outwardMeta?.location_name || null,
-            product_name: row.product_name || outwardMeta?.product_name || null,
-            productName: row.product_name || outwardMeta?.product_name || null,
-            outward_product_name: row.product_name || outwardMeta?.product_name || null,
+            account_name: accountName,
+            company_account_name: accountName,
+            accountName: accountName,
+            warehouse_name: warehouseName,
+            warehouseName: warehouseName,
+            outward_warehouse_name: warehouseName,
+            location_name: locationName,
+            locationName: locationName,
+            outward_location_name: locationName,
+            product_name: productName,
+            productName: productName,
+            outward_product_name: productName,
             shortage_qty,
             settlement_weight,
             sale_amount: saleAmount,
