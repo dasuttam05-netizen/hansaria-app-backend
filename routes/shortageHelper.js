@@ -27,9 +27,10 @@ function resolveShortageRate(rawValue) {
 }
 
 function calculateAppliedShortageRate(rawValue, monthsDiff) {
+  // Empty/manual-unset → automatic 2% per month slab. Explicit company % stays flat.
   const baseRate =
     rawValue === null || rawValue === undefined || String(rawValue).trim() === ""
-      ? DEFAULT_SHORTAGE_SLAB_PERCENT / 100
+      ? getAutoShortageRate(monthsDiff)
       : resolveShortageRate(rawValue);
   return Number((baseRate || 0).toFixed(4));
 }
