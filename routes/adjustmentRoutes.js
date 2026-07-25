@@ -246,7 +246,6 @@ router.get("/inward/report", (req, res) => {
                 mongoAccount?.shortage_percent
               );
             }
-            if (shortagePercent === null) shortagePercent = 2;
 
             const slab = calculateMonthSlab(row.date, outward_date);
             const grossQty = Number(row.gross_qty) || 0;
