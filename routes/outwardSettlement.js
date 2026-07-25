@@ -60,20 +60,31 @@ const normalizeDetailRows = (value, fallbackAmount = 0, fallbackLabel = "") => {
   ];
 };
 
+const ROW_ADJUSTMENT_FIELDS = [
+  "short_amt",
+  "s_amount",
+  "c_deduction",
+  "freight",
+  "labour_chgs",
+  "other_chgs",
+];
+
 const normalizeRowAdjustments = (value) => {
-  const rows = safeJsonParse(value, []);
+  const rows = Array.isArray(value) ? value : safeJsonParse(value, []);
   if (!Array.isArray(rows)) return [];
   return rows
-    .map((item) => ({
-      adjustment_id: item?.adjustment_id ?? item?.id ?? null,
-      short_amt: num(item?.short_amt),
-      s_amount: num(item?.s_amount),
-      c_deduction: num(item?.c_deduction),
-      freight: num(item?.freight),
-      labour_chgs: num(item?.labour_chgs),
-      other_chgs: num(item?.other_chgs),
-    }))
-    .filter((item) => item.adjustment_id);
+    .map((item) => {
+      const adjustment_id = item?.adjustment_id ?? item?.id ?? null;
+      if (adjustment_id == null || adjustment_id === "") return null;
+      const out = { adjustment_id };
+      ROW_ADJUSTMENT_FIELDS.forEach((field) => {
+        if (!Object.prototype.hasOwnProperty.call(item || {}, field)) return;
+        if (item[field] === null || item[field] === undefined || item[field] === "") return;
+        out[field] = num(item[field]);
+      });
+      return Object.keys(out).length > 1 ? out : null;
+    })
+    .filter(Boolean);
 };
 
 const stripEmptyDetailRows = (rows) =>
