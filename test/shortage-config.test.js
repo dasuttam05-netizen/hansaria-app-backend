@@ -7,9 +7,11 @@ test('default shortage remains automatic for month slabs', () => {
   assert.equal(qty, 2);
 });
 
-test('automatic shortage scales by day slab', () => {
+test('automatic shortage scales by month slab', () => {
   assert.equal(getAutoShortageRate(1), 0.02);
   assert.equal(getAutoShortageRate(2), 0.04);
+  assert.equal(calculateShortageQty(100, 2), 4);
+  assert.equal(calculateShortageQty(100, 3), 6);
 });
 
 test('manual company shortage percentage overrides the default automatic rate', () => {
