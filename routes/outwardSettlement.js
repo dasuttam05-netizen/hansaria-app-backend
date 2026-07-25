@@ -69,6 +69,8 @@ const ROW_ADJUSTMENT_FIELDS = [
   "other_chgs",
 ];
 
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
+
 const normalizeRowAdjustments = (value) => {
   const rows = Array.isArray(value) ? value : safeJsonParse(value, []);
   if (!Array.isArray(rows)) return [];
@@ -78,8 +80,9 @@ const normalizeRowAdjustments = (value) => {
       if (adjustment_id == null || adjustment_id === "") return null;
       const out = { adjustment_id };
       ROW_ADJUSTMENT_FIELDS.forEach((field) => {
-        if (!Object.prototype.hasOwnProperty.call(item || {}, field)) return;
-        if (item[field] === null || item[field] === undefined || item[field] === "") return;
+        if (!hasOwn(item, field)) return;
+        // Keep 0 / "00" / "" as manual overrides (blank => 0)
+        if (item[field] === null || item[field] === undefined) return;
         out[field] = num(item[field]);
       });
       return Object.keys(out).length > 1 ? out : null;
