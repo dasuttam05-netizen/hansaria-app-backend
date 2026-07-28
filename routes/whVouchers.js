@@ -4399,34 +4399,67 @@ router.get("/sale/:id/pdf", async (req, res) => {
     if (!row) return res.status(404).json({ error: "Not found" });
     if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
 
+    const purchaseLinks = Array.isArray(row.against_purchase_links)
+      ? row.against_purchase_links
+      : (() => {
+          try {
+            return row.against_purchase_links ? JSON.parse(row.against_purchase_links) : [];
+          } catch {
+            return [];
+          }
+        })();
+    const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
+    const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+    const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
+    const profitLoss = netAmount - directPurchaseAmount;
+
     const doc = new PDFDocument({ size: "A4", margin: 36 });
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="sale_${row.voucher_no || id}.pdf"`);
     doc.pipe(res);
 
-    doc.fontSize(18).text("SALE VOUCHER", { align: "center" });
-    doc.moveDown(0.6);
-    doc.fontSize(11).text(`Voucher No: ${row.voucher_no || "-"}`);
-    doc.text(`Sale Date: ${fmtDate(row.date)}`);
-    doc.text(`Unloading Date: ${fmtDate(row.unloading_date)}`);
-    doc.text(`Due Date: ${fmtDate(row.due_date)}`);
-    doc.text(`Due Days: ${fmtNum(row.due_days)}`);
-    doc.text(`Days Overdue: ${fmtNum(row.days_overdue)}`);
-    doc.text(`Lorry No: ${row.lorry_no || row.reference_id || "-"}`);
-    doc.text(`Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`);
-    doc.text(`Buyer: ${row.buyer_name || row.company_name || "-"}`);
-    doc.text(`Consignee: ${row.consignee_name || "-"}`);
-    doc.text(`Product: ${row.product_name || "-"}`);
+    doc.fontSize(18).text("DIRECT SALE BILL", { align: "center" });
     doc.moveDown(0.4);
-    doc.text(`Dispatch Qty: ${fmtNum(row.quantity)}`);
-    doc.text(`Unloading Qty: ${fmtNum(row.unloading_qty || row.quantity)}`);
-    doc.text(`Shortage Qty: ${fmtNum(row.shortage_quantity)}`);
+    doc.fontSize(10).text(`Voucher No: ${row.voucher_no || "-"}`);
+    doc.text(`Sale Date: ${fmtDate(row.date)}    Unloading Date: ${fmtDate(row.unloading_date)}`);
+    doc.text(`Location: ${row.location_name || row.location_id || "-"}    Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`);
+    doc.text(`Farmer: ${row.farmer_name || row.farmer_id || "-"}    Buyer: ${row.buyer_name || row.company_name || "-"}`);
+    doc.text(`Product: ${row.product_name || "-"}    Lorry No: ${row.lorry_no || row.reference_id || "-"}`);
+
+    doc.moveDown(0.5);
+    doc.fontSize(12).text("Sale Details", { underline: true });
+    doc.fontSize(10);
+    doc.text(`Quantity: ${fmtNum(row.quantity || row.unloading_qty || 0)}`);
     doc.text(`Rate: ${fmtNum(row.rate)}`);
-    doc.text(`Amount: ${fmtNum(row.amount)}`);
-    doc.text(`Shortage Amount: ${fmtNum(row.claim_amount)}`);
-    doc.text(`Total Deduction: ${fmtNum((Number(row.claim_amount) || 0) + (Number(row.other_deduction) || 0) + (Number(row.adjustment_amount) || 0) + (Number(row.tds_amount) || 0))}`);
-    doc.text(`Net Receivable: ${fmtNum(row.net_receivable_amount || row.net_amount || row.amount)}`);
-    doc.text(`Outstanding: ${fmtNum(row.outstanding)}`);
+    doc.text(`Gross Amount: ${fmtNum(row.amount)}`);
+    doc.text(`Net Receivable: ${fmtNum(netAmount)}`);
+
+    doc.moveDown(0.4);
+    doc.fontSize(12).text("Deduction / Journal", { underline: true });
+    doc.fontSize(10);
+    doc.text(`Claim: ${fmtNum(row.claim_amount)}`);
+    doc.text(`Shortage: ${fmtNum(row.shortage_amount || row.claim_amount)}`);
+    doc.text(`Cash Discount: ${fmtNum(row.cd_amount)}`);
+    doc.text(`Other Deduction: ${fmtNum(row.other_deduction)}`);
+    doc.text(`Adjustment: ${fmtNum(row.adjustment_amount)}`);
+    doc.text(`TDS: ${fmtNum(row.tds_amount)}`);
+    doc.text(`Round Off: ${fmtNum(row.round_off)}`);
+    doc.text(`Total Deduction: ${fmtNum(totalDeduction)}`);
+
+    doc.moveDown(0.4);
+    doc.fontSize(12).text("Auto Purchase Entry", { underline: true });
+    doc.fontSize(10);
+    doc.text(`Purchase Qty: ${fmtNum(row.total_qty || row.quantity || 0)}`);
+    doc.text(`Purchase Rate: ${fmtNum(row.direct_purchase_rate || row.rate)}`);
+    doc.text(`Purchase Amount: ${fmtNum(directPurchaseAmount)}`);
+    doc.text(`Linked Purchase Rows: ${fmtNum(purchaseLinks.length)}`);
+
+    doc.moveDown(0.4);
+    doc.fontSize(12).text("Payment / Receipt / Profit", { underline: true });
+    doc.fontSize(10);
+    doc.text(`Receipt Adjusted: ${fmtNum((Array.isArray(row.payment_details) ? row.payment_details : []).reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0))}`);
+    doc.text(`Journal Count: ${fmtNum((Array.isArray(row.journal_details) ? row.journal_details : []).length)}`);
+    doc.text(`Net Profit / Loss: ${fmtNum(profitLoss)}`);
     doc.text(`Follow-up Status: ${getFollowupStatusLabel(row.followup_status)}`);
 
     if (row.description) {
@@ -4435,6 +4468,78 @@ router.get("/sale/:id/pdf", async (req, res) => {
     }
 
     doc.end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/sale/:id/summary", async (req, res) => {
+  const id = req.params.id;
+  try {
+    if (!req.user) return res.status(403).json({ error: "Authentication required" });
+
+    let row = null;
+    if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+      const doc = await SaleVoucher.findById(id).lean();
+      if (doc) {
+        const decorated = await decorateSaleRows([doc]);
+        row = decorated[0] || null;
+      }
+    }
+
+    if (!row) {
+      const q = `
+        SELECT
+          s.*,
+          COALESCE(s.buyer_id, s.company_id) AS buyer_id,
+          w.name AS warehouse_name,
+          c.name AS company_name,
+          b.name AS buyer_name,
+          co.name AS consignee_name,
+          p.name AS product_name
+        FROM wh_sale_vouchers s
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+        LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(s.buyer_id, s.company_id) AS TEXT)
+        LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
+        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
+        WHERE CAST(s.id AS TEXT) = CAST(? AS TEXT)
+      `;
+      row = await dbGet(q, [id]);
+    }
+
+    if (!row) return res.status(404).json({ error: "Not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id)) return;
+
+    const purchaseLinks = Array.isArray(row.against_purchase_links)
+      ? row.against_purchase_links
+      : (() => {
+          try {
+            return row.against_purchase_links ? JSON.parse(row.against_purchase_links) : [];
+          } catch {
+            return [];
+          }
+        })();
+    const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
+    const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
+    const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
+    const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+    const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
+
+    res.json({
+      sale: row,
+      purchase_links: purchaseLinks,
+      payment_details: paymentDetails,
+      journal_details: journalDetails,
+      summary: {
+        gross_amount: Number(row.amount || 0),
+        total_deduction: totalDeduction,
+        net_payable: netAmount,
+        net_receivable: Number(row.net_receivable_amount || netAmount),
+        direct_purchase_amount: directPurchaseAmount,
+        profit_loss: netAmount - directPurchaseAmount,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
