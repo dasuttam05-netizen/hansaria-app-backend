@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 
-const { mongoose, Location } = require("../mongo");
+const { mongoose, Location, Warehouse } = require("../mongo");
 
 const {
   userHasPermission,
@@ -54,6 +54,55 @@ router.get("/", async (req, res) => {
 
     console.error(err);
 
+    return res.status(500).json({
+      error: err.message,
+    });
+  }
+});
+
+router.get("/unmapped", async (req, res) => {
+  try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error: "Database service is temporarily unavailable. Please try again in a moment.",
+      });
+    }
+
+    if (!canReadLocations(req.user)) {
+      return res.status(403).json({
+        error: "You do not have permission to view locations",
+      });
+    }
+
+    const [locations, warehouses] = await Promise.all([
+      Location.find().sort({ created_at: -1 }).lean(),
+      Warehouse.find({}, { location_id: 1 }).lean(),
+    ]);
+
+    const warehouseCountByLocation = new Map();
+    for (const warehouse of warehouses || []) {
+      const locationId = String(warehouse.location_id || "");
+      if (!locationId) continue;
+      warehouseCountByLocation.set(locationId, (warehouseCountByLocation.get(locationId) || 0) + 1);
+    }
+
+    const unmappedLocations = (locations || [])
+      .filter((location) => !warehouseCountByLocation.has(String(location._id)))
+      .map((location) => ({
+        id: location._id,
+        name: location.name || "",
+        address: location.address || "",
+        abbr: location.abbr || "",
+        warehouse_count: 0,
+      }));
+
+    res.json({
+      total_locations: locations.length,
+      unmapped_count: unmappedLocations.length,
+      unmapped_locations: unmappedLocations,
+    });
+  } catch (err) {
+    console.error(err);
     return res.status(500).json({
       error: err.message,
     });
