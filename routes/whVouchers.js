@@ -16,6 +16,7 @@ const {
   CompanyAccount,
   Employee,
   Location,
+  SqliteMirrorRow,
 } = require("../mongo");
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -540,52 +541,32 @@ async function getTransportBiltiMatch({ saleId, voucherNo = "", lorryNo = "" }) 
   const voucherNoText = String(voucherNo || "").trim();
   const lorryNoText = String(lorryNo || "").trim();
 
-  if (mongoose.connection?.db) {
-    const collection = mongoose.connection.db.collection("transport_bilti");
+  if (mongoose.connection?.db && SqliteMirrorRow) {
     const mongoFilters = [];
     if (saleIdText) {
-      mongoFilters.push({
-        $or: [{ sale_id: saleIdText }, { sale_id: Number(saleIdText) }],
-      });
+      mongoFilters.push({ "data.sale_id": saleIdText }, { "data.sale_id": Number(saleIdText) });
     }
     if (voucherNoText) {
-      mongoFilters.push({ voucher_no: voucherNoText });
+      mongoFilters.push({ "data.voucher_no": voucherNoText });
     }
     if (lorryNoText) {
-      mongoFilters.push({ lorry_no: lorryNoText });
+      mongoFilters.push({ "data.lorry_no": lorryNoText });
     }
 
     for (const filter of mongoFilters) {
-      const doc = await collection.findOne(filter, { sort: { id: -1, updated_at: -1, _id: -1 } });
-      if (doc) {
-        const matchedField = filter.$or ? "sale_id" : Object.keys(filter)[0];
+      const doc = await SqliteMirrorRow.findOne({ table: "transport_bilti", ...filter })
+        .sort({ updated_at: -1, row_id: -1 })
+        .lean();
+      if (doc?.data) {
+        const data = doc.data || {};
+        const matchedField = Object.keys(filter).find((key) => key.startsWith("data."))?.replace("data.", "") || "sale_id";
         return {
-          ...doc,
-          transport_amount: Number(doc.payable_amount || doc.net_amount || doc.gross_freight || 0),
-          source: `mongo:${matchedField}`,
+          ...data,
+          id: doc.row_id,
+          _id: doc._id,
+          transport_amount: Number(data.payable_amount || data.net_amount || data.gross_freight || 0),
+          source: `mongo-mirror:${matchedField}`,
         };
-      }
-    }
-
-    if (saleIdText || voucherNoText || lorryNoText) {
-      const orFilters = [];
-      if (saleIdText) orFilters.push({ sale_id: saleIdText }, { sale_id: Number(saleIdText) });
-      if (voucherNoText) orFilters.push({ voucher_no: voucherNoText });
-      if (lorryNoText) orFilters.push({ lorry_no: lorryNoText });
-      if (orFilters.length) {
-        const doc = await collection.findOne({ $or: orFilters }, { sort: { id: -1, updated_at: -1, _id: -1 } });
-        if (doc) {
-          const matchedField = doc.sale_id != null && String(doc.sale_id) === saleIdText
-            ? "sale_id"
-            : doc.voucher_no === voucherNoText
-              ? "voucher_no"
-              : "lorry_no";
-          return {
-            ...doc,
-            transport_amount: Number(doc.payable_amount || doc.net_amount || doc.gross_freight || 0),
-            source: `mongo:${matchedField}:or`,
-          };
-        }
       }
     }
   }
