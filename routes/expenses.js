@@ -655,7 +655,9 @@ function resolveWarehouseForLocation(user, locationId, callback) {
             return;
           }
 
-          callback(new Error("No warehouse is mapped with the selected location"));
+          // Some locations are used for expense entry without a warehouse mapping.
+          // Keep the expense saveable and let warehouse-dependent flows decide later.
+          callback(null, null);
           return;
         }
 
@@ -1528,10 +1530,10 @@ router.post("/", async (req, res) => {
         receive_cash_from_party, receive_cash_from_driver, grand_total, total_expense_amount, narration
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
-      [
+        [
         voucherNo,
         expense_date,
-        resolvedWarehouseId,
+        resolvedWarehouseId || null,
         resolvedIds.location_id,
         resolvedIds.employee_id || null,
         resolvedIds.product_id || null,
@@ -1905,7 +1907,7 @@ router.put("/:id", async (req, res) => {
         return res.status(400).json({ error: warehouseErr.message });
       }
 
-      return updateExpenseWithWarehouse(resolvedWarehouseId);
+      return updateExpenseWithWarehouse(resolvedWarehouseId || null);
     });
     };
 
