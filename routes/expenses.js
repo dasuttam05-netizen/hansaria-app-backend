@@ -916,8 +916,10 @@ router.get("/", (req, res) => {
       `
       SELECT
         x.*,
+        x.location_id AS expense_location_id,
+        xl.name AS expense_location_name,
         w.location_id AS effective_location_id,
-        wl.name AS location_name,
+        COALESCE(wl.name, xl.name) AS location_name,
         w.name AS warehouse_name,
         e.name AS employee_name,
         p.name AS product_name,
@@ -937,6 +939,7 @@ router.get("/", (req, res) => {
         ) AS send_to_company_name
       FROM expenses x
       LEFT JOIN warehouses w ON w.id = x.warehouse_id
+      LEFT JOIN locations xl ON xl.id = x.location_id
       LEFT JOIN locations wl ON wl.id = w.location_id
       LEFT JOIN employees e ON e.id = x.employee_id
       LEFT JOIN products p ON p.id = x.product_id
@@ -1095,9 +1098,11 @@ router.get("/:id", (req, res) => {
       `
       SELECT
         e.*,
+        e.location_id AS expense_location_id,
+        xl.name AS expense_location_name,
         w.location_id AS effective_location_id,
         wl.name AS effective_location_name,
-        wl.name AS location_name,
+        COALESCE(wl.name, xl.name) AS location_name,
         w.name AS warehouse_name,
         w.location_id AS warehouse_location_id,
         wl.name AS warehouse_location_name,
@@ -1110,6 +1115,7 @@ router.get("/:id", (req, res) => {
         stc.name AS send_to_company_name
       FROM expenses e
       LEFT JOIN warehouses w ON w.id = e.warehouse_id
+      LEFT JOIN locations xl ON xl.id = e.location_id
       LEFT JOIN locations wl ON wl.id = w.location_id
       LEFT JOIN employees emp ON emp.id = e.employee_id
       LEFT JOIN products pr ON pr.id = e.product_id
@@ -1174,15 +1180,18 @@ router.post("/:id/approve-cash-book", (req, res) => {
 
   db.get(
     `
-    SELECT
-      x.*,
-      w.location_id AS warehouse_location_id,
-      wl.name AS location_name,
+      SELECT
+        x.*,
+        x.location_id AS expense_location_id,
+        xl.name AS expense_location_name,
+        w.location_id AS warehouse_location_id,
+        wl.name AS location_name,
       w.name AS warehouse_name,
       c.name AS company_name
-    FROM expenses x
-    LEFT JOIN warehouses w ON w.id = x.warehouse_id
-    LEFT JOIN locations wl ON wl.id = w.location_id
+      FROM expenses x
+      LEFT JOIN warehouses w ON w.id = x.warehouse_id
+      LEFT JOIN locations xl ON xl.id = x.location_id
+      LEFT JOIN locations wl ON wl.id = w.location_id
     LEFT JOIN companies c ON c.id = x.company_id
     WHERE x.id = ?
     `,
