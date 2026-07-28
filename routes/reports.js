@@ -49,21 +49,10 @@ function calculateMonthSlab(inwardDateStr, refDateStr) {
   };
 }
 
-function formatLocalDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function getTodayDate() {
-  return formatLocalDate(new Date());
-}
-
 function getMonthEndDate(monthStr) {
   const [year, month] = monthStr.split("-").map(Number);
-  // Local calendar last day — avoid toISOString() which shifts the day in IST/UTC+ offsets
-  return formatLocalDate(new Date(year, month, 0));
+  const d = new Date(year, month, 0);
+  return d.toISOString().split("T")[0];
 }
 
 function getMonthLabel(monthStr) {
@@ -140,7 +129,7 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) =>
   db.all(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
 
-    const refDate = to_date || getTodayDate();
+    const refDate = to_date || new Date().toISOString().split("T")[0];
 
     const details = rows.map((row) => {
       const slab = calculateMonthSlab(row.date, refDate);
@@ -280,14 +269,14 @@ router.get("/party-stock", authorizeReport("report.partyStock"), (req, res) => {
       IFNULL(SUM(a.qty), 0) AS adjusted_qty,
       MAX(o.date) AS outward_date
     FROM inward i
-    LEFT JOIN employees e ON CAST(e.id AS TEXT) = CAST(i.employee_id AS TEXT)
-    LEFT JOIN locations lo ON CAST(lo.id AS TEXT) = CAST(i.location_id AS TEXT)
-    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
-    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(i.product_id AS TEXT)
-    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
-    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
-    LEFT JOIN adjustment a ON CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
-    LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
+    LEFT JOIN employees e ON e.id = i.employee_id
+    LEFT JOIN locations lo ON lo.id = i.location_id
+    LEFT JOIN warehouses w ON w.id = i.warehouse_id
+    LEFT JOIN products p ON p.id = i.product_id
+    LEFT JOIN companies c ON c.id = i.company_id
+    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
+    LEFT JOIN adjustment a ON a.inward_id = i.id
+    LEFT JOIN outward o ON o.id = a.outward_id
     WHERE ${where.join(" AND ")}
     GROUP BY i.id
     ORDER BY i.date ASC, i.id ASC
@@ -296,7 +285,7 @@ router.get("/party-stock", authorizeReport("report.partyStock"), (req, res) => {
   db.all(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
 
-    const refDate = to_date || getTodayDate();
+    const refDate = to_date || new Date().toISOString().split("T")[0];
 
     const details = rows.map((row) => {
       const slab = calculateMonthSlab(row.inward_date, refDate);
@@ -370,7 +359,7 @@ router.get("/party-stock", authorizeReport("report.partyStock"), (req, res) => {
   });
 });
 
-function calculateAvailableQty(weight, inwardDate, alreadyAdjusted, refDate = getTodayDate(), shortagePercent = null) {
+function calculateAvailableQty(weight, inwardDate, alreadyAdjusted, refDate = new Date().toISOString().split("T")[0], shortagePercent = null) {
   const gross = Number(weight) || 0;
   const slab = calculateMonthSlab(inwardDate, refDate);
   const shortage = calculateShortageQty(gross, slab.monthsDiff, shortagePercent);
@@ -426,13 +415,13 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) 
       IFNULL((
         SELECT SUM(a.qty)
         FROM adjustment a
-        WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
+        WHERE a.inward_id = i.id
       ), 0) AS already_adjusted
     FROM inward i
-    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
-    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
-    LEFT JOIN locations lo ON CAST(lo.id AS TEXT) = CAST(i.location_id AS TEXT)
-    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
+    LEFT JOIN companies c ON c.id = i.company_id
+    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
+    LEFT JOIN locations lo ON lo.id = i.location_id
+    LEFT JOIN warehouses w ON w.id = i.warehouse_id
     WHERE ${where.join(" AND ")}
   `;
 
@@ -440,9 +429,8 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), (req, res) 
     if (err) return res.status(500).json({ error: err.message });
 
     const warehouseMap = {};
-    const refDate = to_date || getTodayDate();
     rows.forEach((row) => {
-      const availableQty = calculateAvailableQty(row.weight, row.inward_date, row.already_adjusted, refDate, row.shortage_percent);
+      const availableQty = calculateAvailableQty(row.weight, row.inward_date, row.already_adjusted, to_date || new Date().toISOString().split("T")[0], row.shortage_percent);
       const warehouseName = row.warehouse || "Unknown";
       const partyName = row.party_name || "Unknown";
       const locationName = row.location_name || "Unknown";
@@ -515,22 +503,19 @@ router.get("/total-stock", authorizeReport("report.partyStock"), (req, res) => {
     SELECT
       i.weight,
       i.date AS inward_date,
-      COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
       IFNULL((
         SELECT SUM(a.qty)
         FROM adjustment a
-        WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
+        WHERE a.inward_id = i.id
       ), 0) AS already_adjusted
     FROM inward i
-    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
-    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
     WHERE ${where.join(" AND ")}
   `;
 
   db.all(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
 
-    const refDate = to_date || getTodayDate();
+    const refDate = to_date || new Date().toISOString().split("T")[0];
       const total = rows.reduce((acc, row) => acc + calculateAvailableQty(row.weight, row.inward_date, row.already_adjusted, refDate, row.shortage_percent), 0);
     res.json({ total: Number(total.toFixed(4)) });
   });
@@ -583,7 +568,7 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
   db.all(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
 
-    const today = getTodayDate();
+    const today = new Date().toISOString().split("T")[0];
     const fallbackRefDate = to_date || today;
     const inwardIds = (rows || []).map((row) => row.id);
 
@@ -724,50 +709,41 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
       });
     }
 
-    const placeholders = inwardIds.map(() => "CAST(? AS TEXT)").join(",");
+    const placeholders = inwardIds.map(() => "?").join(",");
     const adjustmentSql = `
       SELECT
-        a.id,
-        a.inward_id,
-        a.qty,
-        a.created_at,
-        o.date AS dispatch_date
-      FROM adjustment a
-      LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
-      WHERE CAST(a.inward_id AS TEXT) IN (${placeholders})
-        AND DATE(COALESCE(o.date, a.created_at)) <= ?
-      ORDER BY COALESCE(o.date, DATE(a.created_at)) ASC, a.id ASC
+        inward_id,
+        qty,
+        created_at
+      FROM adjustment
+      WHERE inward_id IN (${placeholders})
+        AND DATE(created_at) <= ?
+      ORDER BY DATE(created_at) ASC, id ASC
     `;
 
     db.all(adjustmentSql, [...inwardIds, monthEndDate], (adjustmentErr, adjustmentRows) => {
       if (adjustmentErr) return res.status(500).json({ error: adjustmentErr.message });
 
       const adjustmentMap = {};
-      (adjustmentRows || []).forEach((item) => {
-        const key = String(item.inward_id);
-        if (!adjustmentMap[key]) {
-          adjustmentMap[key] = [];
+      adjustmentRows.forEach((item) => {
+        if (!adjustmentMap[item.inward_id]) {
+          adjustmentMap[item.inward_id] = [];
         }
-        adjustmentMap[key].push(item);
+        adjustmentMap[item.inward_id].push(item);
       });
 
       const detailed = rows.map((row) => {
         const monthEndSlab = calculateMonthSlab(row.date, monthEndDate);
         const originalWeight = Number(row.weight) || 0;
         const rentRate = 200;
-        const adjustments = adjustmentMap[String(row.id)] || [];
+        const adjustments = adjustmentMap[row.id] || [];
 
         let adjustedQty = 0;
         let adjustedRentAmount = 0;
 
         adjustments.forEach((adjustment) => {
           const adjustmentQty = Number(adjustment.qty) || 0;
-          const adjustmentDate = firstNonEmptyDate(
-            adjustment.dispatch_date,
-            String(adjustment.created_at || "").split(" ")[0]
-          );
-          if (!adjustmentDate) return;
-
+          const adjustmentDate = String(adjustment.created_at).split(" ")[0];
           const adjustmentSlab = calculateMonthSlab(row.date, adjustmentDate);
 
           adjustedQty += adjustmentQty;
