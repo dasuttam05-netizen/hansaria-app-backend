@@ -533,6 +533,8 @@ router.get("/", (req, res) => {
       ce.entry_type,
       ce.warehouse_id,
       w.name AS warehouse_name,
+      COALESCE(l.name, x_location.name, wl.name) AS location_name,
+      COALESCE(ce.location_id, x.location_id, w.location_id) AS location_id,
       COALESCE(ce.company_id, x.company_id) AS company_id,
       COALESCE(c.name, expCompany.name, ca.account_name, expCa.account_name) AS company_name,
       COALESCE(ce.company_account_id, x.company_account_id) AS company_account_id,
@@ -562,12 +564,14 @@ router.get("/", (req, res) => {
       expEmp.name AS source_expense_employee_name
     FROM cash_entries ce
     LEFT JOIN warehouses w ON w.id = ce.warehouse_id
+    LEFT JOIN locations l ON l.id = ce.location_id
     LEFT JOIN companies c ON c.id = ce.company_id
     LEFT JOIN company_accounts ca ON ca.id = ce.company_account_id
     LEFT JOIN employees e ON e.id = ce.created_by
     LEFT JOIN employees assignedEmp ON assignedEmp.id = ce.employee_id
     LEFT JOIN cash_entry_adjustments cea ON cea.target_entry_id = ce.id
     LEFT JOIN expenses x ON x.id = ce.source_expense_id
+    LEFT JOIN locations x_location ON x_location.id = x.location_id
     LEFT JOIN employees expEmp ON expEmp.id = x.employee_id
     LEFT JOIN companies expCompany ON expCompany.id = x.company_id
     LEFT JOIN company_accounts expCa ON expCa.id = x.company_account_id
