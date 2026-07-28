@@ -920,18 +920,68 @@ function getPurchaseVoucherRowsSqlite(req, res) {
   });
 }
 
-function ensureWarehouseAccess(req, res, warehouseId) {
-  if (!warehouseId) {
-    res.status(400).json({ error: "Warehouse is required" });
+async function resolveUserAccessibleLocationIds(user) {
+  const rawLocationIds = [
+    user?.location_id,
+    ...(Array.isArray(user?.location_ids) ? user.location_ids : []),
+  ].filter(Boolean);
+
+  const resolvedIds = [];
+  for (const rawLocationId of rawLocationIds) {
+    const value = String(rawLocationId || "").trim();
+    if (!value) continue;
+    if (Number.isFinite(Number(value)) && Number(value) > 0) {
+      resolvedIds.push(Number(value));
+      continue;
+    }
+
+    const doc = await Location.findById(value).lean().catch(() => null);
+    if (!doc) continue;
+    if (Number.isFinite(Number(doc.id))) {
+      resolvedIds.push(Number(doc.id));
+      continue;
+    }
+    if (doc._id && Number.isFinite(Number(doc._id))) {
+      resolvedIds.push(Number(doc._id));
+    }
+  }
+
+  return Array.from(new Set(resolvedIds));
+}
+
+async function canAccessLocation(user, locationId) {
+  const normalizedLocationId = Number(locationId);
+  if (!Number.isFinite(normalizedLocationId) || normalizedLocationId <= 0) {
     return false;
   }
 
-  if (!canAccessWarehouse(req.user, warehouseId)) {
-    res.status(403).json({ error: "You do not have access to this warehouse" });
-    return false;
+  const allowed = await resolveUserAccessibleLocationIds(user).catch(() => []);
+  if (allowed.length === 0) {
+    return true;
+  }
+  return allowed.includes(normalizedLocationId);
+}
+
+async function ensureWarehouseAccess(req, res, warehouseId, locationId = null) {
+  if (warehouseId) {
+    if (!canAccessWarehouse(req.user, warehouseId)) {
+      res.status(403).json({ error: "You do not have access to this warehouse" });
+      return false;
+    }
+    return true;
   }
 
-  return true;
+  if (locationId) {
+    const allowed = await canAccessLocation(req.user, locationId);
+    if (!allowed) {
+      res.status(403).json({ error: "You do not have access to this location" });
+      return false;
+    }
+    return true;
+  }
+
+  res.status(400).json({ error: "Warehouse or location is required" });
+  return false;
 }
 
 async function getMongoPurchaseVoucherForPdf(id) {
@@ -3059,7 +3109,8 @@ router.get("/receipt/:id", (req, res) => {
   db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
-    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+    ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id).then((ok) => {
+      if (!ok) return;
 
     // Join with wh_sale_vouchers to fetch voucher_no for each adjusted sale
     db.all(
@@ -3073,6 +3124,7 @@ router.get("/receipt/:id", (req, res) => {
         res.json({ ...row, adjustments: adjustments || [] });
       }
     );
+    });
   });
 });
 
@@ -3082,7 +3134,8 @@ router.post("/receipt", (req, res) => {
   }
 
   const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
-  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+  ensureWarehouseAccess(req, res, warehouse_id, location_id).then((ok) => {
+  if (!ok) return;
   if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
 
   validateReceiptAdjustments({ companyId: company_id, amount, adjustments }, (validationErr, cleanAdjustments) => {
@@ -3159,6 +3212,7 @@ router.post("/receipt", (req, res) => {
         });
       });
     });
+  });
   });
 });
 
@@ -3242,7 +3296,8 @@ router.delete("/receipt/:id", (req, res) => {
   db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (findErr, row) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
-    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+    ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id).then((ok) => {
+      if (!ok) return;
 
     db.serialize(() => {
       db.run("BEGIN TRANSACTION");
@@ -3269,6 +3324,7 @@ router.delete("/receipt/:id", (req, res) => {
         });
       });
     });
+    });
   });
 });
 
@@ -3289,7 +3345,8 @@ router.post("/journal", (req, res) => {
   }
 
   const { voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description } = req.body;
-  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+  ensureWarehouseAccess(req, res, warehouse_id, location_id).then((ok) => {
+  if (!ok) return;
 
   const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
   if (idemKey) {
@@ -3337,6 +3394,7 @@ router.post("/journal", (req, res) => {
       }
       res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
     });
+  });
   });
 });
 
