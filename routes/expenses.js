@@ -1309,72 +1309,24 @@ router.post("/:id/approve-cash-book", (req, res) => {
                   return res.status(400).json({ error: "Employee or party is required to move expense to Cash Book" });
                 }
 
-              const sendSuccessResponse = (inwardInfo, outwardInfo, paltiInfo) => {
-                const inwardPosted = !!inwardInfo?.posted || !!inwardInfo?.already_posted;
-                const outwardPosted = !!outwardInfo?.posted || !!outwardInfo?.already_posted;
-                const paltiPosted = !!paltiInfo?.posted || !!paltiInfo?.already_posted;
-                let message = "Expense approved and moved to Employee/Party Cash Book pending list";
-
-                if (inwardPosted) message += ", and posted to Inward";
-                if (outwardPosted) message += ", and posted to Outward";
-                if (paltiPosted) message += ", and posted to Palti Lorry";
-
-                return res.json({
-                  approved: true,
-                  expense_id: expense.id,
-                  cash_entry_id: employeeCashEntryId || partyCashEntryId,
-                  employee_cash_entry_id: employeeCashEntryId,
-                  party_cash_entry_id: partyCashEntryId,
-                  inward_posted: inwardPosted,
-                  inward_id: inwardInfo?.inward_id || null,
-                  inward_voucher_no: inwardInfo?.inward_voucher_no || null,
-                  outward_posted: outwardPosted,
-                  outward_id: outwardInfo?.outward_id || null,
-                  outward_voucher_no: outwardInfo?.outward_voucher_no || null,
-                  palti_posted: paltiPosted,
-                  message,
-                });
-              };
-
-              const continueAfterCashEntries = () => {
-                const inwardNeeded = shouldPostExpenseToInward(expense);
-                const outwardNeeded = shouldPostExpenseToOutward(expense);
-                const paltiNeeded = shouldPostExpenseToPaltiLorry(expense);
-
-                const continueWithPalti = (inwardInfo, outwardInfo) => {
-                  if (!paltiNeeded) {
-                    return sendSuccessResponse(inwardInfo, outwardInfo, { posted: false, already_posted: false });
-                  }
-
-                  return postExpenseToPaltiLorry(expense, req.user?.id, (paltiErr, paltiInfo) => {
-                    if (paltiErr) return res.status(500).json({ error: paltiErr.message });
-                    return sendSuccessResponse(inwardInfo, outwardInfo, paltiInfo);
-                  });
-                };
-
-                const continueWithOutward = (inwardInfo) => {
-                  if (!outwardNeeded) {
-                    return continueWithPalti(inwardInfo, { posted: false, already_posted: false });
-                  }
-
-                  return postExpenseToOutward(expense, (outwardErr, outwardInfo) => {
-                    if (outwardErr) return res.status(500).json({ error: outwardErr.message });
-                    return continueWithPalti(inwardInfo, outwardInfo);
-                  });
-                };
-
-                if (!inwardNeeded) {
-                  return continueWithOutward({ posted: false, already_posted: false });
-                }
-
-                return postExpenseToInward(expense, (inwardErr, inwardInfo) => {
-                  if (inwardErr) return res.status(500).json({ error: inwardErr.message });
-                  return continueWithOutward(inwardInfo);
-                });
-              };
-
               Promise.all(cashEntryInserts)
-                .then(continueAfterCashEntries)
+                .then(() =>
+                  res.json({
+                    approved: true,
+                    expense_id: expense.id,
+                    cash_entry_id: employeeCashEntryId || partyCashEntryId,
+                    employee_cash_entry_id: employeeCashEntryId,
+                    party_cash_entry_id: partyCashEntryId,
+                    inward_posted: false,
+                    inward_id: null,
+                    inward_voucher_no: null,
+                    outward_posted: false,
+                    outward_id: null,
+                    outward_voucher_no: null,
+                    palti_posted: false,
+                    message: "Expense approved and moved to Employee/Party Cash Book pending list",
+                  })
+                )
                 .catch((insertErr) => {
                   db.run(
                     "UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1573,36 +1525,8 @@ router.post("/", async (req, res) => {
         }
 
         const expenseId = this.lastID;
-        const maybeAutoPostSelfLoading = () => {
-          if (normalizedWorkDescription !== "Self Loading") {
-            return res.json({ id: expenseId, voucher_no: voucherNo });
-          }
-
-          db.get("SELECT * FROM expenses WHERE id = ?", [expenseId], (loadErr, expenseRow) => {
-            if (loadErr) {
-              return res.status(500).json({ error: loadErr.message });
-            }
-            if (!expenseRow) {
-              return res.json({ id: expenseId, voucher_no: voucherNo });
-            }
-
-            postExpenseToOutward(expenseRow, (postErr, outwardInfo) => {
-              if (postErr) {
-                return res.status(500).json({ error: postErr.message });
-              }
-              return res.json({
-                id: expenseId,
-                voucher_no: voucherNo,
-                self_loading_posted: !!outwardInfo?.posted || !!outwardInfo?.already_posted,
-                outward_id: outwardInfo?.outward_id || null,
-                outward_voucher_no: outwardInfo?.outward_voucher_no || null,
-              });
-            });
-          });
-        };
-
         if (safeItems.length === 0) {
-          return maybeAutoPostSelfLoading();
+          return res.json({ id: expenseId, voucher_no: voucherNo });
         }
 
         const stmt = db.prepare(
@@ -1628,7 +1552,7 @@ router.post("/", async (req, res) => {
             return res.status(500).json({ error: finalizeErr.message });
           }
 
-          return maybeAutoPostSelfLoading();
+          return res.json({ id: expenseId, voucher_no: voucherNo });
         });
       }
     );
