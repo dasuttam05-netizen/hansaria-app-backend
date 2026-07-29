@@ -24,6 +24,13 @@ function appendMultiIdFilter(where, params, columnName, singleValue, multiValue)
   params.push(...ids);
 }
 
+function appendLocationFilter(where, params, locationId, locationIds, warehouseAlias = "w") {
+  const ids = parseIdList(locationIds || locationId);
+  if (!ids.length) return;
+  where.push(`CAST(COALESCE(i.location_id, ${warehouseAlias}.location_id) AS TEXT) IN (${ids.map(() => "?").join(",")})`);
+  params.push(...ids);
+}
+
 function authorizeReport(permission) {
   return (req, res, next) => {
     if (!userHasPermission(req.user, permission)) {
@@ -90,7 +97,7 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) =>
     where.push("CAST(i.company_id AS TEXT) = CAST(? AS TEXT)");
     params.push(company_id);
   }
-  appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
+  appendLocationFilter(where, params, location_id, location_ids);
   appendMultiIdFilter(where, params, "i.warehouse_id", warehouse_id, warehouse_ids);
   if (product_id) {
     where.push("i.product_id = ?");
@@ -229,7 +236,7 @@ router.get("/party-stock", authorizeReport("report.partyStock"), (req, res) => {
     where.push("i.company_id = ?");
     params.push(company_id);
   }
-  appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
+  appendLocationFilter(where, params, location_id, location_ids);
   appendMultiIdFilter(where, params, "i.warehouse_id", warehouse_id, warehouse_ids);
   if (product_id) {
     where.push("CAST(i.product_id AS TEXT) = CAST(? AS TEXT)");
