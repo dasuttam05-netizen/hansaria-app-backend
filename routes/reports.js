@@ -27,7 +27,11 @@ function appendMultiIdFilter(where, params, columnName, singleValue, multiValue)
 function appendLocationFilter(where, params, locationId, locationIds, warehouseAlias = "w") {
   const ids = parseIdList(locationIds || locationId);
   if (!ids.length) return;
-  where.push(`CAST(COALESCE(i.location_id, ${warehouseAlias}.location_id) AS TEXT) IN (${ids.map(() => "?").join(",")})`);
+  where.push(`(
+    CAST(i.location_id AS TEXT) IN (${ids.map(() => "?").join(",")})
+    OR CAST(${warehouseAlias}.location_id AS TEXT) IN (${ids.map(() => "?").join(",")})
+  )`);
+  params.push(...ids);
   params.push(...ids);
 }
 
@@ -233,7 +237,7 @@ router.get("/party-stock", authorizeReport("report.partyStock"), (req, res) => {
     params.push(to_date);
   }
   if (company_id) {
-    where.push("i.company_id = ?");
+    where.push("CAST(i.company_id AS TEXT) = CAST(? AS TEXT)");
     params.push(company_id);
   }
   appendLocationFilter(where, params, location_id, location_ids);
