@@ -823,14 +823,33 @@ function userHasPermission(
       user.role
     );
 
-  return (
+  if (
     permissions.includes(
       "all"
-    ) ||
-    permissions.includes(
-      permission
     )
-  );
+  ) {
+    return true;
+  }
+
+  const normalizedPermission = String(permission).trim();
+  if (permissions.includes(normalizedPermission)) {
+    return true;
+  }
+
+  const reportFallbacks = {
+    "report.partyLedger": ["reports.view", "report.expense"],
+    "report.partyStock": ["reports.view", "report.expense"],
+    "report.warehouseRentLedger": ["reports.view", "report.expense"],
+    "report.warehouseRentMonthEnd": ["reports.view", "report.expense"],
+    "report.outwardSettlement": ["reports.view", "report.expense"],
+    "report.expense": ["reports.view"],
+    "report.paltiLorryAdjustment": ["reports.view", "report.expense"],
+    "report.inward": ["reports.view"],
+    "report.erp": ["reports.view"],
+  };
+
+  const fallbackPermissions = reportFallbacks[normalizedPermission] || [];
+  return fallbackPermissions.some((fallback) => permissions.includes(fallback));
 }
 
 async function buildAuthenticatedUserPayload(user) {
