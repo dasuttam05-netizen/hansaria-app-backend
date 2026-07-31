@@ -1035,7 +1035,7 @@ async function canAccessLocation(user, locationId) {
   return allowed.includes(normalizedLocationId);
 }
 
-async function ensureWarehouseAccess(req, res, warehouseId, locationId = null) {
+function ensureWarehouseAccess(req, res, warehouseId, locationId = null) {
   if (warehouseId) {
     if (!canAccessWarehouse(req.user, warehouseId)) {
       res.status(403).json({ error: "You do not have access to this warehouse" });
@@ -1045,12 +1045,18 @@ async function ensureWarehouseAccess(req, res, warehouseId, locationId = null) {
   }
 
   if (locationId) {
-    const allowed = await canAccessLocation(req.user, locationId);
-    if (!allowed) {
-      res.status(403).json({ error: "You do not have access to this location" });
-      return false;
-    }
-    return true;
+    return canAccessLocation(req.user, locationId)
+      .then((allowed) => {
+        if (!allowed) {
+          res.status(403).json({ error: "You do not have access to this location" });
+          return false;
+        }
+        return true;
+      })
+      .catch((err) => {
+        res.status(500).json({ error: err?.message || "Failed to check location access" });
+        return false;
+      });
   }
 
   res.status(400).json({ error: "Warehouse or location is required" });
@@ -4596,7 +4602,7 @@ router.get("/sale/:id/summary", async (req, res) => {
     }
 
     if (!row) return res.status(404).json({ error: "Not found" });
-    if (!ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id)) return;
+    if (!(await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id))) return;
 
     const purchaseLinks = Array.isArray(row.against_purchase_links)
       ? row.against_purchase_links
