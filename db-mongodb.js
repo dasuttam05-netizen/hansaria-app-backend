@@ -138,6 +138,7 @@ const buyerNameSchema = new mongoose.Schema({
 
 const consigneeNameSchema = new mongoose.Schema({
   name: { type: String, required: true, unique: true },
+  buyer_ids: [String],
   mobile: String,
   email: String,
   address: String,
