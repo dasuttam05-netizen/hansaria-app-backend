@@ -44,6 +44,7 @@ function rowBody(body) {
     name,
     buyer_id,
     buyer_ids,
+    buyer_ids_json: JSON.stringify(buyer_ids),
     mobile: (body.mobile || "").trim() || null,
     email: (body.email || "").trim() || null,
     address: (body.address || "").trim() || null,
@@ -76,7 +77,18 @@ function replaceConsigneeBuyers(consigneeId, buyerIds, done) {
 }
 
 function mapConsigneeRow(row) {
-  const buyer_ids = String(row.buyer_ids_csv || "")
+  const buyerIdsFromJson = String(row.buyer_ids_json || "")
+    .trim();
+  const buyer_ids = buyerIdsFromJson
+    ? (() => {
+        try {
+          const parsed = JSON.parse(buyerIdsFromJson);
+          return Array.isArray(parsed) ? parsed.map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0) : [];
+        } catch (err) {
+          return [];
+        }
+      })()
+    : String(row.buyer_ids_csv || "")
     .split(",")
     .map((v) => Number(v))
     .filter((n) => Number.isFinite(n) && n > 0);
@@ -86,6 +98,7 @@ function mapConsigneeRow(row) {
     buyer_ids: uniqueIds,
     buyer_id: uniqueIds[0] || row.buyer_id || null,
     buyer_name: row.buyer_name || null,
+    buyer_ids_json: row.buyer_ids_json || null,
     buyer_ids_csv: undefined,
   };
 }
@@ -140,11 +153,12 @@ router.post("/", (req, res) => {
   db.run(
     `
     INSERT INTO consignee_names (
-      buyer_id, name, mobile, email, address, gst_no, pan_no, state, location
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      buyer_id, buyer_ids, name, mobile, email, address, gst_no, pan_no, state, location
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     [
       r.buyer_id,
+      r.buyer_ids_json,
       r.name,
       r.mobile,
       r.email,
@@ -227,10 +241,10 @@ function importConsigneeRows(rows, res) {
 
         db.run(
           `
-          INSERT INTO consignee_names (buyer_id, name, mobile, email, address, gst_no, pan_no, state, location)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO consignee_names (buyer_id, buyer_ids, name, mobile, email, address, gst_no, pan_no, state, location)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
-          [r.buyer_id, r.name, r.mobile, r.email, r.address, r.gst_no, r.pan_no, r.state, r.location],
+          [r.buyer_id, r.buyer_ids_json, r.name, r.mobile, r.email, r.address, r.gst_no, r.pan_no, r.state, r.location],
           function (insertErr) {
             if (insertErr) {
               skipped += 1;
@@ -318,11 +332,12 @@ router.put("/:id", (req, res) => {
   db.run(
     `
     UPDATE consignee_names SET
-      buyer_id = ?, name = ?, mobile = ?, email = ?, address = ?, gst_no = ?, pan_no = ?, state = ?, location = ?
+      buyer_id = ?, buyer_ids = ?, name = ?, mobile = ?, email = ?, address = ?, gst_no = ?, pan_no = ?, state = ?, location = ?
     WHERE id = ?
     `,
     [
       r.buyer_id,
+      r.buyer_ids_json,
       r.name,
       r.mobile,
       r.email,
