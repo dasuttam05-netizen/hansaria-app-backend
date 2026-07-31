@@ -2730,6 +2730,7 @@ router.put("/sale/:id", (req, res) => {
           const adjustmentValue = Number(req.body.adjustment_amount !== undefined ? req.body.adjustment_amount : existing.adjustment_amount) || 0;
           const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
           const roundOffValue = Number(req.body.round_off !== undefined ? req.body.round_off : existing.round_off) || 0;
+          const transportChargeValue = Number(req.body.transport_charge !== undefined ? req.body.transport_charge : existing.transport_charge) || 0;
           const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
           const saleQty = Number(existing.quantity || 0);
           const grossAmount = Number(existing.amount || 0);
@@ -2743,7 +2744,7 @@ router.put("/sale/:id", (req, res) => {
           const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
           const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
 
-          const netAmount = grossAmount - claimValue - otherDeductionValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+          const netAmount = grossAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
 
           existing.unloading_date = req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date;
           existing.due_date = dueFields.due_date || existing.due_date || "";
@@ -2756,6 +2757,7 @@ router.put("/sale/:id", (req, res) => {
           existing.discolour = Number(req.body.discolour !== undefined ? req.body.discolour : existing.discolour) || 0;
           existing.others = Number(req.body.others !== undefined ? req.body.others : existing.others) || 0;
           existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : existing.total_deduction) || 0;
+          existing.transport_charge = transportChargeValue;
           existing.claim_amount = claimValue;
           existing.other_deduction = otherDeductionValue;
           existing.cd_percent = cdPercentValue;
@@ -2873,15 +2875,13 @@ router.put("/sale/:id", (req, res) => {
   const amountValue = Number(amount) || 0;
   const claimValue = Number(claim_amount) || 0;
   const otherDeductionValue = Number(other_deduction) || 0;
+  const transportChargeValue = Number(transport_charge) || 0;
   const cdPercentValue = Number(cd_percent) || 0;
   const cdAmountValue = Number(cd_amount) || 0;
   const adjustmentValue = Number(adjustment_amount) || 0;
   const tdsValue = Number(tds_amount) || 0;
   const roundOffValue = Number(round_off) || 0;
-  const netAmount = amountValue - claimValue - otherDeductionValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
-  const unloadingQtyValue = Number(unloading_qty) || Number(quantity) || 0;
-  const fifoAmountValue = amountValue;
-  const fifoRateValue = unloadingQtyValue > 0 ? amountValue / unloadingQtyValue : 0;
+  const netAmount = amountValue - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
   const netReceivableValue = netAmount;
 
   if (!deductionOnly) {
@@ -2899,7 +2899,7 @@ router.put("/sale/:id", (req, res) => {
           UPDATE wh_sale_vouchers SET
             voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?,
             po_no=?, due_date=?, against_purchase_enabled=?, against_purchase_farmer_id=?, against_purchase_links=?, lorry_no=?, product_id=?,
-            quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?, cd_percent=?, cd_amount=?,
+            quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?, transport_charge=?, cd_percent=?, cd_amount=?,
             adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, fifo_rate=?, fifo_amount=?,
             outstanding=?, employee_id=?, location_id=?, description=?
           WHERE id = ?
@@ -2908,7 +2908,7 @@ router.put("/sale/:id", (req, res) => {
         return db.run(query, [
           voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id,
           po_no || "", due_date || "", against_purchase_enabled ? 1 : 0, against_purchase_farmer_id || "", JSON.stringify(Array.isArray(against_purchase_links) ? against_purchase_links : []), lorry_no || req.body.reference_id || "", product_id,
-          quantity, shortage_quantity, unloadingQtyValue, rate, amountValue, claimValue, otherDeductionValue, cdPercentValue, cdAmountValue,
+          quantity, shortage_quantity, unloading_qty, rate, amountValue, claimValue, otherDeductionValue, transportChargeValue, cdPercentValue, cdAmountValue,
           adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, netAmount, fifoRateValue, fifoAmountValue,
           netAmount, employee_id, location_id, description, id
         ], function (err) {
