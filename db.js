@@ -325,6 +325,7 @@ let db = null;
     CREATE TABLE IF NOT EXISTS consignee_names (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       buyer_id INTEGER,
+      buyer_ids TEXT,
       name TEXT NOT NULL UNIQUE,
       mobile TEXT,
       email TEXT,
@@ -846,6 +847,7 @@ let db = null;
   addColIgnoreDup(`ALTER TABLE buyer_adjustments ADD COLUMN consignee_name TEXT`, "buyer_adjustments consignee_name");
   addColIgnoreDup(`ALTER TABLE buyer_adjustments ADD COLUMN shortage_amount REAL DEFAULT 0`, "buyer_adjustments shortage_amount");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN buyer_id INTEGER`, "consignee_names buyer_id");
+  addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN buyer_ids TEXT`, "consignee_names buyer_ids");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN mobile TEXT`, "consignee_names mobile");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN email TEXT`, "consignee_names email");
   addColIgnoreDup(`ALTER TABLE consignee_names ADD COLUMN address TEXT`, "consignee_names address");
@@ -863,6 +865,25 @@ let db = null;
     `,
     (err) => {
       if (err) console.log("consignee_buyers backfill error:", err.message);
+    }
+  );
+  db.run(
+    `
+    UPDATE consignee_names
+    SET buyer_ids = (
+      SELECT
+        CASE
+          WHEN COUNT(cb.buyer_id) > 0 THEN '[' || GROUP_CONCAT(cb.buyer_id) || ']'
+          WHEN consignee_names.buyer_id IS NOT NULL THEN '[' || CAST(consignee_names.buyer_id AS TEXT) || ']'
+          ELSE '[]'
+        END
+      FROM consignee_buyers cb
+      WHERE cb.consignee_id = consignee_names.id
+    )
+    WHERE buyer_ids IS NULL OR TRIM(buyer_ids) = ''
+    `,
+    (err) => {
+      if (err) console.log("consignee_names buyer_ids backfill error:", err.message);
     }
   );
   addColIgnoreDup(`ALTER TABLE transporters ADD COLUMN gst_no TEXT`, "transporters gst_no");
