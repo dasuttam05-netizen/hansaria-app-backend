@@ -4,6 +4,8 @@ const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 const { calculateShortageQty } = require("./shortageHelper");
 const { appendLocationFilter, appendMultiIdFilter, parseIdList } = require("./reportFilters");
+const { resolveMongoMasterId } = require("../helpers/sqliteMasterResolver");
+const { Warehouse, Company, Location } = require("../mongo");
 
 function authorizeReport(permission) {
   return (req, res, next) => {
@@ -51,6 +53,40 @@ function firstNonEmptyDate(...values) {
     }
   }
   return null;
+}
+
+async function resolveMasterIdList(values, model, sqliteTable) {
+  const rawItems = parseIdList(values);
+  const resolvedIds = [];
+
+  for (const item of rawItems) {
+    if (!item) continue;
+    const resolvedId = await resolveMongoMasterId(db, item, model, sqliteTable);
+    if (resolvedId != null) {
+      const normalized = String(resolvedId).trim();
+      if (normalized) resolvedIds.push(normalized);
+    }
+  }
+
+  return Array.from(new Set(resolvedIds));
+}
+
+async function appendResolvedIdOrNameFilter(where, params, columnId, columnName, values, model, sqliteTable) {
+  const rawValues = parseIdList(values);
+  if (!rawValues.length) return;
+
+  const resolvedIds = await resolveMasterIdList(values, model, sqliteTable);
+  const conditions = [];
+
+  if (resolvedIds.length) {
+    conditions.push(`CAST(${columnId} AS TEXT) IN (${resolvedIds.map(() => "?").join(",")})`);
+    params.push(...resolvedIds);
+  }
+
+  conditions.push(`CAST(${columnName} AS TEXT) IN (${rawValues.map(() => "?").join(",")})`);
+  params.push(...rawValues);
+
+  where.push(`(${conditions.join(" OR ")})`);
 }
 
 router.get("/party-ledger", authorizeReport("report.partyLedger"), (req, res) => {
@@ -502,188 +538,160 @@ router.get("/total-stock", authorizeReport("report.partyStock"), (req, res) => {
   });
 });
 
-router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger"), (req, res) => {
+router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger"), async (req, res) => {
   const { from_date, to_date, company_id, warehouse_id, warehouse_ids, location_id, location_ids } = req.query;
 
-  let where = ["1=1"];
-  const params = [];
+  try {
+    let where = ["1=1"];
+    const params = [];
 
-  if (from_date) {
-    where.push("i.date >= ?");
-    params.push(from_date);
-  }
-  if (to_date) {
-    where.push("i.date <= ?");
-    params.push(to_date);
-  }
-  const companyValues = parseIdList(company_id);
-  if (companyValues.length) {
-    const placeholders = companyValues.map(() => "?").join(",");
-    where.push(`(
-      CAST(i.company_id AS TEXT) IN (${placeholders})
-      OR CAST(c.name AS TEXT) IN (${placeholders})
-    )`);
-    params.push(...companyValues, ...companyValues);
-  }
-  appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
-
-  const warehouseValues = parseIdList(warehouse_id || warehouse_ids);
-  if (warehouseValues.length) {
-    const placeholders = warehouseValues.map(() => "?").join(",");
-    where.push(`(
-      CAST(i.warehouse_id AS TEXT) IN (${placeholders})
-      OR CAST(w.name AS TEXT) IN (${placeholders})
-    )`);
-    params.push(...warehouseValues, ...warehouseValues);
-  }
-
-  const sql = `
-    SELECT
-      i.id,
-      i.date,
-      i.voucher_no,
-      i.lorry_no,
-      i.weight,
-      c.name AS party_name,
-      w.name AS warehouse_name,
-      COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
-      IFNULL((
-        SELECT SUM(a.qty)
-        FROM adjustment a
-        WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
-      ), 0) AS adjusted_qty
-    FROM inward i
-    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
-    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
-    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
-    WHERE ${where.join(" AND ")}
-    ORDER BY i.date ASC, i.id ASC
-  `;
-
-  db.all(sql, params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-
-    const today = new Date().toISOString().split("T")[0];
-    const fallbackRefDate = to_date || today;
-    const inwardIds = (rows || []).map((row) => row.id);
-
-    if (!inwardIds.length) {
-      return res.json([]);
+    if (from_date) {
+      where.push("i.date >= ?");
+      params.push(from_date);
+    }
+    if (to_date) {
+      where.push("i.date <= ?");
+      params.push(to_date);
     }
 
-    const adjustmentSql = `
+    await appendResolvedIdOrNameFilter(where, params, "i.company_id", "c.name", company_id, Company, "companies");
+    await appendResolvedIdOrNameFilter(where, params, "i.location_id", "w.location_id", location_id || location_ids, Location, "locations");
+    await appendResolvedIdOrNameFilter(where, params, "i.warehouse_id", "w.name", warehouse_id || warehouse_ids, Warehouse, "warehouses");
+
+    const sql = `
       SELECT
-        a.id,
-        a.inward_id,
-        a.qty,
-        a.created_at,
-        o.date AS dispatch_date
-      FROM adjustment a
-      LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
-      WHERE CAST(a.inward_id AS TEXT) IN (${inwardIds.map(() => "CAST(? AS TEXT)").join(",")})
-      ORDER BY COALESCE(o.date, DATE(a.created_at)) ASC, a.id ASC
+        i.id,
+        i.date,
+        i.voucher_no,
+        i.lorry_no,
+        i.weight,
+        c.name AS party_name,
+        w.name AS warehouse_name,
+        COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
+        IFNULL((
+          SELECT SUM(a.qty)
+          FROM adjustment a
+          WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)
+        ), 0) AS adjusted_qty
+      FROM inward i
+      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
+      WHERE ${where.join(" AND ")}
+      ORDER BY i.date ASC, i.id ASC
     `;
 
-    db.all(adjustmentSql, inwardIds, (adjErr, adjustmentRows) => {
-      if (adjErr) return res.status(500).json({ error: adjErr.message });
+    db.all(sql, params, (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
 
-      const adjustmentMap = {};
-      (adjustmentRows || []).forEach((item) => {
-        const key = String(item.inward_id);
-        if (!adjustmentMap[key]) adjustmentMap[key] = [];
-        adjustmentMap[key].push(item);
-      });
+      const today = new Date().toISOString().split("T")[0];
+      const fallbackRefDate = to_date || today;
+      const inwardIds = (rows || []).map((row) => row.id);
 
-      const rentRate = 200;
-      const result = (rows || []).map((row) => {
-        const originalWeight = Number(row.weight) || 0;
-        const adjustments = adjustmentMap[String(row.id)] || [];
+      if (!inwardIds.length) {
+        return res.json([]);
+      }
 
-        let adjustedQty = 0;
-        let adjustedRentAmount = 0;
-        let lastDispatchDate = null;
+      const adjustmentSql = `
+        SELECT
+          a.id,
+          a.inward_id,
+          a.qty,
+          a.created_at,
+          o.date AS dispatch_date
+        FROM adjustment a
+        LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
+        WHERE CAST(a.inward_id AS TEXT) IN (${inwardIds.map(() => "CAST(? AS TEXT)").join(",")})
+        ORDER BY COALESCE(o.date, DATE(a.created_at)) ASC, a.id ASC
+      `;
 
-        adjustments.forEach((adjustment) => {
-          const qty = Number(adjustment.qty) || 0;
-          const dispatchDate = firstNonEmptyDate(
-            adjustment.dispatch_date,
-            String(adjustment.created_at || "").split(" ")[0]
-          );
-          if (!dispatchDate) return;
+      db.all(adjustmentSql, inwardIds, (adjErr, adjustmentRows) => {
+        if (adjErr) return res.status(500).json({ error: adjErr.message });
 
-          const adjustmentSlab = calculateMonthSlab(row.date, dispatchDate);
-          adjustedQty += qty;
-          adjustedRentAmount += qty * rentRate * adjustmentSlab.monthsDiff;
-          if (!lastDispatchDate || dispatchDate > lastDispatchDate) {
-            lastDispatchDate = dispatchDate;
-          }
+        const adjustmentMap = {};
+        (adjustmentRows || []).forEach((item) => {
+          const key = String(item.inward_id);
+          if (!adjustmentMap[key]) adjustmentMap[key] = [];
+          adjustmentMap[key].push(item);
         });
 
-        const referenceDate = originalWeight - adjustedQty > 0 ? fallbackRefDate : lastDispatchDate || fallbackRefDate;
-        const slab = calculateMonthSlab(row.date, referenceDate);
-        const shortageQty = calculateShortageQty(originalWeight, slab.monthsDiff, row.shortage_percent);
-        const balanceQty = originalWeight - shortageQty - adjustedQty;
-        const balanceRentAmount = Math.max(balanceQty, 0) * rentRate * slab.monthsDiff;
-        const rentAmount = adjustedRentAmount + balanceRentAmount;
+        const rentRate = 200;
+        const result = (rows || []).map((row) => {
+          const originalWeight = Number(row.weight) || 0;
+          const adjustments = adjustmentMap[String(row.id)] || [];
 
-        return {
-          id: row.id,
-          inward_date: row.date,
-          reference_date: referenceDate,
-          dispatch_date: lastDispatchDate || null,
-          days_diff: slab.daysDiff,
-          month_slab: slab.monthsDiff,
-          party_name: row.party_name,
-          warehouse_name: row.warehouse_name,
-          voucher_no: row.voucher_no,
-          lorry_no: row.lorry_no,
-          original_weight: Number(originalWeight.toFixed(4)),
-          shortage_qty: Number(shortageQty.toFixed(4)),
-          adjusted_qty: Number(adjustedQty.toFixed(4)),
-          balance_qty: Number(balanceQty.toFixed(4)),
-          rent_rate: rentRate,
-          rent_amount: Number(rentAmount.toFixed(2)),
-        };
+          let adjustedQty = 0;
+          let adjustedRentAmount = 0;
+          let lastDispatchDate = null;
+
+          adjustments.forEach((adjustment) => {
+            const qty = Number(adjustment.qty) || 0;
+            const dispatchDate = firstNonEmptyDate(
+              adjustment.dispatch_date,
+              String(adjustment.created_at || "").split(" ")[0]
+            );
+            if (!dispatchDate) return;
+
+            const adjustmentSlab = calculateMonthSlab(row.date, dispatchDate);
+            adjustedQty += qty;
+            adjustedRentAmount += qty * rentRate * adjustmentSlab.monthsDiff;
+            if (!lastDispatchDate || dispatchDate > lastDispatchDate) {
+              lastDispatchDate = dispatchDate;
+            }
+          });
+
+          const referenceDate = originalWeight - adjustedQty > 0 ? fallbackRefDate : lastDispatchDate || fallbackRefDate;
+          const slab = calculateMonthSlab(row.date, referenceDate);
+          const shortageQty = calculateShortageQty(originalWeight, slab.monthsDiff, row.shortage_percent);
+          const balanceQty = originalWeight - shortageQty - adjustedQty;
+          const balanceRentAmount = Math.max(balanceQty, 0) * rentRate * slab.monthsDiff;
+          const rentAmount = adjustedRentAmount + balanceRentAmount;
+
+          return {
+            id: row.id,
+            inward_date: row.date,
+            reference_date: referenceDate,
+            dispatch_date: lastDispatchDate || null,
+            days_diff: slab.daysDiff,
+            month_slab: slab.monthsDiff,
+            party_name: row.party_name,
+            warehouse_name: row.warehouse_name,
+            voucher_no: row.voucher_no,
+            lorry_no: row.lorry_no,
+            original_weight: Number(originalWeight.toFixed(4)),
+            shortage_qty: Number(shortageQty.toFixed(4)),
+            adjusted_qty: Number(adjustedQty.toFixed(4)),
+            balance_qty: Number(balanceQty.toFixed(4)),
+            rent_rate: rentRate,
+            rent_amount: Number(rentAmount.toFixed(2)),
+          };
+        });
+
+        res.json(result);
       });
-
-      res.json(result);
     });
-  });
+  } catch (routeErr) {
+    return res.status(500).json({ error: routeErr.message });
+  }
 });
 
-router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMonthEnd"), (req, res) => {
-  const { month, company_id, warehouse_id, warehouse_ids, location_id, location_ids } = req.query;
+router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMonthEnd"), async (req, res) => {
+  try {
+    const { month, company_id, warehouse_id, warehouse_ids, location_id, location_ids } = req.query;
 
-  if (!month) {
-    return res.status(400).json({ error: "month required in YYYY-MM format" });
-  }
+    if (!month) {
+      return res.status(400).json({ error: "month required in YYYY-MM format" });
+    }
 
-  const monthEndDate = getMonthEndDate(month);
-  const monthLabel = getMonthLabel(month);
+    const monthEndDate = getMonthEndDate(month);
+    const monthLabel = getMonthLabel(month);
 
-  let where = ["i.date <= ?"];
-  const params = [monthEndDate];
+    let where = ["i.date <= ?"];
+    const params = [monthEndDate];
 
-  const companyValues = parseIdList(company_id);
-  if (companyValues.length) {
-    const placeholders = companyValues.map(() => "?").join(",");
-    where.push(`(
-      CAST(i.company_id AS TEXT) IN (${placeholders})
-      OR CAST(c.name AS TEXT) IN (${placeholders})
-    )`);
-    params.push(...companyValues, ...companyValues);
-  }
-  appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
-
-  const warehouseValues = parseIdList(warehouse_id || warehouse_ids);
-  if (warehouseValues.length) {
-    const placeholders = warehouseValues.map(() => "?").join(",");
-    where.push(`(
-      CAST(i.warehouse_id AS TEXT) IN (${placeholders})
-      OR CAST(w.name AS TEXT) IN (${placeholders})
-    )`);
-    params.push(...warehouseValues, ...warehouseValues);
-  }
+    await appendResolvedIdOrNameFilter(where, params, "i.company_id", "c.name", company_id, Company, "companies");
+    await appendResolvedIdOrNameFilter(where, params, "i.location_id", "w.location_id", location_id || location_ids, Location, "locations");
+    await appendResolvedIdOrNameFilter(where, params, "i.warehouse_id", "w.name", warehouse_id || warehouse_ids, Warehouse, "warehouses");
 
   const sql = `
     SELECT
@@ -750,20 +758,26 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
 
         let adjustedQty = 0;
         let adjustedRentAmount = 0;
+        let lastDispatchDate = null;
 
         adjustments.forEach((adjustment) => {
           const adjustmentQty = Number(adjustment.qty) || 0;
           const adjustmentDate = firstNonEmptyDate(adjustment.outward_date, adjustment.created_at);
-          const adjustmentSlab = calculateMonthSlab(row.date, adjustmentDate);
+          if (!adjustmentDate) return;
 
+          const adjustmentSlab = calculateMonthSlab(row.date, adjustmentDate);
           adjustedQty += adjustmentQty;
           adjustedRentAmount += adjustmentQty * rentRate * adjustmentSlab.monthsDiff;
+          if (!lastDispatchDate || adjustmentDate > lastDispatchDate) {
+            lastDispatchDate = adjustmentDate;
+          }
         });
 
         const shortageQty = calculateShortageQty(originalWeight, monthEndSlab.monthsDiff, row.shortage_percent);
         const balanceQty = originalWeight - shortageQty - adjustedQty;
         const balanceRentAmount = Math.max(balanceQty, 0) * rentRate * monthEndSlab.monthsDiff;
         const rentAmount = adjustedRentAmount + balanceRentAmount;
+        const referenceDate = originalWeight - adjustedQty > 0 ? monthEndDate : lastDispatchDate || monthEndDate;
 
         return {
           id: row.id,
@@ -771,6 +785,8 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
           month_label: monthLabel,
           month_end_date: monthEndDate,
           inward_date: row.date,
+          reference_date: referenceDate,
+          dispatch_date: lastDispatchDate || null,
           party_name: row.party_name,
           warehouse_name: row.warehouse_name,
           voucher_no: row.voucher_no,
@@ -778,7 +794,7 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
           original_weight: Number(originalWeight.toFixed(4)),
           adjusted_qty: Number(adjustedQty.toFixed(4)),
           shortage_qty: Number(shortageQty.toFixed(4)),
-          balance_qty: Number(balanceQty.toFixed(4)),
+          balance_qty: Number(Math.max(balanceQty, 0).toFixed(4)),
           days_diff: monthEndSlab.daysDiff,
           month_slab: monthEndSlab.monthsDiff,
           rent_rate: rentRate,
@@ -825,6 +841,9 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
       });
     });
   });
+  } catch (routeErr) {
+    return res.status(500).json({ error: routeErr.message });
+  }
 });
 
 router.get("/palti-lorry-adjustment", authorizeReport("report.paltiLorryAdjustment"), (req, res) => {
