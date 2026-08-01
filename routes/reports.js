@@ -699,7 +699,7 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
       FROM adjustment a
       LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
       WHERE a.inward_id IN (${placeholders})
-        AND DATE(a.created_at) <= ?
+        AND DATE(COALESCE(o.date, a.created_at)) <= ?
       ORDER BY DATE(COALESCE(o.date, a.created_at)) ASC, a.id ASC
     `;
 
