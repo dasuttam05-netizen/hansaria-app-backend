@@ -605,8 +605,7 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
           }
         });
 
-        // Reference date = dispatch date (fallback to filter to_date / today if not dispatched yet)
-        const referenceDate = lastDispatchDate || fallbackRefDate;
+        const referenceDate = originalWeight - adjustedQty > 0 ? fallbackRefDate : lastDispatchDate || fallbackRefDate;
         const slab = calculateMonthSlab(row.date, referenceDate);
         const shortageQty = calculateShortageQty(originalWeight, slab.monthsDiff, row.shortage_percent);
         const balanceQty = originalWeight - shortageQty - adjustedQty;
@@ -693,13 +692,15 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
     const placeholders = inwardIds.map(() => "?").join(",");
     const adjustmentSql = `
       SELECT
-        inward_id,
-        qty,
-        created_at
-      FROM adjustment
-      WHERE inward_id IN (${placeholders})
-        AND DATE(created_at) <= ?
-      ORDER BY DATE(created_at) ASC, id ASC
+        a.inward_id,
+        a.qty,
+        a.created_at,
+        o.date AS outward_date
+      FROM adjustment a
+      LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
+      WHERE a.inward_id IN (${placeholders})
+        AND DATE(a.created_at) <= ?
+      ORDER BY DATE(COALESCE(o.date, a.created_at)) ASC, a.id ASC
     `;
 
     db.all(adjustmentSql, [...inwardIds, monthEndDate], (adjustmentErr, adjustmentRows) => {
@@ -724,7 +725,7 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
 
         adjustments.forEach((adjustment) => {
           const adjustmentQty = Number(adjustment.qty) || 0;
-          const adjustmentDate = String(adjustment.created_at).split(" ")[0];
+          const adjustmentDate = firstNonEmptyDate(adjustment.outward_date, adjustment.created_at);
           const adjustmentSlab = calculateMonthSlab(row.date, adjustmentDate);
 
           adjustedQty += adjustmentQty;
