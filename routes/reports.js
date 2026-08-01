@@ -624,11 +624,25 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
           a.inward_id,
           a.qty,
           a.created_at,
-          o.date AS dispatch_date
+          o.date AS outward_date,
+          tb.dispatch_date AS transport_dispatch_date,
+          ba.unloading_date AS buyer_unloading_date
         FROM adjustment a
         LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
+        LEFT JOIN (
+          SELECT outward_id, MAX(dispatch_date) AS dispatch_date
+          FROM transport_bilti
+          WHERE COALESCE(dispatch_date, '') != ''
+          GROUP BY outward_id
+        ) tb ON CAST(tb.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
+        LEFT JOIN (
+          SELECT outward_id, MAX(unloading_date) AS unloading_date
+          FROM buyer_adjustments
+          WHERE COALESCE(unloading_date, '') != ''
+          GROUP BY outward_id
+        ) ba ON CAST(ba.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
         WHERE CAST(a.inward_id AS TEXT) IN (${inwardIds.map(() => "CAST(? AS TEXT)").join(",")})
-        ORDER BY COALESCE(o.date, DATE(a.created_at)) ASC, a.id ASC
+        ORDER BY COALESCE(tb.dispatch_date, ba.unloading_date, o.date, DATE(a.created_at)) ASC, a.id ASC
       `;
 
       db.all(adjustmentSql, inwardIds, (adjErr, adjustmentRows) => {
@@ -653,7 +667,9 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
           adjustments.forEach((adjustment) => {
             const qty = Number(adjustment.qty) || 0;
             const dispatchDate = firstNonEmptyDate(
-              adjustment.dispatch_date,
+              adjustment.transport_dispatch_date,
+              adjustment.buyer_unloading_date,
+              adjustment.outward_date,
               String(adjustment.created_at || "").split(" ")[0]
             );
             if (!dispatchDate) return;
@@ -763,12 +779,26 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
           a.inward_id,
           a.qty,
           a.created_at,
-          o.date AS outward_date
+          o.date AS outward_date,
+          tb.dispatch_date AS transport_dispatch_date,
+          ba.unloading_date AS buyer_unloading_date
         FROM adjustment a
         LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
+        LEFT JOIN (
+          SELECT outward_id, MAX(dispatch_date) AS dispatch_date
+          FROM transport_bilti
+          WHERE COALESCE(dispatch_date, '') != ''
+          GROUP BY outward_id
+        ) tb ON CAST(tb.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
+        LEFT JOIN (
+          SELECT outward_id, MAX(unloading_date) AS unloading_date
+          FROM buyer_adjustments
+          WHERE COALESCE(unloading_date, '') != ''
+          GROUP BY outward_id
+        ) ba ON CAST(ba.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
         WHERE a.inward_id IN (${placeholders})
-          AND DATE(COALESCE(o.date, a.created_at)) <= ?
-        ORDER BY DATE(COALESCE(o.date, a.created_at)) ASC, a.id ASC
+          AND DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) <= ?
+        ORDER BY DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) ASC, a.id ASC
       `;
 
       db.all(adjustmentSql, [...inwardIds, lastMonth.month_end_date], (adjustmentErr, adjustmentRows) => {
@@ -795,7 +825,12 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
             let lastDispatchDate = null;
 
             adjustments.forEach((adjustment) => {
-              const adjustmentDate = firstNonEmptyDate(adjustment.outward_date, adjustment.created_at);
+              const adjustmentDate = firstNonEmptyDate(
+                adjustment.transport_dispatch_date,
+                adjustment.buyer_unloading_date,
+                adjustment.outward_date,
+                String(adjustment.created_at || "").split(" ")[0]
+              );
               if (!adjustmentDate || adjustmentDate > monthObj.month_end_date) return;
 
               const adjustmentQty = Number(adjustment.qty) || 0;
