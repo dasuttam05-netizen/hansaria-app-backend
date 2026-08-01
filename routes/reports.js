@@ -650,9 +650,12 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
   let where = ["i.date <= ?"];
   const params = [monthEndDate];
 
-  if (company_id) {
-    where.push("i.company_id = ?");
-    params.push(company_id);
+  if (company_id || warehouse_id || warehouse_ids) {
+    const companyValues = parseIdList(company_id);
+    if (companyValues.length) {
+      where.push(`CAST(i.company_id AS TEXT) IN (${companyValues.map(() => "?").join(",")})`);
+      params.push(...companyValues);
+    }
   }
   appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
   appendMultiIdFilter(where, params, "i.warehouse_id", warehouse_id, warehouse_ids);
