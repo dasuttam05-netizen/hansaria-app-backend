@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 const { calculateShortageQty } = require("./shortageHelper");
-const { appendLocationFilter, appendMultiIdFilter } = require("./reportFilters");
+const { appendLocationFilter, appendMultiIdFilter, parseIdList } = require("./reportFilters");
 
 function authorizeReport(permission) {
   return (req, res, next) => {
@@ -516,12 +516,26 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
     where.push("i.date <= ?");
     params.push(to_date);
   }
-  if (company_id) {
-    where.push("i.company_id = ?");
-    params.push(company_id);
+  const companyValues = parseIdList(company_id);
+  if (companyValues.length) {
+    const placeholders = companyValues.map(() => "?").join(",");
+    where.push(`(
+      CAST(i.company_id AS TEXT) IN (${placeholders})
+      OR CAST(c.name AS TEXT) IN (${placeholders})
+    )`);
+    params.push(...companyValues, ...companyValues);
   }
   appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
-  appendMultiIdFilter(where, params, "i.warehouse_id", warehouse_id, warehouse_ids);
+
+  const warehouseValues = parseIdList(warehouse_id || warehouse_ids);
+  if (warehouseValues.length) {
+    const placeholders = warehouseValues.map(() => "?").join(",");
+    where.push(`(
+      CAST(i.warehouse_id AS TEXT) IN (${placeholders})
+      OR CAST(w.name AS TEXT) IN (${placeholders})
+    )`);
+    params.push(...warehouseValues, ...warehouseValues);
+  }
 
   const sql = `
     SELECT
@@ -650,15 +664,26 @@ router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMon
   let where = ["i.date <= ?"];
   const params = [monthEndDate];
 
-  if (company_id || warehouse_id || warehouse_ids) {
-    const companyValues = parseIdList(company_id);
-    if (companyValues.length) {
-      where.push(`CAST(i.company_id AS TEXT) IN (${companyValues.map(() => "?").join(",")})`);
-      params.push(...companyValues);
-    }
+  const companyValues = parseIdList(company_id);
+  if (companyValues.length) {
+    const placeholders = companyValues.map(() => "?").join(",");
+    where.push(`(
+      CAST(i.company_id AS TEXT) IN (${placeholders})
+      OR CAST(c.name AS TEXT) IN (${placeholders})
+    )`);
+    params.push(...companyValues, ...companyValues);
   }
   appendMultiIdFilter(where, params, "i.location_id", location_id, location_ids);
-  appendMultiIdFilter(where, params, "i.warehouse_id", warehouse_id, warehouse_ids);
+
+  const warehouseValues = parseIdList(warehouse_id || warehouse_ids);
+  if (warehouseValues.length) {
+    const placeholders = warehouseValues.map(() => "?").join(",");
+    where.push(`(
+      CAST(i.warehouse_id AS TEXT) IN (${placeholders})
+      OR CAST(w.name AS TEXT) IN (${placeholders})
+    )`);
+    params.push(...warehouseValues, ...warehouseValues);
+  }
 
   const sql = `
     SELECT
