@@ -13,7 +13,9 @@ const {
   Warehouse,
   Farmer,
   Product,
+  Company,
   CompanyAccount,
+  Consignee,
   Employee,
   Location,
   SqliteMirrorRow,
@@ -1654,6 +1656,76 @@ function purchaseImportTemplateBuffer() {
   return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 }
 
+function paymentImportTemplateBuffer() {
+  const headers = [
+    "Date",
+    "Voucher No",
+    "Warehouse",
+    "Farmer",
+    "Account",
+    "Amount",
+    "Reference Type",
+    "Reference ID",
+    "Employee",
+    "Location",
+    "Narration",
+  ];
+  const sample = [
+    new Date().toISOString().slice(0, 10),
+    "",
+    "Hemtobat Warehouse",
+    "Manikul Islam",
+    "Agri Rise Pvt Ltd",
+    5000,
+    "purchase",
+    "",
+    "Subrajyoti Mondal",
+    "Hemtobat Hub",
+    "",
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+  ws["!cols"] = headers.map(() => ({ wch: 18 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Payment Import");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
+function receiptImportTemplateBuffer() {
+  const headers = [
+    "Date",
+    "Voucher No",
+    "Warehouse",
+    "Company",
+    "Account",
+    "Consignee",
+    "Amount",
+    "Reference Type",
+    "Reference ID",
+    "Employee",
+    "Location",
+    "Narration",
+  ];
+  const sample = [
+    new Date().toISOString().slice(0, 10),
+    "",
+    "Hemtobat Warehouse",
+    "Hemtobat Pvt Ltd",
+    "Agri Rise Pvt Ltd",
+    "",
+    4000,
+    "sale",
+    "",
+    "Subrajyoti Mondal",
+    "Hemtobat Hub",
+    "",
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+  ws["!cols"] = headers.map(() => ({ wch: 18 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Receipt Import");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
 // Idempotency helpers: prevent duplicate resource creation when client retries
 function getIdempotency(key, route, cb) {
   if (!key) return cb(null, null);
@@ -2018,6 +2090,26 @@ router.get("/purchase/import-template", (req, res) => {
   const buffer = purchaseImportTemplateBuffer();
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", 'attachment; filename="purchase_voucher_import_format.xlsx"');
+  res.send(buffer);
+});
+
+router.get("/payment/import-template", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const buffer = paymentImportTemplateBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", 'attachment; filename="payment_voucher_import_format.xlsx"');
+  res.send(buffer);
+});
+
+router.get("/receipt/import-template", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const buffer = receiptImportTemplateBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", 'attachment; filename="receipt_voucher_import_format.xlsx"');
   res.send(buffer);
 });
 
