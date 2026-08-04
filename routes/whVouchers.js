@@ -1598,6 +1598,13 @@ function purchaseImportRowsFromSheet(buffer) {
   return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
 }
 
+function paymentImportRowsFromSheet(buffer) {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) return [];
+  return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
+}
+
 function purchaseImportTemplateBuffer() {
   const headers = [
     "Date",
@@ -2101,6 +2108,155 @@ router.get("/payment/import-template", (req, res) => {
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", 'attachment; filename="payment_voucher_import_format.xlsx"');
   res.send(buffer);
+});
+
+router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!req.file?.buffer) {
+    return res.status(400).json({ error: "Please upload an Excel file" });
+  }
+
+  try {
+    const rows = paymentImportRowsFromSheet(req.file.buffer);
+    if (!rows.length) return res.status(400).json({ error: "No rows found in Excel file" });
+
+    const [warehouses, farmers, accounts, employees, locations] = await Promise.all([
+      Warehouse.find({}).lean(),
+      Farmer.find({}).lean(),
+      CompanyAccount.find({}).lean(),
+      Employee.find({}).lean(),
+      Location.find({}).lean(),
+    ]);
+
+    const warehouseMap = buildImportMap(warehouses, ["name"]);
+    const farmerMap = buildImportMap(farmers, ["name", "mobile", "phone"]);
+    const accountMap = buildImportMap(accounts, ["account_name", "name"]);
+    const employeeMap = buildImportMap(employees, ["name", "mobile", "phone"]);
+    const locationMap = buildImportMap(locations, ["name"]);
+    const imported = [];
+    const errors = [];
+
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const rowNo = index + 2;
+      const date = excelDateToIso(firstValue(row, ["Date", "date"]));
+      const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse", "Warehouse Name", "warehouse", "warehouse_id"]));
+      const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Party", "Name", "farmer", "farmer_id"]));
+      const account = resolveByNameOrId(accountMap, firstValue(row, ["Account", "Account Name", "company_account", "company_account_id"]));
+      const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee", "Employee Name", "employee", "employee_id"]));
+      const location = resolveByNameOrId(locationMap, firstValue(row, ["Location", "location", "location_id"]));
+      const amount = importNumber(firstValue(row, ["Amount", "amount"]));
+      const referenceType = String(firstValue(row, ["Reference Type", "reference_type"]) || "").trim().toLowerCase();
+      const referenceId = String(firstValue(row, ["Reference ID", "reference_id"]) || "").trim();
+      const narration = String(firstValue(row, ["Narration", "Description", "description"]) || "").trim();
+      const requestedVoucherNo = String(firstValue(row, ["Voucher No", "voucher_no"]) || "").trim();
+
+      const missing = [];
+      if (!date) missing.push("Date");
+      if (!warehouse) missing.push("Warehouse");
+      if (!farmer) missing.push("Farmer");
+      if (!account) missing.push("Account");
+      if (amount <= 0) missing.push("Amount");
+      if (!referenceType) missing.push("Reference Type");
+      if (!referenceId) missing.push("Reference ID");
+      if (missing.length) {
+        errors.push({ row: rowNo, error: `Missing/invalid: ${missing.join(", ")}` });
+        continue;
+      }
+      if (!canAccessWarehouse(req.user, warehouse._id)) {
+        errors.push({ row: rowNo, error: `No access to warehouse: ${warehouse.name || warehouse._id}` });
+        continue;
+      }
+
+      let purchase = null;
+      if (referenceType === "purchase") {
+        const query = { $or: [{ voucher_no: referenceId }, { _id: referenceId }] };
+        if (mongoose.Types.ObjectId.isValid(referenceId)) {
+          query.$or.push({ _id: referenceId });
+        }
+        const purchaseFilter = { $or: [{ voucher_no: referenceId }, { _id: referenceId }] };
+        if (farmer?._id) purchaseFilter.farmer_id = String(farmer._id);
+        try {
+          purchase = await PurchaseVoucher.findOne(purchaseFilter).lean();
+        } catch (findErr) {
+          errors.push({ row: rowNo, error: `Unable to lookup purchase reference: ${findErr.message}` });
+          continue;
+        }
+        if (!purchase) {
+          errors.push({ row: rowNo, error: `Invalid purchase reference: ${referenceId}` });
+          continue;
+        }
+      } else {
+        errors.push({ row: rowNo, error: `Unsupported reference type: ${referenceType}` });
+        continue;
+      }
+
+      const adjustments = [{
+        purchase_id: String(purchase._id || purchase.id || purchase.id),
+        adjusted_amount: amount,
+        voucher_no: purchase.voucher_no || String(purchase._id || purchase.id),
+      }];
+
+      try {
+        const cleanAdjustments = await new Promise((resolve, reject) => {
+          validatePaymentAdjustments({ farmerId: farmer._id || farmer.id, warehouseId: warehouse._id || warehouse.id, amount, adjustments }, (validationErr, value) => (validationErr ? reject(validationErr) : resolve(value)));
+        });
+
+        const voucherNo = await new Promise((resolve, reject) => {
+          createVoucherNoIfMissing("payment", requestedVoucherNo, (err, value) => (err ? reject(err) : resolve(value)));
+        });
+
+        const insertData = {
+          voucher_no: voucherNo,
+          date,
+          warehouse_id: String(warehouse._id || warehouse.id),
+          farmer_id: String(farmer._id || farmer.id),
+          company_account_id: String(account._id || account.id),
+          amount,
+          reference_type: referenceType,
+          reference_id: referenceId,
+          employee_id: employee ? String(employee._id || employee.id) : String(warehouse.employee_id || ""),
+          location_id: location ? String(location._id || location.id) : String(warehouse.location_id || ""),
+          description: narration,
+        };
+
+        const paymentId = await new Promise((resolve, reject) => {
+          db.run(
+            `INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [insertData.voucher_no, insertData.date, insertData.warehouse_id, insertData.farmer_id, insertData.company_account_id, insertData.amount, insertData.reference_type, insertData.reference_id, insertData.employee_id, insertData.location_id, insertData.description],
+            function (err) {
+              if (err) return reject(err);
+              resolve(this.lastID);
+            }
+          );
+        });
+
+        await new Promise((resolve, reject) => {
+          insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => (adjErr ? reject(adjErr) : resolve()));
+        });
+
+        const stats = await new Promise((resolve, reject) => {
+          computeOutstandingForFarmer(String(farmer._id || farmer.id), (err2, statsData) => (err2 ? reject(err2) : resolve(statsData)));
+        });
+
+        await new Promise((resolve, reject) => {
+          db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], (updateErr) => (updateErr ? reject(updateErr) : resolve()));
+        });
+
+        imported.push({ row: rowNo, id: paymentId, voucher_no: voucherNo });
+      } catch (err) {
+        const message = err?.message || "Payment import failed";
+        errors.push({ row: rowNo, error: message });
+      }
+    }
+
+    res.json({ imported: imported.length, failed: errors.length, rows: imported, errors });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 router.get("/receipt/import-template", (req, res) => {
