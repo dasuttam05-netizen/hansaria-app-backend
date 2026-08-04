@@ -2133,7 +2133,7 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
     ]);
 
     const warehouseMap = buildImportMap(warehouses, ["name"]);
-    const farmerMap = buildImportMap(farmers, ["name", "mobile", "phone"]);
+    const farmerMap = buildImportMap(farmers, ["name", "mobile", "phone", "farmer_no", "farmer_number"]);
     const accountMap = buildImportMap(accounts, ["account_name", "name"]);
     const employeeMap = buildImportMap(employees, ["name", "mobile", "phone"]);
     const locationMap = buildImportMap(locations, ["name"]);
