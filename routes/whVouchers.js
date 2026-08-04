@@ -2184,7 +2184,10 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
 
       let purchase = null;
       if (normalizedReferenceType === "purchase") {
-        const purchaseFilter = { $or: [{ voucher_no: referenceId }, { _id: referenceId }] };
+        const purchaseFilter = { $or: [{ voucher_no: referenceId }] };
+        if (mongoose.Types.ObjectId.isValid(referenceId)) {
+          purchaseFilter.$or.push({ _id: referenceId });
+        }
         if (farmer?._id) purchaseFilter.farmer_id = String(farmer._id);
         try {
           purchase = await PurchaseVoucher.findOne(purchaseFilter).lean();
