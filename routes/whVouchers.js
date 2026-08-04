@@ -2170,6 +2170,7 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
           ? "purchase"
           : referenceType
         : "";
+      const finalReferenceType = hasReference ? normalizedReferenceType : "on_account";
 
       const missing = [];
       if (!date) missing.push("Date");
@@ -2234,7 +2235,7 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
           farmer_id: String(farmer._id || farmer.id),
           company_account_id: String(account._id || account.id),
           amount,
-          reference_type: referenceType,
+          reference_type: finalReferenceType,
           reference_id: referenceId,
           employee_id: employee ? String(employee._id || employee.id) : String(warehouse.employee_id || ""),
           location_id: location ? String(location._id || location.id) : String(warehouse.location_id || ""),
@@ -3270,7 +3271,7 @@ router.post("/payment", (req, res) => {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        const finalReferenceType = reference_type || "purchase";
+        const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
         const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
         db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
           if (err) {
@@ -3302,7 +3303,7 @@ router.post("/payment", (req, res) => {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `;
 
-      const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "");
+      const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
       const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
       db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
         if (err) {
@@ -3343,7 +3344,7 @@ router.put("/payment/:id", (req, res) => {
     validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, excludePaymentId: id }, (validationErr, cleanAdjustments) => {
       if (validationErr) return res.status(400).json({ error: validationErr.message });
 
-      const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "");
+      const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
       const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
       const query = `
         UPDATE wh_payment_vouchers SET
@@ -4225,13 +4226,16 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
         const adjustmentDetails = paymentAdjustments
           .map((item) => `${item.purchase_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`)
           .join("; ");
+        const isOnAccount = !paymentAdjustments.length && !String(row.reference_id || "").trim();
         return {
           date: row.date,
           voucher_no: row.voucher_no,
           voucher_type: "Payment",
-          particulars: `Payment adjusted against ${paymentAdjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", ") || row.reference_id || "purchase bill"}`,
+          particulars: isOnAccount
+            ? "Unadjusted on account"
+            : `Payment adjusted against ${paymentAdjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", ") || row.reference_id || "purchase bill"}`,
           adjustment_details: adjustmentDetails,
-          reference_id: row.reference_id || paymentAdjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", "),
+          reference_id: row.reference_id || paymentAdjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
           warehouse_id: row.warehouse_id,
           warehouse_name: row.warehouse_name,
           farmer_id: row.farmer_id,
@@ -4243,31 +4247,6 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
         };
       }),
     ];
-
-    res.json(buildLedgerRows(rows, (row) => row.farmer_id, (row) => row.farmer_name || "Unknown Farmer"));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.get("/report/sale-party-ledger", async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
-    return res.status(403).json({ error: "Permission denied" });
-  }
-
-  try {
-    const companyAccountId = String(req.query.company_account_id || "").trim();
-    const buyerId = String(req.query.company_id || req.query.buyer_id || "").trim();
-    const sales = (await getSaleReportRowsForUser(req.user)).filter((row) => {
-      if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
-      if (buyerId && String(row.buyer_id || row.company_id || "") !== buyerId) return false;
-      return true;
-    });
-    const saleByVoucherNo = new Map((sales || []).map((row) => [String(row.voucher_no || ""), row]).filter(([voucherNo]) => voucherNo));
-    const saleVoucherNos = new Set(saleByVoucherNo.keys());
-    const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
-    const receiptParams = [...filter.params];
-    let accountClause = "";
     let buyerClause = "";
     if (companyAccountId) {
       accountClause = " AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)";
