@@ -1668,6 +1668,7 @@ function paymentImportTemplateBuffer() {
     "Date",
     "Voucher No",
     "Warehouse",
+    "Farmer No",
     "Farmer",
     "Account",
     "Amount",
@@ -1681,6 +1682,7 @@ function paymentImportTemplateBuffer() {
     new Date().toISOString().slice(0, 10),
     "",
     "Hemtobat Warehouse",
+    "FARMER001",
     "Manikul Islam",
     "Agri Rise Pvt Ltd",
     5000,
@@ -2143,7 +2145,7 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
       const rowNo = index + 2;
       const date = excelDateToIso(firstValue(row, ["Date", "date"]));
       const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse", "Warehouse Name", "warehouse", "warehouse_id"]));
-      const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Party", "Name", "farmer", "farmer_id"]));
+      const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Farmer No", "Party", "Name", "farmer", "farmer_id", "farmer_no", "farmer_number"]));
       const account = resolveByNameOrId(accountMap, firstValue(row, ["Account", "Account Name", "company_account", "company_account_id"]));
       const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee", "Employee Name", "employee", "employee_id"]));
       const location = resolveByNameOrId(locationMap, firstValue(row, ["Location", "location", "location_id"]));
