@@ -2148,10 +2148,23 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
       const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee", "Employee Name", "employee", "employee_id"]));
       const location = resolveByNameOrId(locationMap, firstValue(row, ["Location", "location", "location_id"]));
       const amount = importNumber(firstValue(row, ["Amount", "amount"]));
-      const referenceType = String(firstValue(row, ["Reference Type", "reference_type"]) || "").trim().toLowerCase();
+      const rawReferenceType = String(firstValue(row, ["Reference Type", "reference_type"]) || "").trim();
+      const referenceType = rawReferenceType.toLowerCase();
       const referenceId = String(firstValue(row, ["Reference ID", "reference_id"]) || "").trim();
       const narration = String(firstValue(row, ["Narration", "Description", "description"]) || "").trim();
       const requestedVoucherNo = String(firstValue(row, ["Voucher No", "voucher_no"]) || "").trim();
+
+      const normalizedReferenceType = (
+        referenceType === "purchase" ||
+        referenceType === "purchase bill" ||
+        referenceType === "purchase_bill" ||
+        referenceType === "bill" ||
+        referenceType === "purchase invoice" ||
+        referenceType === "purchase_invoice" ||
+        referenceType === ""
+      )
+        ? "purchase"
+        : referenceType;
 
       const missing = [];
       if (!date) missing.push("Date");
@@ -2159,7 +2172,6 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
       if (!farmer) missing.push("Farmer");
       if (!account) missing.push("Account");
       if (amount <= 0) missing.push("Amount");
-      if (!referenceType) missing.push("Reference Type");
       if (!referenceId) missing.push("Reference ID");
       if (missing.length) {
         errors.push({ row: rowNo, error: `Missing/invalid: ${missing.join(", ")}` });
@@ -2171,11 +2183,7 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
       }
 
       let purchase = null;
-      if (referenceType === "purchase") {
-        const query = { $or: [{ voucher_no: referenceId }, { _id: referenceId }] };
-        if (mongoose.Types.ObjectId.isValid(referenceId)) {
-          query.$or.push({ _id: referenceId });
-        }
+      if (normalizedReferenceType === "purchase") {
         const purchaseFilter = { $or: [{ voucher_no: referenceId }, { _id: referenceId }] };
         if (farmer?._id) purchaseFilter.farmer_id = String(farmer._id);
         try {
@@ -2189,7 +2197,7 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
           continue;
         }
       } else {
-        errors.push({ row: rowNo, error: `Unsupported reference type: ${referenceType}` });
+        errors.push({ row: rowNo, error: `Unsupported reference type: ${rawReferenceType || referenceType}` });
         continue;
       }
 
