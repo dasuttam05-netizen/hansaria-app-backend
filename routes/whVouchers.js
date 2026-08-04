@@ -1824,7 +1824,7 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
   }
 
   if (!cleanAdjustments.length) {
-    return callback(new Error("Please adjust this payment against purchase bills"));
+    return callback(null, []);
   }
 
   if (Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
@@ -2172,7 +2172,7 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
       if (!farmer) missing.push("Farmer");
       if (!account) missing.push("Account");
       if (amount <= 0) missing.push("Amount");
-      if (!referenceId) missing.push("Reference ID");
+      if (referenceId && !normalizedReferenceType) missing.push("Reference Type");
       if (missing.length) {
         errors.push({ row: rowNo, error: `Missing/invalid: ${missing.join(", ")}` });
         continue;
@@ -3291,7 +3291,7 @@ router.post("/payment", (req, res) => {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `;
 
-      const finalReferenceType = reference_type || "purchase";
+      const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "");
       const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
       db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
         if (err) {
@@ -3332,7 +3332,7 @@ router.put("/payment/:id", (req, res) => {
     validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, excludePaymentId: id }, (validationErr, cleanAdjustments) => {
       if (validationErr) return res.status(400).json({ error: validationErr.message });
 
-      const finalReferenceType = reference_type || "purchase";
+      const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "");
       const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
       const query = `
         UPDATE wh_payment_vouchers SET
