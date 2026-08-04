@@ -4390,7 +4390,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
         });
       });
 
-    const rows = [
+    const ledgerRows = [
       ...sales.map((row) => {
         const saleId = String(row.id || row._id);
         const receiptDetails = adjustmentsBySale.get(saleId) || [];
@@ -4482,7 +4482,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     ];
 
 res.json(buildLedgerRows(
-      rows,
+      ledgerRows,
       (row) => `${row.buyer_id || row.company_id || "unknown"}::${row.company_account_id || "no-account"}`,
       (row) => row.buyer_name || row.company_name || "Unknown Buyer"
     ));
