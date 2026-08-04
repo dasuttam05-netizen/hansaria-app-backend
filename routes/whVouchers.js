@@ -2154,17 +2154,20 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
       const narration = String(firstValue(row, ["Narration", "Description", "description"]) || "").trim();
       const requestedVoucherNo = String(firstValue(row, ["Voucher No", "voucher_no"]) || "").trim();
 
-      const normalizedReferenceType = (
-        referenceType === "purchase" ||
-        referenceType === "purchase bill" ||
-        referenceType === "purchase_bill" ||
-        referenceType === "bill" ||
-        referenceType === "purchase invoice" ||
-        referenceType === "purchase_invoice" ||
-        referenceType === ""
-      )
-        ? "purchase"
-        : referenceType;
+      const hasReference = Boolean(referenceId);
+      const normalizedReferenceType = hasReference
+        ? (
+          referenceType === "purchase" ||
+          referenceType === "purchase bill" ||
+          referenceType === "purchase_bill" ||
+          referenceType === "bill" ||
+          referenceType === "purchase invoice" ||
+          referenceType === "purchase_invoice" ||
+          referenceType === ""
+        )
+          ? "purchase"
+          : referenceType
+        : "";
 
       const missing = [];
       if (!date) missing.push("Date");
@@ -2183,32 +2186,35 @@ router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
       }
 
       let purchase = null;
-      if (normalizedReferenceType === "purchase") {
-        const purchaseFilter = { $or: [{ voucher_no: referenceId }] };
-        if (mongoose.Types.ObjectId.isValid(referenceId)) {
-          purchaseFilter.$or.push({ _id: referenceId });
-        }
-        if (farmer?._id) purchaseFilter.farmer_id = String(farmer._id);
-        try {
-          purchase = await PurchaseVoucher.findOne(purchaseFilter).lean();
-        } catch (findErr) {
-          errors.push({ row: rowNo, error: `Unable to lookup purchase reference: ${findErr.message}` });
+      let adjustments = [];
+      if (hasReference) {
+        if (normalizedReferenceType === "purchase") {
+          const purchaseFilter = { $or: [{ voucher_no: referenceId }] };
+          if (mongoose.Types.ObjectId.isValid(referenceId)) {
+            purchaseFilter.$or.push({ _id: referenceId });
+          }
+          if (farmer?._id) purchaseFilter.farmer_id = String(farmer._id);
+          try {
+            purchase = await PurchaseVoucher.findOne(purchaseFilter).lean();
+          } catch (findErr) {
+            errors.push({ row: rowNo, error: `Unable to lookup purchase reference: ${findErr.message}` });
+            continue;
+          }
+          if (!purchase) {
+            errors.push({ row: rowNo, error: `Invalid purchase reference: ${referenceId}` });
+            continue;
+          }
+        } else {
+          errors.push({ row: rowNo, error: `Unsupported reference type: ${rawReferenceType || referenceType}` });
           continue;
         }
-        if (!purchase) {
-          errors.push({ row: rowNo, error: `Invalid purchase reference: ${referenceId}` });
-          continue;
-        }
-      } else {
-        errors.push({ row: rowNo, error: `Unsupported reference type: ${rawReferenceType || referenceType}` });
-        continue;
-      }
 
-      const adjustments = [{
-        purchase_id: String(purchase._id || purchase.id || purchase.id),
-        adjusted_amount: amount,
-        voucher_no: purchase.voucher_no || String(purchase._id || purchase.id),
-      }];
+        adjustments = [{
+          purchase_id: String(purchase._id || purchase.id || purchase.id),
+          adjusted_amount: amount,
+          voucher_no: purchase.voucher_no || String(purchase._id || purchase.id),
+        }];
+      }
 
       try {
         const cleanAdjustments = await new Promise((resolve, reject) => {
