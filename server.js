@@ -159,6 +159,8 @@ const farmersRoutes = require("./routes/farmers");
 const whVouchersRoutes = require("./routes/whVouchers");
 
 const cashEntriesRoutes = require("./routes/cashEntries");
+const { normalizeDashboardList, normalizeDashboardSummary } = require("./helpers/dashboardPayload");
+const { Location, Employee, Company, Warehouse, Product, Inward, Outward } = require("./mongo");
 
 function authorizeConsigneeOrExpense(
   req,
@@ -391,6 +393,130 @@ app.use(
   authenticate,
   reportsRoute
 );
+
+app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req, res) => {
+  try {
+    const { user } = req;
+    const currentMonth = new Date().toISOString().slice(0, 7);
+    const currentDate = new Date().toISOString().slice(0, 10);
+
+    const canReadLocations = userHasPermission(user, "locations.manage") || userHasPermission(user, "expense.entry") || userHasPermission(user, "expense.view") || userHasPermission(user, "expense.create") || userHasPermission(user, "expense.edit") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create") || userHasPermission(user, "employees.view") || userHasPermission(user, "report.partyStock") || userHasPermission(user, "report.warehouseRentLedger") || userHasPermission(user, "report.warehouseRentMonthEnd");
+    const canReadEmployees = userHasPermission(user, "employees.view") || userHasPermission(user, "inward.view") || userHasPermission(user, "outward.view") || userHasPermission(user, "expense.entry") || userHasPermission(user, "report.erp");
+    const canReadCompanies = userHasPermission(user, "companies.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create") || userHasPermission(user, "adjustment.manage") || userHasPermission(user, "expense.entry") || userHasPermission(user, "expense.view") || userHasPermission(user, "expense.create") || userHasPermission(user, "cash.view") || userHasPermission(user, "settlement.view") || userHasPermission(user, "report.inward") || userHasPermission(user, "report.erp") || userHasPermission(user, "report.partyLedger") || userHasPermission(user, "report.partyStock") || userHasPermission(user, "report.warehouseRentLedger") || userHasPermission(user, "report.warehouseRentMonthEnd") || userHasPermission(user, "report.outwardSettlement") || userHasPermission(user, "report.expense");
+    const canReadCompanyAccounts = userHasPermission(user, "companyAccounts.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create") || userHasPermission(user, "adjustment.manage") || userHasPermission(user, "expense.entry") || userHasPermission(user, "expense.view") || userHasPermission(user, "expense.create") || userHasPermission(user, "cash.view") || userHasPermission(user, "settlement.view") || userHasPermission(user, "report.inward") || userHasPermission(user, "report.erp") || userHasPermission(user, "report.partyLedger") || userHasPermission(user, "report.partyStock") || userHasPermission(user, "report.warehouseRentLedger") || userHasPermission(user, "report.warehouseRentMonthEnd") || userHasPermission(user, "report.outwardSettlement") || userHasPermission(user, "report.expense");
+    const canReadWarehouses = userHasPermission(user, "warehouses.manage") || userHasPermission(user, "warehouse.trading.purchase.view") || userHasPermission(user, "warehouse.trading.sale.view") || userHasPermission(user, "warehouse.trading.payment.view") || userHasPermission(user, "warehouse.trading.receipt.view") || userHasPermission(user, "warehouse.trading.journal.view") || userHasPermission(user, "outward.view") || userHasPermission(user, "inward.view");
+    const canReadProducts = userHasPermission(user, "products.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create") || userHasPermission(user, "adjustment.manage") || userHasPermission(user, "expense.entry") || userHasPermission(user, "expense.view") || userHasPermission(user, "expense.create") || userHasPermission(user, "transport.manage") || userHasPermission(user, "report.inward") || userHasPermission(user, "report.erp") || userHasPermission(user, "report.partyLedger") || userHasPermission(user, "report.partyStock");
+    const canLoadPartyStockInsights = userHasPermission(user, "report.partyStock");
+    const canLoadWarehouseRentInsights = userHasPermission(user, "report.warehouseRentMonthEnd");
+    const canReadInwards = userHasPermission(user, "inward.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create");
+    const canReadOutwards = userHasPermission(user, "outward.manage") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create");
+
+    const [locations, employees, companies, companyAccounts, warehouses, products, inwardResponse, outwardResponse, partyStockRows, warehouseStockRows, totalStockRows, monthEndRentRows] = await Promise.all([
+      canReadLocations ? Location.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
+      canReadEmployees ? Employee.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
+      canReadCompanies ? Company.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
+      canReadCompanyAccounts ? new Promise((resolve, reject) => db.all("SELECT id, account_name, address, company_id, pan_no, mobile, shortage_percent FROM company_accounts ORDER BY id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+      canReadWarehouses ? Warehouse.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
+      canReadProducts ? Product.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
+      canReadInwards ? new Promise((resolve, reject) => db.all("SELECT id, voucher_no, date, company_id, company_account_id, weight, lorry_no, shortage_percent, employee_id, location_id, warehouse_id, product_id FROM inward ORDER BY date DESC, id DESC LIMIT 200", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+      canReadOutwards ? new Promise((resolve, reject) => db.all("SELECT id, inv_no, date, company_id, company_account_id, weight, lorry_no, employee_id, location_id, warehouse_id, product_id FROM outward ORDER BY date DESC, id DESC LIMIT 200", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+      canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT id, date, company_id, location_id, warehouse_id, product_id, company_account_id, weight, shortage_percent FROM inward ORDER BY date ASC, id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+      canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT id, company_id, location_id, warehouse_id, company_account_id, weight, date, shortage_percent FROM inward ORDER BY date ASC, id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+      canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT weight, date, shortage_percent FROM inward", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+      canLoadWarehouseRentInsights ? new Promise((resolve, reject) => db.all("SELECT id, date, voucher_no, lorry_no, weight, company_id, company_account_id, warehouse_id, shortage_percent FROM inward ORDER BY date ASC, id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+    ]);
+
+    const listPayload = {
+      locations: normalizeDashboardList(locations).map((item) => ({
+        ...item,
+        id: item.id ?? item._id,
+        name: item.name || item.account_name || "",
+      })),
+      employees: normalizeDashboardList(employees).map((item) => ({
+        ...item,
+        id: item.id ?? item._id,
+        name: item.name || "",
+      })),
+      companies: normalizeDashboardList(companies).map((item) => ({
+        ...item,
+        id: item.id ?? item._id,
+        name: item.name || "",
+      })),
+      companyAccounts: normalizeDashboardList(companyAccounts).map((item) => ({
+        ...item,
+        id: item.id ?? item._id,
+        name: item.account_name || item.name || "",
+      })),
+      warehouses: normalizeDashboardList(warehouses).map((item) => ({
+        ...item,
+        id: item.id ?? item._id,
+        name: item.name || "",
+      })),
+      products: normalizeDashboardList(products).map((item) => ({
+        ...item,
+        id: item.id ?? item._id,
+        name: item.name || "",
+      })),
+      inwards: normalizeDashboardList(inwardResponse),
+      outwards: normalizeDashboardList(outwardResponse),
+    };
+
+    const partyStockSummary = canLoadPartyStockInsights
+      ? normalizeDashboardSummary({
+          summary: (partyStockRows || []).map((row) => ({
+            party_name: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
+            warehouse_name: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "-",
+            gross_qty: Number(row.weight || 0),
+            shortage_qty: 0,
+            net_opening_qty: Number(row.weight || 0),
+            already_adjusted_qty: 0,
+            available_balance_qty: Number(row.weight || 0),
+          })),
+        })
+      : [];
+
+    const warehouseStockSummary = canLoadPartyStockInsights
+      ? normalizeDashboardSummary({
+          summary: (warehouseStockRows || []).map((row) => ({
+            warehouse: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "Unknown",
+            party: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
+            location: row.location_id ? `Location ${row.location_id}` : "-",
+            stock: Number(row.weight || 0),
+          })),
+        })
+      : [];
+
+    const totalStockValue = canLoadPartyStockInsights
+      ? (totalStockRows || []).reduce((sum, row) => sum + Number(row.weight || 0), 0)
+      : 0;
+
+    const monthEndRentSummary = canLoadWarehouseRentInsights
+      ? normalizeDashboardSummary({
+          summary: (monthEndRentRows || []).map((row) => ({
+            party_name: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
+            warehouse_name: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "-",
+            total_rent: 0,
+            total_entries: 1,
+          })),
+        })
+      : [];
+
+    res.json({
+      ...listPayload,
+      partyStock: partyStockSummary,
+      warehouseStock: warehouseStockSummary,
+      totalStock: totalStockValue,
+      monthEndRentSummary,
+      meta: {
+        currentMonth,
+        currentDate,
+      },
+    });
+  } catch (error) {
+    console.error("Failed to load dashboard payload:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 if (systemRoutes) {
   app.use(
