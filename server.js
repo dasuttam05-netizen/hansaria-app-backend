@@ -160,7 +160,7 @@ const whVouchersRoutes = require("./routes/whVouchers");
 
 const cashEntriesRoutes = require("./routes/cashEntries");
 const { normalizeDashboardList, normalizeDashboardSummary } = require("./helpers/dashboardPayload");
-const { Location, Employee, Company, Warehouse, Product, Inward, Outward } = require("./mongo");
+const { Location, Employee, Company, CompanyAccount, Warehouse, Product, Inward, Outward } = require("./db-mongodb");
 
 function authorizeConsigneeOrExpense(
   req,
@@ -412,14 +412,14 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     const canReadOutwards = userHasPermission(user, "outward.manage") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create");
 
     const [locations, employees, companies, companyAccounts, warehouses, products, inwardResponse, outwardResponse, partyStockRows, warehouseStockRows, totalStockRows, monthEndRentRows] = await Promise.all([
-      canReadLocations ? Location.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
-      canReadEmployees ? Employee.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
-      canReadCompanies ? Company.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
-      canReadCompanyAccounts ? new Promise((resolve, reject) => db.all("SELECT id, account_name, address, company_id, pan_no, mobile, shortage_percent FROM company_accounts ORDER BY id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
-      canReadWarehouses ? Warehouse.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
-      canReadProducts ? Product.find().sort({ createdAt: -1 }).lean() : Promise.resolve([]),
-      canReadInwards ? new Promise((resolve, reject) => db.all("SELECT id, voucher_no, date, company_id, company_account_id, weight, lorry_no, shortage_percent, employee_id, location_id, warehouse_id, product_id FROM inward ORDER BY date DESC, id DESC LIMIT 200", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
-      canReadOutwards ? new Promise((resolve, reject) => db.all("SELECT id, inv_no, date, company_id, company_account_id, weight, lorry_no, employee_id, location_id, warehouse_id, product_id FROM outward ORDER BY date DESC, id DESC LIMIT 200", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+      canReadLocations ? Location.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
+      canReadEmployees ? Employee.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
+      canReadCompanies ? Company.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
+      canReadCompanyAccounts ? CompanyAccount.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
+      canReadWarehouses ? Warehouse.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
+      canReadProducts ? Product.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
+      canReadInwards ? Inward.find().sort({ date: -1, _id: -1 }).limit(200).lean() : Promise.resolve([]),
+      canReadOutwards ? Outward.find().sort({ date: -1, _id: -1 }).limit(200).lean() : Promise.resolve([]),
       canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT id, date, company_id, location_id, warehouse_id, product_id, company_account_id, weight, shortage_percent FROM inward ORDER BY date ASC, id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
       canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT id, company_id, location_id, warehouse_id, company_account_id, weight, date, shortage_percent FROM inward ORDER BY date ASC, id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
       canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT weight, date, shortage_percent FROM inward", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
@@ -457,8 +457,25 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
         id: item.id ?? item._id,
         name: item.name || "",
       })),
-      inwards: normalizeDashboardList(inwardResponse),
-      outwards: normalizeDashboardList(outwardResponse),
+      inwards: normalizeDashboardList(inwardResponse).map((item) => ({
+        ...item,
+        id: item.id ?? item._id,
+        voucher_no: item.voucher_no || item.inward_no || item.inwardNo || item.voucherNo,
+        date: item.date ? (typeof item.date === "string" ? item.date : item.date.toISOString().slice(0, 10)) : "",
+        company_name: item.company_name || item.company || (typeof item.company_id === "string" ? item.company_id : undefined) || "",
+        account_name: item.account_name || item.company_account || item.companyAccount || "",
+        weight: item.weight ?? item.quantity ?? 0,
+      })),
+      outwards: normalizeDashboardList(outwardResponse).map((item) => ({
+        ...item,
+        id: item.id ?? item._id,
+        inv_no: item.inv_no || item.outward_no || item.outwardNo || item.invoice_no || item.voucher_no || item.voucherNo,
+        date: item.date ? (typeof item.date === "string" ? item.date : item.date.toISOString().slice(0, 10)) : "",
+        party_name: item.party_name || item.buyer_name || item.buyer || item.company_name || item.company || "",
+        company_name: item.company_name || item.company || "",
+        account_name: item.account_name || item.company_account || item.companyAccount || "",
+        weight: item.weight ?? item.quantity ?? 0,
+      })),
     };
 
     const partyStockSummary = canLoadPartyStockInsights
