@@ -439,6 +439,13 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       return null;
     };
 
+    const calculateAvailableQty = (weight, inwardDate, alreadyAdjusted, refDate = currentDate, shortagePercent = null) => {
+      const gross = Number(weight) || 0;
+      const slab = calculateMonthSlab(inwardDate, refDate);
+      const shortage = calculateShortageQty(gross, slab.monthsDiff, shortagePercent);
+      return gross - shortage - Number(alreadyAdjusted || 0);
+    };
+
     const [
       locations,
       employees,
@@ -489,6 +496,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
               i.product_id,
               i.weight,
               i.shortage_percent,
+              IFNULL((SELECT SUM(a.qty) FROM adjustment a WHERE CAST(a.inward_id AS TEXT) = CAST(i.id AS TEXT)), 0) AS already_adjusted,
               COALESCE(ca.account_name, c.name, 'Unknown') AS party_name,
               COALESCE(w.name, 'Unknown') AS warehouse_name
             FROM inward i
@@ -620,7 +628,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       const originalWeight = Number(row.weight) || 0;
       const adjustments = adjustmentMap[String(row.id)] || [];
       const slab = calculateMonthSlab(row.date, referenceDate);
-      let adjustedQty = 0;
+      const adjustedQty = Number(row.already_adjusted || 0);
       let adjustedRentAmount = 0;
       let lastDispatchDate = null;
 
@@ -635,13 +643,12 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
 
         const qty = Number(adj.qty) || 0;
         const adjustmentSlab = calculateMonthSlab(row.date, adjustmentDate);
-        adjustedQty += qty;
         adjustedRentAmount += qty * rentRate * adjustmentSlab.monthsDiff;
         if (!lastDispatchDate || adjustmentDate > lastDispatchDate) lastDispatchDate = adjustmentDate;
       });
 
       const shortageQty = calculateShortageQty(originalWeight, slab.monthsDiff, row.shortage_percent);
-      const balanceQty = Math.max(originalWeight - shortageQty - adjustedQty, 0);
+      const balanceQty = Math.max(calculateAvailableQty(originalWeight, row.date, adjustedQty, referenceDate, row.shortage_percent), 0);
       const balanceRentAmount = balanceQty * rentRate * slab.monthsDiff;
 
       rentDetailedRows.push({
