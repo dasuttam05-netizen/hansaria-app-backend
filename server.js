@@ -411,6 +411,8 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     const canReadOutwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "outward.manage") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create");
     const rentRate = 200;
     const referenceDate = currentDate;
+    const dashboardFromDate = `${currentMonth}-01`;
+    const dashboardToDate = currentDate;
 
     const queryAll = (sql, params = []) => new Promise((resolve, reject) => {
       db.all(sql, params, (err, rows) => {
@@ -503,8 +505,9 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
             LEFT JOIN companies c ON c.id = i.company_id
             LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
             LEFT JOIN warehouses w ON w.id = i.warehouse_id
+            WHERE i.date >= ? AND i.date <= ?
             ORDER BY i.date ASC, i.id ASC
-          `)
+          `, [dashboardFromDate, dashboardToDate])
         : Promise.resolve([]),
       true
         ? queryAll(`
@@ -530,12 +533,11 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
               WHERE COALESCE(unloading_date, '') != ''
               GROUP BY outward_id
             ) ba ON CAST(ba.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
+            LEFT JOIN inward i ON CAST(i.id AS TEXT) = CAST(a.inward_id AS TEXT)
             WHERE DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) <= ?
+              AND i.date >= ? AND i.date <= ?
             ORDER BY DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) ASC, a.id ASC
-          `, [referenceDate])
-        : Promise.resolve([]),
-      true
-        ? queryAll("SELECT weight, date, shortage_percent FROM inward")
+          `, [referenceDate, dashboardFromDate, dashboardToDate])
         : Promise.resolve([]),
       true
         ? queryAll(
@@ -557,9 +559,10 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
             LEFT JOIN companies c ON c.id = i.company_id
             LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
             LEFT JOIN warehouses w ON w.id = i.warehouse_id
+            WHERE i.date >= ? AND i.date <= ?
             ORDER BY i.date ASC, i.id ASC
           `,
-            []
+            [dashboardFromDate, dashboardToDate]
           )
         : Promise.resolve([]),
     ]);
