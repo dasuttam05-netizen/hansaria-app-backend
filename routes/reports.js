@@ -566,6 +566,9 @@ router.get("/total-stock", authorizeReport("report.partyStock"), (req, res) => {
 
 router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger"), async (req, res) => {
   const { from_date, to_date, company_id, warehouse_id, warehouse_ids, location_id, location_ids } = req.query;
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 100, 1), 500);
+  const usePagination = req.query.page !== undefined || req.query.page_size !== undefined;
 
   try {
     let where = ["1=1"];
@@ -584,7 +587,23 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
     await appendResolvedIdOrNameFilter(where, params, "i.location_id", "w.location_id", location_id || location_ids, Location, "locations");
     await appendResolvedIdOrNameFilter(where, params, "i.warehouse_id", "w.name", warehouse_id || warehouse_ids, Warehouse, "warehouses");
 
-    const sql = `
+    const countSql = `
+      SELECT COUNT(1) AS total_count
+      FROM inward i
+      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
+      WHERE ${where.join(" AND ")}
+    `;
+
+    db.get(countSql, params, (countErr, countRow) => {
+      if (countErr) return res.status(500).json({ error: countErr.message });
+
+      const totalCount = Number(countRow?.total_count || 0);
+      const limitClause = usePagination ? "LIMIT ? OFFSET ?" : "";
+      const listParams = usePagination ? [...params, pageSize, (page - 1) * pageSize] : params.slice();
+
+      const sql = `
       SELECT
         i.id,
         i.date,
@@ -605,17 +624,18 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
       LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
       WHERE ${where.join(" AND ")}
       ORDER BY i.date ASC, i.id ASC
+      ${limitClause}
     `;
 
-    db.all(sql, params, (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
+      db.all(sql, listParams, (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
 
       const today = new Date().toISOString().split("T")[0];
       const fallbackRefDate = to_date || today;
       const inwardIds = (rows || []).map((row) => row.id);
 
       if (!inwardIds.length) {
-        return res.json([]);
+        return res.json(usePagination ? { data: [], pagination: { page, pageSize, totalCount, totalPages: 0 } } : []);
       }
 
       const adjustmentSql = `
@@ -709,7 +729,20 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
           };
         });
 
-        res.json(result);
+        return res.json(
+          usePagination
+            ? {
+                data: result,
+                pagination: {
+                  page,
+                  pageSize,
+                  totalCount,
+                  totalPages: Math.max(Math.ceil(totalCount / pageSize), 1),
+                },
+              }
+            : result
+        );
+      });
       });
     });
   } catch (routeErr) {
