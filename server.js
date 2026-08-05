@@ -436,10 +436,10 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
         ? queryAll("SELECT id, name, address FROM locations ORDER BY id DESC")
         : Promise.resolve([]),
       canReadEmployees
-        ? queryAll("SELECT id, name, mobile, address, username, role, permissions, location_id, created_at FROM employees ORDER BY id DESC")
+        ? queryAll("SELECT id, name, mobile, address, username, role, permissions, location_id FROM employees ORDER BY id DESC")
         : Promise.resolve([]),
       canReadCompanies
-        ? queryAll("SELECT id, name, address, mobile, shortage_percent, created_at FROM companies ORDER BY id DESC")
+        ? queryAll("SELECT id, name, address, mobile, shortage_percent FROM companies ORDER BY id DESC")
         : Promise.resolve([]),
       canReadCompanyAccounts
         ? queryAll("SELECT id, account_name, address, company_id, pan_no, mobile, shortage_percent FROM company_accounts ORDER BY id DESC")
@@ -451,10 +451,10 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
         ? queryAll("SELECT id, name, hsn_code FROM products ORDER BY id DESC")
         : Promise.resolve([]),
       canReadInwards
-        ? queryAll("SELECT id, sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, remaining_qty, shortage_percent, labour_charges, rent, shortage, narration, created_at FROM inward ORDER BY date DESC, id DESC LIMIT 200")
+        ? queryAll("SELECT id, sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, remaining_qty, shortage_percent, labour_charges, rent, shortage, narration FROM inward ORDER BY date DESC, id DESC LIMIT 200")
         : Promise.resolve([]),
       canReadOutwards
-        ? queryAll("SELECT id, sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, quantity, rate, amount, buyer_name, consignee_name, inv_no, self_loading, narration, labour_charges, total_freight, rent, shortage, status, created_at FROM outward ORDER BY date DESC, id DESC LIMIT 200")
+        ? queryAll("SELECT id, sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, quantity, rate, amount, buyer_name, consignee_name, inv_no, self_loading, narration, labour_charges, total_freight, rent, shortage, status FROM outward ORDER BY date DESC, id DESC LIMIT 200")
         : Promise.resolve([]),
       canLoadPartyStockInsights
         ? queryAll("SELECT id, date, company_id, location_id, warehouse_id, product_id, company_account_id, weight, shortage_percent FROM inward ORDER BY date ASC, id ASC")
