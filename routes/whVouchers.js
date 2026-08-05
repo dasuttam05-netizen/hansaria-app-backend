@@ -4627,11 +4627,86 @@ router.get("/report/warehouse-stock", async (req, res) => {
   }
 
   try {
-    const [purchases, sales] = await Promise.all([
-      getPurchaseReportRowsForUser(req.user),
-      getSaleReportRowsForUser(req.user),
-    ]);
-    res.json(groupStock(purchases, sales));
+    const view = String(req.query.view || "").toLowerCase();
+    if (view === "details") {
+      const [purchases, sales] = await Promise.all([
+        getPurchaseReportRowsForUser(req.user),
+        getSaleReportRowsForUser(req.user),
+      ]);
+      return res.json(groupStock(purchases, sales));
+    }
+
+    const currentDate = new Date().toISOString().slice(0, 10);
+    const sql = `
+      WITH adjusted AS (
+        SELECT inward_id, SUM(qty) AS adjusted_qty
+        FROM adjustment
+        GROUP BY inward_id
+      )
+      SELECT
+        COALESCE(w.name, 'Unknown') AS warehouse,
+        COALESCE(c.name, ca.account_name, 'Unknown') AS party,
+        COALESCE(l.name, '') AS location,
+        COUNT(i.id) AS rows_count,
+        SUM(COALESCE(i.weight, 0)) AS gross_qty,
+        SUM(COALESCE(adj.adjusted_qty, 0)) AS already_adjusted_qty,
+        SUM(
+          CASE
+            WHEN COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) IS NULL THEN
+              COALESCE(i.weight, 0) * (
+                0.02 * (
+                  CASE
+                    WHEN CAST((julianday(?) - julianday(i.date)) AS INTEGER) <= 0 THEN 1
+                    ELSE CAST((CAST((julianday(?) - julianday(i.date)) AS INTEGER) - 1) / 30 AS INTEGER) + 1
+                  END
+                )
+              )
+            ELSE
+              COALESCE(i.weight, 0) * (COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) / 100.0)
+          END
+        ) AS shortage_qty,
+        SUM(
+          COALESCE(i.weight, 0)
+          - (
+            CASE
+              WHEN COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) IS NULL THEN
+                COALESCE(i.weight, 0) * (
+                  0.02 * (
+                    CASE
+                      WHEN CAST((julianday(?) - julianday(i.date)) AS INTEGER) <= 0 THEN 1
+                      ELSE CAST((CAST((julianday(?) - julianday(i.date)) AS INTEGER) - 1) / 30 AS INTEGER) + 1
+                    END
+                  )
+                )
+              ELSE
+                COALESCE(i.weight, 0) * (COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) / 100.0)
+            END
+          )
+          - COALESCE(adj.adjusted_qty, 0)
+        ) AS available_balance_qty
+      FROM inward i
+      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
+      LEFT JOIN locations l ON CAST(l.id AS TEXT) = CAST(w.location_id AS TEXT)
+      LEFT JOIN adjusted adj ON CAST(adj.inward_id AS TEXT) = CAST(i.id AS TEXT)
+      GROUP BY COALESCE(w.name, 'Unknown'), COALESCE(c.name, ca.account_name, 'Unknown'), COALESCE(l.name, '')
+      ORDER BY warehouse ASC, party ASC, location ASC
+    `;
+
+    const rows = await dbAll(sql, [currentDate, currentDate, currentDate, currentDate]);
+    return res.json(
+      (rows || []).map((row) => ({
+        warehouse: row.warehouse,
+        party: row.party,
+        location: row.location,
+        stock: Number(Number(row.available_balance_qty || 0).toFixed(4)),
+        rows_count: Number(row.rows_count || 0),
+        gross_qty: Number(Number(row.gross_qty || 0).toFixed(4)),
+        already_adjusted_qty: Number(Number(row.already_adjusted_qty || 0).toFixed(4)),
+        shortage_qty: Number(Number(row.shortage_qty || 0).toFixed(4)),
+      }))
+    );
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
