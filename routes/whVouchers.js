@@ -3969,8 +3969,13 @@ router.get("/report/sale-summary", (req, res) => {
   const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
 
   getSaleReportRowsForUser(req.user, usePaging ? { limit: pageSize, offset: (page - 1) * pageSize } : {})
-    .then((rows) =>
-      res.json(
+    .then(async (rows) => {
+      let total = Array.isArray(rows) ? rows.length : 0;
+      if (usePaging) {
+        const allRows = await getSaleReportRowsForUser(req.user);
+        total = Array.isArray(allRows) ? allRows.length : 0;
+      }
+      return res.json(
         usePaging
           ? {
               data: (rows || []).map((row) => ({
@@ -3981,7 +3986,8 @@ router.get("/report/sale-summary", (req, res) => {
               pagination: {
                 page,
                 pageSize,
-                hasMore: (rows || []).length === pageSize,
+                total,
+                hasMore: page * pageSize < total,
               },
             }
           : (rows || []).map((row) => ({
@@ -3989,8 +3995,8 @@ router.get("/report/sale-summary", (req, res) => {
               total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
               total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
             }))
-      )
-    )
+      );
+    })
     .catch((err) => res.status(500).json({ error: err.message }));
 });
 
@@ -4009,8 +4015,27 @@ router.get("/report/purchase-summary", (req, res) => {
     if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
     return query
       .lean()
-      .then((rows) => decoratePurchaseRows(rows))
-      .then((rows) => res.json(usePaging ? { data: rows || [], pagination: { page, pageSize, hasMore: (rows || []).length === pageSize } } : (rows || [])))
+      .then(async (rows) => {
+        const decoratedRows = await decoratePurchaseRows(rows);
+        let total = Array.isArray(decoratedRows) ? decoratedRows.length : 0;
+        if (usePaging) {
+          const totalCountQuery = PurchaseVoucher.countDocuments(mongoPurchaseScope(req.user));
+          total = await totalCountQuery;
+        }
+        return res.json(
+          usePaging
+            ? {
+                data: decoratedRows || [],
+                pagination: {
+                  page,
+                  pageSize,
+                  total,
+                  hasMore: page * pageSize < total,
+                },
+              }
+            : (decoratedRows || [])
+        );
+      })
       .catch((err) => {
         console.error("Mongo purchase report query failed, falling back to SQLite:", err.message);
         res.status(500).json({ error: err.message });
