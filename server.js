@@ -457,16 +457,75 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
         ? queryAll("SELECT id, sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, quantity, rate, amount, buyer_name, consignee_name, inv_no, self_loading, narration, labour_charges, total_freight, rent, shortage, status FROM outward ORDER BY date DESC, id DESC LIMIT 200")
         : Promise.resolve([]),
       canLoadPartyStockInsights
-        ? queryAll("SELECT id, date, company_id, location_id, warehouse_id, product_id, company_account_id, weight, shortage_percent FROM inward ORDER BY date ASC, id ASC")
+        ? queryAll(`
+            SELECT
+              i.id,
+              i.date,
+              i.company_id,
+              i.company_account_id,
+              i.location_id,
+              i.warehouse_id,
+              i.product_id,
+              i.weight,
+              i.shortage_percent,
+              COALESCE(ca.account_name, c.name, 'Unknown') AS party_name,
+              COALESCE(w.name, 'Unknown') AS warehouse_name
+            FROM inward i
+            LEFT JOIN companies c ON c.id = i.company_id
+            LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
+            LEFT JOIN warehouses w ON w.id = i.warehouse_id
+            ORDER BY i.date ASC, i.id ASC
+          `)
         : Promise.resolve([]),
       canLoadWarehouseRentInsights
-        ? queryAll("SELECT id, date, voucher_no, lorry_no, weight, company_id, company_account_id, warehouse_id, shortage_percent FROM inward ORDER BY date ASC, id ASC")
+        ? queryAll(`
+            SELECT
+              i.id,
+              i.date,
+              i.voucher_no,
+              i.lorry_no,
+              i.weight,
+              i.company_id,
+              i.company_account_id,
+              i.warehouse_id,
+              i.shortage_percent,
+              COALESCE(ca.account_name, c.name, 'Unknown') AS party_name,
+              COALESCE(w.name, 'Unknown') AS warehouse_name
+            FROM inward i
+            LEFT JOIN companies c ON c.id = i.company_id
+            LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
+            LEFT JOIN warehouses w ON w.id = i.warehouse_id
+            ORDER BY i.date ASC, i.id ASC
+          `)
         : Promise.resolve([]),
       canLoadPartyStockInsights
         ? queryAll("SELECT weight, date, shortage_percent FROM inward")
         : Promise.resolve([]),
       canLoadWarehouseRentInsights
-        ? queryAll("SELECT id, date, voucher_no, lorry_no, weight, company_id, company_account_id, warehouse_id, shortage_percent FROM inward ORDER BY date ASC, id ASC")
+        ? queryAll(
+            `
+            SELECT
+              i.id,
+              i.date,
+              i.voucher_no,
+              i.lorry_no,
+              i.weight,
+              i.company_id,
+              i.company_account_id,
+              i.warehouse_id,
+              i.shortage_percent,
+              i.rent,
+              COALESCE(ca.account_name, c.name, 'Unknown') AS party_name,
+              COALESCE(w.name, 'Unknown') AS warehouse_name
+            FROM inward i
+            LEFT JOIN companies c ON c.id = i.company_id
+            LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
+            LEFT JOIN warehouses w ON w.id = i.warehouse_id
+            WHERE substr(i.date, 1, 7) = ?
+            ORDER BY i.date ASC, i.id ASC
+          `,
+            [currentMonth]
+          )
         : Promise.resolve([]),
     ]);
 
@@ -524,8 +583,8 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
 
     const partyStockSummary = normalizeDashboardSummary({
       summary: (partyStockRows || []).map((row) => ({
-        party_name: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
-        warehouse_name: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "-",
+        party_name: row.party_name || "Unknown",
+        warehouse_name: row.warehouse_name || "-",
         gross_qty: Number(row.weight || 0),
         shortage_qty: 0,
         net_opening_qty: Number(row.weight || 0),
@@ -536,8 +595,8 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
 
     const warehouseStockSummary = normalizeDashboardSummary({
       summary: (warehouseStockRows || []).map((row) => ({
-        warehouse: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "Unknown",
-        party: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
+        warehouse: row.warehouse_name || "Unknown",
+        party: row.party_name || "Unknown",
         location: row.location_id ? `Location ${row.location_id}` : "-",
         stock: Number(row.weight || 0),
       })),
@@ -547,9 +606,9 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
 
     const monthEndRentSummary = normalizeDashboardSummary({
       summary: (monthEndRentRows || []).map((row) => ({
-        party_name: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
-        warehouse_name: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "-",
-        total_rent: 0,
+        party_name: row.party_name || "Unknown",
+        warehouse_name: row.warehouse_name || "-",
+        total_rent: Number(row.rent || 0),
         total_entries: 1,
       })),
     });
