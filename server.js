@@ -410,7 +410,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     const canReadInwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "inward.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create");
     const canReadOutwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "outward.manage") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create");
     const rentRate = 200;
-    const monthEndDate = new Date(Number(currentMonth.slice(0, 4)), Number(currentMonth.slice(5, 7)), 0).toISOString().slice(0, 10);
+    const referenceDate = currentDate;
 
     const queryAll = (sql, params = []) => new Promise((resolve, reject) => {
       db.all(sql, params, (err, rows) => {
@@ -524,7 +524,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
             ) ba ON CAST(ba.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
             WHERE DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) <= ?
             ORDER BY DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) ASC, a.id ASC
-          `, [monthEndDate])
+          `, [referenceDate])
         : Promise.resolve([]),
       true
         ? queryAll("SELECT weight, date, shortage_percent FROM inward")
@@ -612,7 +612,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     (partyStockRows || []).forEach((row) => {
       const originalWeight = Number(row.weight) || 0;
       const adjustments = (monthEndRentRows || []).filter((adj) => String(adj.inward_id) === String(row.id));
-      const slab = calculateMonthSlab(row.date, monthEndDate);
+      const slab = calculateMonthSlab(row.date, referenceDate);
       let adjustedQty = 0;
       let adjustedRentAmount = 0;
       let lastDispatchDate = null;
@@ -624,7 +624,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
           adj.outward_date,
           adj.created_at
         );
-        if (!adjustmentDate || adjustmentDate > monthEndDate) return;
+        if (!adjustmentDate || adjustmentDate > referenceDate) return;
 
         const qty = Number(adj.qty) || 0;
         const adjustmentSlab = calculateMonthSlab(row.date, adjustmentDate);
