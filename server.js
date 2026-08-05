@@ -497,8 +497,9 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
             LEFT JOIN companies c ON c.id = i.company_id
             LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
             LEFT JOIN warehouses w ON w.id = i.warehouse_id
+            WHERE substr(i.date, 1, 7) = ?
             ORDER BY i.date ASC, i.id ASC
-          `)
+          `, [currentMonth])
         : Promise.resolve([]),
       canLoadWarehouseRentInsights
         ? queryAll(`
@@ -524,12 +525,14 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
               WHERE COALESCE(unloading_date, '') != ''
               GROUP BY outward_id
             ) ba ON CAST(ba.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
+            LEFT JOIN inward i ON CAST(i.id AS TEXT) = CAST(a.inward_id AS TEXT)
             WHERE DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) <= ?
+              AND substr(i.date, 1, 7) = ?
             ORDER BY DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) ASC, a.id ASC
-          `, [monthEndDate])
+          `, [monthEndDate, currentMonth])
         : Promise.resolve([]),
       canLoadPartyStockInsights
-        ? queryAll("SELECT weight, date, shortage_percent FROM inward")
+        ? queryAll("SELECT weight, date, shortage_percent FROM inward WHERE substr(date, 1, 7) = ?", [currentMonth])
         : Promise.resolve([]),
       canLoadWarehouseRentInsights
         ? queryAll(
