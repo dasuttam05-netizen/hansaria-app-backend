@@ -161,6 +161,7 @@ const whVouchersRoutes = require("./routes/whVouchers");
 const cashEntriesRoutes = require("./routes/cashEntries");
 const { normalizeDashboardList, normalizeDashboardSummary } = require("./helpers/dashboardPayload");
 const { Location, Employee, Company, CompanyAccount, Warehouse, Product, Inward, Outward } = require("./db-mongodb");
+const { calculateShortageQty } = require("./routes/shortageHelper");
 
 function authorizeConsigneeOrExpense(
   req,
@@ -410,6 +411,8 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     const canLoadWarehouseRentInsights = userHasPermission(user, "report.warehouseRentMonthEnd");
     const canReadInwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "inward.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create");
     const canReadOutwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "outward.manage") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create");
+    const rentRate = 200;
+    const monthEndDate = new Date(Number(currentMonth.slice(0, 4)), Number(currentMonth.slice(5, 7)), 0).toISOString().slice(0, 10);
 
     const queryAll = (sql, params = []) => new Promise((resolve, reject) => {
       db.all(sql, params, (err, rows) => {
@@ -417,6 +420,26 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
         return resolve(rows || []);
       });
     });
+
+    const calculateMonthSlab = (inwardDateStr, refDateStr) => {
+      const inwardDate = new Date(inwardDateStr);
+      const refDate = new Date(refDateStr);
+      const msPerDay = 1000 * 60 * 60 * 24;
+      const daysDiff = Math.floor((refDate - inwardDate) / msPerDay);
+      let monthsDiff = Math.floor((daysDiff <= 0 ? 0 : daysDiff - 1) / 30) + 1;
+      if (monthsDiff < 1) monthsDiff = 1;
+      return { daysDiff: daysDiff < 0 ? 0 : daysDiff, monthsDiff };
+    };
+
+    const firstNonEmptyDate = (...values) => {
+      for (const value of values) {
+        const text = String(value || "").trim();
+        if (text && text !== "-" && text.toLowerCase() !== "null" && text.toLowerCase() !== "undefined") {
+          return text.slice(0, 10);
+        }
+      }
+      return null;
+    };
 
     const [
       locations,
@@ -480,23 +503,30 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       canLoadWarehouseRentInsights
         ? queryAll(`
             SELECT
-              i.id,
-              i.date,
-              i.voucher_no,
-              i.lorry_no,
-              i.weight,
-              i.company_id,
-              i.company_account_id,
-              i.warehouse_id,
-              i.shortage_percent,
-              COALESCE(ca.account_name, c.name, 'Unknown') AS party_name,
-              COALESCE(w.name, 'Unknown') AS warehouse_name
-            FROM inward i
-            LEFT JOIN companies c ON c.id = i.company_id
-            LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
-            LEFT JOIN warehouses w ON w.id = i.warehouse_id
-            ORDER BY i.date ASC, i.id ASC
-          `)
+              a.id,
+              a.inward_id,
+              a.qty,
+              a.created_at,
+              o.date AS outward_date,
+              tb.dispatch_date AS transport_dispatch_date,
+              ba.unloading_date AS buyer_unloading_date
+            FROM adjustment a
+            LEFT JOIN outward o ON CAST(o.id AS TEXT) = CAST(a.outward_id AS TEXT)
+            LEFT JOIN (
+              SELECT outward_id, MAX(dispatch_date) AS dispatch_date
+              FROM transport_bilti
+              WHERE COALESCE(dispatch_date, '') != ''
+              GROUP BY outward_id
+            ) tb ON CAST(tb.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
+            LEFT JOIN (
+              SELECT outward_id, MAX(unloading_date) AS unloading_date
+              FROM buyer_adjustments
+              WHERE COALESCE(unloading_date, '') != ''
+              GROUP BY outward_id
+            ) ba ON CAST(ba.outward_id AS TEXT) = CAST(a.outward_id AS TEXT)
+            WHERE DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) <= ?
+            ORDER BY DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) ASC, a.id ASC
+          `, [monthEndDate])
         : Promise.resolve([]),
       canLoadPartyStockInsights
         ? queryAll("SELECT weight, date, shortage_percent FROM inward")
@@ -581,35 +611,86 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       })),
     };
 
-    const partyStockSummary = normalizeDashboardSummary({
-      summary: (partyStockRows || []).map((row) => ({
+    const rentDetailedRows = [];
+    (partyStockRows || []).forEach((row) => {
+      const originalWeight = Number(row.weight) || 0;
+      const adjustments = (monthEndRentRows || []).filter((adj) => String(adj.inward_id) === String(row.id));
+      const slab = calculateMonthSlab(row.date, monthEndDate);
+      let adjustedQty = 0;
+      let adjustedRentAmount = 0;
+      let lastDispatchDate = null;
+
+      adjustments.forEach((adj) => {
+        const adjustmentDate = firstNonEmptyDate(
+          adj.transport_dispatch_date,
+          adj.buyer_unloading_date,
+          adj.outward_date,
+          adj.created_at
+        );
+        if (!adjustmentDate || adjustmentDate > monthEndDate) return;
+
+        const qty = Number(adj.qty) || 0;
+        const adjustmentSlab = calculateMonthSlab(row.date, adjustmentDate);
+        adjustedQty += qty;
+        adjustedRentAmount += qty * rentRate * adjustmentSlab.monthsDiff;
+        if (!lastDispatchDate || adjustmentDate > lastDispatchDate) lastDispatchDate = adjustmentDate;
+      });
+
+      const shortageQty = calculateShortageQty(originalWeight, slab.monthsDiff, row.shortage_percent);
+      const balanceQty = Math.max(originalWeight - shortageQty - adjustedQty, 0);
+      const balanceRentAmount = balanceQty * rentRate * slab.monthsDiff;
+
+      rentDetailedRows.push({
+        id: row.id,
         party_name: row.party_name || "Unknown",
         warehouse_name: row.warehouse_name || "-",
-        gross_qty: Number(row.weight || 0),
-        shortage_qty: 0,
-        net_opening_qty: Number(row.weight || 0),
-        already_adjusted_qty: 0,
-        available_balance_qty: Number(row.weight || 0),
+        voucher_no: row.voucher_no || "",
+        lorry_no: row.lorry_no || "",
+        original_weight: Number(originalWeight.toFixed(4)),
+        shortage_qty: Number(shortageQty.toFixed(4)),
+        adjusted_qty: Number(adjustedQty.toFixed(4)),
+        balance_qty: Number(balanceQty.toFixed(4)),
+        total_rent: Number((adjustedRentAmount + balanceRentAmount).toFixed(2)),
+        total_entries: 1,
+        dispatch_date: lastDispatchDate || null,
+      });
+    });
+
+    const partyStockSummary = normalizeDashboardSummary({
+      summary: rentDetailedRows.map((row) => ({
+        party_name: row.party_name,
+        warehouse_name: row.warehouse_name,
+        gross_qty: row.original_weight,
+        shortage_qty: row.shortage_qty,
+        net_opening_qty: row.original_weight,
+        already_adjusted_qty: row.adjusted_qty,
+        available_balance_qty: row.balance_qty,
       })),
     });
 
     const warehouseStockSummary = normalizeDashboardSummary({
-      summary: (warehouseStockRows || []).map((row) => ({
-        warehouse: row.warehouse_name || "Unknown",
-        party: row.party_name || "Unknown",
-        location: row.location_id ? `Location ${row.location_id}` : "-",
-        stock: Number(row.weight || 0),
+      summary: rentDetailedRows.map((row) => ({
+        warehouse: row.warehouse_name,
+        party: row.party_name,
+        location: "-",
+        stock: row.balance_qty,
       })),
     });
 
-    const totalStockValue = (totalStockRows || []).reduce((sum, row) => sum + Number(row.weight || 0), 0);
+    const totalStockValue = rentDetailedRows.reduce((sum, row) => sum + Number(row.balance_qty || 0), 0);
 
     const monthEndRentSummary = normalizeDashboardSummary({
-      summary: (monthEndRentRows || []).map((row) => ({
-        party_name: row.party_name || "Unknown",
-        warehouse_name: row.warehouse_name || "-",
-        total_rent: Number(row.rent || 0),
-        total_entries: 1,
+      summary: rentDetailedRows.map((row) => ({
+        party_name: row.party_name,
+        warehouse_name: row.warehouse_name,
+        total_rent: row.total_rent,
+        total_entries: row.total_entries,
+        voucher_no: row.voucher_no,
+        lorry_no: row.lorry_no,
+        original_weight: row.original_weight,
+        adjusted_qty: row.adjusted_qty,
+        shortage_qty: row.shortage_qty,
+        balance_qty: row.balance_qty,
       })),
     });
 
