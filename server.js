@@ -411,19 +411,63 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     const canReadInwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "inward.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create");
     const canReadOutwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "outward.manage") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create");
 
-    const [locations, employees, companies, companyAccounts, warehouses, products, inwardResponse, outwardResponse, partyStockRows, warehouseStockRows, totalStockRows, monthEndRentRows] = await Promise.all([
-      canReadLocations ? Location.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
-      canReadEmployees ? Employee.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
-      canReadCompanies ? Company.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
-      canReadCompanyAccounts ? CompanyAccount.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
-      canReadWarehouses ? Warehouse.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
-      canReadProducts ? Product.find().sort({ created_at: -1 }).lean() : Promise.resolve([]),
-      canReadInwards ? Inward.find().sort({ date: -1, _id: -1 }).limit(200).lean() : Promise.resolve([]),
-      canReadOutwards ? Outward.find().sort({ date: -1, _id: -1 }).limit(200).lean() : Promise.resolve([]),
-      canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT id, date, company_id, location_id, warehouse_id, product_id, company_account_id, weight, shortage_percent FROM inward ORDER BY date ASC, id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
-      canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT id, company_id, location_id, warehouse_id, company_account_id, weight, date, shortage_percent FROM inward ORDER BY date ASC, id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
-      canLoadPartyStockInsights ? new Promise((resolve, reject) => db.all("SELECT weight, date, shortage_percent FROM inward", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
-      canLoadWarehouseRentInsights ? new Promise((resolve, reject) => db.all("SELECT id, date, voucher_no, lorry_no, weight, company_id, company_account_id, warehouse_id, shortage_percent FROM inward ORDER BY date ASC, id ASC", (err, rows) => err ? reject(err) : resolve(rows))) : Promise.resolve([]),
+    const queryAll = (sql, params = []) => new Promise((resolve, reject) => {
+      db.all(sql, params, (err, rows) => {
+        if (err) return reject(err);
+        return resolve(rows || []);
+      });
+    });
+
+    const [
+      locations,
+      employees,
+      companies,
+      companyAccounts,
+      warehouses,
+      products,
+      inwardRows,
+      outwardRows,
+      partyStockRows,
+      warehouseStockRows,
+      totalStockRows,
+      monthEndRentRows,
+    ] = await Promise.all([
+      canReadLocations
+        ? queryAll("SELECT id, name, address, abbr, created_at FROM locations ORDER BY id DESC")
+        : Promise.resolve([]),
+      canReadEmployees
+        ? queryAll("SELECT id, name, mobile, address, username, role, permissions, location_id, created_at FROM employees ORDER BY id DESC")
+        : Promise.resolve([]),
+      canReadCompanies
+        ? queryAll("SELECT id, name, address, mobile, shortage_percent, created_at FROM companies ORDER BY id DESC")
+        : Promise.resolve([]),
+      canReadCompanyAccounts
+        ? queryAll("SELECT id, account_name, address, company_id, pan_no, mobile, shortage_percent FROM company_accounts ORDER BY id DESC")
+        : Promise.resolve([]),
+      canReadWarehouses
+        ? queryAll("SELECT id, name, address, location_id, employee_id FROM warehouses ORDER BY id DESC")
+        : Promise.resolve([]),
+      canReadProducts
+        ? queryAll("SELECT id, name, hsn_code FROM products ORDER BY id DESC")
+        : Promise.resolve([]),
+      canReadInwards
+        ? queryAll("SELECT id, sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, remaining_qty, shortage_percent, labour_charges, rent, shortage, narration, created_at FROM inward ORDER BY date DESC, id DESC LIMIT 200")
+        : Promise.resolve([]),
+      canReadOutwards
+        ? queryAll("SELECT id, sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, quantity, rate, amount, buyer_name, consignee_name, inv_no, self_loading, narration, labour_charges, total_freight, rent, shortage, status, created_at FROM outward ORDER BY date DESC, id DESC LIMIT 200")
+        : Promise.resolve([]),
+      canLoadPartyStockInsights
+        ? queryAll("SELECT id, date, company_id, location_id, warehouse_id, product_id, company_account_id, weight, shortage_percent FROM inward ORDER BY date ASC, id ASC")
+        : Promise.resolve([]),
+      canLoadWarehouseRentInsights
+        ? queryAll("SELECT id, date, voucher_no, lorry_no, weight, company_id, company_account_id, warehouse_id, shortage_percent FROM inward ORDER BY date ASC, id ASC")
+        : Promise.resolve([]),
+      canLoadPartyStockInsights
+        ? queryAll("SELECT weight, date, shortage_percent FROM inward")
+        : Promise.resolve([]),
+      canLoadWarehouseRentInsights
+        ? queryAll("SELECT id, date, voucher_no, lorry_no, weight, company_id, company_account_id, warehouse_id, shortage_percent FROM inward ORDER BY date ASC, id ASC")
+        : Promise.resolve([]),
     ]);
 
     const listPayload = {
@@ -457,20 +501,20 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
         id: item.id ?? item._id,
         name: item.name || "",
       })),
-      inwards: normalizeDashboardList(inwardResponse).map((item) => ({
+      inwards: normalizeDashboardList(inwardRows).map((item) => ({
         ...item,
         id: item.id ?? item._id,
         voucher_no: item.voucher_no || item.inward_no || item.inwardNo || item.voucherNo,
-        date: item.date ? (typeof item.date === "string" ? item.date : item.date.toISOString().slice(0, 10)) : "",
+        date: item.date ? String(item.date).slice(0, 10) : "",
         company_name: item.company_name || item.company || (typeof item.company_id === "string" ? item.company_id : undefined) || "",
         account_name: item.account_name || item.company_account || item.companyAccount || "",
         weight: item.weight ?? item.quantity ?? 0,
       })),
-      outwards: normalizeDashboardList(outwardResponse).map((item) => ({
+      outwards: normalizeDashboardList(outwardRows).map((item) => ({
         ...item,
         id: item.id ?? item._id,
         inv_no: item.inv_no || item.outward_no || item.outwardNo || item.invoice_no || item.voucher_no || item.voucherNo,
-        date: item.date ? (typeof item.date === "string" ? item.date : item.date.toISOString().slice(0, 10)) : "",
+        date: item.date ? String(item.date).slice(0, 10) : "",
         party_name: item.party_name || item.buyer_name || item.buyer || item.company_name || item.company || "",
         company_name: item.company_name || item.company || "",
         account_name: item.account_name || item.company_account || item.companyAccount || "",
@@ -478,45 +522,37 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       })),
     };
 
-    const partyStockSummary = canLoadPartyStockInsights
-      ? normalizeDashboardSummary({
-          summary: (partyStockRows || []).map((row) => ({
-            party_name: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
-            warehouse_name: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "-",
-            gross_qty: Number(row.weight || 0),
-            shortage_qty: 0,
-            net_opening_qty: Number(row.weight || 0),
-            already_adjusted_qty: 0,
-            available_balance_qty: Number(row.weight || 0),
-          })),
-        })
-      : [];
+    const partyStockSummary = normalizeDashboardSummary({
+      summary: (partyStockRows || []).map((row) => ({
+        party_name: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
+        warehouse_name: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "-",
+        gross_qty: Number(row.weight || 0),
+        shortage_qty: 0,
+        net_opening_qty: Number(row.weight || 0),
+        already_adjusted_qty: 0,
+        available_balance_qty: Number(row.weight || 0),
+      })),
+    });
 
-    const warehouseStockSummary = canLoadPartyStockInsights
-      ? normalizeDashboardSummary({
-          summary: (warehouseStockRows || []).map((row) => ({
-            warehouse: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "Unknown",
-            party: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
-            location: row.location_id ? `Location ${row.location_id}` : "-",
-            stock: Number(row.weight || 0),
-          })),
-        })
-      : [];
+    const warehouseStockSummary = normalizeDashboardSummary({
+      summary: (warehouseStockRows || []).map((row) => ({
+        warehouse: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "Unknown",
+        party: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
+        location: row.location_id ? `Location ${row.location_id}` : "-",
+        stock: Number(row.weight || 0),
+      })),
+    });
 
-    const totalStockValue = canLoadPartyStockInsights
-      ? (totalStockRows || []).reduce((sum, row) => sum + Number(row.weight || 0), 0)
-      : 0;
+    const totalStockValue = (totalStockRows || []).reduce((sum, row) => sum + Number(row.weight || 0), 0);
 
-    const monthEndRentSummary = canLoadWarehouseRentInsights
-      ? normalizeDashboardSummary({
-          summary: (monthEndRentRows || []).map((row) => ({
-            party_name: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
-            warehouse_name: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "-",
-            total_rent: 0,
-            total_entries: 1,
-          })),
-        })
-      : [];
+    const monthEndRentSummary = normalizeDashboardSummary({
+      summary: (monthEndRentRows || []).map((row) => ({
+        party_name: row.company_id || row.company_account_id ? `Party ${row.company_id || row.company_account_id}` : "Unknown",
+        warehouse_name: row.warehouse_id ? `Warehouse ${row.warehouse_id}` : "-",
+        total_rent: 0,
+        total_entries: 1,
+      })),
+    });
 
     res.json({
       ...listPayload,
