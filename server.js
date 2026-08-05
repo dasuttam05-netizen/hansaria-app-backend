@@ -451,7 +451,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       partyStockRows,
       warehouseStockRows,
       totalStockRows,
-      monthEndRentRows,
+      adjustmentRows,
     ] = await Promise.all([
       canReadLocations
         ? queryAll("SELECT id, name, address FROM locations ORDER BY id DESC")
@@ -608,10 +608,17 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       })),
     };
 
+    const adjustmentMap = {};
+    (adjustmentRows || []).forEach((item) => {
+      const key = String(item.inward_id);
+      if (!adjustmentMap[key]) adjustmentMap[key] = [];
+      adjustmentMap[key].push(item);
+    });
+
     const rentDetailedRows = [];
     (partyStockRows || []).forEach((row) => {
       const originalWeight = Number(row.weight) || 0;
-      const adjustments = (monthEndRentRows || []).filter((adj) => String(adj.inward_id) === String(row.id));
+      const adjustments = adjustmentMap[String(row.id)] || [];
       const slab = calculateMonthSlab(row.date, referenceDate);
       let adjustedQty = 0;
       let adjustedRentAmount = 0;
