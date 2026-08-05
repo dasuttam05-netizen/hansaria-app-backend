@@ -407,8 +407,6 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     const canReadCompanyAccounts = userHasPermission(user, "dashboard.view") || userHasPermission(user, "companyAccounts.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create") || userHasPermission(user, "adjustment.manage") || userHasPermission(user, "expense.entry") || userHasPermission(user, "expense.view") || userHasPermission(user, "expense.create") || userHasPermission(user, "cash.view") || userHasPermission(user, "settlement.view") || userHasPermission(user, "report.inward") || userHasPermission(user, "report.erp") || userHasPermission(user, "report.partyLedger") || userHasPermission(user, "report.partyStock") || userHasPermission(user, "report.warehouseRentLedger") || userHasPermission(user, "report.warehouseRentMonthEnd") || userHasPermission(user, "report.outwardSettlement") || userHasPermission(user, "report.expense");
     const canReadWarehouses = userHasPermission(user, "dashboard.view") || userHasPermission(user, "warehouses.manage") || userHasPermission(user, "warehouse.trading.purchase.view") || userHasPermission(user, "warehouse.trading.sale.view") || userHasPermission(user, "warehouse.trading.payment.view") || userHasPermission(user, "warehouse.trading.receipt.view") || userHasPermission(user, "warehouse.trading.journal.view") || userHasPermission(user, "outward.view") || userHasPermission(user, "inward.view");
     const canReadProducts = userHasPermission(user, "dashboard.view") || userHasPermission(user, "products.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create") || userHasPermission(user, "adjustment.manage") || userHasPermission(user, "expense.entry") || userHasPermission(user, "expense.view") || userHasPermission(user, "expense.create") || userHasPermission(user, "transport.manage") || userHasPermission(user, "report.inward") || userHasPermission(user, "report.erp") || userHasPermission(user, "report.partyLedger") || userHasPermission(user, "report.partyStock");
-    const canLoadPartyStockInsights = userHasPermission(user, "report.partyStock");
-    const canLoadWarehouseRentInsights = userHasPermission(user, "report.warehouseRentMonthEnd");
     const canReadInwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "inward.manage") || userHasPermission(user, "inward.view") || userHasPermission(user, "inward.create");
     const canReadOutwards = userHasPermission(user, "dashboard.view") || userHasPermission(user, "outward.manage") || userHasPermission(user, "outward.view") || userHasPermission(user, "outward.create");
     const rentRate = 200;
@@ -479,7 +477,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       canReadOutwards
         ? queryAll("SELECT id, sl_no, voucher_no, date, employee_id, location_id, warehouse_id, product_id, company_id, company_account_id, lorry_no, weight, quantity, rate, amount, buyer_name, consignee_name, inv_no, self_loading, narration, labour_charges, total_freight, rent, shortage, status FROM outward ORDER BY date DESC, id DESC LIMIT 200")
         : Promise.resolve([]),
-      canLoadPartyStockInsights
+      true
         ? queryAll(`
             SELECT
               i.id,
@@ -500,7 +498,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
             ORDER BY i.date ASC, i.id ASC
           `)
         : Promise.resolve([]),
-      canLoadWarehouseRentInsights
+      true
         ? queryAll(`
             SELECT
               a.id,
@@ -528,10 +526,10 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
             ORDER BY DATE(COALESCE(tb.dispatch_date, ba.unloading_date, o.date, a.created_at)) ASC, a.id ASC
           `, [monthEndDate])
         : Promise.resolve([]),
-      canLoadPartyStockInsights
+      true
         ? queryAll("SELECT weight, date, shortage_percent FROM inward")
         : Promise.resolve([]),
-      canLoadWarehouseRentInsights
+      true
         ? queryAll(
             `
             SELECT
@@ -551,10 +549,9 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
             LEFT JOIN companies c ON c.id = i.company_id
             LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
             LEFT JOIN warehouses w ON w.id = i.warehouse_id
-            WHERE substr(i.date, 1, 7) = ?
             ORDER BY i.date ASC, i.id ASC
           `,
-            [currentMonth]
+            []
           )
         : Promise.resolve([]),
     ]);
