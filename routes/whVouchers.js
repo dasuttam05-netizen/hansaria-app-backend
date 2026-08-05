@@ -2102,6 +2102,52 @@ router.get("/purchase", (req, res) => {
   getPurchaseVoucherRows(req, res);
 });
 
+router.get("/purchase/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const query = `
+    SELECT
+      v.*,
+      (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
+      (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
+      (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
+      ca.account_name AS company_account_name
+    FROM wh_purchase_vouchers v
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    WHERE CAST(v.id AS TEXT) = ?
+    LIMIT 1
+  `;
+
+  db.get(query, [id], async (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) {
+      if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+        try {
+          const purchase = await PurchaseVoucher.findById(id).lean();
+          if (purchase) {
+            const [decorated] = await decoratePurchaseRows([purchase]);
+            row = decorated || null;
+          }
+        } catch (mongoErr) {
+          console.error("Mongo purchase lookup failed:", mongoErr.message);
+        }
+      }
+    }
+
+    if (!row) return res.status(404).json({ error: "Purchase voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    return res.json({
+      ...row,
+      id: String(row.id || row._id),
+      _id: String(row._id || row.id || id),
+    });
+  });
+});
+
 router.get("/purchase/import-template", (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
     return res.status(403).json({ error: "Permission denied" });
