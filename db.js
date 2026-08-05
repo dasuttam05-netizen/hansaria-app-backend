@@ -589,6 +589,28 @@ let db = null;
   )
 `);
 
+  const createIndexIfNotExists = (name, sql) => {
+    db.run(`CREATE INDEX IF NOT EXISTS ${name} ${sql}`, (err) => {
+      if (err && !String(err.message || "").includes("already exists")) {
+        console.log(`Index ${name} create error:`, err.message);
+      }
+    });
+  };
+
+  createIndexIfNotExists("idx_inward_date", "ON inward(date)");
+  createIndexIfNotExists("idx_inward_company_date", "ON inward(company_id, date)");
+  createIndexIfNotExists("idx_inward_warehouse_date", "ON inward(warehouse_id, date)");
+  createIndexIfNotExists("idx_inward_location_date", "ON inward(location_id, date)");
+  createIndexIfNotExists("idx_inward_account_date", "ON inward(company_account_id, date)");
+  createIndexIfNotExists("idx_adjustment_inward", "ON adjustment(inward_id)");
+  createIndexIfNotExists("idx_adjustment_outward", "ON adjustment(outward_id)");
+  createIndexIfNotExists("idx_buyer_adjustments_outward", "ON buyer_adjustments(outward_id)");
+  createIndexIfNotExists("idx_transport_bilti_outward_dispatch", "ON transport_bilti(outward_id, dispatch_date)");
+  createIndexIfNotExists("idx_companies_name", "ON companies(name)");
+  createIndexIfNotExists("idx_warehouses_name", "ON warehouses(name)");
+  createIndexIfNotExists("idx_locations_name", "ON locations(name)");
+  createIndexIfNotExists("idx_company_accounts_name", "ON company_accounts(account_name)");
+
   db.run(`
     CREATE TABLE IF NOT EXISTS warehouse_journeys (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
