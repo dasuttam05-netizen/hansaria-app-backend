@@ -2137,7 +2137,38 @@ router.get("/purchase/:id", (req, res) => {
       }
     }
 
-    if (!row) return res.status(404).json({ error: "Purchase voucher not found" });
+    if (!row) {
+      const legacyQuery = `
+        SELECT
+          t.*, 
+          w.name AS warehouse_name,
+          f.name AS farmer_name,
+          p.name AS product_name,
+          t.quantity AS total_quantity,
+          t.amount AS total_amount,
+          t.amount AS net_amount_payable,
+          1 AS legacy_purchase_entry
+        FROM warehouse_trading_entries t
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(t.warehouse_id AS TEXT)
+        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(t.farmer_id AS TEXT)
+        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(t.product_id AS TEXT)
+        WHERE LOWER(COALESCE(t.transaction_type, '')) = 'purchase' AND CAST(t.id AS TEXT) = ?
+        LIMIT 1
+      `;
+
+      return db.get(legacyQuery, [id], (legacyErr, legacyRow) => {
+        if (legacyErr) return res.status(500).json({ error: legacyErr.message });
+        if (!legacyRow) return res.status(404).json({ error: "Purchase voucher not found" });
+        if (!ensureWarehouseAccess(req, res, legacyRow.warehouse_id)) return;
+
+        return res.json({
+          ...legacyRow,
+          id: String(legacyRow.id || legacyRow._id || id),
+          _id: String(legacyRow._id || legacyRow.id || id),
+        });
+      });
+    }
+
     if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
 
     return res.json({
