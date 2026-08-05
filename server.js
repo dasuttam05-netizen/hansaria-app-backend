@@ -433,7 +433,7 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       monthEndRentRows,
     ] = await Promise.all([
       canReadLocations
-        ? queryAll("SELECT id, name, address, abbr, created_at FROM locations ORDER BY id DESC")
+        ? queryAll("SELECT id, name, address FROM locations ORDER BY id DESC")
         : Promise.resolve([]),
       canReadEmployees
         ? queryAll("SELECT id, name, mobile, address, username, role, permissions, location_id, created_at FROM employees ORDER BY id DESC")
