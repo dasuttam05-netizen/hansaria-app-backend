@@ -4261,12 +4261,12 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
   try {
     const farmerId = String(req.query.farmer_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
-    const allPurchases = await getPurchaseReportRowsForUser(req.user);
-    const purchases = allPurchases.filter((row) => {
+    const purchases = (await getPurchaseReportRowsForUser(req.user)).filter((row) => {
       if (farmerId && String(row.farmer_id || "") !== farmerId) return false;
       if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
       return true;
     });
+
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
     const paymentParams = [...filter.params];
     let farmerClause = "";
@@ -4279,6 +4279,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       accountClause = " AND CAST(p.company_account_id AS TEXT) = CAST(? AS TEXT)";
       paymentParams.push(companyAccountId);
     }
+
     const payments = await dbAll(
       `
         SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name, ca.account_name AS company_account_name
@@ -4304,14 +4305,16 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
           paymentIds
         )
       : [];
+
     const purchaseMap = new Map(purchases.map((row) => [String(row.id || row._id), row]));
     const paymentMap = new Map(payments.map((row) => [String(row.id), row]));
     const adjustmentsByPayment = new Map();
     const adjustmentsByPurchase = new Map();
+
     sqliteAdjustments.forEach((item) => {
       const paymentId = String(item.payment_id);
       const purchaseId = String(item.purchase_id);
-      const purchase = purchaseMap.get(String(item.purchase_id));
+      const purchase = purchaseMap.get(purchaseId);
       const payment = paymentMap.get(paymentId);
       const voucherNo = item.purchase_voucher_no || purchase?.voucher_no || item.purchase_id;
       const detail = {
@@ -4327,9 +4330,6 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       adjustmentsByPurchase.get(purchaseId).push(detail);
     });
 
-    const sales = await getSaleReportRowsForUser(req.user);
-    const saleByVoucherNo = new Map((sales || []).map((row) => [String(row.voucher_no || ""), row]).filter(([voucherNo]) => voucherNo));
-    const saleVoucherNos = new Set(saleByVoucherNo.keys());
     const rows = [
       ...purchases.map((row) => {
         const purchaseId = String(row.id || row._id);
@@ -4387,244 +4387,11 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
         };
       }),
     ];
-    let buyerClause = "";
-    if (companyAccountId) {
-      accountClause = " AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)";
-      receiptParams.push(companyAccountId);
-    }
-    if (buyerId) {
-      buyerClause = " AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)";
-      receiptParams.push(buyerId);
-    }
-    const receipts = await dbAll(
-      `
-        SELECT r.*, w.name AS warehouse_name, b.name AS buyer_name, ca.account_name AS company_account_name
-        FROM wh_receipt_vouchers r
-        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(r.warehouse_id AS TEXT)
-        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(r.company_id AS TEXT)
-        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
-        WHERE 1 = 1 ${filter.clause}${accountClause}${buyerClause}
-      `,
-      receiptParams
-    );
 
-    const journalParams = [...filter.params];
-    let journalAccountClause = "";
-    if (companyAccountId) {
-      journalAccountClause = " AND CAST(j.company_account_id AS TEXT) = CAST(? AS TEXT)";
-      journalParams.push(companyAccountId);
-    }
-    const journals = await dbAll(
-      `
-        SELECT j.*, w.name AS warehouse_name, ca.account_name AS company_account_name
-        FROM wh_journal_vouchers j
-        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(j.warehouse_id AS TEXT)
-        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(j.company_account_id AS TEXT)
-        WHERE j.description LIKE 'Auto sale deduction:%' ${filter.clause.replace(/r\./g, "j.")}${journalAccountClause}
-      `,
-      journalParams
-    );
-
-    const getSaleVoucherNoFromJournal = (row) => {
-      const parts = String(row.description || "").split(":");
-      return String(parts[1] || "").trim();
-    };
-    const journalsBySaleVoucherNo = new Map();
-    (journals || []).forEach((row) => {
-      const sourceVoucher = getSaleVoucherNoFromJournal(row);
-      if (!sourceVoucher || !saleVoucherNos.has(sourceVoucher)) return;
-      if (!journalsBySaleVoucherNo.has(sourceVoucher)) journalsBySaleVoucherNo.set(sourceVoucher, []);
-      journalsBySaleVoucherNo.get(sourceVoucher).push(row);
-    });
-
-    const receiptIds = (receipts || []).map((row) => row.id);
-    const receiptAdjustments = receiptIds.length
-      ? await dbAll(
-          `
-            SELECT a.*, sv.voucher_no AS sale_voucher_no
-            FROM wh_receipt_adjustments a
-            LEFT JOIN wh_sale_vouchers sv ON CAST(sv.id AS TEXT) = CAST(a.sale_id AS TEXT)
-            WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
-            ORDER BY a.id ASC
-          `,
-          receiptIds
-        )
-      : [];
-
-    const saleMap = new Map((sales || []).map((row) => [String(row.id || row._id), row]));
-    const receiptMap = new Map((receipts || []).map((row) => [String(row.id), row]));
-    const adjustmentsByReceipt = new Map();
-    const adjustmentsBySale = new Map();
-    (receiptAdjustments || []).forEach((item) => {
-      const receiptId = String(item.receipt_id);
-      const saleId = String(item.sale_id);
-      const sale = saleMap.get(saleId);
-      const receipt = receiptMap.get(receiptId);
-      const detail = {
-        ...item,
-        sale_voucher_no: item.sale_voucher_no || sale?.voucher_no || item.sale_id,
-        receipt_voucher_no: receipt?.voucher_no || "",
-        receipt_date: receipt?.date || "",
-      };
-      if (!adjustmentsByReceipt.has(receiptId)) adjustmentsByReceipt.set(receiptId, []);
-      adjustmentsByReceipt.get(receiptId).push(detail);
-      if (!adjustmentsBySale.has(saleId)) adjustmentsBySale.set(saleId, []);
-      adjustmentsBySale.get(saleId).push(detail);
-    });
-
-    const adjustedBySale = new Map();
-    (receiptAdjustments || []).forEach((item) => {
-      const saleId = String(item.sale_id);
-      adjustedBySale.set(saleId, (adjustedBySale.get(saleId) || 0) + Number(item.adjusted_amount || 0));
-    });
-
-    (receipts || [])
-      .filter((receipt) => !(adjustmentsByReceipt.get(String(receipt.id)) || []).length)
-      .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
-      .forEach((receipt) => {
-        let remaining = Number(receipt.amount || 0);
-        if (remaining <= 0) return;
-
-        const reference = String(receipt.reference_id || "").trim().toLowerCase();
-        const matchingSales = (sales || [])
-          .filter((sale) => {
-            const sameBuyer = String(sale.buyer_id || sale.company_id || "") === String(receipt.company_id || "");
-            const sameAccount = String(sale.company_account_id || "") === String(receipt.company_account_id || "");
-            return sameBuyer && sameAccount;
-          })
-          .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
-
-        const referencedSales = reference
-          ? matchingSales.filter((sale) => {
-              const saleId = String(sale.id || sale._id || "").toLowerCase();
-              const voucherNo = String(sale.voucher_no || "").toLowerCase();
-              return reference === saleId || reference === voucherNo || reference.includes(voucherNo);
-            })
-          : [];
-        const saleCandidates = referencedSales.length ? referencedSales : matchingSales;
-
-        saleCandidates.forEach((sale) => {
-          if (remaining <= 0) return;
-          const saleId = String(sale.id || sale._id);
-          const saleAmount = Number(sale.total_amount || sale.net_receivable_amount || sale.amount || 0);
-          const alreadyAdjusted = adjustedBySale.get(saleId) || 0;
-          const pending = Math.max(0, saleAmount - alreadyAdjusted);
-          const adjustedAmount = Math.min(remaining, pending);
-          if (adjustedAmount <= 0) return;
-
-          const detail = {
-            receipt_id: receipt.id,
-            sale_id: saleId,
-            adjusted_amount: Number(adjustedAmount.toFixed(2)),
-            sale_voucher_no: sale.voucher_no || saleId,
-            receipt_voucher_no: receipt.voucher_no || "",
-            receipt_date: receipt.date || "",
-            inferred_adjustment: true,
-          };
-          if (!adjustmentsByReceipt.has(String(receipt.id))) adjustmentsByReceipt.set(String(receipt.id), []);
-          adjustmentsByReceipt.get(String(receipt.id)).push(detail);
-          if (!adjustmentsBySale.has(saleId)) adjustmentsBySale.set(saleId, []);
-          adjustmentsBySale.get(saleId).push(detail);
-          adjustedBySale.set(saleId, alreadyAdjusted + adjustedAmount);
-          remaining -= adjustedAmount;
-        });
-      });
-
-    const ledgerRows = [
-      ...sales.map((row) => {
-        const saleId = String(row.id || row._id);
-        const receiptDetails = adjustmentsBySale.get(saleId) || [];
-        const saleAmount = Number(row.amount || row.total_amount || row.net_receivable_amount || 0);
-        const receiptAmount = receiptDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
-        const journalDetails = journalsBySaleVoucherNo.get(String(row.voucher_no || "")) || [];
-        const journalAmount = journalDetails.reduce((sum, item) => sum + Number(item.amount || 0), 0);
-        return {
-          date: row.date,
-          voucher_no: row.voucher_no,
-          voucher_type: "Sale",
-          warehouse_id: row.warehouse_id,
-          warehouse_name: row.warehouse_name,
-          company_id: row.buyer_id || row.company_id,
-          company_name: row.buyer_name || row.company_name,
-          company_account_id: row.company_account_id,
-          company_account_name: row.company_account_name,
-          buyer_id: row.buyer_id,
-          buyer_name: row.buyer_name,
-          buyer_email: row.buyer_email || "",
-          buyer_mobile: row.buyer_mobile || "",
-          party_name: row.buyer_name || row.company_name || "-",
-          sale_id: saleId,
-          sale_amount: Number(saleAmount.toFixed(2)),
-          receipt_amount: Number(receiptAmount.toFixed(2)),
-          journal_amount: Number(journalAmount.toFixed(2)),
-          payment_details: receiptDetails,
-          journal_details: journalDetails.map((item) => ({
-            date: item.date,
-            voucher_no: item.voucher_no,
-            type: item.credit_account || "Deduction",
-            amount: Number(item.amount || 0),
-            description: item.description || "",
-          })),
-          bill_balance: Number((saleAmount - receiptAmount - journalAmount).toFixed(2)),
-          balance: Number((saleAmount - receiptAmount - journalAmount).toFixed(2)),
-          debit: saleAmount,
-          credit: 0,
-          unloading_date: row.unloading_date || "",
-          due_date: row.due_date || "",
-          due_days: Number.isFinite(Number(row.due_days)) ? Number(row.due_days) : calculateDaysDiff(row.unloading_date || row.date, row.due_date),
-          days_overdue: Number.isFinite(Number(row.days_overdue)) ? Number(row.days_overdue) : calculateDaysDiff(row.due_date, new Date().toISOString().slice(0, 10)),
-          followup_status: row.followup_status || "pending",
-          followup_status_label: getFollowupStatusLabel(row.followup_status),
-        };
-      }),
-      ...receipts.map((row) => {
-        const receiptItems = adjustmentsByReceipt.get(String(row.id)) || [];
-        return {
-          date: row.date,
-          voucher_no: row.voucher_no,
-          voucher_type: "Receipt",
-          warehouse_id: row.warehouse_id,
-          warehouse_name: row.warehouse_name,
-          company_id: row.company_id,
-          company_name: row.buyer_name || row.company_name,
-          company_account_id: row.company_account_id,
-          company_account_name: row.company_account_name,
-          buyer_id: row.company_id,
-          buyer_name: row.buyer_name || row.company_name,
-          debit: 0,
-          credit: Number(row.amount || 0),
-          particulars: `Receipt adjusted against ${receiptItems.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || "sale bill"}`,
-          adjustment_details: receiptItems.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
-        };
-      }),
-      ...journals.map((row) => {
-        const sourceVoucher = getSaleVoucherNoFromJournal(row);
-        const sourceSale = saleByVoucherNo.get(sourceVoucher);
-        if (!sourceSale) return null;
-        return {
-          date: row.date,
-          voucher_no: row.voucher_no,
-          voucher_type: row.credit_account || "Journal",
-          warehouse_id: row.warehouse_id,
-          warehouse_name: row.warehouse_name || sourceSale?.warehouse_name,
-          company_id: sourceSale?.buyer_id || sourceSale?.company_id,
-          company_name: sourceSale?.buyer_name || sourceSale?.company_name,
-          company_account_id: row.company_account_id || sourceSale?.company_account_id,
-          company_account_name: row.company_account_name || sourceSale?.company_account_name,
-          buyer_id: sourceSale?.buyer_id || sourceSale?.company_id || `account-${row.company_account_id || "unknown"}`,
-          buyer_name: sourceSale?.buyer_name || sourceSale?.company_name || row.company_account_name || "Sale Deduction",
-          debit: 0,
-          credit: Number(row.amount || 0),
-          particulars: `${row.credit_account || "Deduction"} against ${sourceVoucher || "sale bill"}`,
-          adjustment_details: row.description || "",
-        };
-      }).filter(Boolean),
-    ];
-
-res.json(buildLedgerRows(
-      ledgerRows,
-      (row) => `${row.buyer_id || row.company_id || "unknown"}::${row.company_account_id || "no-account"}`,
-      (row) => row.buyer_name || row.company_name || "Unknown Buyer"
+    return res.json(buildLedgerRows(
+      rows,
+      (row) => `${row.farmer_id || "unknown"}::${row.company_account_id || "no-account"}`,
+      (row) => row.farmer_name || row.company_account_name || "Unknown Farmer"
     ));
   } catch (err) {
     res.status(500).json({ error: err.message });
