@@ -165,8 +165,13 @@ function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
   });
 }
 
-function getSqliteSaleRowsForUser(user) {
+function getSqliteSaleRowsForUser(user, options = {}) {
   const filter = assignedWarehouseFilter(user, "v.warehouse_id");
+  const hasLimit = Number.isFinite(Number(options.limit));
+  const queryParams = [...filter.params];
+  if (hasLimit) {
+    queryParams.push(Number(options.limit), Number(options.offset) || 0);
+  }
   return dbAll(
     `
       SELECT
@@ -191,15 +196,20 @@ function getSqliteSaleRowsForUser(user) {
       LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
       WHERE 1 = 1 ${filter.clause}
       ORDER BY v.date DESC, v.id DESC
+      ${hasLimit ? "LIMIT ? OFFSET ?" : ""}
     `,
-    filter.params
+    queryParams
   );
 }
 
-async function getAllSaleVoucherRowsForUser(user) {
-  const sqliteRows = await getSqliteSaleRowsForUser(user);
+async function getAllSaleVoucherRowsForUser(user, options = {}) {
+  const sqliteRows = await getSqliteSaleRowsForUser(user, options);
   if (!mongoReady()) return sqliteRows;
-  const mongoRows = await SaleVoucher.find(mongoPurchaseScope(user)).lean();
+  const mongoQuery = SaleVoucher.find(mongoPurchaseScope(user)).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+  if (Number.isFinite(Number(options.limit))) {
+    mongoQuery.skip(Number(options.offset) || 0).limit(Number(options.limit));
+  }
+  const mongoRows = await mongoQuery;
   const mergedRows = mergeSaleRows(await decorateSaleRows(mongoRows), sqliteRows);
   const withBilti = await attachSaleBiltiIds(mergedRows);
   return withBilti.map((row) => ({
@@ -3751,11 +3761,13 @@ function dbAll(query, params = []) {
   });
 }
 
-async function getPurchaseReportRowsForUser(user) {
+async function getPurchaseReportRowsForUser(user, options = {}) {
   if (mongoReady()) {
-    const rows = await PurchaseVoucher.find(mongoPurchaseScope(user))
-      .sort({ date: -1, createdAt: -1, _id: -1 })
-      .lean();
+    const query = PurchaseVoucher.find(mongoPurchaseScope(user)).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+    if (Number.isFinite(Number(options.limit))) {
+      query.skip(Number(options.offset) || 0).limit(Number(options.limit));
+    }
+    const rows = await query;
     return decoratePurchaseRows(rows);
   }
 
@@ -3952,14 +3964,31 @@ router.get("/report/sale-summary", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  getSaleReportRowsForUser(req.user)
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 25, 1), 200);
+  const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
+
+  getSaleReportRowsForUser(req.user, usePaging ? { limit: pageSize, offset: (page - 1) * pageSize } : {})
     .then((rows) =>
       res.json(
-        (rows || []).map((row) => ({
-          ...row,
-          total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
-          total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
-        }))
+        usePaging
+          ? {
+              data: (rows || []).map((row) => ({
+                ...row,
+                total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
+                total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
+              })),
+              pagination: {
+                page,
+                pageSize,
+                hasMore: (rows || []).length === pageSize,
+              },
+            }
+          : (rows || []).map((row) => ({
+              ...row,
+              total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
+              total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
+            }))
       )
     )
     .catch((err) => res.status(500).json({ error: err.message }));
@@ -3970,12 +3999,18 @@ router.get("/report/purchase-summary", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 25, 1), 200);
+  const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
+
   if (mongoReady()) {
-    return PurchaseVoucher.find(mongoPurchaseScope(req.user))
-      .sort({ date: -1, createdAt: -1, _id: -1 })
+    const query = PurchaseVoucher.find(mongoPurchaseScope(req.user))
+      .sort({ date: -1, createdAt: -1, _id: -1 });
+    if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
+    return query
       .lean()
       .then((rows) => decoratePurchaseRows(rows))
-      .then((rows) => res.json(rows || []))
+      .then((rows) => res.json(usePaging ? { data: rows || [], pagination: { page, pageSize, hasMore: (rows || []).length === pageSize } } : (rows || [])))
       .catch((err) => {
         console.error("Mongo purchase report query failed, falling back to SQLite:", err.message);
         res.status(500).json({ error: err.message });
@@ -4002,7 +4037,9 @@ router.get("/report/purchase-summary", (req, res) => {
     WHERE 1 = 1 ${filter.clause}
     ORDER BY v.date DESC, v.id DESC
   `;
-  db.all(query, filter.params, (err, rows) => {
+  const queryParams = usePaging ? [...filter.params, pageSize, (page - 1) * pageSize] : filter.params;
+  const pagedQuery = usePaging ? `${query}\nLIMIT ? OFFSET ?` : query;
+  db.all(pagedQuery, queryParams, (err, rows) => {
     const sendRowsWithLegacy = (purchaseRows) => {
       const legacyQuery = `
         SELECT
@@ -4035,7 +4072,8 @@ router.get("/report/purchase-summary", (req, res) => {
           console.error("Legacy purchase report query failed:", legacyErr.message);
           return res.json(purchaseRows || []);
         }
-        res.json([...(purchaseRows || []), ...(legacyRows || [])]);
+        const merged = [...(purchaseRows || []), ...(legacyRows || [])];
+        return res.json(usePaging ? { data: merged, pagination: { page, pageSize, hasMore: merged.length === pageSize } } : merged);
       });
     };
 
