@@ -88,6 +88,27 @@ app.use((req, res, next) => {
   }
   return next();
 });
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isAllowedOrigin(origin)) {
+    if (!res.getHeader("Access-Control-Allow-Origin")) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    }
+    if (!res.getHeader("Access-Control-Allow-Credentials")) {
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+    }
+    if (!res.getHeader("Access-Control-Allow-Methods")) {
+      res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
+    }
+    if (!res.getHeader("Access-Control-Allow-Headers")) {
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+    }
+    if (!res.getHeader("Vary")) {
+      res.setHeader("Vary", "Origin");
+    }
+  }
+  return next();
+});
 app.use(express.json());
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
