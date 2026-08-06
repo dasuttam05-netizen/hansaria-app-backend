@@ -238,6 +238,7 @@ let db = null;
       reference_type TEXT,
       reference_id INTEGER,
       outstanding_after REAL DEFAULT 0,
+      payment_mode TEXT DEFAULT 'on_account',
       employee_id INTEGER,
       location_id INTEGER,
       description TEXT,
@@ -249,6 +250,12 @@ let db = null;
       FOREIGN KEY(location_id) REFERENCES locations(id)
     )
   `);
+
+  db.run("ALTER TABLE wh_payment_vouchers ADD COLUMN payment_mode TEXT DEFAULT 'on_account'", (err) => {
+    if (err && !/duplicate column/i.test(err.message)) {
+      console.error("Failed to add payment_mode column to wh_payment_vouchers:", err.message);
+    }
+  });
 
   db.run(`
     CREATE TABLE IF NOT EXISTS wh_payment_adjustments (
