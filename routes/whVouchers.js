@@ -4323,7 +4323,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
         LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
         LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
         LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
-        WHERE 1 = 1 ${filter.clause} ${farmerClause} ${accountClause}
+        WHERE 1 = 1 ${filter.clause} ${farmerClause} ${warehouseClause} ${accountClause}
       `,
       paymentParams
     );
