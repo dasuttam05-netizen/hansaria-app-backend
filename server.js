@@ -124,6 +124,42 @@ app.use((req, res, next) => {
   return next();
 });
 
+// Fallback: ensure CORS headers are always present on every response
+// This helps when other middleware or route handlers send responses
+// before headers are set by `cors()` (deployed environments may differ).
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isAllowedOrigin(origin)) {
+    if (!res.getHeader("Access-Control-Allow-Origin")) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    }
+    if (!res.getHeader("Access-Control-Allow-Credentials")) {
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+    }
+    if (!res.getHeader("Access-Control-Allow-Methods")) {
+      res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
+    }
+    if (!res.getHeader("Access-Control-Allow-Headers")) {
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+    }
+    if (!res.getHeader("Vary")) {
+      res.setHeader("Vary", "Origin");
+    }
+  }
+
+  // Monkey-patch res.send to ensure headers are present just before sending
+  const originalSend = res.send;
+  res.send = function sendWithCors(body) {
+    const o = req.headers.origin;
+    if (o && isAllowedOrigin(o) && !res.getHeader("Access-Control-Allow-Origin")) {
+      res.setHeader("Access-Control-Allow-Origin", o);
+    }
+    return originalSend.call(this, body);
+  };
+
+  return next();
+});
+
 const authRoutes = require("./routes/auth");
 
 const locationRoutes = require("./routes/location");
