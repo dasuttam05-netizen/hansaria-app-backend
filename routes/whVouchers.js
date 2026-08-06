@@ -4123,6 +4123,7 @@ router.get("/report/purchase-summary", (req, res) => {
     if (farmerId) query.where("farmer_id").equals(farmerId);
     if (warehouseId) query.where("warehouse_id").equals(warehouseId);
     if (companyAccountId) query.where("company_account_id").equals(companyAccountId);
+    const countQuery = PurchaseVoucher.countDocuments(query.getQuery());
     if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
     return query
       .lean()
@@ -4130,8 +4131,7 @@ router.get("/report/purchase-summary", (req, res) => {
         const decoratedRows = await decoratePurchaseRows(rows);
         let total = Array.isArray(decoratedRows) ? decoratedRows.length : 0;
         if (usePaging) {
-          const totalCountQuery = PurchaseVoucher.countDocuments(mongoPurchaseScope(req.user));
-          total = await totalCountQuery;
+          total = await countQuery;
         }
         return res.json(
           usePaging
