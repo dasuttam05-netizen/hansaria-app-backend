@@ -60,6 +60,8 @@ const mongoRestoreEnabled = String(process.env.MONGODB_RESTORE_SQLITE_ON_START |
 let waitingForMongoConnection = false;
 let initialBackfillDone = false;
 let restoreInProgress = false;
+let transactionDepth = 0;
+const transactionMirrorTasks = [];
 
 function logMirror(message, error) {
   if (error) {
@@ -67,6 +69,33 @@ function logMirror(message, error) {
     return;
   }
   console.log(`[MongoMirror] ${message}`);
+}
+
+function getTransactionControlType(sql) {
+  const normalized = normalizeMutationSql(sql).trim().toUpperCase();
+  if (/^BEGIN\b/.test(normalized)) return "BEGIN";
+  if (/^(COMMIT|END)\b/.test(normalized)) return "COMMIT";
+  if (/^ROLLBACK\b/.test(normalized)) return "ROLLBACK";
+  return null;
+}
+
+function scheduleMirrorTask(task) {
+  if (!mongoMirrorConfigured) return;
+  if (transactionDepth > 0) {
+    transactionMirrorTasks.push(task);
+    return;
+  }
+  enqueueMirrorTask(task);
+}
+
+function flushTransactionMirrorTasks() {
+  if (!transactionMirrorTasks.length) return;
+  const tasksToRun = transactionMirrorTasks.splice(0, transactionMirrorTasks.length);
+  tasksToRun.reduce((prev, task) => prev.then(() => task().catch((error) => logMirror("Transaction mirror task failed", error))), Promise.resolve());
+}
+
+function clearTransactionMirrorTasks() {
+  transactionMirrorTasks.length = 0;
 }
 
 function countPlaceholders(sqlFragment) {
@@ -442,46 +471,68 @@ function scheduleMutationSync(db, mutation, sql, params, statementContext) {
   const safeTable = sanitizeTableName(mutation.table);
   if (!safeTable || !TRACKED_TABLES.has(safeTable)) return;
 
+  const schedule = (task) => scheduleMirrorTask(task);
+
   if (mutation.operation === "insert") {
     const insertedId = Number(statementContext?.lastID);
     if (Number.isFinite(insertedId) && insertedId > 0) {
-      enqueueMirrorTask(async () => syncRowById(db, safeTable, insertedId));
+      schedule(async () => syncRowById(db, safeTable, insertedId));
       return;
     }
 
-    enqueueMirrorTask(async () => runFullTableSync(db, safeTable));
+    schedule(async () => runFullTableSync(db, safeTable));
     return;
   }
 
   const ids = parseIdValues(sql, params);
   if (ids.length > 0) {
     if (mutation.operation === "delete") {
-      enqueueMirrorTask(async () => deleteMirrorRows(safeTable, ids));
+      schedule(async () => deleteMirrorRows(safeTable, ids));
     } else {
-      enqueueMirrorTask(async () => {
+      schedule(async () => {
         ids.forEach((id) => syncRowById(db, safeTable, id));
       });
     }
     return;
   }
 
-  enqueueMirrorTask(async () => runFullTableSync(db, safeTable));
+  schedule(async () => runFullTableSync(db, safeTable));
 }
 
 function patchRunMethod(db) {
   const originalRun = db.run.bind(db);
 
   db.run = function patchedRun(sql, ...args) {
+    const controlType = getTransactionControlType(sql);
     const mutation = parseMutation(sql);
-    if (!mutation) {
+    if (!mutation && !controlType) {
       return originalRun(sql, ...args);
     }
 
     const { argsWithoutCallback, callback, params } = normalizeRunArgs(args);
     const wrappedCallback = function wrappedRunCallback(error) {
       if (!error && !restoreInProgress) {
-        scheduleMutationSync(db, mutation, sql, params, this);
+        if (controlType === "BEGIN") {
+          transactionDepth += 1;
+        } else if (controlType === "COMMIT" || controlType === "END") {
+          if (transactionDepth > 0) {
+            transactionDepth -= 1;
+          }
+          if (transactionDepth === 0) {
+            flushTransactionMirrorTasks();
+          }
+        } else if (controlType === "ROLLBACK") {
+          if (transactionDepth > 0) {
+            transactionDepth -= 1;
+          }
+          if (transactionDepth === 0) {
+            clearTransactionMirrorTasks();
+          }
+        } else {
+          scheduleMutationSync(db, mutation, sql, params, this);
+        }
       }
+
       if (typeof callback === "function") {
         callback.apply(this, arguments);
       }
@@ -497,8 +548,9 @@ function patchPrepareMethod(db) {
   db.prepare = function patchedPrepare(sql, ...prepareArgs) {
     const statement = originalPrepare(sql, ...prepareArgs);
     const mutation = parseMutation(sql);
+    const controlType = getTransactionControlType(sql);
 
-    if (!mutation || !statement || typeof statement.run !== "function") {
+    if ((!mutation && !controlType) || !statement || typeof statement.run !== "function") {
       return statement;
     }
 
@@ -508,7 +560,25 @@ function patchPrepareMethod(db) {
       const { argsWithoutCallback, callback, params } = normalizeRunArgs(runArgs);
       const wrappedCallback = function wrappedStatementRunCallback(error) {
         if (!error && !restoreInProgress) {
-          scheduleMutationSync(db, mutation, sql, params, this);
+          if (controlType === "BEGIN") {
+            transactionDepth += 1;
+          } else if (controlType === "COMMIT" || controlType === "END") {
+            if (transactionDepth > 0) {
+              transactionDepth -= 1;
+            }
+            if (transactionDepth === 0) {
+              flushTransactionMirrorTasks();
+            }
+          } else if (controlType === "ROLLBACK") {
+            if (transactionDepth > 0) {
+              transactionDepth -= 1;
+            }
+            if (transactionDepth === 0) {
+              clearTransactionMirrorTasks();
+            }
+          } else {
+            scheduleMutationSync(db, mutation, sql, params, this);
+          }
         }
 
         if (typeof callback === "function") {
