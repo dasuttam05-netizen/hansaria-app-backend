@@ -4289,9 +4289,11 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
 
   try {
     const farmerId = String(req.query.farmer_id || "").trim();
+    const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
     const purchases = (await getPurchaseReportRowsForUser(req.user)).filter((row) => {
       if (farmerId && String(row.farmer_id || "") !== farmerId) return false;
+      if (warehouseId && String(row.warehouse_id || "") !== warehouseId) return false;
       if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
       return true;
     });
@@ -4299,10 +4301,15 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
     const paymentParams = [...filter.params];
     let farmerClause = "";
+    let warehouseClause = "";
     let accountClause = "";
     if (farmerId) {
       farmerClause = " AND CAST(p.farmer_id AS TEXT) = CAST(? AS TEXT)";
       paymentParams.push(farmerId);
+    }
+    if (warehouseId) {
+      warehouseClause = " AND CAST(p.warehouse_id AS TEXT) = CAST(? AS TEXT)";
+      paymentParams.push(warehouseId);
     }
     if (companyAccountId) {
       accountClause = " AND CAST(p.company_account_id AS TEXT) = CAST(? AS TEXT)";
