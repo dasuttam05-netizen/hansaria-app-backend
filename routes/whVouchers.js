@@ -1815,6 +1815,15 @@ function getReceiptAdjustmentsBySale(callback, excludeReceiptId = null) {
   );
 }
 
+function normalizePaymentMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["advance", "advance_payment"].includes(normalized)) return "advance";
+  if (["new_reference", "new reference", "newref", "new-ref", "reference"].includes(normalized)) return "new_reference";
+  if (["against", "against_purchase", "purchase", "bill", "billwise"].includes(normalized)) return "against";
+  if (["on_account", "on-account", "account"].includes(normalized)) return "on_account";
+  return "on_account";
+}
+
 function normalizePaymentAdjustments(input) {
   if (!Array.isArray(input)) return [];
   return input
@@ -1826,8 +1835,9 @@ function normalizePaymentAdjustments(input) {
     .filter((item) => item.purchase_id && Number.isFinite(item.adjusted_amount) && item.adjusted_amount > 0);
 }
 
-function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments, excludePaymentId = null }, callback) {
+function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments, paymentMode = "on_account", excludePaymentId = null }, callback) {
   const cleanAdjustments = normalizePaymentAdjustments(adjustments);
+  const normalizedPaymentMode = normalizePaymentMode(paymentMode);
   const paymentAmount = Number(amount || 0);
   const adjustedTotal = cleanAdjustments.reduce((sum, item) => sum + item.adjusted_amount, 0);
 
@@ -1835,11 +1845,20 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
     return callback(new Error("Payment amount is required"));
   }
 
+  if (normalizedPaymentMode === "against") {
+    if (!cleanAdjustments.length) {
+      return callback(new Error("Please adjust this payment against purchase bills"));
+    }
+    if (Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
+      return callback(new Error("Payment amount and adjustment amount must be equal"));
+    }
+  }
+
   if (!cleanAdjustments.length) {
     return callback(null, []);
   }
 
-  if (Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
+  if (normalizedPaymentMode !== "against" && Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
     return callback(new Error("Payment amount and adjustment amount must be equal"));
   }
 
@@ -3332,11 +3351,12 @@ router.post("/payment", (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
+  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description, adjustments } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
 
-  validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments }, (validationErr, cleanAdjustments) => {
+  const finalPaymentMode = normalizePaymentMode(payment_mode || (adjustments && adjustments.length ? "against" : "on_account"));
+  validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, paymentMode: finalPaymentMode }, (validationErr, cleanAdjustments) => {
     if (validationErr) return res.status(400).json({ error: validationErr.message });
 
     const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
@@ -3354,13 +3374,13 @@ router.post("/payment", (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
 
         const query = `
-          INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
         const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
         const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
-        db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
+        db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, finalPaymentMode, employee_id, location_id, description], function (err) {
           if (err) {
             if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
             return res.status(500).json({ error: err.message });
@@ -3386,13 +3406,13 @@ router.post("/payment", (req, res) => {
       if (err) return res.status(500).json({ error: err.message });
 
       const query = `
-        INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `;
 
       const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
       const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
-      db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
+      db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, finalPaymentMode, employee_id, location_id, description], function (err) {
         if (err) {
           if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
           return res.status(500).json({ error: err.message });
@@ -3419,7 +3439,7 @@ router.put("/payment/:id", (req, res) => {
   }
 
   const id = req.params.id;
-  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
+  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description, adjustments } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
 
@@ -3428,7 +3448,8 @@ router.put("/payment/:id", (req, res) => {
     if (!oldRow) return res.status(404).json({ error: "Payment voucher not found" });
     if (!ensureWarehouseAccess(req, res, oldRow.warehouse_id)) return;
 
-    validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, excludePaymentId: id }, (validationErr, cleanAdjustments) => {
+    const finalPaymentMode = normalizePaymentMode(payment_mode || (adjustments && adjustments.length ? "against" : "on_account"));
+    validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, paymentMode: finalPaymentMode, excludePaymentId: id }, (validationErr, cleanAdjustments) => {
       if (validationErr) return res.status(400).json({ error: validationErr.message });
 
       const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
@@ -3436,13 +3457,13 @@ router.put("/payment/:id", (req, res) => {
       const query = `
         UPDATE wh_payment_vouchers SET
           voucher_no=?, date=?, warehouse_id=?, farmer_id=?, company_account_id=?, amount=?,
-          reference_type=?, reference_id=?, employee_id=?, location_id=?, description=?, updated_at=CURRENT_TIMESTAMP
+          reference_type=?, reference_id=?, payment_mode=?, employee_id=?, location_id=?, description=?, updated_at=CURRENT_TIMESTAMP
         WHERE id=?
       `;
 
       db.serialize(() => {
         db.run("BEGIN TRANSACTION");
-        db.run(query, [voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description, id], function (err) {
+        db.run(query, [voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, finalPaymentMode, employee_id, location_id, description, id], function (err) {
           if (err) {
             db.run("ROLLBACK");
             if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
@@ -4036,6 +4057,14 @@ function buildFifoStock(purchases, sales) {
 // ===========================
 // REPORTS
 // ===========================
+router.get("/report/payment", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  getPaymentRowsForUser(req, res);
+});
+
 router.get("/report/sale-summary", (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
