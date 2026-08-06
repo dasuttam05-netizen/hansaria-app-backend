@@ -4114,10 +4114,15 @@ router.get("/report/purchase-summary", (req, res) => {
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
   const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 25, 1), 200);
   const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
+  const farmerId = String(req.query.farmer_id || "").trim();
+  const warehouseId = String(req.query.warehouse_id || "").trim();
+  const companyAccountId = String(req.query.company_account_id || "").trim();
 
   if (mongoReady()) {
-    const query = PurchaseVoucher.find(mongoPurchaseScope(req.user))
-      .sort({ date: -1, createdAt: -1, _id: -1 });
+    const query = PurchaseVoucher.find(mongoPurchaseScope(req.user)).sort({ date: -1, createdAt: -1, _id: -1 });
+    if (farmerId) query.where("farmer_id").equals(farmerId);
+    if (warehouseId) query.where("warehouse_id").equals(warehouseId);
+    if (companyAccountId) query.where("company_account_id").equals(companyAccountId);
     if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
     return query
       .lean()
@@ -4150,6 +4155,28 @@ router.get("/report/purchase-summary", (req, res) => {
 
   const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
   const legacyFilter = assignedWarehouseFilter(req.user, "t.warehouse_id");
+  const purchaseFilterParams = [...filter.params];
+  const legacyPurchaseFilterParams = [...legacyFilter.params];
+  let purchaseFilterClause = "";
+  let legacyPurchaseFilterClause = "";
+  if (farmerId) {
+    purchaseFilterClause += " AND CAST(v.farmer_id AS TEXT) = CAST(? AS TEXT)";
+    legacyPurchaseFilterClause += " AND CAST(t.farmer_id AS TEXT) = CAST(? AS TEXT)";
+    purchaseFilterParams.push(farmerId);
+    legacyPurchaseFilterParams.push(farmerId);
+  }
+  if (warehouseId) {
+    purchaseFilterClause += " AND CAST(v.warehouse_id AS TEXT) = CAST(? AS TEXT)";
+    legacyPurchaseFilterClause += " AND CAST(t.warehouse_id AS TEXT) = CAST(? AS TEXT)";
+    purchaseFilterParams.push(warehouseId);
+    legacyPurchaseFilterParams.push(warehouseId);
+  }
+  if (companyAccountId) {
+    purchaseFilterClause += " AND CAST(v.company_account_id AS TEXT) = CAST(? AS TEXT)";
+    legacyPurchaseFilterClause += " AND CAST(t.company_account_id AS TEXT) = CAST(? AS TEXT)";
+    purchaseFilterParams.push(companyAccountId);
+    legacyPurchaseFilterParams.push(companyAccountId);
+  }
   const query = `
     SELECT
       v.*,
@@ -4165,10 +4192,10 @@ router.get("/report/purchase-summary", (req, res) => {
     LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
     LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(v.farmer_id AS TEXT)
     LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
-    WHERE 1 = 1 ${filter.clause}
+    WHERE 1 = 1 ${filter.clause}${purchaseFilterClause}
     ORDER BY v.date DESC, v.id DESC
   `;
-  const queryParams = usePaging ? [...filter.params, pageSize, (page - 1) * pageSize] : filter.params;
+  const queryParams = usePaging ? [...purchaseFilterParams, pageSize, (page - 1) * pageSize] : purchaseFilterParams;
   const pagedQuery = usePaging ? `${query}\nLIMIT ? OFFSET ?` : query;
   db.all(pagedQuery, queryParams, (err, rows) => {
     const sendRowsWithLegacy = (purchaseRows) => {
@@ -4194,11 +4221,11 @@ router.get("/report/purchase-summary", (req, res) => {
         LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(t.warehouse_id AS TEXT)
         LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(t.farmer_id AS TEXT)
         LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(t.product_id AS TEXT)
-        WHERE LOWER(COALESCE(t.transaction_type, '')) = 'purchase' ${legacyFilter.clause}
+        WHERE LOWER(COALESCE(t.transaction_type, '')) = 'purchase' ${legacyFilter.clause}${legacyPurchaseFilterClause}
         ORDER BY t.date DESC, t.id DESC
       `;
 
-      db.all(legacyQuery, legacyFilter.params, (legacyErr, legacyRows) => {
+      db.all(legacyQuery, legacyPurchaseFilterParams, (legacyErr, legacyRows) => {
         if (legacyErr) {
           console.error("Legacy purchase report query failed:", legacyErr.message);
           return res.json(purchaseRows || []);
@@ -4220,10 +4247,10 @@ router.get("/report/purchase-summary", (req, res) => {
           COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
           COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
         FROM wh_purchase_vouchers v
-        WHERE 1 = 1 ${filter.clause}
+        WHERE 1 = 1 ${filter.clause}${purchaseFilterClause}
         ORDER BY v.date DESC, v.id DESC
       `;
-      return db.all(fallbackQuery, filter.params, (fallbackErr, fallbackRows) => {
+      return db.all(fallbackQuery, purchaseFilterParams, (fallbackErr, fallbackRows) => {
         if (fallbackErr) return res.status(500).json({ error: fallbackErr.message });
         sendRowsWithLegacy(fallbackRows || []);
       });
