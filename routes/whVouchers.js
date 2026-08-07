@@ -3346,6 +3346,53 @@ router.get("/payment", (req, res) => {
   getPaymentRowsForUser(req, res);
 });
 
+router.get("/payment/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const query = `
+    SELECT p.*, ca.account_name AS company_account_name, f.name AS farmer_name
+    FROM wh_payment_vouchers p
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+    LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
+    WHERE CAST(p.id AS TEXT) = ?
+    LIMIT 1
+  `;
+
+  db.get(query, [id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: "Payment voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    db.all(
+      `
+        SELECT a.*, pv.voucher_no AS purchase_voucher_no
+        FROM wh_payment_adjustments a
+        LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
+        WHERE a.payment_id = ?
+        ORDER BY a.id ASC
+      `,
+      [id],
+      (adjErr, adjustmentRows) => {
+        if (adjErr) return res.status(500).json({ error: adjErr.message });
+        const adjustments = (adjustmentRows || []).map((item) => ({
+          purchase_id: String(item.purchase_id || ""),
+          voucher_no: item.purchase_voucher_no || item.purchase_id || "",
+          adjusted_amount: Number(item.adjusted_amount || 0),
+        }));
+        return res.json({
+          ...row,
+          id: String(row.id || row._id),
+          _id: String(row.id || row._id),
+          adjustments,
+        });
+      }
+    );
+  });
+});
+
 router.post("/payment", (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.payment.create")) {
     return res.status(403).json({ error: "Permission denied" });
