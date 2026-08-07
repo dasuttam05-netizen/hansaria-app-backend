@@ -3528,20 +3528,41 @@ router.put("/payment/:id", (req, res) => {
                 db.run("ROLLBACK");
                 return res.status(500).json({ error: adjErr.message });
               }
-              computeOutstandingForFarmer(farmer_id, (statsErr, stats) => {
-                if (statsErr) {
-                  db.run("ROLLBACK");
-                  return res.status(500).json({ error: statsErr.message });
+              // Do not make the HTTP request wait for the outstanding calculation.
+              // The calculation can touch purchase data in SQLite/Mongo and may be
+              // comparatively slow. The voucher transaction itself is what must be
+              // atomic; outstanding_after can safely be refreshed immediately after
+              // the commit.
+              db.run("COMMIT", (commitErr) => {
+                if (commitErr) {
+                  return res.status(500).json({ error: commitErr.message });
                 }
-                db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, id], (outErr) => {
-                  if (outErr) {
-                    db.run("ROLLBACK");
-                    return res.status(500).json({ error: outErr.message });
+
+                // Respond immediately after the voucher + adjustments are committed.
+                // This prevents the frontend from staying on Saving while statistics
+                // are being calculated.
+                res.status(200).json({
+                  id: String(id),
+                  updated: 1,
+                  voucher_no,
+                  adjustments: cleanAdjustments,
+                  reference_id: finalReferenceId,
+                });
+
+                // Refresh outstanding asynchronously; this must not affect the
+                // already-successful update response.
+                computeOutstandingForFarmer(farmer_id, (statsErr, stats) => {
+                  if (statsErr) {
+                    console.error("Payment outstanding refresh failed:", statsErr.message);
+                    return;
                   }
-                  db.run("COMMIT", (commitErr) => {
-                    if (commitErr) return res.status(500).json({ error: commitErr.message });
-                    res.json({ id, updated: 1, voucher_no, stats, adjustments: cleanAdjustments, reference_id: finalReferenceId });
-                  });
+                  db.run(
+                    "UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?",
+                    [stats.outstanding, id],
+                    (outErr) => {
+                      if (outErr) console.error("Payment outstanding update failed:", outErr.message);
+                    }
+                  );
                 });
               });
             });
@@ -3776,8 +3797,20 @@ router.put("/receipt/:id", (req, res) => {
                     return res.status(500).json({ error: outErr.message });
                   }
                   db.run("COMMIT", (commitErr) => {
-                    if (commitErr) return res.status(500).json({ error: commitErr.message });
-                    res.json({ id, updated: 1, voucher_no, stats, adjustments: cleanAdjustments, reference_id: finalReferenceId });
+                    if (commitErr) {
+                      // sqlite can report a commit failure after the transaction
+                      // work has completed; return the actual error instead of
+                      // leaving the client waiting indefinitely.
+                      return res.status(500).json({ error: commitErr.message });
+                    }
+                    return res.status(200).json({
+                      id: String(id),
+                      updated: 1,
+                      voucher_no,
+                      stats,
+                      adjustments: cleanAdjustments,
+                      reference_id: finalReferenceId,
+                    });
                   });
                 });
               });
