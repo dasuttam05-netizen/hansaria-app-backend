@@ -1856,9 +1856,6 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
   getPaymentAdjustmentsByPurchase((err, adjustedMap) => {
     if (err) return callback(err);
 
-    // wh_payment_adjustments.purchase_id stores the SQLite purchase id.
-    // The UI can sometimes receive a Mongo _id, so resolve the target by
-    // SQLite id first and by voucher_no as a safe fallback.
     const params = [farmerId];
     let warehouseClause = "";
     if (warehouseId) {
@@ -1873,7 +1870,7 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
         WHERE CAST(farmer_id AS TEXT) = CAST(? AS TEXT) ${warehouseClause}
       `,
       params,
-      (rowsErr, rows) => {
+      async (rowsErr, rows) => {
         if (rowsErr) return callback(rowsErr);
 
         const purchaseMap = new Map();
@@ -1885,13 +1882,54 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
         });
 
         const resolved = [];
+
         for (const item of cleanAdjustments) {
           const rawId = String(item.purchase_id || "").trim();
           const voucher = String(item.voucher_no || "").trim();
-          const purchase = purchaseMap.get(`id:${rawId}`) || (voucher ? purchaseMap.get(`voucher:${voucher}`) : null);
+          let purchase = purchaseMap.get(`id:${rawId}`) || (voucher ? purchaseMap.get(`voucher:${voucher}`) : null);
+
+          // The frontend may receive the MongoDB PurchaseVoucher _id from
+          // the outstanding-purchases response. wh_payment_adjustments,
+          // however, stores the SQLite purchase id. Resolve Mongo _id ->
+          // voucher_no -> SQLite id before inserting the adjustment.
+          if (!purchase && mongoReady() && mongoose.Types.ObjectId.isValid(rawId)) {
+            try {
+              const mongoPurchase = await PurchaseVoucher.findById(rawId).lean();
+              const mongoVoucher = String(mongoPurchase?.voucher_no || "").trim();
+              if (mongoVoucher) {
+                purchase = purchaseMap.get(`voucher:${mongoVoucher}`) || null;
+              }
+            } catch (mongoErr) {
+              console.warn("Mongo purchase-id resolution failed:", mongoErr.message);
+            }
+          }
+
+          // If the UI supplied only the Mongo id and the SQLite purchase is
+          // not present in the current farmer/warehouse-filtered rows, do a
+          // direct SQLite voucher lookup after resolving the Mongo document.
+          if (!purchase && mongoReady() && mongoose.Types.ObjectId.isValid(rawId)) {
+            try {
+              const mongoPurchase = await PurchaseVoucher.findById(rawId).lean();
+              const mongoVoucher = String(mongoPurchase?.voucher_no || "").trim();
+              if (mongoVoucher) {
+                purchase = await new Promise((resolve, reject) => {
+                  db.get(
+                    `SELECT id, voucher_no, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
+                     FROM wh_purchase_vouchers
+                     WHERE CAST(voucher_no AS TEXT) = CAST(? AS TEXT)
+                     LIMIT 1`,
+                    [mongoVoucher],
+                    (lookupErr, row) => lookupErr ? reject(lookupErr) : resolve(row || null)
+                  );
+                });
+              }
+            } catch (lookupErr) {
+              return callback(lookupErr);
+            }
+          }
 
           if (!purchase) {
-            return callback(new Error(`Invalid purchase adjustment target: ${voucher || rawId}`));
+            return callback(new Error(`Invalid purchase adjustment target: ${rawId || voucher}`));
           }
 
           const purchaseId = String(purchase.id);
