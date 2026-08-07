@@ -1441,46 +1441,26 @@ function createSequentialVoucherNo(type, callback) {
 }
 
 function computeOutstandingForFarmer(farmerId, callback, companyAccountId = null) {
-  const purchaseSql = mongoReady()
-    ? null
-    : `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE farmer_id = ?${companyAccountId ? " AND company_account_id = ?" : ""}`;
+  const purchaseSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE farmer_id = ?${companyAccountId ? " AND company_account_id = ?" : ""}`;
   const paymentSql = `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE farmer_id = ?${companyAccountId ? " AND company_account_id = ?" : ""}`;
-  const finish = (totalPurchase) => {
-    const paymentParams = [farmerId];
-    if (companyAccountId) paymentParams.push(companyAccountId);
+  const purchaseParams = [farmerId];
+  const paymentParams = [farmerId];
+  if (companyAccountId) {
+    purchaseParams.push(companyAccountId);
+    paymentParams.push(companyAccountId);
+  }
+  db.get(purchaseSql, purchaseParams, (err, purchase) => {
+    if (err) return callback(err);
     db.get(paymentSql, paymentParams, (err2, payment) => {
       if (err2) return callback(err2);
-      const totalPayment = payment?.total_payment || 0;
+      const totalPurchase = Number(purchase?.total_purchase || 0);
+      const totalPayment = Number(payment?.total_payment || 0);
       callback(null, {
         total_purchase: totalPurchase,
         total_payment: totalPayment,
         outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
       });
     });
-  };
-
-  if (mongoReady()) {
-    const filter = { farmer_id: String(farmerId || "") };
-    if (companyAccountId) filter.company_account_id = String(companyAccountId);
-    PurchaseVoucher.find(filter)
-      .maxTimeMS(5000)
-      .lean()
-      .then((rows) => {
-        const totalPurchase = (rows || []).reduce(
-          (sum, row) => sum + Number(row.net_amount_payable || row.amount || 0),
-          0
-        );
-        finish(totalPurchase);
-      })
-      .catch(callback);
-    return;
-  }
-
-  const purchaseParams = [farmerId];
-  if (companyAccountId) purchaseParams.push(companyAccountId);
-  db.get(purchaseSql, purchaseParams, (err, purchase) => {
-    if (err) return callback(err);
-    finish(purchase?.total_purchase || 0);
   });
 }
 
@@ -1842,81 +1822,56 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
   const paymentAmount = Number(amount || 0);
   const adjustedTotal = cleanAdjustments.reduce((sum, item) => sum + item.adjusted_amount, 0);
 
-  if (paymentAmount <= 0) {
-    return callback(new Error("Payment amount is required"));
-  }
+  if (paymentAmount <= 0) return callback(new Error("Payment amount is required"));
 
   if (normalizedPaymentMode === "against") {
-    if (!cleanAdjustments.length) {
-      return callback(new Error("Please adjust this payment against purchase bills"));
-    }
+    if (!cleanAdjustments.length) return callback(new Error("Please adjust this payment against purchase bills"));
     if (Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
       return callback(new Error("Payment amount and adjustment amount must be equal"));
     }
   }
 
-  if (!cleanAdjustments.length) {
-    return callback(null, []);
-  }
+  if (!cleanAdjustments.length) return callback(null, []);
 
   if (normalizedPaymentMode !== "against" && Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
     return callback(new Error("Payment amount and adjustment amount must be equal"));
   }
 
+  // IMPORTANT: Payment edit/save must not depend on MongoDB. The payment and
+  // adjustment tables are stored in SQLite, so validate against SQLite here.
+  // The old code used MongoDB whenever mongoReady() was true, which could leave
+  // the PUT request stuck at "Saving..." if MongoDB was slow/unavailable.
   getPaymentAdjustmentsByPurchase((err, adjustedMap) => {
     if (err) return callback(err);
 
-    const finish = (purchaseRows) => {
-      const purchaseMap = new Map((purchaseRows || []).map((row) => [String(row.id || row._id), row]));
-      for (const item of cleanAdjustments) {
-        const purchase = purchaseMap.get(String(item.purchase_id));
-        if (!purchase) {
-          return callback(new Error("Invalid purchase adjustment target"));
-        }
-
-        const billAmount = Number(purchase.amount || purchase.net_amount_payable || purchase.total_amount || 0);
-        const alreadyAdjusted = adjustedMap.get(String(item.purchase_id)) || 0;
-        const pending = Math.max(0, billAmount - alreadyAdjusted);
-        if (item.adjusted_amount - pending > 0.0001) {
-          return callback(new Error(`Adjustment cannot exceed pending amount for ${purchase.voucher_no || item.purchase_id}`));
-        }
-      }
-
-      callback(null, cleanAdjustments);
-    };
-
-    // Payment edit should use the local SQLite mirror first. This keeps the save path
-    // independent of a slow/unavailable MongoDB connection. MongoDB is only a fallback
-    // when SQLite has no purchase rows for the farmer.
     const params = [farmerId];
     let warehouseClause = "";
     if (warehouseId) {
       warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
       params.push(warehouseId);
     }
-    db.all(
-      `
-        SELECT id, voucher_no, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
-        FROM wh_purchase_vouchers
-        WHERE CAST(farmer_id AS TEXT) = CAST(? AS TEXT) ${warehouseClause}
-      `,
-      params,
-      (rowsErr, rows) => {
-        if (rowsErr) return callback(rowsErr);
-        if (rows && rows.length) return finish(rows);
 
-        if (!mongoReady()) return finish([]);
-        const filter = { farmer_id: String(farmerId || "") };
-        if (warehouseId) filter.warehouse_id = String(warehouseId);
-        PurchaseVoucher.find(filter)
-          .maxTimeMS(3000)
-          .lean()
-          .then((mongoRows) => finish((mongoRows || []).map((row) => ({
-            ...row,
-            id: String(row._id),
-            amount: Number(row.net_amount_payable || row.amount || 0),
-          }))))
-          .catch((mongoErr) => callback(mongoErr));
+    db.all(
+      `SELECT id, voucher_no, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
+       FROM wh_purchase_vouchers
+       WHERE farmer_id = ?${warehouseClause}`,
+      params,
+      (purchaseErr, purchaseRows) => {
+        if (purchaseErr) return callback(purchaseErr);
+
+        const purchaseMap = new Map((purchaseRows || []).map((row) => [String(row.id), row]));
+        for (const item of cleanAdjustments) {
+          const purchase = purchaseMap.get(String(item.purchase_id));
+          if (!purchase) return callback(new Error("Invalid purchase adjustment target"));
+
+          const billAmount = Number(purchase.amount || 0);
+          const alreadyAdjusted = adjustedMap.get(String(item.purchase_id)) || 0;
+          const pending = Math.max(0, billAmount - alreadyAdjusted);
+          if (item.adjusted_amount - pending > 0.0001) {
+            return callback(new Error(`Adjustment cannot exceed pending amount for ${purchase.voucher_no || item.purchase_id}`));
+          }
+        }
+        callback(null, cleanAdjustments);
       }
     );
   }, excludePaymentId);
@@ -3492,12 +3447,7 @@ router.put("/payment/:id", (req, res) => {
   }
 
   const id = req.params.id;
-  const {
-    voucher_no, date, warehouse_id, farmer_id, company_account_id,
-    amount, reference_type, reference_id, payment_mode,
-    employee_id, location_id, description, adjustments
-  } = req.body;
-
+  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description, adjustments } = req.body;
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
   if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
 
@@ -3506,83 +3456,44 @@ router.put("/payment/:id", (req, res) => {
     if (!oldRow) return res.status(404).json({ error: "Payment voucher not found" });
     if (!ensureWarehouseAccess(req, res, oldRow.warehouse_id)) return;
 
-    const finalPaymentMode = normalizePaymentMode(
-      payment_mode || (adjustments && adjustments.length ? "against" : "on_account")
-    );
-
-    validatePaymentAdjustments({
-      farmerId: farmer_id,
-      warehouseId: warehouse_id,
-      amount,
-      adjustments,
-      paymentMode: finalPaymentMode,
-      excludePaymentId: id,
-    }, (validationErr, cleanAdjustments) => {
+    const finalPaymentMode = normalizePaymentMode(payment_mode || (adjustments && adjustments.length ? "against" : "on_account"));
+    validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, paymentMode: finalPaymentMode, excludePaymentId: id }, (validationErr, cleanAdjustments) => {
       if (validationErr) return res.status(400).json({ error: validationErr.message });
 
       const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
       const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
-      const query = `
-        UPDATE wh_payment_vouchers SET
-          voucher_no=?, date=?, warehouse_id=?, farmer_id=?, company_account_id=?, amount=?,
-          reference_type=?, reference_id=?, payment_mode=?, employee_id=?, location_id=?, description=?, updated_at=CURRENT_TIMESTAMP
-        WHERE id=?
-      `;
+      const query = `UPDATE wh_payment_vouchers SET voucher_no=?, date=?, warehouse_id=?, farmer_id=?, company_account_id=?, amount=?, reference_type=?, reference_id=?, payment_mode=?, employee_id=?, location_id=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`;
+      const values = [voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, finalPaymentMode, employee_id, location_id, description, id];
 
       db.serialize(() => {
-        db.run("BEGIN TRANSACTION", (beginErr) => {
+        db.run("BEGIN IMMEDIATE TRANSACTION", (beginErr) => {
           if (beginErr) return res.status(500).json({ error: beginErr.message });
 
-          db.run(query, [
-            voucher_no, date, warehouse_id, farmer_id, company_account_id, amount,
-            finalReferenceType, finalReferenceId, finalPaymentMode,
-            employee_id, location_id, description, id
-          ], (err) => {
-            if (err) {
-              return db.run("ROLLBACK", () => {
-                if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-                return res.status(500).json({ error: err.message });
-              });
+          db.run(query, values, (updateErr) => {
+            if (updateErr) {
+              return db.run("ROLLBACK", () => res.status(updateErr.message.includes("UNIQUE") ? 400 : 500).json({ error: updateErr.message.includes("UNIQUE") ? "Voucher number already exists" : updateErr.message }));
             }
 
             db.run("DELETE FROM wh_payment_adjustments WHERE payment_id = ?", [id], (deleteErr) => {
-              if (deleteErr) {
-                return db.run("ROLLBACK", () => res.status(500).json({ error: deleteErr.message }));
-              }
+              if (deleteErr) return db.run("ROLLBACK", () => res.status(500).json({ error: deleteErr.message }));
 
               insertPaymentAdjustments(id, cleanAdjustments, (adjErr) => {
-                if (adjErr) {
-                  return db.run("ROLLBACK", () => res.status(500).json({ error: adjErr.message }));
-                }
+                if (adjErr) return db.run("ROLLBACK", () => res.status(500).json({ error: adjErr.message }));
 
                 db.run("COMMIT", (commitErr) => {
-                  if (commitErr) {
-                    return db.run("ROLLBACK", () => res.status(500).json({ error: commitErr.message }));
-                  }
+                  if (commitErr) return db.run("ROLLBACK", () => res.status(500).json({ error: commitErr.message }));
 
-                  res.json({
-                    id,
-                    updated: 1,
-                    voucher_no,
-                    adjustments: cleanAdjustments,
-                    reference_id: finalReferenceId,
-                    payment_mode: finalPaymentMode,
-                  });
+                  // Respond immediately after the actual database update is committed.
+                  // Outstanding calculation is deliberately outside the save transaction.
+                  res.json({ id, updated: 1, voucher_no, adjustments: cleanAdjustments, reference_id: finalReferenceId });
 
+                  // Best-effort background refresh of outstanding_after. Never delay or
+                  // fail the already-successful payment update because of this calculation.
                   setImmediate(() => {
                     computeOutstandingForFarmer(farmer_id, (statsErr, stats) => {
-                      if (statsErr) {
-                        console.error("Payment outstanding recalculation failed:", statsErr.message);
-                        return;
-                      }
-                      db.run(
-                        "UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?",
-                        [stats.outstanding, id],
-                        (outErr) => {
-                          if (outErr) console.error("Payment outstanding update failed:", outErr.message);
-                        }
-                      );
-                    }, company_account_id || null);
+                      if (statsErr || !stats) return;
+                      db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, id], () => {});
+                    }, company_account_id);
                   });
                 });
               });
@@ -3818,20 +3729,8 @@ router.put("/receipt/:id", (req, res) => {
                     return res.status(500).json({ error: outErr.message });
                   }
                   db.run("COMMIT", (commitErr) => {
-                    if (commitErr) {
-                      // sqlite can report a commit failure after the transaction
-                      // work has completed; return the actual error instead of
-                      // leaving the client waiting indefinitely.
-                      return res.status(500).json({ error: commitErr.message });
-                    }
-                    return res.status(200).json({
-                      id: String(id),
-                      updated: 1,
-                      voucher_no,
-                      stats,
-                      adjustments: cleanAdjustments,
-                      reference_id: finalReferenceId,
-                    });
+                    if (commitErr) return res.status(500).json({ error: commitErr.message });
+                    res.json({ id, updated: 1, voucher_no, stats, adjustments: cleanAdjustments, reference_id: finalReferenceId });
                   });
                 });
               });
