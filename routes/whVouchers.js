@@ -1842,16 +1842,13 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
   const adjustedTotal = cleanAdjustments.reduce((sum, item) => sum + item.adjusted_amount, 0);
 
   if (paymentAmount <= 0) return callback(new Error("Payment amount is required"));
-
   if (normalizedPaymentMode === "against") {
     if (!cleanAdjustments.length) return callback(new Error("Please adjust this payment against purchase bills"));
     if (Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
       return callback(new Error("Payment amount and adjustment amount must be equal"));
     }
   }
-
   if (!cleanAdjustments.length) return callback(null, []);
-
   if (normalizedPaymentMode !== "against" && Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
     return callback(new Error("Payment amount and adjustment amount must be equal"));
   }
@@ -1859,89 +1856,100 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
   getPaymentAdjustmentsByPurchase((err, adjustedMap) => {
     if (err) return callback(err);
 
-    // Resolve purchase targets from MongoDB first. The frontend can send a Mongo
-    // ObjectId while the payment itself is stored in SQLite. Do NOT require the
-    // Mongo farmer_id/warehouse_id to have the same representation as SQLite.
-    const resolveMongoPurchases = async () => {
-      if (!mongoReady()) return null;
-      const resolved = [];
-      for (const item of cleanAdjustments) {
-        const ors = [];
-        if (item.voucher_no) ors.push({ voucher_no: String(item.voucher_no) });
-        if (mongoose.Types.ObjectId.isValid(String(item.purchase_id))) {
-          ors.push({ _id: String(item.purchase_id) });
-        }
-        if (!ors.length) {
-          resolved.push(null);
-          continue;
-        }
-        let doc = null;
-        try {
-          doc = await PurchaseVoucher.findOne({ $or: ors }).lean();
-        } catch (e) {
-          throw e;
-        }
-        resolved.push(doc ? {
-          ...doc,
-          id: String(doc._id),
-          _id: String(doc._id),
-          amount: Number(doc.net_amount_payable || doc.amount || doc.total_amount || 0),
-          voucher_no: doc.voucher_no || item.voucher_no || String(doc._id),
-        } : null);
-      }
-      return resolved;
-    };
+    const params = [farmerId];
+    let warehouseClause = "";
+    if (warehouseId) {
+      warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
+      params.push(warehouseId);
+    }
 
-    const validateRows = (purchaseRows) => {
-      const purchaseMap = new Map((purchaseRows || []).filter(Boolean).map((row) => [String(row.id || row._id), row]));
-      const voucherMap = new Map((purchaseRows || []).filter(Boolean).map((row) => [String(row.voucher_no || "").trim(), row]));
+    db.all(
+      `
+        SELECT id, voucher_no, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
+        FROM wh_purchase_vouchers
+        WHERE CAST(farmer_id AS TEXT) = CAST(? AS TEXT) ${warehouseClause}
+      `,
+      params,
+      async (rowsErr, rows) => {
+        if (rowsErr) return callback(rowsErr);
 
-      for (const item of cleanAdjustments) {
-        let purchase = purchaseMap.get(String(item.purchase_id));
-        if (!purchase && item.voucher_no) purchase = voucherMap.get(String(item.voucher_no).trim());
-        if (!purchase) return new Error(`Invalid purchase adjustment target: ${item.purchase_id}`);
+        const purchaseMap = new Map();
+        (rows || []).forEach((row) => {
+          const id = String(row.id || "").trim();
+          const voucher = String(row.voucher_no || "").trim();
+          if (id) purchaseMap.set(`id:${id}`, row);
+          if (voucher) purchaseMap.set(`voucher:${voucher}`, row);
+        });
 
-        const billAmount = Number(purchase.amount || purchase.net_amount_payable || purchase.total_amount || 0);
-        const key = String(purchase.id || purchase._id);
-        const alreadyAdjusted = adjustedMap.get(key) || adjustedMap.get(String(item.purchase_id)) || 0;
-        const pending = Math.max(0, billAmount - alreadyAdjusted);
-        if (item.adjusted_amount - pending > 0.0001) {
-          return new Error(`Adjustment cannot exceed pending amount for ${purchase.voucher_no || item.purchase_id}`);
-        }
-      }
-      return null;
-    };
+        const resolved = [];
 
-    resolveMongoPurchases()
-      .then((mongoRows) => {
-        if (mongoRows) {
-          const mongoError = validateRows(mongoRows);
-          if (!mongoError) return callback(null, cleanAdjustments);
-          // Mongo is authoritative when it has the purchase data, but if an
-          // adjustment target was supplied as a legacy SQLite id, allow the
-          // SQLite fallback below.
-        }
+        for (const item of cleanAdjustments) {
+          const rawId = String(item.purchase_id || "").trim();
+          const voucher = String(item.voucher_no || "").trim();
+          let purchase = purchaseMap.get(`id:${rawId}`) || (voucher ? purchaseMap.get(`voucher:${voucher}`) : null);
 
-        const params = [farmerId];
-        let warehouseClause = "";
-        if (warehouseId) {
-          warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
-          params.push(warehouseId);
-        }
-        db.all(
-          `SELECT id, voucher_no, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
-           FROM wh_purchase_vouchers
-           WHERE CAST(farmer_id AS TEXT) = CAST(? AS TEXT) ${warehouseClause}`,
-          params,
-          (rowsErr, rows) => {
-            if (rowsErr) return callback(rowsErr);
-            const sqliteError = validateRows(rows || []);
-            if (sqliteError) return callback(sqliteError);
-            callback(null, cleanAdjustments);
+          // The frontend may receive the MongoDB PurchaseVoucher _id from
+          // the outstanding-purchases response. wh_payment_adjustments,
+          // however, stores the SQLite purchase id. Resolve Mongo _id ->
+          // voucher_no -> SQLite id before inserting the adjustment.
+          if (!purchase && mongoReady() && mongoose.Types.ObjectId.isValid(rawId)) {
+            try {
+              const mongoPurchase = await PurchaseVoucher.findById(rawId).lean();
+              const mongoVoucher = String(mongoPurchase?.voucher_no || "").trim();
+              if (mongoVoucher) {
+                purchase = purchaseMap.get(`voucher:${mongoVoucher}`) || null;
+              }
+            } catch (mongoErr) {
+              console.warn("Mongo purchase-id resolution failed:", mongoErr.message);
+            }
           }
-        );
-      })
-      .catch(callback);
+
+          // If the UI supplied only the Mongo id and the SQLite purchase is
+          // not present in the current farmer/warehouse-filtered rows, do a
+          // direct SQLite voucher lookup after resolving the Mongo document.
+          if (!purchase && mongoReady() && mongoose.Types.ObjectId.isValid(rawId)) {
+            try {
+              const mongoPurchase = await PurchaseVoucher.findById(rawId).lean();
+              const mongoVoucher = String(mongoPurchase?.voucher_no || "").trim();
+              if (mongoVoucher) {
+                purchase = await new Promise((resolve, reject) => {
+                  db.get(
+                    `SELECT id, voucher_no, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
+                     FROM wh_purchase_vouchers
+                     WHERE CAST(voucher_no AS TEXT) = CAST(? AS TEXT)
+                     LIMIT 1`,
+                    [mongoVoucher],
+                    (lookupErr, row) => lookupErr ? reject(lookupErr) : resolve(row || null)
+                  );
+                });
+              }
+            } catch (lookupErr) {
+              return callback(lookupErr);
+            }
+          }
+
+          if (!purchase) {
+            return callback(new Error(`Invalid purchase adjustment target: ${rawId || voucher}`));
+          }
+
+          const purchaseId = String(purchase.id);
+          const billAmount = Number(purchase.amount || 0);
+          const alreadyAdjusted = Number(adjustedMap.get(purchaseId) || 0);
+          const pending = Math.max(0, billAmount - alreadyAdjusted);
+          if (item.adjusted_amount - pending > 0.0001) {
+            return callback(new Error(`Adjustment cannot exceed pending amount for ${purchase.voucher_no || purchaseId}`));
+          }
+
+          resolved.push({
+            purchase_id: purchaseId,
+            voucher_no: purchase.voucher_no || voucher,
+            adjusted_amount: item.adjusted_amount,
+          });
+        }
+
+        callback(null, resolved);
+      }
+    );
   }, excludePaymentId);
 }
 
