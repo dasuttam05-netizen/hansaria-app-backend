@@ -3002,7 +3002,7 @@ router.get("/outstanding", (req, res) => {
 // ===========================
 // FARMERS BY ACCOUNT WITH OUTSTANDING
 // ===========================
-router.get("/farmers-by-account/:accountId", (req, res) => {
+router.get("/farmers-by-account/:accountId", async (req, res) => {
   const { accountId } = req.params;
   const { warehouse_id } = req.query;
   if (!accountId) return res.status(400).json({ error: "Account ID is required" });
@@ -3014,50 +3014,72 @@ router.get("/farmers-by-account/:accountId", (req, res) => {
       ? req.user.assigned_warehouses.map((id) => String(id))
       : [];
     if (selectedWarehouseId) {
-      if (assignedWarehouses.length) {
-        if (!assignedWarehouses.includes(selectedWarehouseId)) return res.json([]);
-      }
+      if (assignedWarehouses.length && !assignedWarehouses.includes(selectedWarehouseId)) return res.json([]);
       filter.warehouse_id = selectedWarehouseId;
     } else if (assignedWarehouses.length) {
       filter.warehouse_id = { $in: assignedWarehouses };
     }
 
-    return PurchaseVoucher.find(filter)
-      .lean()
-      .then(async (rows) => {
-        const farmerIds = [...new Set((rows || []).map((r) => String(r.farmer_id || "")).filter(Boolean))];
-        if (!farmerIds.length) return res.json([]);
+    // One Mongo aggregation replaces the previous N+1 pattern where every
+    // farmer triggered a full purchase scan plus a separate payment query.
+    const purchaseTotals = await PurchaseVoucher.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: "$farmer_id",
+          total_purchase: {
+            $sum: { $ifNull: ["$net_amount_payable", { $ifNull: ["$amount", 0] }] }
+          }
+        }
+      }
+    ]);
 
-        const farmers = await Farmer.find({ _id: { $in: farmerIds } })
-          .select("_id name mobile address village")
-          .lean();
+    const farmerIds = purchaseTotals.map((row) => String(row._id || "")).filter(Boolean);
+    if (!farmerIds.length) return res.json([]);
 
-        const result = await Promise.all(
-          (farmers || []).map(
-            (f) =>
-              new Promise((resolve) => {
-                computeOutstandingForFarmer(String(f._id), (_err, stats = {}) => {
-                  const outstanding = Number(stats.outstanding || 0);
-                  resolve({
-                    id: String(f._id),
-                    name: f.name,
-                    mobile: f.mobile,
-                    address: f.address,
-                    village: f.village,
-                    total_purchase: Number(stats.total_purchase || 0),
-                    total_adjusted: Number(stats.total_payment || 0),
-                    outstanding: Number(outstanding.toFixed(2)),
-                  });
-                }, accountId);
-              })
-          )
-        );
+    const farmers = await Farmer.find({ _id: { $in: farmerIds } })
+      .select("_id name mobile address village")
+      .lean();
 
-        return res.json(result.filter((f) => f.outstanding > 0));
-      })
-      .catch((err) => res.status(500).json({ error: err.message }));
+    const paymentFilter = ["CAST(pv.company_account_id AS TEXT) = CAST(? AS TEXT)"];
+    const paymentParams = [accountId];
+    if (selectedWarehouseId) {
+      paymentFilter.push("CAST(pv.warehouse_id AS TEXT) = CAST(? AS TEXT)");
+      paymentParams.push(selectedWarehouseId);
+    } else if (assignedWarehouses.length) {
+      paymentFilter.push(`CAST(pv.warehouse_id AS TEXT) IN (${assignedWarehouses.map(() => "?").join(",")})`);
+      paymentParams.push(...assignedWarehouses);
+    }
+    paymentFilter.push(`CAST(pv.farmer_id AS TEXT) IN (${farmerIds.map(() => "?").join(",")})`);
+    paymentParams.push(...farmerIds);
+
+    const paymentRows = await dbAll(
+      `SELECT CAST(pv.farmer_id AS TEXT) AS farmer_id, COALESCE(SUM(pv.amount), 0) AS total_payment
+       FROM wh_payment_vouchers pv
+       WHERE ${paymentFilter.join(" AND ")}
+       GROUP BY pv.farmer_id`,
+      paymentParams
+    );
+    const purchaseMap = new Map(purchaseTotals.map((row) => [String(row._id), Number(row.total_purchase || 0)]));
+    const paymentMap = new Map(paymentRows.map((row) => [String(row.farmer_id), Number(row.total_payment || 0)]));
+
+    const result = (farmers || []).map((f) => {
+      const totalPurchase = purchaseMap.get(String(f._id)) || 0;
+      const totalPayment = paymentMap.get(String(f._id)) || 0;
+      return {
+        id: String(f._id),
+        name: f.name,
+        mobile: f.mobile,
+        address: f.address,
+        village: f.village,
+        total_purchase: Number(totalPurchase.toFixed(2)),
+        total_adjusted: Number(totalPayment.toFixed(2)),
+        outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
+      };
+    });
+
+    return res.json(result.filter((f) => f.outstanding > 0));
   }
-
   const filter = assignedWarehouseFilter(req.user, "pv.warehouse_id");
   const filters = ["1=1"];
   const params = [];
@@ -4007,7 +4029,11 @@ function dbAll(query, params = []) {
 
 async function getPurchaseReportRowsForUser(user, options = {}) {
   if (mongoReady()) {
-    const query = PurchaseVoucher.find(mongoPurchaseScope(user)).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+    const filter = { ...mongoPurchaseScope(user) };
+    if (options.farmer_id) filter.farmer_id = String(options.farmer_id);
+    if (options.warehouse_id) filter.warehouse_id = String(options.warehouse_id);
+    if (options.company_account_id) filter.company_account_id = String(options.company_account_id);
+    const query = PurchaseVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
     if (Number.isFinite(Number(options.limit))) {
       query.skip(Number(options.offset) || 0).limit(Number(options.limit));
     }
@@ -4464,11 +4490,12 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
-    const purchases = (await getPurchaseReportRowsForUser(req.user)).filter((row) => {
-      if (farmerId && String(row.farmer_id || "") !== farmerId) return false;
-      if (warehouseId && String(row.warehouse_id || "") !== warehouseId) return false;
-      if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
-      return true;
+    // IMPORTANT: filter in MongoDB. The old code loaded every purchase voucher
+    // first and filtered in Node.js, which made this report take 3-4+ seconds.
+    const purchases = await getPurchaseReportRowsForUser(req.user, {
+      farmer_id: farmerId,
+      warehouse_id: warehouseId,
+      company_account_id: companyAccountId,
     });
 
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
