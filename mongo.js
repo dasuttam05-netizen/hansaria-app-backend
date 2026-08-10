@@ -417,6 +417,18 @@ const saleVoucherSchema =
     timestamps: true,
   });
 
+// Trading list indexes: keep filter + newest-first sorting inside MongoDB.
+purchaseVoucherSchema.index({ warehouse_id: 1, date: -1, _id: -1 });
+purchaseVoucherSchema.index({ farmer_id: 1, date: -1, _id: -1 });
+purchaseVoucherSchema.index({ company_account_id: 1, date: -1, _id: -1 });
+purchaseVoucherSchema.index({ product_id: 1, date: -1, _id: -1 });
+
+saleVoucherSchema.index({ warehouse_id: 1, date: -1, _id: -1 });
+saleVoucherSchema.index({ buyer_id: 1, date: -1, _id: -1 });
+saleVoucherSchema.index({ company_account_id: 1, date: -1, _id: -1 });
+saleVoucherSchema.index({ product_id: 1, date: -1, _id: -1 });
+saleVoucherSchema.index({ journey_token: 1, date: -1, _id: -1 });
+
 
 // =========================
 // EXPORTS
