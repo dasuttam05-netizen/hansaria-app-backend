@@ -202,34 +202,126 @@ function getSqliteSaleRowsForUser(user, options = {}) {
   );
 }
 
-async function getAllSaleVoucherRowsForUser(user, options = {}) {
-  const sqliteRows = await getSqliteSaleRowsForUser(user, options);
-  if (!mongoReady()) return sqliteRows;
-  const mongoQuery = SaleVoucher.find(mongoPurchaseScope(user)).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
-  if (Number.isFinite(Number(options.limit))) {
-    mongoQuery.skip(Number(options.offset) || 0).limit(Number(options.limit));
+function parseVoucherListOptions(req) {
+  const rawPage = Number.parseInt(req.query.page, 10);
+  const rawLimit = Number.parseInt(req.query.limit || req.query.page_size, 10);
+  const all = String(req.query.all || "") === "1";
+  const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
+  const limit = all ? Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 5000, 1), 5000) : Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 15, 1), 100);
+  const order = String(req.query.order || "desc").toLowerCase() === "asc" ? 1 : -1;
+  const search = String(req.query.search || "").trim();
+  const warehouseId = String(req.query.warehouse_id || "").trim();
+  const farmerId = String(req.query.farmer_id || "").trim();
+  const buyerId = String(req.query.buyer_id || "").trim();
+  const companyAccountId = String(req.query.company_account_id || "").trim();
+  const productId = String(req.query.product_id || "").trim();
+  const fromDate = toDateOnly(req.query.from_date);
+  const toDate = toDateOnly(req.query.to_date);
+  return {
+    page,
+    limit,
+    skip: all ? 0 : (page - 1) * limit,
+    all,
+    order,
+    search,
+    warehouseId,
+    farmerId,
+    buyerId,
+    companyAccountId,
+    productId,
+    fromDate,
+    toDate,
+  };
+}
+
+function applyVoucherListFilters(query, options, type) {
+  const scope = mongoPurchaseScope(query.user);
+  const filter = { ...scope };
+
+  if (options.warehouseId) filter.warehouse_id = options.warehouseId;
+  if (options.companyAccountId) filter.company_account_id = options.companyAccountId;
+  if (options.productId) filter.product_id = options.productId;
+  if (type === "purchase" && options.farmerId) filter.farmer_id = options.farmerId;
+  if (type === "sale" && options.buyerId) filter.buyer_id = options.buyerId;
+
+  if (options.fromDate || options.toDate) {
+    filter.date = {};
+    if (options.fromDate) filter.date.$gte = options.fromDate;
+    if (options.toDate) filter.date.$lte = options.toDate;
   }
-  const mongoRows = await mongoQuery;
-  const mergedRows = mergeSaleRows(await decorateSaleRows(mongoRows), sqliteRows);
-  const withBilti = await attachSaleBiltiIds(mergedRows);
-  return withBilti.map((row) => ({
-    ...row,
-    ...calculateSaleFollowupMeta(row),
-  }));
+
+  if (options.search) {
+    const safe = options.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(safe, "i");
+    const fields = type === "purchase"
+      ? ["voucher_no", "farmer_name", "product_name", "warehouse_name", "company_account_name", "description"]
+      : ["voucher_no", "bill_no", "buyer_name", "company_name", "product_name", "warehouse_name", "company_account_name", "consignee_name", "lorry_no", "po_no", "description"];
+    filter.$or = fields.map((field) => ({ [field]: rx }));
+  }
+
+  return filter;
+}
+
+function voucherListResponse(rows, total, options) {
+  const pageCount = Math.max(1, Math.ceil(total / options.limit));
+  return {
+    data: rows || [],
+    pagination: {
+      page: options.page,
+      pageSize: options.limit,
+      total,
+      totalPages: pageCount,
+      hasMore: options.page < pageCount,
+    },
+  };
+}
+
+async function getPurchaseVoucherPage(req) {
+  const options = parseVoucherListOptions(req);
+  const filter = applyVoucherListFilters({ user: req.user }, options, "purchase");
+  const [total, docs] = await Promise.all([
+    PurchaseVoucher.countDocuments(filter),
+    PurchaseVoucher.find(filter)
+      .sort({ date: options.order, _id: options.order })
+      .skip(options.skip)
+      .limit(options.limit)
+      .lean(),
+  ]);
+  const rows = await decoratePurchaseRows(docs);
+  if (options.all) return rows;
+  return voucherListResponse(rows, total, options);
+}
+
+async function getSaleVoucherPage(req) {
+  const options = parseVoucherListOptions(req);
+  const filter = applyVoucherListFilters({ user: req.user }, options, "sale");
+  const [total, docs] = await Promise.all([
+    SaleVoucher.countDocuments(filter),
+    SaleVoucher.find(filter)
+      .sort({ date: options.order, _id: options.order })
+      .skip(options.skip)
+      .limit(options.limit)
+      .lean(),
+  ]);
+  const rows = await decorateSaleRows(docs);
+  const withBilti = await attachSaleBiltiIds(rows);
+  return voucherListResponse(
+    withBilti.map((row) => ({ ...row, ...calculateSaleFollowupMeta(row) })),
+    total,
+    options
+  );
 }
 
 function getSaleVoucherRows(req, res) {
-  if (mongoReady()) {
-    getAllSaleVoucherRowsForUser(req.user)
-      .then((rows) => res.json(rows || []))
-      .catch((err) => {
-        console.error("Mongo sale voucher query failed, falling back to SQLite:", err.message);
-        getSaleVoucherRowsSqlite(req, res);
-      });
-    return;
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is required for Warehouse Trading voucher lists" });
   }
-
-  getSaleVoucherRowsSqlite(req, res);
+  getSaleVoucherPage(req)
+    .then((payload) => res.json(payload))
+    .catch((err) => {
+      console.error("Mongo sale voucher page query failed:", err);
+      res.status(500).json({ error: err.message || "Failed to load sale vouchers" });
+    });
 }
 
 function getSaleVoucherRowsSqlite(req, res) {
@@ -781,38 +873,41 @@ async function decorateSaleRows(rows) {
   const mongoProductIds = productIds.filter(mongoose.Types.ObjectId.isValid);
   const mongoAccountIds = accountIds.filter(mongoose.Types.ObjectId.isValid);
 
+  // All list decoration stays in MongoDB. Buyer/consignee records are read from
+  // the existing Mongo mirror collection so the Trading list never queries SQLite.
+  const mirrorFilters = (table, ids) => ({
+    table,
+    row_id: { $in: ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0) },
+  });
   const [
     mongoWarehouses,
     mongoProducts,
     mongoAccounts,
-    sqliteWarehouses,
-    sqliteProducts,
-    sqliteAccounts,
-    sqliteBuyers,
-    sqliteConsignees,
+    mirrorBuyers,
+    mirrorConsignees,
   ] = await Promise.all([
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : [],
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : [],
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : [],
-    sqliteRowsByIds("warehouses", warehouseIds),
-    sqliteRowsByIds("products", productIds),
-    sqliteRowsByIds("company_accounts", accountIds),
-    sqliteRowsByIds("buyer_names", buyerIds),
-    sqliteRowsByIds("consignee_names", consigneeIds),
+    buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : [],
+    consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : [],
   ]);
 
   const byMongoId = (items) => new Map(items.map((item) => [String(item._id), item]));
+  const byMirrorId = (items) => new Map(items.map((item) => [String(item.row_id), item.data || {}]));
   const mongoWarehouseMap = byMongoId(mongoWarehouses);
   const mongoProductMap = byMongoId(mongoProducts);
   const mongoAccountMap = byMongoId(mongoAccounts);
+  const buyerMap = byMirrorId(mirrorBuyers);
+  const consigneeMap = byMirrorId(mirrorConsignees);
 
   return plainRows.map((plain) => {
     const buyerId = plain.buyer_id || plain.company_id || "";
-    const warehouse = mongoWarehouseMap.get(String(plain.warehouse_id)) || sqliteWarehouses.get(String(plain.warehouse_id));
-    const product = mongoProductMap.get(String(plain.product_id)) || sqliteProducts.get(String(plain.product_id));
-    const account = mongoAccountMap.get(String(plain.company_account_id)) || sqliteAccounts.get(String(plain.company_account_id));
-    const buyer = sqliteBuyers.get(String(buyerId));
-    const consignee = sqliteConsignees.get(String(plain.consignee_id));
+    const warehouse = mongoWarehouseMap.get(String(plain.warehouse_id));
+    const product = mongoProductMap.get(String(plain.product_id));
+    const account = mongoAccountMap.get(String(plain.company_account_id));
+    const buyer = buyerMap.get(String(buyerId));
+    const consignee = consigneeMap.get(String(plain.consignee_id));
     const totalQuantity = plain.quantity || Math.max(Number(plain.gross_weight || 0) - Number(plain.tare_weight || 0), 0);
     const totalAmount = plain.amount || 0;
     return {
@@ -825,8 +920,10 @@ async function decorateSaleRows(rows) {
       company_account_name: account?.account_name || account?.name || plain.company_account_name,
       buyer_name: buyer?.name || plain.buyer_name || plain.company_name,
       buyer_email: buyer?.email || plain.buyer_email || "",
+      buyer_mobile: buyer?.mobile || plain.buyer_mobile || "",
       consignee_name: consignee?.name || plain.consignee_name,
       consignee_email: consignee?.email || plain.consignee_email || "",
+      consignee_mobile: consignee?.mobile || plain.consignee_mobile || "",
       total_quantity: totalQuantity,
       total_amount: totalAmount,
       ...calculateSaleFollowupMeta(plain),
@@ -947,27 +1044,16 @@ function mergePurchaseRows(mongoRows, sqliteRows) {
   });
 }
 
-async function getAllPurchaseVoucherRows(req) {
-  const mongoRows = await PurchaseVoucher.find(mongoPurchaseScope(req.user)).lean();
-  const sqliteRows = await getSqlitePurchaseRows(req);
-  return mergePurchaseRows(
-    await decoratePurchaseRows(mongoRows),
-    sqliteRows
-  );
-}
-
 function getPurchaseVoucherRows(req, res) {
-  if (mongoReady()) {
-    getAllPurchaseVoucherRows(req)
-      .then((rows) => res.json(rows || []))
-      .catch((err) => {
-        console.error("Mongo purchase voucher query failed, falling back to SQLite:", err.message);
-        getPurchaseVoucherRowsSqlite(req, res);
-      });
-    return;
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is required for Warehouse Trading voucher lists" });
   }
-
-  getPurchaseVoucherRowsSqlite(req, res);
+  getPurchaseVoucherPage(req)
+    .then((payload) => res.json(payload))
+    .catch((err) => {
+      console.error("Mongo purchase voucher page query failed:", err);
+      res.status(500).json({ error: err.message || "Failed to load purchase vouchers" });
+    });
 }
 
 function getPurchaseVoucherRowsSqlite(req, res) {
