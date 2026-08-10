@@ -21,6 +21,43 @@ const {
 } = require("../mongo");
 
 const upload = multer({ storage: multer.memoryStorage() });
+const { BuyerName, ConsigneeName, SqliteMirrorRow } = require("../db-mongodb");
+
+function setServerTiming(res, entries = []) {
+  const clean = entries
+    .filter((entry) => entry && Number.isFinite(Number(entry.duration)))
+    .map((entry) => `${entry.name};dur=${Math.max(0, Number(entry.duration)).toFixed(1)}`);
+  if (clean.length) res.setHeader("Server-Timing", clean.join(", "));
+}
+
+const voucherCountCache = new Map();
+async function cachedMongoCount(Model, filter, ttlMs = 5000) {
+  const key = `${Model.modelName}:${JSON.stringify(filter, (_key, value) => (value instanceof RegExp ? { __regex: value.source, __flags: value.flags } : value))}`;
+  const now = Date.now();
+  const hit = voucherCountCache.get(key);
+  if (hit && now - hit.at < ttlMs) return hit.value;
+  const value = await Model.countDocuments(filter);
+  voucherCountCache.set(key, { at: now, value });
+  if (voucherCountCache.size > 250) {
+    const oldest = voucherCountCache.keys().next().value;
+    if (oldest) voucherCountCache.delete(oldest);
+  }
+  return value;
+}
+
+// Lightweight SQLite indexes for the remaining legacy payment/receipt adjustment tables.
+// They are created idempotently and only affect the read paths that still use SQLite.
+[
+  "CREATE INDEX IF NOT EXISTS idx_wh_payment_warehouse_date ON wh_payment_vouchers (warehouse_id, date DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_wh_payment_adjustment_payment ON wh_payment_adjustments (payment_id, id)",
+  "CREATE INDEX IF NOT EXISTS idx_wh_receipt_warehouse_date ON wh_receipt_vouchers (warehouse_id, date DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_wh_receipt_adjustment_receipt ON wh_receipt_adjustments (receipt_id, id)",
+  "CREATE INDEX IF NOT EXISTS idx_transport_bilti_sale ON transport_bilti (sale_id, id)",
+].forEach((sql) => {
+  db.run(sql, (err) => {
+    if (err) console.warn("Trading index setup warning:", err.message);
+  });
+});
 
 function fmtDate(value) {
   if (!value) return "-";
@@ -241,7 +278,12 @@ function applyVoucherListFilters(query, options, type) {
   if (options.companyAccountId) filter.company_account_id = options.companyAccountId;
   if (options.productId) filter.product_id = options.productId;
   if (type === "purchase" && options.farmerId) filter.farmer_id = options.farmerId;
-  if (type === "sale" && options.buyerId) filter.buyer_id = options.buyerId;
+  if (type === "sale" && options.buyerId) {
+    filter.$and = [
+      ...(filter.$and || []),
+      { $or: [{ buyer_id: options.buyerId }, { company_id: options.buyerId }] },
+    ];
+  }
 
   if (options.fromDate || options.toDate) {
     filter.date = {};
@@ -249,15 +291,46 @@ function applyVoucherListFilters(query, options, type) {
     if (options.toDate) filter.date.$lte = options.toDate;
   }
 
-  if (options.search) {
-    const safe = options.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const rx = new RegExp(safe, "i");
-    const fields = type === "purchase"
-      ? ["voucher_no", "farmer_name", "product_name", "warehouse_name", "company_account_name", "description"]
-      : ["voucher_no", "bill_no", "buyer_name", "company_name", "product_name", "warehouse_name", "company_account_name", "consignee_name", "lorry_no", "po_no", "description"];
-    filter.$or = fields.map((field) => ({ [field]: rx }));
+  return filter;
+}
+
+async function addVoucherTextSearch(filter, search, type) {
+  const text = String(search || "").trim();
+  if (!text) return filter;
+
+  const safe = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rx = new RegExp(safe, "i");
+  const ors = [
+    { voucher_no: rx },
+    { description: rx },
+  ];
+
+  const [warehouses, products, accounts] = await Promise.all([
+    Warehouse.find({ name: rx }).select("_id").lean(),
+    Product.find({ name: rx }).select("_id").lean(),
+    CompanyAccount.find({ $or: [{ account_name: rx }, { name: rx }] }).select("_id").lean(),
+  ]);
+  if (warehouses.length) ors.push({ warehouse_id: { $in: warehouses.map((x) => String(x._id)) } });
+  if (products.length) ors.push({ product_id: { $in: products.map((x) => String(x._id)) } });
+  if (accounts.length) ors.push({ company_account_id: { $in: accounts.map((x) => String(x._id)) } });
+
+  if (type === "purchase") {
+    const farmers = await Farmer.find({ name: rx }).select("_id").lean();
+    if (farmers.length) ors.push({ farmer_id: { $in: farmers.map((x) => String(x._id)) } });
+  } else {
+    const [buyers, consignees] = await Promise.all([
+      BuyerName.find({ name: rx }).select("_id").lean().catch(() => []),
+      ConsigneeName.find({ name: rx }).select("_id").lean().catch(() => []),
+    ]);
+    if (buyers.length) {
+      const ids = buyers.map((x) => String(x._id));
+      ors.push({ buyer_id: { $in: ids } }, { company_id: { $in: ids } });
+    }
+    if (consignees.length) ors.push({ consignee_id: { $in: consignees.map((x) => String(x._id)) } });
+    ["bill_no", "lorry_no", "po_no", "journey_token"].forEach((field) => ors.push({ [field]: rx }));
   }
 
+  filter.$and = [...(filter.$and || []), { $or: ors }];
   return filter;
 }
 
@@ -276,39 +349,62 @@ function voucherListResponse(rows, total, options) {
 }
 
 async function getPurchaseVoucherPage(req) {
+  const started = performance.now();
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "purchase");
+  await addVoucherTextSearch(filter, options.search, "purchase");
+  const queryStarted = performance.now();
   const [total, docs] = await Promise.all([
-    PurchaseVoucher.countDocuments(filter),
+    cachedMongoCount(PurchaseVoucher, filter),
     PurchaseVoucher.find(filter)
       .sort({ date: options.order, _id: options.order })
       .skip(options.skip)
       .limit(options.limit)
       .lean(),
   ]);
+  const queryDuration = performance.now() - queryStarted;
+  const decorateStarted = performance.now();
   const rows = await decoratePurchaseRows(docs);
-  if (options.all) return rows;
-  return voucherListResponse(rows, total, options);
+  const decorateDuration = performance.now() - decorateStarted;
+  const payload = options.all ? rows : voucherListResponse(rows, total, options);
+  return { payload, timing: [
+    { name: "mongo-query", duration: queryDuration },
+    { name: "decorate", duration: decorateDuration },
+    { name: "total", duration: performance.now() - started },
+  ] };
 }
 
 async function getSaleVoucherPage(req) {
+  const started = performance.now();
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "sale");
+  await addVoucherTextSearch(filter, options.search, "sale");
+  const queryStarted = performance.now();
   const [total, docs] = await Promise.all([
-    SaleVoucher.countDocuments(filter),
+    cachedMongoCount(SaleVoucher, filter),
     SaleVoucher.find(filter)
       .sort({ date: options.order, _id: options.order })
       .skip(options.skip)
       .limit(options.limit)
       .lean(),
   ]);
+  const queryDuration = performance.now() - queryStarted;
+  const decorateStarted = performance.now();
   const rows = await decorateSaleRows(docs);
   const withBilti = await attachSaleBiltiIds(rows);
-  return voucherListResponse(
-    withBilti.map((row) => ({ ...row, ...calculateSaleFollowupMeta(row) })),
-    total,
-    options
-  );
+  const decorateDuration = performance.now() - decorateStarted;
+  return {
+    payload: voucherListResponse(
+      withBilti.map((row) => ({ ...row, ...calculateSaleFollowupMeta(row) })),
+      total,
+      options
+    ),
+    timing: [
+      { name: "mongo-query", duration: queryDuration },
+      { name: "decorate", duration: decorateDuration },
+      { name: "total", duration: performance.now() - started },
+    ],
+  };
 }
 
 function getSaleVoucherRows(req, res) {
@@ -316,7 +412,10 @@ function getSaleVoucherRows(req, res) {
     return res.status(503).json({ error: "MongoDB is required for Warehouse Trading voucher lists" });
   }
   getSaleVoucherPage(req)
-    .then((payload) => res.json(payload))
+    .then(({ payload, timing }) => {
+      setServerTiming(res, timing);
+      res.json(payload);
+    })
     .catch((err) => {
       console.error("Mongo sale voucher page query failed:", err);
       res.status(500).json({ error: err.message || "Failed to load sale vouchers" });
@@ -795,7 +894,8 @@ async function nextMongoVoucherNo(type) {
   const shortPrefix = getVoucherPrefix(type);
   const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, "");
   const prefix = `${shortPrefix}-${datePart}-`;
-  const latest = await PurchaseVoucher.findOne({ voucher_no: new RegExp(`^${shortPrefix}-`) })
+  const Model = type === "sale" ? SaleVoucher : PurchaseVoucher;
+  const latest = await Model.findOne({ voucher_no: new RegExp(`^${shortPrefix}-`) })
     .sort({ createdAt: -1, _id: -1 })
     .lean();
   let next = 1;
@@ -865,48 +965,64 @@ async function decorateSaleRows(rows) {
   const warehouseIds = [...new Set(plainRows.map((r) => r.warehouse_id).filter(Boolean))];
   const productIds = [...new Set(plainRows.map((r) => r.product_id).filter(Boolean))];
   const accountIds = [...new Set(plainRows.map((r) => r.company_account_id).filter(Boolean))];
+  const buyerIds = [...new Set(plainRows.map((r) => r.buyer_id || r.company_id).filter(Boolean))];
+  const consigneeIds = [...new Set(plainRows.map((r) => r.consignee_id).filter(Boolean))];
 
   const mongoWarehouseIds = warehouseIds.filter(mongoose.Types.ObjectId.isValid);
   const mongoProductIds = productIds.filter(mongoose.Types.ObjectId.isValid);
   const mongoAccountIds = accountIds.filter(mongoose.Types.ObjectId.isValid);
 
-  // IMPORTANT: the main Trading list is MongoDB-only. Do not read SQLite or
-  // an optional mirror collection here. Buyer/consignee names are already
-  // available in the sale document when present, and the React page also has
-  // the master-data lookup maps.
-  const [mongoWarehouses, mongoProducts, mongoAccounts] = await Promise.all([
-    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).select("name").lean() : [],
-    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).select("name").lean() : [],
-    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).select("account_name name").lean() : [],
+  // All list decoration stays in MongoDB. Buyer/consignee records are read from
+  // the existing Mongo mirror collection so the Trading list never queries SQLite.
+  const mirrorFilters = (table, ids) => ({
+    table,
+    row_id: { $in: ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0) },
+  });
+  const [
+    mongoWarehouses,
+    mongoProducts,
+    mongoAccounts,
+    mirrorBuyers,
+    mirrorConsignees,
+  ] = await Promise.all([
+    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : [],
+    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : [],
+    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : [],
+    buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : [],
+    consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : [],
   ]);
 
   const byMongoId = (items) => new Map(items.map((item) => [String(item._id), item]));
+  const byMirrorId = (items) => new Map(items.map((item) => [String(item.row_id), item.data || {}]));
   const mongoWarehouseMap = byMongoId(mongoWarehouses);
   const mongoProductMap = byMongoId(mongoProducts);
   const mongoAccountMap = byMongoId(mongoAccounts);
+  const buyerMap = byMirrorId(mirrorBuyers);
+  const consigneeMap = byMirrorId(mirrorConsignees);
 
   return plainRows.map((plain) => {
     const buyerId = plain.buyer_id || plain.company_id || "";
     const warehouse = mongoWarehouseMap.get(String(plain.warehouse_id));
     const product = mongoProductMap.get(String(plain.product_id));
     const account = mongoAccountMap.get(String(plain.company_account_id));
+    const buyer = buyerMap.get(String(buyerId));
+    const consignee = consigneeMap.get(String(plain.consignee_id));
     const totalQuantity = plain.quantity || Math.max(Number(plain.gross_weight || 0) - Number(plain.tare_weight || 0), 0);
     const totalAmount = plain.amount || 0;
-
     return {
       ...plain,
       id: String(plain._id || plain.id),
       _id: String(plain._id || plain.id),
       buyer_id: buyerId,
-      warehouse_name: warehouse?.name || plain.warehouse_name || "",
-      product_name: product?.name || plain.product_name || "",
-      company_account_name: account?.account_name || account?.name || plain.company_account_name || "",
-      buyer_name: plain.buyer_name || plain.company_name || "",
-      buyer_email: plain.buyer_email || "",
-      buyer_mobile: plain.buyer_mobile || "",
-      consignee_name: plain.consignee_name || "",
-      consignee_email: plain.consignee_email || "",
-      consignee_mobile: plain.consignee_mobile || "",
+      warehouse_name: warehouse?.name || plain.warehouse_name,
+      product_name: product?.name || plain.product_name,
+      company_account_name: account?.account_name || account?.name || plain.company_account_name,
+      buyer_name: buyer?.name || plain.buyer_name || plain.company_name,
+      buyer_email: buyer?.email || plain.buyer_email || "",
+      buyer_mobile: buyer?.mobile || plain.buyer_mobile || "",
+      consignee_name: consignee?.name || plain.consignee_name,
+      consignee_email: consignee?.email || plain.consignee_email || "",
+      consignee_mobile: consignee?.mobile || plain.consignee_mobile || "",
       total_quantity: totalQuantity,
       total_amount: totalAmount,
       ...calculateSaleFollowupMeta(plain),
@@ -943,12 +1059,19 @@ function mergeSaleRows(mongoRows, sqliteRows) {
 }
 
 async function attachSaleBiltiIds(rows) {
-  // Main Trading list must stay MongoDB-only. Bilti is optional for the list;
-  // preserve an already stored value, otherwise return null. Detailed Bilti
-  // information is loaded separately when the user opens a voucher/transport.
-  return (rows || []).map((row) => ({
+  const saleIds = [...new Set((rows || []).map((row) => String(row.id || row._id).trim()).filter(Boolean))];
+  if (!saleIds.length) return rows;
+
+  const placeholders = saleIds.map(() => "?").join(",");
+  const biltiRows = await dbAll(
+    `SELECT sale_id, MAX(id) AS bilti_id FROM transport_bilti WHERE sale_id IS NOT NULL AND CAST(sale_id AS TEXT) IN (${placeholders}) GROUP BY sale_id`,
+    saleIds
+  );
+
+  const biltiMap = new Map((biltiRows || []).map((row) => [String(row.sale_id), row.bilti_id]));
+  return rows.map((row) => ({
     ...row,
-    bilti_id: row.bilti_id || row.transport_bilti_id || null,
+    bilti_id: biltiMap.get(String(row.id || row._id)) || null,
   }));
 }
 
@@ -1597,7 +1720,7 @@ function computeOutstandingForCompany(companyId, callback, companyAccountId = nu
 
 function createVoucherNoIfMissing(type, voucherNo, callback) {
   if (voucherNo && String(voucherNo).trim()) return callback(null, voucherNo);
-  if (type === "purchase" && mongoReady()) {
+  if ((type === "purchase" || type === "sale") && mongoReady()) {
     nextMongoVoucherNo(type)
       .then((nextNo) => callback(null, nextNo))
       .catch((err) => callback(err));
@@ -2140,74 +2263,131 @@ function buildReceiptReferenceId(adjustments, saleRows = []) {
     .join(", ");
 }
 
-function getPaymentRowsForUser(req, res) {
+async function getPaymentRowsPage(req) {
+  const rawPage = parseInt(req.query.page, 10);
+  const rawLimit = parseInt(req.query.limit || req.query.page_size, 10);
+  const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
+  const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 15, 1), 100);
+  const usePaging = req.query.page !== undefined || req.query.page_size !== undefined || req.query.limit !== undefined;
+  const offset = (page - 1) * limit;
+  const search = String(req.query.search || "").trim();
   const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
-  const query = `
-    SELECT p.*, ca.account_name AS company_account_name, f.name AS farmer_name
-    FROM wh_payment_vouchers p
-    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
-    LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
-    WHERE 1 = 1 ${filter.clause}
-    ORDER BY p.date DESC, p.id DESC
-  `;
-  db.all(query, filter.params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const paymentRows = rows || [];
-    if (!paymentRows.length) return res.json([]);
-    const ids = paymentRows.map((row) => row.id);
-    db.all(
-      `
-        SELECT a.*, pv.voucher_no AS purchase_voucher_no
-        FROM wh_payment_adjustments a
-        LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
-        WHERE a.payment_id IN (${ids.map(() => "?").join(",")})
-        ORDER BY a.id ASC
-      `,
-      ids,
-      async (adjErr, adjustmentRows) => {
-        if (adjErr) return res.status(500).json({ error: adjErr.message });
-        let mongoPurchaseMap = new Map();
-        if (mongoReady()) {
-          const mongoPurchaseIds = [...new Set((adjustmentRows || [])
-            .map((row) => String(row.purchase_id || ""))
-            .filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-          if (mongoPurchaseIds.length) {
-            try {
-              const mongoPurchases = await PurchaseVoucher.find({ _id: { $in: mongoPurchaseIds } }).lean();
-              mongoPurchaseMap = new Map((mongoPurchases || []).map((row) => [String(row._id), row]));
-            } catch (mongoErr) {
-              console.error("Payment adjustment purchase lookup failed:", mongoErr.message);
-            }
-          }
-        }
-        const byPayment = new Map();
-        (adjustmentRows || []).forEach((row) => {
-          const paymentId = String(row.payment_id);
-          const mongoPurchase = mongoPurchaseMap.get(String(row.purchase_id));
-          if (!byPayment.has(paymentId)) byPayment.set(paymentId, []);
-          byPayment.get(paymentId).push({
-            ...row,
-            voucher_no: row.purchase_voucher_no || mongoPurchase?.voucher_no || row.purchase_id,
-            purchase_voucher_no: row.purchase_voucher_no || mongoPurchase?.voucher_no || row.purchase_id,
-          });
-        });
-        res.json(paymentRows.map((row) => {
-          const adjustments = byPayment.get(String(row.id)) || [];
-          const adjustmentDetails = adjustments
-            .filter((item) => item.purchase_voucher_no && item.adjusted_amount)
-            .map((item) => `${item.purchase_voucher_no}: ${fmtNum(item.adjusted_amount)}`)
-            .join(", ");
-          return {
-            ...row,
-            party_name: row.company_account_name || row.farmer_name || "-",
-            adjustments,
-            reference_type: row.reference_type || "purchase",
-            reference_id: row.reference_id || adjustmentDetails || adjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", "),
-          };
-        }));
-      }
-    );
+  const searchParams = [...filter.params];
+  let searchClause = "";
+  if (search) {
+    searchClause = `
+      AND (
+        LOWER(COALESCE(p.voucher_no, '')) LIKE LOWER(?) OR
+        LOWER(COALESCE(p.reference_id, '')) LIKE LOWER(?) OR
+        LOWER(COALESCE(f.name, '')) LIKE LOWER(?) OR
+        LOWER(COALESCE(ca.account_name, '')) LIKE LOWER(?)
+      )`;
+    const term = `%${search}%`;
+    searchParams.push(term, term, term, term);
+  }
+
+  const countStarted = performance.now();
+  const totalRow = usePaging
+    ? await dbAll(
+        `
+          SELECT COUNT(*) AS total
+          FROM wh_payment_vouchers p
+          LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+          LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
+          WHERE 1 = 1 ${filter.clause} ${searchClause}
+        `,
+        searchParams
+      )
+    : [{ total: 0 }];
+
+  const total = Number(totalRow?.[0]?.total || 0);
+  const rows = await dbAll(
+    `
+      SELECT p.*, ca.account_name AS company_account_name, f.name AS farmer_name
+      FROM wh_payment_vouchers p
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+      LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
+      WHERE 1 = 1 ${filter.clause} ${searchClause}
+      ORDER BY p.date DESC, p.id DESC
+      ${usePaging ? "LIMIT ? OFFSET ?" : ""}
+    `,
+    usePaging ? [...searchParams, limit, offset] : searchParams
+  );
+
+  if (!rows.length) {
+    return usePaging
+      ? { data: [], pagination: { page, pageSize: limit, total, totalPages: Math.max(1, Math.ceil(total / limit)), hasMore: page * limit < total } }
+      : [];
+  }
+
+  const ids = rows.map((row) => row.id);
+  const adjustmentRows = await dbAll(
+    `
+      SELECT a.*, pv.voucher_no AS purchase_voucher_no
+      FROM wh_payment_adjustments a
+      LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
+      WHERE a.payment_id IN (${ids.map(() => "?").join(",")})
+      ORDER BY a.id ASC
+    `,
+    ids
+  );
+
+  let mongoPurchaseMap = new Map();
+  if (mongoReady()) {
+    const mongoPurchaseIds = [...new Set((adjustmentRows || [])
+      .map((row) => String(row.purchase_id || ""))
+      .filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+    if (mongoPurchaseIds.length) {
+      const mongoPurchases = await PurchaseVoucher.find({ _id: { $in: mongoPurchaseIds } })
+        .select("voucher_no")
+        .lean();
+      mongoPurchaseMap = new Map(mongoPurchases.map((row) => [String(row._id), row]));
+    }
+  }
+
+  const byPayment = new Map();
+  (adjustmentRows || []).forEach((row) => {
+    const paymentId = String(row.payment_id);
+    const mongoPurchase = mongoPurchaseMap.get(String(row.purchase_id));
+    if (!byPayment.has(paymentId)) byPayment.set(paymentId, []);
+    byPayment.get(paymentId).push({
+      ...row,
+      voucher_no: row.purchase_voucher_no || mongoPurchase?.voucher_no || row.purchase_id,
+      purchase_voucher_no: row.purchase_voucher_no || mongoPurchase?.voucher_no || row.purchase_id,
+    });
   });
+
+  const result = rows.map((row) => {
+    const adjustments = byPayment.get(String(row.id)) || [];
+    const adjustmentDetails = adjustments
+      .filter((item) => item.purchase_voucher_no && item.adjusted_amount)
+      .map((item) => `${item.purchase_voucher_no}: ${fmtNum(item.adjusted_amount)}`)
+      .join(", ");
+    return {
+      ...row,
+      party_name: row.company_account_name || row.farmer_name || "-",
+      adjustments,
+      reference_type: row.reference_type || "purchase",
+      reference_id: row.reference_id || adjustmentDetails || adjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", "),
+    };
+  });
+
+  return usePaging
+    ? { data: result, pagination: { page, pageSize: limit, total, totalPages: Math.max(1, Math.ceil(total / limit)), hasMore: page * limit < total } }
+    : result;
+}
+
+function getPaymentRowsForUser(req, res) {
+  const started = performance.now();
+  getPaymentRowsPage(req)
+    .then((payload) => {
+      setServerTiming(res, [{ name: "sqlite-query", duration: performance.now() - started }]);
+      res.json(payload);
+    })
+    .catch((err) => {
+      console.error("Payment page query failed:", err);
+      res.status(500).json({ error: err.message || "Failed to load payment vouchers" });
+    });
 }
 
 // ===========================
@@ -3013,6 +3193,7 @@ router.get("/farmers-by-account/:accountId", async (req, res) => {
     const assignedWarehouses = req.user && Array.isArray(req.user.assigned_warehouses)
       ? req.user.assigned_warehouses.map((id) => String(id))
       : [];
+
     if (selectedWarehouseId) {
       if (assignedWarehouses.length && !assignedWarehouses.includes(selectedWarehouseId)) return res.json([]);
       filter.warehouse_id = selectedWarehouseId;
@@ -3020,66 +3201,89 @@ router.get("/farmers-by-account/:accountId", async (req, res) => {
       filter.warehouse_id = { $in: assignedWarehouses };
     }
 
-    // One Mongo aggregation replaces the previous N+1 pattern where every
-    // farmer triggered a full purchase scan plus a separate payment query.
-    const purchaseTotals = await PurchaseVoucher.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: "$farmer_id",
-          total_purchase: {
-            $sum: { $ifNull: ["$net_amount_payable", { $ifNull: ["$amount", 0] }] }
-          }
-        }
+    try {
+      const purchaseGroups = await PurchaseVoucher.aggregate([
+        { $match: filter },
+        {
+          $group: {
+            _id: "$farmer_id",
+            total_purchase: {
+              $sum: {
+                $cond: [
+                  { $ne: ["$net_amount_payable", 0] },
+                  { $ifNull: ["$net_amount_payable", 0] },
+                  { $ifNull: ["$amount", 0] },
+                ],
+              },
+            },
+          },
+        },
+      ]);
+
+      const farmerIds = purchaseGroups
+        .map((row) => String(row._id || ""))
+        .filter(Boolean);
+      if (!farmerIds.length) return res.json([]);
+
+      const farmers = await Farmer.find({ _id: { $in: farmerIds } })
+        .select("_id name mobile address village")
+        .lean();
+      const farmerMap = new Map(farmers.map((f) => [String(f._id), f]));
+
+      const paymentFilter = [
+        "CAST(p.company_account_id AS TEXT) = CAST(? AS TEXT)",
+        `p.farmer_id IN (${farmerIds.map(() => "?").join(",")})`,
+      ];
+      const paymentParams = [accountId, ...farmerIds];
+      if (selectedWarehouseId) {
+        paymentFilter.push("CAST(p.warehouse_id AS TEXT) = CAST(? AS TEXT)");
+        paymentParams.push(selectedWarehouseId);
+      } else if (assignedWarehouses.length) {
+        paymentFilter.push(`CAST(p.warehouse_id AS TEXT) IN (${assignedWarehouses.map(() => "?").join(",")})`);
+        paymentParams.push(...assignedWarehouses);
       }
-    ]);
 
-    const farmerIds = purchaseTotals.map((row) => String(row._id || "")).filter(Boolean);
-    if (!farmerIds.length) return res.json([]);
+      const paymentRows = await dbAll(
+        `
+          SELECT p.farmer_id, COALESCE(SUM(a.adjusted_amount), 0) AS total_adjusted
+          FROM wh_payment_adjustments a
+          INNER JOIN wh_payment_vouchers p ON CAST(p.id AS TEXT) = CAST(a.payment_id AS TEXT)
+          WHERE ${paymentFilter.join(" AND ")}
+          GROUP BY p.farmer_id
+        `,
+        paymentParams
+      );
+      const paymentMap = new Map(paymentRows.map((row) => [String(row.farmer_id), Number(row.total_adjusted || 0)]));
+      const purchaseMap = new Map(purchaseGroups.map((row) => [String(row._id), Number(row.total_purchase || 0)]));
 
-    const farmers = await Farmer.find({ _id: { $in: farmerIds } })
-      .select("_id name mobile address village")
-      .lean();
+      const result = farmerIds
+        .map((id) => {
+          const farmer = farmerMap.get(id);
+          if (!farmer) return null;
+          const totalPurchase = purchaseMap.get(id) || 0;
+          const totalAdjusted = paymentMap.get(id) || 0;
+          const outstanding = Math.max(0, totalPurchase - totalAdjusted);
+          return {
+            id,
+            name: farmer.name,
+            mobile: farmer.mobile,
+            address: farmer.address,
+            village: farmer.village,
+            total_purchase: Number(totalPurchase.toFixed(2)),
+            total_adjusted: Number(totalAdjusted.toFixed(2)),
+            outstanding: Number(outstanding.toFixed(2)),
+          };
+        })
+        .filter((row) => row && row.outstanding > 0)
+        .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
 
-    const paymentFilter = ["CAST(pv.company_account_id AS TEXT) = CAST(? AS TEXT)"];
-    const paymentParams = [accountId];
-    if (selectedWarehouseId) {
-      paymentFilter.push("CAST(pv.warehouse_id AS TEXT) = CAST(? AS TEXT)");
-      paymentParams.push(selectedWarehouseId);
-    } else if (assignedWarehouses.length) {
-      paymentFilter.push(`CAST(pv.warehouse_id AS TEXT) IN (${assignedWarehouses.map(() => "?").join(",")})`);
-      paymentParams.push(...assignedWarehouses);
+      return res.json(result);
+    } catch (err) {
+      console.error("Mongo farmers-by-account aggregation failed:", err);
+      return res.status(500).json({ error: err.message });
     }
-    paymentFilter.push(`CAST(pv.farmer_id AS TEXT) IN (${farmerIds.map(() => "?").join(",")})`);
-    paymentParams.push(...farmerIds);
-
-    const paymentRows = await dbAll(
-      `SELECT CAST(pv.farmer_id AS TEXT) AS farmer_id, COALESCE(SUM(pv.amount), 0) AS total_payment
-       FROM wh_payment_vouchers pv
-       WHERE ${paymentFilter.join(" AND ")}
-       GROUP BY pv.farmer_id`,
-      paymentParams
-    );
-    const purchaseMap = new Map(purchaseTotals.map((row) => [String(row._id), Number(row.total_purchase || 0)]));
-    const paymentMap = new Map(paymentRows.map((row) => [String(row.farmer_id), Number(row.total_payment || 0)]));
-
-    const result = (farmers || []).map((f) => {
-      const totalPurchase = purchaseMap.get(String(f._id)) || 0;
-      const totalPayment = paymentMap.get(String(f._id)) || 0;
-      return {
-        id: String(f._id),
-        name: f.name,
-        mobile: f.mobile,
-        address: f.address,
-        village: f.village,
-        total_purchase: Number(totalPurchase.toFixed(2)),
-        total_adjusted: Number(totalPayment.toFixed(2)),
-        outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
-      };
-    });
-
-    return res.json(result.filter((f) => f.outstanding > 0));
   }
+
   const filter = assignedWarehouseFilter(req.user, "pv.warehouse_id");
   const filters = ["1=1"];
   const params = [];
@@ -4029,11 +4233,7 @@ function dbAll(query, params = []) {
 
 async function getPurchaseReportRowsForUser(user, options = {}) {
   if (mongoReady()) {
-    const filter = { ...mongoPurchaseScope(user) };
-    if (options.farmer_id) filter.farmer_id = String(options.farmer_id);
-    if (options.warehouse_id) filter.warehouse_id = String(options.warehouse_id);
-    if (options.company_account_id) filter.company_account_id = String(options.company_account_id);
-    const query = PurchaseVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+    const query = PurchaseVoucher.find(mongoPurchaseScope(user)).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
     if (Number.isFinite(Number(options.limit))) {
       query.skip(Number(options.offset) || 0).limit(Number(options.limit));
     }
@@ -4065,8 +4265,22 @@ async function getPurchaseReportRowsForUser(user, options = {}) {
   );
 }
 
-async function getSaleReportRowsForUser(user) {
-  return getAllSaleVoucherRowsForUser(user);
+async function getSaleReportRowsForUser(user, options = {}) {
+  if (!mongoReady()) return [];
+  const filter = mongoPurchaseScope(user);
+  if (options.buyerId) {
+    filter.$or = [{ buyer_id: String(options.buyerId) }, { company_id: String(options.buyerId) }];
+  }
+  if (options.companyAccountId) filter.company_account_id = String(options.companyAccountId);
+  if (options.search) await addVoucherTextSearch(filter, options.search, "sale");
+
+  const query = SaleVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 });
+  if (Number.isFinite(Number(options.limit))) {
+    query.skip(Number(options.offset) || 0).limit(Number(options.limit));
+  }
+  const rows = await query.lean();
+  const decorated = await decorateSaleRows(rows);
+  return attachSaleBiltiIds(decorated);
 }
 
 function buildLedgerRows(rows, getPartyId, getPartyName) {
@@ -4237,198 +4451,116 @@ router.get("/report/payment", (req, res) => {
   getPaymentRowsForUser(req, res);
 });
 
-router.get("/report/sale-summary", (req, res) => {
+router.get("/report/sale-summary", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
+  const started = performance.now();
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 25, 1), 200);
+  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 200);
   const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
+  const buyerId = String(req.query.buyer_id || "").trim();
+  const companyAccountId = String(req.query.company_account_id || "").trim();
+  const search = String(req.query.search || "").trim();
 
-  getSaleReportRowsForUser(req.user, usePaging ? { limit: pageSize, offset: (page - 1) * pageSize } : {})
-    .then(async (rows) => {
-      let total = Array.isArray(rows) ? rows.length : 0;
-      if (usePaging) {
-        const allRows = await getSaleReportRowsForUser(req.user);
-        total = Array.isArray(allRows) ? allRows.length : 0;
-      }
-      return res.json(
-        usePaging
-          ? {
-              data: (rows || []).map((row) => ({
-                ...row,
-                total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
-                total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
-              })),
-              pagination: {
-                page,
-                pageSize,
-                total,
-                hasMore: page * pageSize < total,
-              },
-            }
-          : (rows || []).map((row) => ({
-              ...row,
-              total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
-              total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
-            }))
-      );
-    })
-    .catch((err) => res.status(500).json({ error: err.message }));
+  try {
+    if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Sale Summary" });
+    const filter = mongoPurchaseScope(req.user);
+    if (buyerId) filter.$or = [{ buyer_id: buyerId }, { company_id: buyerId }];
+    if (companyAccountId) filter.company_account_id = companyAccountId;
+    await addVoucherTextSearch(filter, search, "sale");
+
+    const queryStarted = performance.now();
+    const [total, rows] = await Promise.all([
+      cachedMongoCount(SaleVoucher, filter),
+      SaleVoucher.find(filter)
+        .sort({ date: -1, createdAt: -1, _id: -1 })
+        .skip(usePaging ? (page - 1) * pageSize : 0)
+        .limit(usePaging ? pageSize : 0)
+        .lean(),
+    ]);
+    const queryDuration = performance.now() - queryStarted;
+    const decorateStarted = performance.now();
+    const decorated = await decorateSaleRows(rows);
+    const withBilti = await attachSaleBiltiIds(decorated);
+    const decorateDuration = performance.now() - decorateStarted;
+
+    const mapped = withBilti.map((row) => ({
+      ...row,
+      total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
+      total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
+    }));
+
+    setServerTiming(res, [
+      { name: "mongo-query", duration: queryDuration },
+      { name: "decorate", duration: decorateDuration },
+      { name: "total", duration: performance.now() - started },
+    ]);
+
+    return res.json(usePaging ? {
+      data: mapped,
+      pagination: { page, pageSize, total, hasMore: page * pageSize < total },
+    } : mapped);
+  } catch (err) {
+    console.error("Mongo sale report query failed:", err);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
-router.get("/report/purchase-summary", (req, res) => {
+router.get("/report/purchase-summary", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
+  const started = performance.now();
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 25, 1), 200);
+  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 200);
   const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
   const farmerId = String(req.query.farmer_id || "").trim();
   const warehouseId = String(req.query.warehouse_id || "").trim();
   const companyAccountId = String(req.query.company_account_id || "").trim();
+  const search = String(req.query.search || "").trim();
 
-  if (mongoReady()) {
-    const query = PurchaseVoucher.find(mongoPurchaseScope(req.user)).sort({ date: -1, createdAt: -1, _id: -1 });
-    if (farmerId) query.where("farmer_id").equals(farmerId);
-    if (warehouseId) query.where("warehouse_id").equals(warehouseId);
-    if (companyAccountId) query.where("company_account_id").equals(companyAccountId);
-    const countQuery = PurchaseVoucher.countDocuments(query.getQuery());
-    if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
-    return query
-      .lean()
-      .then(async (rows) => {
-        const decoratedRows = await decoratePurchaseRows(rows);
-        let total = Array.isArray(decoratedRows) ? decoratedRows.length : 0;
-        if (usePaging) {
-          total = await countQuery;
-        }
-        return res.json(
-          usePaging
-            ? {
-                data: decoratedRows || [],
-                pagination: {
-                  page,
-                  pageSize,
-                  total,
-                  hasMore: page * pageSize < total,
-                },
-              }
-            : (decoratedRows || [])
-        );
-      })
-      .catch((err) => {
-        console.error("Mongo purchase report query failed, falling back to SQLite:", err.message);
-        res.status(500).json({ error: err.message });
-      });
-  }
+  try {
+    if (mongoReady()) {
+      const filter = mongoPurchaseScope(req.user);
+      if (farmerId) filter.farmer_id = farmerId;
+      if (warehouseId) filter.warehouse_id = warehouseId;
+      if (companyAccountId) filter.company_account_id = companyAccountId;
+      await addVoucherTextSearch(filter, search, "purchase");
 
-  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
-  const legacyFilter = assignedWarehouseFilter(req.user, "t.warehouse_id");
-  const purchaseFilterParams = [...filter.params];
-  const legacyPurchaseFilterParams = [...legacyFilter.params];
-  let purchaseFilterClause = "";
-  let legacyPurchaseFilterClause = "";
-  if (farmerId) {
-    purchaseFilterClause += " AND CAST(v.farmer_id AS TEXT) = CAST(? AS TEXT)";
-    legacyPurchaseFilterClause += " AND CAST(t.farmer_id AS TEXT) = CAST(? AS TEXT)";
-    purchaseFilterParams.push(farmerId);
-    legacyPurchaseFilterParams.push(farmerId);
-  }
-  if (warehouseId) {
-    purchaseFilterClause += " AND CAST(v.warehouse_id AS TEXT) = CAST(? AS TEXT)";
-    legacyPurchaseFilterClause += " AND CAST(t.warehouse_id AS TEXT) = CAST(? AS TEXT)";
-    purchaseFilterParams.push(warehouseId);
-    legacyPurchaseFilterParams.push(warehouseId);
-  }
-  if (companyAccountId) {
-    purchaseFilterClause += " AND CAST(v.company_account_id AS TEXT) = CAST(? AS TEXT)";
-    legacyPurchaseFilterClause += " AND CAST(t.company_account_id AS TEXT) = CAST(? AS TEXT)";
-    purchaseFilterParams.push(companyAccountId);
-    legacyPurchaseFilterParams.push(companyAccountId);
-  }
-  const query = `
-    SELECT
-      v.*,
-      w.name AS warehouse_name,
-      ca.account_name AS company_account_name,
-      f.name AS farmer_name,
-      p.name AS product_name,
-      (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
-      COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
-      COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
-    FROM wh_purchase_vouchers v
-    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
-    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
-    LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(v.farmer_id AS TEXT)
-    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
-    WHERE 1 = 1 ${filter.clause}${purchaseFilterClause}
-    ORDER BY v.date DESC, v.id DESC
-  `;
-  const queryParams = usePaging ? [...purchaseFilterParams, pageSize, (page - 1) * pageSize] : purchaseFilterParams;
-  const pagedQuery = usePaging ? `${query}\nLIMIT ? OFFSET ?` : query;
-  db.all(pagedQuery, queryParams, (err, rows) => {
-    const sendRowsWithLegacy = (purchaseRows) => {
-      const legacyQuery = `
-        SELECT
-          t.id,
-          t.date,
-          t.warehouse_id,
-          t.farmer_id,
-          t.product_id,
-          t.quantity,
-          t.amount,
-          t.description,
-          t.created_at,
-          w.name AS warehouse_name,
-          f.name AS farmer_name,
-          p.name AS product_name,
-          t.quantity AS total_quantity,
-          t.amount AS total_amount,
-          t.amount AS net_amount_payable,
-          1 AS legacy_purchase_entry
-        FROM warehouse_trading_entries t
-        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(t.warehouse_id AS TEXT)
-        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(t.farmer_id AS TEXT)
-        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(t.product_id AS TEXT)
-        WHERE LOWER(COALESCE(t.transaction_type, '')) = 'purchase' ${legacyFilter.clause}${legacyPurchaseFilterClause}
-        ORDER BY t.date DESC, t.id DESC
-      `;
+      const queryStarted = performance.now();
+      const [total, rows] = await Promise.all([
+        cachedMongoCount(PurchaseVoucher, filter),
+        PurchaseVoucher.find(filter)
+          .sort({ date: -1, createdAt: -1, _id: -1 })
+          .skip(usePaging ? (page - 1) * pageSize : 0)
+          .limit(usePaging ? pageSize : 0)
+          .lean(),
+      ]);
+      const queryDuration = performance.now() - queryStarted;
+      const decorateStarted = performance.now();
+      const decoratedRows = await decoratePurchaseRows(rows);
+      const decorateDuration = performance.now() - decorateStarted;
 
-      db.all(legacyQuery, legacyPurchaseFilterParams, (legacyErr, legacyRows) => {
-        if (legacyErr) {
-          console.error("Legacy purchase report query failed:", legacyErr.message);
-          return res.json(purchaseRows || []);
-        }
-        const merged = [...(purchaseRows || []), ...(legacyRows || [])];
-        return res.json(usePaging ? { data: merged, pagination: { page, pageSize, hasMore: merged.length === pageSize } } : merged);
-      });
-    };
+      setServerTiming(res, [
+        { name: "mongo-query", duration: queryDuration },
+        { name: "decorate", duration: decorateDuration },
+        { name: "total", duration: performance.now() - started },
+      ]);
 
-    if (err) {
-      console.error("Purchase report mapped query failed, falling back to base rows:", err.message);
-      const fallbackQuery = `
-        SELECT
-          v.*,
-          (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
-          (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
-          (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
-          (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
-          COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
-          COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
-        FROM wh_purchase_vouchers v
-        WHERE 1 = 1 ${filter.clause}${purchaseFilterClause}
-        ORDER BY v.date DESC, v.id DESC
-      `;
-      return db.all(fallbackQuery, purchaseFilterParams, (fallbackErr, fallbackRows) => {
-        if (fallbackErr) return res.status(500).json({ error: fallbackErr.message });
-        sendRowsWithLegacy(fallbackRows || []);
-      });
+      return res.json(usePaging ? {
+        data: decoratedRows,
+        pagination: { page, pageSize, total, hasMore: page * pageSize < total },
+      } : decoratedRows);
     }
-    sendRowsWithLegacy(rows || []);
-  });
+
+    return res.status(503).json({ error: "MongoDB is required for Purchase Detail report" });
+  } catch (err) {
+    console.error("Mongo purchase report query failed:", err);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 router.get("/report/profit-loss", async (req, res) => {
@@ -4490,13 +4622,20 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
-    // IMPORTANT: filter in MongoDB. The old code loaded every purchase voucher
-    // first and filtered in Node.js, which made this report take 3-4+ seconds.
-    const purchases = await getPurchaseReportRowsForUser(req.user, {
-      farmer_id: farmerId,
-      warehouse_id: warehouseId,
-      company_account_id: companyAccountId,
-    });
+    let purchases = [];
+    if (mongoReady()) {
+      const purchaseFilter = mongoPurchaseScope(req.user);
+      if (farmerId) purchaseFilter.farmer_id = farmerId;
+      if (warehouseId) purchaseFilter.warehouse_id = warehouseId;
+      if (companyAccountId) purchaseFilter.company_account_id = companyAccountId;
+      if (req.query.search) await addVoucherTextSearch(purchaseFilter, req.query.search, "purchase");
+      const purchaseDocs = await PurchaseVoucher.find(purchaseFilter)
+        .sort({ date: -1, createdAt: -1, _id: -1 })
+        .lean();
+      purchases = await decoratePurchaseRows(purchaseDocs);
+    } else {
+      purchases = await getPurchaseReportRowsForUser(req.user);
+    }
 
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
     const paymentParams = [...filter.params];
@@ -4631,6 +4770,150 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     ));
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/sale-party-ledger", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const buyerId = String(req.query.buyer_id || req.query.company_id || "").trim();
+    const companyAccountId = String(req.query.company_account_id || "").trim();
+    const search = String(req.query.search || "").trim();
+
+    const sales = await getSaleReportRowsForUser(req.user, {
+      buyerId,
+      companyAccountId,
+      search,
+    });
+
+    const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
+    const receiptParams = [...filter.params];
+    let buyerClause = "";
+    let accountClause = "";
+    if (buyerId) {
+      buyerClause = " AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)";
+      receiptParams.push(buyerId);
+    }
+    if (companyAccountId) {
+      accountClause = " AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)";
+      receiptParams.push(companyAccountId);
+    }
+
+    const receipts = await dbAll(
+      `
+        SELECT r.*, ca.account_name AS company_account_name
+        FROM wh_receipt_vouchers r
+        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
+        WHERE 1 = 1 ${filter.clause} ${buyerClause} ${accountClause}
+        ORDER BY r.date DESC, r.id DESC
+      `,
+      receiptParams
+    );
+
+    const receiptIds = receipts.map((row) => row.id).filter(Boolean);
+    const adjustments = receiptIds.length
+      ? await dbAll(
+          `
+            SELECT a.*, sv.voucher_no AS sale_voucher_no
+            FROM wh_receipt_adjustments a
+            LEFT JOIN wh_sale_vouchers sv ON CAST(sv.id AS TEXT) = CAST(a.sale_id AS TEXT)
+            WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
+            ORDER BY a.id ASC
+          `,
+          receiptIds
+        )
+      : [];
+
+    const salesMap = new Map(sales.map((row) => [String(row.id || row._id), row]));
+    const adjustmentsBySale = new Map();
+    const adjustmentsByReceipt = new Map();
+
+    adjustments.forEach((item) => {
+      const saleId = String(item.sale_id || "");
+      const receiptId = String(item.receipt_id || "");
+      const sale = salesMap.get(saleId);
+      const detail = {
+        ...item,
+        sale_voucher_no: item.sale_voucher_no || sale?.voucher_no || item.sale_id,
+        receipt_date: receipts.find((r) => String(r.id) === receiptId)?.date || "",
+        receipt_voucher_no: receipts.find((r) => String(r.id) === receiptId)?.voucher_no || "",
+      };
+      if (!adjustmentsBySale.has(saleId)) adjustmentsBySale.set(saleId, []);
+      adjustmentsBySale.get(saleId).push(detail);
+      if (!adjustmentsByReceipt.has(receiptId)) adjustmentsByReceipt.set(receiptId, []);
+      adjustmentsByReceipt.get(receiptId).push(detail);
+    });
+
+    const rows = [
+      ...sales.map((row) => {
+        const saleId = String(row.id || row._id);
+        const receiptDetails = adjustmentsBySale.get(saleId) || [];
+        const saleAmount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+        const receiptAmount = receiptDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
+        return {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Sale",
+          particulars: `Sale Bill ${row.voucher_no || ""}`.trim(),
+          adjustment_details: receiptDetails
+            .map((item) => `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`)
+            .join("; "),
+          receipt_details: receiptDetails,
+          sale_id: saleId,
+          sale_amount: Number(saleAmount.toFixed(2)),
+          receipt_amount: Number(receiptAmount.toFixed(2)),
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name,
+          buyer_id: row.buyer_id || row.company_id,
+          buyer_name: row.buyer_name || row.company_name,
+          party_name: row.buyer_name || row.company_name || "Unknown Party",
+          company_account_id: row.company_account_id,
+          company_account_name: row.company_account_name,
+          due_date: row.due_date,
+          due_days: row.due_days,
+          unloading_date: row.unloading_date,
+          ...calculateSaleFollowupMeta(row),
+          debit: saleAmount,
+          credit: 0,
+        };
+      }),
+      ...receipts.map((row) => {
+        const receiptAdjustments = adjustmentsByReceipt.get(String(row.id)) || [];
+        const adjustmentDetails = receiptAdjustments
+          .map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`)
+          .join("; ");
+        const isOnAccount = !receiptAdjustments.length && !String(row.reference_id || "").trim();
+        return {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Receipt",
+          particulars: isOnAccount
+            ? "Unadjusted on account"
+            : `Receipt adjusted against ${receiptAdjustments.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
+          adjustment_details: adjustmentDetails,
+          reference_id: row.reference_id || receiptAdjustments.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
+          warehouse_id: row.warehouse_id,
+          company_account_id: row.company_account_id,
+          company_account_name: row.company_account_name,
+          buyer_id: row.company_id,
+          party_name: row.company_name || row.buyer_name || "Unknown Party",
+          debit: 0,
+          credit: Number(row.amount || 0),
+        };
+      }),
+    ];
+
+    return res.json(buildLedgerRows(
+      rows,
+      (row) => `${row.buyer_id || row.company_id || "unknown"}::${row.company_account_id || "no-account"}`,
+      (row) => row.party_name || row.buyer_name || row.company_name || row.company_account_name || "Unknown Party"
+    ));
+  } catch (err) {
+    console.error("Sale party ledger failed:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
