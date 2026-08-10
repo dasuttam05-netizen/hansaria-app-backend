@@ -18,7 +18,6 @@ const {
   Consignee,
   Employee,
   Location,
-  SqliteMirrorRow,
 } = require("../mongo");
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -279,26 +278,14 @@ function voucherListResponse(rows, total, options) {
 async function getPurchaseVoucherPage(req) {
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "purchase");
-  const lookupOnly = String(req.query.lookup || "") === "1";
-
-  let docsQuery = PurchaseVoucher.find(filter)
-    .sort({ date: options.order, _id: options.order })
-    .skip(options.skip)
-    .limit(options.limit);
-
-  // Sale -> Against Purchase only needs a small set of fields. Never send the
-  // full purchase document to the browser for this lookup.
-  if (lookupOnly) {
-    docsQuery = docsQuery.select(
-      "_id voucher_no date warehouse_id farmer_id company_account_id product_id quantity rate amount net_weight total_qty net_amount_payable"
-    );
-  }
-
   const [total, docs] = await Promise.all([
     PurchaseVoucher.countDocuments(filter),
-    docsQuery.lean(),
+    PurchaseVoucher.find(filter)
+      .sort({ date: options.order, _id: options.order })
+      .skip(options.skip)
+      .limit(options.limit)
+      .lean(),
   ]);
-
   const rows = await decoratePurchaseRows(docs);
   if (options.all) return rows;
   return voucherListResponse(rows, total, options);
@@ -878,64 +865,48 @@ async function decorateSaleRows(rows) {
   const warehouseIds = [...new Set(plainRows.map((r) => r.warehouse_id).filter(Boolean))];
   const productIds = [...new Set(plainRows.map((r) => r.product_id).filter(Boolean))];
   const accountIds = [...new Set(plainRows.map((r) => r.company_account_id).filter(Boolean))];
-  const buyerIds = [...new Set(plainRows.map((r) => r.buyer_id || r.company_id).filter(Boolean))];
-  const consigneeIds = [...new Set(plainRows.map((r) => r.consignee_id).filter(Boolean))];
 
   const mongoWarehouseIds = warehouseIds.filter(mongoose.Types.ObjectId.isValid);
   const mongoProductIds = productIds.filter(mongoose.Types.ObjectId.isValid);
   const mongoAccountIds = accountIds.filter(mongoose.Types.ObjectId.isValid);
 
-  // All list decoration stays in MongoDB. Buyer/consignee records are read from
-  // the existing Mongo mirror collection so the Trading list never queries SQLite.
-  const mirrorFilters = (table, ids) => ({
-    table,
-    row_id: { $in: ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0) },
-  });
-  const [
-    mongoWarehouses,
-    mongoProducts,
-    mongoAccounts,
-    mirrorBuyers,
-    mirrorConsignees,
-  ] = await Promise.all([
-    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : [],
-    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : [],
-    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : [],
-    buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : [],
-    consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : [],
+  // IMPORTANT: the main Trading list is MongoDB-only. Do not read SQLite or
+  // an optional mirror collection here. Buyer/consignee names are already
+  // available in the sale document when present, and the React page also has
+  // the master-data lookup maps.
+  const [mongoWarehouses, mongoProducts, mongoAccounts] = await Promise.all([
+    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).select("name").lean() : [],
+    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).select("name").lean() : [],
+    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).select("account_name name").lean() : [],
   ]);
 
   const byMongoId = (items) => new Map(items.map((item) => [String(item._id), item]));
-  const byMirrorId = (items) => new Map(items.map((item) => [String(item.row_id), item.data || {}]));
   const mongoWarehouseMap = byMongoId(mongoWarehouses);
   const mongoProductMap = byMongoId(mongoProducts);
   const mongoAccountMap = byMongoId(mongoAccounts);
-  const buyerMap = byMirrorId(mirrorBuyers);
-  const consigneeMap = byMirrorId(mirrorConsignees);
 
   return plainRows.map((plain) => {
     const buyerId = plain.buyer_id || plain.company_id || "";
     const warehouse = mongoWarehouseMap.get(String(plain.warehouse_id));
     const product = mongoProductMap.get(String(plain.product_id));
     const account = mongoAccountMap.get(String(plain.company_account_id));
-    const buyer = buyerMap.get(String(buyerId));
-    const consignee = consigneeMap.get(String(plain.consignee_id));
     const totalQuantity = plain.quantity || Math.max(Number(plain.gross_weight || 0) - Number(plain.tare_weight || 0), 0);
     const totalAmount = plain.amount || 0;
+
     return {
       ...plain,
       id: String(plain._id || plain.id),
       _id: String(plain._id || plain.id),
       buyer_id: buyerId,
-      warehouse_name: warehouse?.name || plain.warehouse_name,
-      product_name: product?.name || plain.product_name,
-      company_account_name: account?.account_name || account?.name || plain.company_account_name,
-      buyer_name: buyer?.name || plain.buyer_name || plain.company_name,
-      buyer_email: buyer?.email || plain.buyer_email || "",
-      buyer_mobile: buyer?.mobile || plain.buyer_mobile || "",
-      consignee_name: consignee?.name || plain.consignee_name,
-      consignee_email: consignee?.email || plain.consignee_email || "",
-      consignee_mobile: consignee?.mobile || plain.consignee_mobile || "",
+      warehouse_name: warehouse?.name || plain.warehouse_name || "",
+      product_name: product?.name || plain.product_name || "",
+      company_account_name: account?.account_name || account?.name || plain.company_account_name || "",
+      buyer_name: plain.buyer_name || plain.company_name || "",
+      buyer_email: plain.buyer_email || "",
+      buyer_mobile: plain.buyer_mobile || "",
+      consignee_name: plain.consignee_name || "",
+      consignee_email: plain.consignee_email || "",
+      consignee_mobile: plain.consignee_mobile || "",
       total_quantity: totalQuantity,
       total_amount: totalAmount,
       ...calculateSaleFollowupMeta(plain),
@@ -972,19 +943,12 @@ function mergeSaleRows(mongoRows, sqliteRows) {
 }
 
 async function attachSaleBiltiIds(rows) {
-  const saleIds = [...new Set((rows || []).map((row) => String(row.id || row._id).trim()).filter(Boolean))];
-  if (!saleIds.length) return rows;
-
-  const placeholders = saleIds.map(() => "?").join(",");
-  const biltiRows = await dbAll(
-    `SELECT sale_id, MAX(id) AS bilti_id FROM transport_bilti WHERE sale_id IS NOT NULL AND CAST(sale_id AS TEXT) IN (${placeholders}) GROUP BY sale_id`,
-    saleIds
-  );
-
-  const biltiMap = new Map((biltiRows || []).map((row) => [String(row.sale_id), row.bilti_id]));
-  return rows.map((row) => ({
+  // Main Trading list must stay MongoDB-only. Bilti is optional for the list;
+  // preserve an already stored value, otherwise return null. Detailed Bilti
+  // information is loaded separately when the user opens a voucher/transport.
+  return (rows || []).map((row) => ({
     ...row,
-    bilti_id: biltiMap.get(String(row.id || row._id)) || null,
+    bilti_id: row.bilti_id || row.transport_bilti_id || null,
   }));
 }
 
