@@ -279,14 +279,26 @@ function voucherListResponse(rows, total, options) {
 async function getPurchaseVoucherPage(req) {
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "purchase");
+  const lookupOnly = String(req.query.lookup || "") === "1";
+
+  let docsQuery = PurchaseVoucher.find(filter)
+    .sort({ date: options.order, _id: options.order })
+    .skip(options.skip)
+    .limit(options.limit);
+
+  // Sale -> Against Purchase only needs a small set of fields. Never send the
+  // full purchase document to the browser for this lookup.
+  if (lookupOnly) {
+    docsQuery = docsQuery.select(
+      "_id voucher_no date warehouse_id farmer_id company_account_id product_id quantity rate amount net_weight total_qty net_amount_payable"
+    );
+  }
+
   const [total, docs] = await Promise.all([
     PurchaseVoucher.countDocuments(filter),
-    PurchaseVoucher.find(filter)
-      .sort({ date: options.order, _id: options.order })
-      .skip(options.skip)
-      .limit(options.limit)
-      .lean(),
+    docsQuery.lean(),
   ]);
+
   const rows = await decoratePurchaseRows(docs);
   if (options.all) return rows;
   return voucherListResponse(rows, total, options);
