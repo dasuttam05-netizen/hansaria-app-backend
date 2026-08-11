@@ -5057,7 +5057,13 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
         const paymentDetails = adjustmentsByPurchase.get(purchaseId) || [];
         const netPurchaseAmount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
         const grossPurchaseAmount = purchaseGrossAmountFromRow(row);
-        const purchaseAmount = detailsOfDeduction ? grossPurchaseAmount : netPurchaseAmount;
+        // Round-off belongs to the purchase credit itself. A positive round-off
+        // increases the credited purchase amount; a negative round-off reduces it.
+        // In Details of Deduction mode the gross amount is therefore adjusted by
+        // round-off before the deduction rows are applied.
+        const roundOffAmount = Number(row.round_off || 0);
+        const purchaseCreditAmount = grossPurchaseAmount + roundOffAmount;
+        const purchaseAmount = detailsOfDeduction ? purchaseCreditAmount : netPurchaseAmount;
         const paymentAmount = paymentDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
         const base = {
           date: row.date,
@@ -5071,6 +5077,8 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
           purchase_id: purchaseId,
           purchase_amount: Number(purchaseAmount.toFixed(2)),
           gross_purchase_amount: Number(grossPurchaseAmount.toFixed(2)),
+          round_off_amount: Number(roundOffAmount.toFixed(2)),
+          purchase_credit_amount: Number(purchaseCreditAmount.toFixed(2)),
           net_purchase_amount: Number(netPurchaseAmount.toFixed(2)),
           payment_amount: Number(paymentAmount.toFixed(2)),
           journal_amount: 0,
