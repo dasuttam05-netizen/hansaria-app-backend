@@ -434,6 +434,12 @@ const numberFields = [
   "net_weight",
   "bags_claim",
   "labour",
+  "claim_amount",
+  "other_deduction",
+  "cd_percent",
+  "cd_amount",
+  "adjustment_amount",
+  "tds_amount",
   "total_deduct_amount",
   "total_qty",
   "total_deduction",
@@ -460,6 +466,47 @@ function buildPurchasePayload(body, voucherNo) {
   });
 
   return payload;
+}
+
+
+function buildPurchaseDeductionDetails(body = {}) {
+  const n = (key) => {
+    const value = Number(body?.[key]);
+    return Number.isFinite(value) ? value : 0;
+  };
+  const claim = n("claim_amount") || n("bags_claim");
+  const rows = [
+    { key: "tds", label: "TDS", amount: n("tds_amount"), account_label: "TDS" },
+    { key: "cd", label: `CD${n("cd_percent") > 0 ? ` ${n("cd_percent")} %` : ""}`, amount: n("cd_amount"), account_label: "Cash Discount" },
+    { key: "claim", label: "Claim", amount: claim, account_label: "Claim" },
+    { key: "labour", label: "EXP", amount: n("labour"), account_label: "Labour" },
+    { key: "transport", label: "Freight", amount: n("transport_charge"), account_label: "Freight" },
+    { key: "other", label: "Other Deduction", amount: n("other_deduction"), account_label: "Other Deduction" },
+    { key: "adjustment", label: "Adjustment", amount: n("adjustment_amount"), account_label: "Adjustment" },
+  ];
+  return rows
+    .filter((row) => row.amount > 0)
+    .map((row) => ({
+      key: row.key,
+      label: row.label,
+      account_label: row.account_label,
+      amount: Number(row.amount.toFixed(2)),
+    }));
+}
+
+function purchaseDeductionTotalFromRow(row = {}) {
+  const n = (key) => Number(row?.[key]) || 0;
+  const claim = n("claim_amount") || n("bags_claim");
+  return Number((
+    claim + n("labour") + n("transport_charge") + n("cd_amount") + n("tds_amount") + n("other_deduction") + n("adjustment_amount")
+  ).toFixed(2));
+}
+
+function purchaseGrossAmountFromRow(row = {}) {
+  const qty = Number(row.total_qty || row.net_weight || row.quantity || 0) || 0;
+  const rate = Number(row.rate || 0) || 0;
+  const calculated = qty * rate;
+  return Number((calculated || row.gross_amount || row.amount || 0).toFixed(2));
 }
 
 function buildSalePayload(body, voucherNo) {
@@ -2817,6 +2864,11 @@ router.post("/purchase", (req, res) => {
       try {
         const payload = buildPurchasePayload(req.body, generatedVoucherNo);
         const doc = await PurchaseVoucher.create(payload);
+        const deductionDetails = buildPurchaseDeductionDetails(req.body);
+        await PurchaseVoucher.collection.updateOne(
+          { _id: doc._id },
+          { $set: { claim_amount: Number(req.body.claim_amount || req.body.bags_claim || 0), other_deduction: Number(req.body.other_deduction || 0), cd_percent: Number(req.body.cd_percent || 0), cd_amount: Number(req.body.cd_amount || 0), adjustment_amount: Number(req.body.adjustment_amount || 0), tds_amount: Number(req.body.tds_amount || 0), deduction_details: deductionDetails, total_deduction: Number(req.body.total_deduction || 0) } }
+        );
         return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: doc.voucher_no, saved_to: "mongodb" });
       } catch (mongoErr) {
         if (mongoErr?.code === 11000) return res.status(400).json({ error: "Voucher number already exists" });
@@ -4927,6 +4979,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
+    const detailsOfDeduction = ["1", "true", "yes", "details"].includes(String(req.query.details_of_deduction || "").trim().toLowerCase());
     const purchasePromise = getPurchaseReportRowsForUser(req.user, { farmerId, warehouseId, companyAccountId });
 
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
@@ -4999,12 +5052,14 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     });
 
     const rows = [
-      ...purchases.map((row) => {
+      ...purchases.flatMap((row) => {
         const purchaseId = String(row.id || row._id);
         const paymentDetails = adjustmentsByPurchase.get(purchaseId) || [];
-        const purchaseAmount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+        const netPurchaseAmount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+        const grossPurchaseAmount = purchaseGrossAmountFromRow(row);
+        const purchaseAmount = detailsOfDeduction ? grossPurchaseAmount : netPurchaseAmount;
         const paymentAmount = paymentDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
-        return {
+        const base = {
           date: row.date,
           voucher_no: row.voucher_no,
           voucher_type: "Purchase",
@@ -5015,6 +5070,8 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
           payment_details: paymentDetails,
           purchase_id: purchaseId,
           purchase_amount: Number(purchaseAmount.toFixed(2)),
+          gross_purchase_amount: Number(grossPurchaseAmount.toFixed(2)),
+          net_purchase_amount: Number(netPurchaseAmount.toFixed(2)),
           payment_amount: Number(paymentAmount.toFixed(2)),
           journal_amount: 0,
           receipt_amount: 0,
@@ -5028,6 +5085,34 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
           debit: 0,
           credit: purchaseAmount,
         };
+        if (!detailsOfDeduction) return [base];
+        const deductions = Array.isArray(row.deduction_details) && row.deduction_details.length
+          ? row.deduction_details
+          : buildPurchaseDeductionDetails(row);
+        const deductionRows = deductions.map((detail) => {
+          const amount = Number(detail.amount || 0);
+          const label = String(detail.label || detail.account_label || detail.key || "Deduction");
+          const particular = detail.key === "labour"
+            ? `EXP - Labour - ${fmtNum(amount)}`
+            : `${label} - ${fmtNum(amount)}`;
+          return {
+            ...base,
+            id: `${purchaseId}-deduction-${detail.key}`,
+            row_type: "deduction",
+            voucher_type: "Deduction",
+            particulars: particular,
+            adjustment_details: detail.account_label || label,
+            deduction_type: detail.key,
+            deduction_label: label,
+            deduction_amount: Number(amount.toFixed(2)),
+            debit: Number(amount.toFixed(2)),
+            credit: 0,
+            payment_details: [],
+            purchase_amount: 0,
+            bill_balance: 0,
+          };
+        });
+        return [base, ...deductionRows];
       }),
       ...payments.map((row) => {
         const paymentAdjustments = adjustmentsByPayment.get(String(row.id)) || [];
@@ -5696,8 +5781,13 @@ router.put("/purchase/:id", (req, res) => {
   if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
     const payload = buildPurchasePayload(req.body, voucher_no);
     return PurchaseVoucher.findByIdAndUpdate(id, payload, { new: true })
-      .then((doc) => {
+      .then(async (doc) => {
         if (!doc) return res.status(404).json({ error: "Voucher not found" });
+        const deductionDetails = buildPurchaseDeductionDetails(req.body);
+        await PurchaseVoucher.collection.updateOne(
+          { _id: doc._id },
+          { $set: { claim_amount: Number(req.body.claim_amount || req.body.bags_claim || 0), other_deduction: Number(req.body.other_deduction || 0), cd_percent: Number(req.body.cd_percent || 0), cd_amount: Number(req.body.cd_amount || 0), adjustment_amount: Number(req.body.adjustment_amount || 0), tds_amount: Number(req.body.tds_amount || 0), deduction_details: deductionDetails, total_deduction: Number(req.body.total_deduction || 0) } }
+        );
         res.json({ id: String(doc._id), _id: String(doc._id), message: "Voucher updated successfully", saved_to: "mongodb" });
       })
       .catch((err) => {
