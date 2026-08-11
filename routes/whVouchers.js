@@ -6,6 +6,9 @@ const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/acce
 const PDFDocument = require('pdfkit');
 const multer = require("multer");
 const XLSX = require("xlsx");
+const tradingFilterCache = new Map();
+const TRADING_FILTER_CACHE_MS = 5 * 60 * 1000;
+
 const {
   mongoose,
   PurchaseVoucher,
@@ -22,6 +25,21 @@ const {
 } = require("../mongo");
 
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Trading report indexes. Build in the background so the first HTTP request is
+// not blocked by index creation. These cover the common filter + newest-first
+// pagination path used by Purchase/Sale reports.
+let tradingIndexesStarted = false;
+function ensureTradingIndexes() {
+  if (tradingIndexesStarted || !mongoReady()) return;
+  tradingIndexesStarted = true;
+  Promise.allSettled([
+    PurchaseVoucher.collection.createIndex({ date: -1, createdAt: -1, _id: -1 }, { name: "trading_purchase_date_desc" }),
+    PurchaseVoucher.collection.createIndex({ warehouse_id: 1, company_account_id: 1, farmer_id: 1, date: -1, createdAt: -1 }, { name: "trading_purchase_filters_date" }),
+    SaleVoucher.collection.createIndex({ date: -1, createdAt: -1, _id: -1 }, { name: "trading_sale_date_desc" }),
+    SaleVoucher.collection.createIndex({ warehouse_id: 1, company_account_id: 1, farmer_id: 1, date: -1, createdAt: -1 }, { name: "trading_sale_filters_date" }),
+  ]).catch(() => {});
+}
 
 function fmtDate(value) {
   if (!value) return "-";
@@ -4331,6 +4349,7 @@ router.get("/report/payment", (req, res) => {
 });
 
 router.get("/report/filter-options", async (req, res) => {
+  ensureTradingIndexes();
   const type = String(req.query.type || "purchase").trim().toLowerCase();
   if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Trading report filters" });
 
@@ -4342,6 +4361,13 @@ router.get("/report/filter-options", async (req, res) => {
   const warehouseId = String(req.query.warehouse_id || "").trim();
   const farmerId = String(req.query.farmer_id || "").trim();
   const buyerId = String(req.query.buyer_id || "").trim();
+  const cacheKey = JSON.stringify([
+    req.user?.id || req.user?._id || "", type, accountId, warehouseId, farmerId, buyerId,
+  ]);
+  const cached = tradingFilterCache.get(cacheKey);
+  if (cached && Date.now() - cached.time < TRADING_FILTER_CACHE_MS) {
+    return res.json(cached.data);
+  }
 
   try {
     const base = isPurchase ? { ...mongoPurchaseScope(req.user) } : { ...mongoSaleScope(req.user) };
@@ -4372,12 +4398,51 @@ router.get("/report/filter-options", async (req, res) => {
     }
 
     const clean = (values) => [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))];
-    res.json({
+    const validIds = (values) => clean(values).filter((value) => mongoose.Types.ObjectId.isValid(value));
+
+    const cleanAccountIds = validIds(accountIds);
+    const cleanWarehouseIds = validIds(warehouseIds);
+    const cleanFarmerIds = validIds(farmerIds);
+    const cleanBuyerIds = validIds(buyerIds);
+
+    // Return labels together with IDs so Reports do not need to load the
+    // entire nine-table master bundle just to populate filter dropdowns.
+    const [accountDocs, warehouseDocs, farmerDocs, buyerDocs] = await Promise.all([
+      cleanAccountIds.length ? CompanyAccount.find({ _id: { $in: cleanAccountIds } }).select("_id account_name name").lean() : [],
+      cleanWarehouseIds.length ? Warehouse.find({ _id: { $in: cleanWarehouseIds } }).select("_id name").lean() : [],
+      cleanFarmerIds.length ? Farmer.find({ _id: { $in: cleanFarmerIds } }).select("_id name").lean() : [],
+      cleanBuyerIds.length ? SqliteMirrorRow.find({
+        table: "buyer_names",
+        row_id: { $in: cleanBuyerIds.map((value) => Number(value)).filter(Number.isFinite) },
+      }).select("row_id data").lean() : [],
+    ]);
+
+    const cleanNamed = (docs, type) => {
+      if (type === "buyer") {
+        return (docs || []).map((doc) => ({
+          id: String(doc.row_id),
+          name: String(doc?.data?.name || doc?.data?.company_name || "").trim(),
+        })).filter((item) => item.id && item.name);
+      }
+      return (docs || []).map((doc) => ({
+        id: String(doc._id),
+        name: String(doc.account_name || doc.name || "").trim(),
+      })).filter((item) => item.id && item.name);
+    };
+
+    const data = {
       account_ids: clean(accountIds),
       warehouse_ids: clean(warehouseIds),
       farmer_ids: clean(farmerIds),
       buyer_ids: clean(buyerIds),
-    });
+      accounts: cleanNamed(accountDocs),
+      warehouses: cleanNamed(warehouseDocs),
+      farmers: cleanNamed(farmerDocs),
+      buyers: cleanNamed(buyerDocs, "buyer"),
+    };
+    tradingFilterCache.set(cacheKey, { time: Date.now(), data });
+    res.set("Cache-Control", "private, max-age=300, stale-while-revalidate=60");
+    res.json(data);
   } catch (err) {
     console.error("Trading report filter options failed:", err);
     res.status(500).json({ error: err.message || "Failed to load report filters" });
@@ -4385,6 +4450,7 @@ router.get("/report/filter-options", async (req, res) => {
 });
 
 router.get("/report/sale-summary", async (req, res) => {
+  ensureTradingIndexes();
   if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
   }
@@ -4408,16 +4474,17 @@ router.get("/report/sale-summary", async (req, res) => {
       if (options.warehouseId) filter.warehouse_id = options.warehouseId;
       if (options.companyAccountId) filter.company_account_id = options.companyAccountId;
       if (options.productId) filter.product_id = options.productId;
-      const total = usePaging ? await SaleVoucher.countDocuments(filter) : 0;
       const query = SaleVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+      const countPromise = usePaging ? SaleVoucher.countDocuments(filter).exec() : Promise.resolve(0);
       if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
-      const rows = await decorateSaleRows(await query);
-      const data = rows.map((row) => ({
+      const [rows, total] = await Promise.all([query.exec(), countPromise]);
+      const decorated = await decorateSaleRows(rows || []);
+      const data = decorated.map((row) => ({
         ...row,
         total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
         total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
       }));
-      return res.json(usePaging ? { data, pagination: { page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)), hasMore: page * pageSize < total } } : data);
+      return res.json(usePaging ? { data, pagination: { page, pageSize, total: Number(total || 0), totalPages: Math.max(1, Math.ceil(Number(total || 0) / pageSize)), hasMore: page * pageSize < Number(total || 0) } } : data);
     }
 
     const rows = await getSaleReportRowsForUser(req.user, options);
@@ -4430,6 +4497,7 @@ router.get("/report/sale-summary", async (req, res) => {
 });
 
 router.get("/report/purchase-summary", (req, res) => {
+  ensureTradingIndexes();
   if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
     return res.status(403).json({ error: "Permission denied" });
   }
@@ -4446,16 +4514,14 @@ router.get("/report/purchase-summary", (req, res) => {
     if (farmerId) query.where("farmer_id").equals(farmerId);
     if (warehouseId) query.where("warehouse_id").equals(warehouseId);
     if (companyAccountId) query.where("company_account_id").equals(companyAccountId);
-    const countQuery = PurchaseVoucher.countDocuments(query.getQuery());
+    const countPromise = usePaging ? PurchaseVoucher.countDocuments(query.getQuery()).exec() : Promise.resolve(null);
     if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
-    return query
-      .lean()
-      .then(async (rows) => {
-        const decoratedRows = await decoratePurchaseRows(rows);
-        let total = Array.isArray(decoratedRows) ? decoratedRows.length : 0;
-        if (usePaging) {
-          total = await countQuery;
-        }
+    const rowsPromise = query.lean().exec();
+
+    return Promise.all([rowsPromise, countPromise])
+      .then(async ([rows, totalCount]) => {
+        const decoratedRows = await decoratePurchaseRows(rows || []);
+        const total = usePaging ? Number(totalCount || 0) : decoratedRows.length;
         return res.json(
           usePaging
             ? {
@@ -4641,7 +4707,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
-    const purchases = await getPurchaseReportRowsForUser(req.user, { farmerId, warehouseId, companyAccountId });
+    const purchasePromise = getPurchaseReportRowsForUser(req.user, { farmerId, warehouseId, companyAccountId });
 
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
     const paymentParams = [...filter.params];
@@ -4661,7 +4727,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       paymentParams.push(companyAccountId);
     }
 
-    const payments = await dbAll(
+    const paymentsPromise = dbAll(
       `
         SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name, ca.account_name AS company_account_name
         FROM wh_payment_vouchers p
@@ -4673,6 +4739,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       paymentParams
     );
 
+    const [purchases, payments] = await Promise.all([purchasePromise, paymentsPromise]);
     const paymentIds = payments.map((row) => row.id);
     const sqliteAdjustments = paymentIds.length
       ? await dbAll(
