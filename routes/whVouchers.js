@@ -334,9 +334,11 @@ async function getSaleVoucherPage(req) {
       .lean(),
   ]);
   const rows = await decorateSaleRows(docs);
-  const withBilti = await attachSaleBiltiIds(rows);
+  // Do not make the fast MongoDB Sale list wait for the legacy SQLite Bilti
+  // table. Bilti is an auxiliary field and is loaded lazily by the relevant
+  // action. This removes an unnecessary cross-database query from every page.
   return voucherListResponse(
-    withBilti.map((row) => ({ ...row, ...calculateSaleFollowupMeta(row) })),
+    rows.map((row) => ({ ...row, bilti_id: row.bilti_id || null, ...calculateSaleFollowupMeta(row) })),
     total,
     options
   );
@@ -1002,17 +1004,22 @@ async function attachSaleBiltiIds(rows) {
   const saleIds = [...new Set((rows || []).map((row) => String(row.id || row._id).trim()).filter(Boolean))];
   if (!saleIds.length) return rows;
 
-  const placeholders = saleIds.map(() => "?").join(",");
-  const biltiRows = await dbAll(
-    `SELECT sale_id, MAX(id) AS bilti_id FROM transport_bilti WHERE sale_id IS NOT NULL AND CAST(sale_id AS TEXT) IN (${placeholders}) GROUP BY sale_id`,
-    saleIds
-  );
+  try {
+    const placeholders = saleIds.map(() => "?").join(",");
+    const biltiRows = await dbAll(
+      `SELECT sale_id, MAX(id) AS bilti_id FROM transport_bilti WHERE sale_id IS NOT NULL AND CAST(sale_id AS TEXT) IN (${placeholders}) GROUP BY sale_id`,
+      saleIds
+    );
 
-  const biltiMap = new Map((biltiRows || []).map((row) => [String(row.sale_id), row.bilti_id]));
-  return rows.map((row) => ({
-    ...row,
-    bilti_id: biltiMap.get(String(row.id || row._id)) || null,
-  }));
+    const biltiMap = new Map((biltiRows || []).map((row) => [String(row.sale_id), row.bilti_id]));
+    return rows.map((row) => ({
+      ...row,
+      bilti_id: biltiMap.get(String(row.id || row._id)) || null,
+    }));
+  } catch (err) {
+    console.warn("Optional sale Bilti lookup skipped:", err?.message || err);
+    return rows;
+  }
 }
 
 function getSqlitePurchaseRows(req) {
@@ -4550,7 +4557,22 @@ router.get("/report/sale-summary", async (req, res) => {
       const countPromise = usePaging ? SaleVoucher.countDocuments(filter).exec() : Promise.resolve(0);
       if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
       const [rows, total] = await Promise.all([query.exec(), countPromise]);
-      const decorated = await decorateSaleRows(rows || []);
+      let decorated;
+      try {
+        decorated = await decorateSaleRows(rows || []);
+      } catch (decorateErr) {
+        // Reporting must not fail because an optional master/mirror record is
+        // missing. MongoDB voucher data is still valid and should be returned.
+        console.error("Sale report decoration skipped:", decorateErr);
+        decorated = (rows || []).map((row) => ({
+          ...(row?.toObject ? row.toObject() : row),
+          id: String(row?._id || row?.id || ""),
+          _id: String(row?._id || row?.id || ""),
+          total_quantity: Number(row?.quantity || row?.total_quantity || 0),
+          total_amount: Number(row?.amount || row?.total_amount || 0),
+          ...calculateSaleFollowupMeta(row || {}),
+        }));
+      }
       const data = decorated.map((row) => ({
         ...row,
         total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
