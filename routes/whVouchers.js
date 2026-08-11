@@ -9,6 +9,18 @@ const XLSX = require("xlsx");
 const tradingFilterCache = new Map();
 const TRADING_FILTER_CACHE_MS = 15 * 60 * 1000;
 
+// Fast payment-edit/outstanding indexes. These are cheap SQLite indexes and
+// prevent full-table scans when filtering by farmer + account + warehouse.
+function ensurePaymentSqliteIndexes() {
+  const statements = [
+    `CREATE INDEX IF NOT EXISTS idx_wh_payment_farmer_account_warehouse ON wh_payment_vouchers(farmer_id, company_account_id, warehouse_id, date)`,
+    `CREATE INDEX IF NOT EXISTS idx_wh_purchase_farmer_account_warehouse ON wh_purchase_vouchers(farmer_id, company_account_id, warehouse_id, date)`,
+    `CREATE INDEX IF NOT EXISTS idx_wh_payment_adjustments_purchase_payment ON wh_payment_adjustments(purchase_id, payment_id)`,
+  ];
+  statements.forEach((sql) => db.run(sql, () => {}));
+}
+setImmediate(ensurePaymentSqliteIndexes);
+
 const {
   mongoose,
   PurchaseVoucher,
@@ -2904,6 +2916,7 @@ router.get("/next-voucher-no", (req, res) => {
 });
 
 router.get("/outstanding", (req, res) => {
+  const startedAt = Date.now();
   const { party_type, id, warehouse_id, location_id, exclude_payment_id, company_account_id } = req.query;
   if (!party_type || !id) return res.status(400).json({ error: "party_type and id are required" });
 
@@ -2932,9 +2945,10 @@ router.get("/outstanding", (req, res) => {
       paymentParams.push(exclude_payment_id);
     }
     paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_payment_vouchers WHERE farmer_id = ? ${paymentFilters.length ? `AND ${paymentFilters.join(" AND ")}` : ""} ORDER BY date ASC`;
-    computeOutstandingForFarmer(id, (err, stats) => {
-      if (err) return res.status(500).json({ error: err.message });
-      getPaymentAdjustmentsByPurchase((adjustErr, adjustedMap) => {
+    // The scoped stats below are authoritative for this account/warehouse.
+    // Avoid the older global farmer aggregation here; it was both slower and
+    // could produce a different balance during payment edit.
+    getPaymentAdjustmentsByPurchase((adjustErr, adjustedMap) => {
         if (adjustErr) return res.status(500).json({ error: adjustErr.message });
 
         const send = (purchaseRows) => {
@@ -2969,7 +2983,8 @@ router.get("/outstanding", (req, res) => {
               total_payment: Number(totalPayment.toFixed(2)),
               outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
             };
-            res.json({ party_type: "farmer", id, stats: scopedStats, purchases, payments });
+            res.set("Server-Timing", `outstanding;dur=${Date.now() - startedAt}`);
+            res.json({ party_type: "farmer", id, party_id: String(id), farmer_id: String(id), warehouse_id: warehouse_id ? String(warehouse_id) : "", company_account_id: company_account_id ? String(company_account_id) : "", exclude_payment_id: exclude_payment_id ? String(exclude_payment_id) : "", stats: scopedStats, purchases, payments });
           });
         };
 
@@ -2995,7 +3010,6 @@ router.get("/outstanding", (req, res) => {
           send(purchases || []);
         });
       }, exclude_payment_id);
-    }, company_account_id);
     return;
   }
 
@@ -3089,13 +3103,14 @@ const paymentFarmerCache = new Map();
 const PAYMENT_FARMER_CACHE_MS = 60 * 1000;
 const paymentFarmerInFlight = new Map();
 
-async function getFastPaymentFarmers(req, accountId, warehouseId = "") {
+async function getFastPaymentFarmers(req, accountId, warehouseId = "", excludePaymentId = "") {
   const accountKey = String(accountId || "").trim();
   const warehouseKey = String(warehouseId || "").trim();
+  const excludePaymentKey = String(excludePaymentId || "").trim();
   const assigned = req.user && Array.isArray(req.user.assigned_warehouses)
     ? req.user.assigned_warehouses.map((id) => String(id))
     : [];
-  const key = JSON.stringify([String(req.user?.id || req.user?._id || ""), accountKey, warehouseKey, assigned.join(",")]);
+  const key = JSON.stringify([String(req.user?.id || req.user?._id || ""), accountKey, warehouseKey, excludePaymentKey, assigned.join(",")]);
   const cached = paymentFarmerCache.get(key);
   if (cached && Date.now() - cached.time < PAYMENT_FARMER_CACHE_MS) return cached.data;
   if (paymentFarmerInFlight.has(key)) return paymentFarmerInFlight.get(key);
@@ -3130,12 +3145,23 @@ async function getFastPaymentFarmers(req, accountId, warehouseId = "") {
     // One SQL GROUP BY replaces one payment query per farmer.
     const placeholders = farmerIds.map(() => "?").join(",");
     const paymentParams = [...farmerIds, accountKey];
+    const paymentWhere = [
+      `CAST(farmer_id AS TEXT) IN (${placeholders})`,
+      `CAST(company_account_id AS TEXT) = CAST(? AS TEXT)`,
+    ];
+    if (warehouseKey) {
+      paymentWhere.push(`CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)`);
+      paymentParams.push(warehouseKey);
+    }
+    if (excludePaymentKey) {
+      paymentWhere.push(`CAST(id AS TEXT) <> CAST(? AS TEXT)`);
+      paymentParams.push(excludePaymentKey);
+    }
     const paymentRows = await new Promise((resolve, reject) => {
       db.all(
         `SELECT CAST(farmer_id AS TEXT) AS farmer_id, COALESCE(SUM(amount),0) AS total_payment
          FROM wh_payment_vouchers
-         WHERE CAST(farmer_id AS TEXT) IN (${placeholders})
-           AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)
+         WHERE ${paymentWhere.join(" AND ")}
          GROUP BY CAST(farmer_id AS TEXT)`,
         paymentParams,
         (err, rows) => err ? reject(err) : resolve(rows || [])
@@ -3167,12 +3193,12 @@ async function getFastPaymentFarmers(req, accountId, warehouseId = "") {
 
 router.get("/farmers-by-account/:accountId", async (req, res) => {
   const { accountId } = req.params;
-  const { warehouse_id } = req.query;
+  const { warehouse_id, exclude_payment_id } = req.query;
   if (!accountId) return res.status(400).json({ error: "Account ID is required" });
   if (mongoReady()) {
     try {
       const started = Date.now();
-      const result = await getFastPaymentFarmers(req, accountId, warehouse_id);
+      const result = await getFastPaymentFarmers(req, accountId, warehouse_id, exclude_payment_id);
       res.set("Server-Timing", `payment-farmers;dur=${Date.now() - started}`);
       res.set("Cache-Control", "private, max-age=60, stale-while-revalidate=30");
       return res.json(result);
@@ -3771,16 +3797,17 @@ router.put("/payment/:id", (req, res) => {
                 db.run("COMMIT", (commitErr) => {
                   if (commitErr) return res.status(500).json({ error: commitErr.message });
 
-                  // Do not hold the SQLite transaction open while MongoDB is queried.
-                  computeOutstandingForFarmer(farmer_id, (statsErr, stats) => {
-                    if (statsErr) {
-                      console.error("Payment outstanding refresh failed:", statsErr.message);
-                      return res.json({ id, updated: 1, voucher_no, stats: null, adjustments: cleanAdjustments, reference_id: finalReferenceId, warning: statsErr.message });
-                    }
-                    db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, id], (outErr) => {
-                      if (outErr) console.error("Payment outstanding_after update failed:", outErr.message);
-                      return res.json({ id, updated: 1, voucher_no, stats, adjustments: cleanAdjustments, reference_id: finalReferenceId });
-                    });
+                  // The voucher is already committed. Do not run the old global
+                  // farmer aggregation here; it was slower and could fail/return a
+                  // balance from another warehouse/account during edit. The UI will
+                  // refresh the scoped outstanding endpoint after save.
+                  return res.json({
+                    id,
+                    updated: 1,
+                    voucher_no,
+                    stats: null,
+                    adjustments: cleanAdjustments,
+                    reference_id: finalReferenceId,
                   });
                 });
               });
