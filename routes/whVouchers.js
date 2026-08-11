@@ -944,6 +944,12 @@ async function decorateSaleRows(rows) {
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
     buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : Promise.resolve([]),
     consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : Promise.resolve([]),
+    // Some Sale vouchers still contain the legacy SQLite buyer id directly.
+    // Read buyer_names by TEXT id as a reliable fallback so the Sale Party
+    // Ledger never shows a blank party merely because the mirror row is stale.
+    buyerIds.length
+      ? dbAll(`SELECT * FROM buyer_names WHERE CAST(id AS TEXT) IN (${buyerIds.map(() => "?").join(",")})`, buyerIds)
+      : Promise.resolve([]),
   ]);
 
   const valueAt = (index) => results[index].status === "fulfilled" && Array.isArray(results[index].value) ? results[index].value : [];
@@ -958,13 +964,16 @@ async function decorateSaleRows(rows) {
   const mongoAccountMap = byMongoId(valueAt(2));
   const buyerMap = byMirrorId(valueAt(3));
   const consigneeMap = byMirrorId(valueAt(4));
+  const sqliteBuyerMap = new Map(
+    valueAt(5).map((item) => [String(item?.id || ""), item]).filter(([id]) => id)
+  );
 
   return plainRows.map((plain) => {
     const buyerId = String(plain?.buyer_id || plain?.company_id || "");
     const warehouse = mongoWarehouseMap.get(String(plain?.warehouse_id || ""));
     const product = mongoProductMap.get(String(plain?.product_id || ""));
     const account = mongoAccountMap.get(String(plain?.company_account_id || ""));
-    const buyer = buyerMap.get(buyerId);
+    const buyer = buyerMap.get(buyerId) || sqliteBuyerMap.get(buyerId) || {};
     const consignee = consigneeMap.get(String(plain?.consignee_id || ""));
     const totalQuantity = Number(plain?.quantity ?? plain?.total_quantity ?? Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0));
     const totalAmount = Number(plain?.amount ?? plain?.total_amount ?? plain?.net_receivable_amount ?? 0);
@@ -976,7 +985,7 @@ async function decorateSaleRows(rows) {
       warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
       product_name: product?.name || plain?.product_name || "-",
       company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
-      buyer_name: buyer?.name || plain?.buyer_name || plain?.company_name || "-",
+      buyer_name: buyer?.name || buyer?.company_name || plain?.buyer_name || plain?.party_name || plain?.company_name || "-",
       buyer_email: buyer?.email || plain?.buyer_email || "",
       buyer_mobile: buyer?.mobile || plain?.buyer_mobile || "",
       consignee_name: consignee?.name || plain?.consignee_name || "-",
@@ -5015,9 +5024,13 @@ router.get("/report/sale-party-ledger", async (req, res) => {
     if (companyAccountId) { clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(companyAccountId); }
     try {
       receipts = await dbAll(`
-        SELECT r.*, ca.account_name AS company_account_name
+        SELECT
+          r.*,
+          ca.account_name AS company_account_name,
+          b.name AS buyer_name
         FROM wh_receipt_vouchers r
         LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
+        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(r.company_id AS TEXT)
         WHERE 1=1 ${filter.clause} ${clauses.join(" ")}
         ORDER BY r.date DESC, r.id DESC
       `, receiptParams);
@@ -5098,7 +5111,8 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           debit: 0,
           credit: Number(row.amount || 0),
           party_id: String(row.company_id || ""),
-          party_name: row.company_account_name || "-",
+          party_name: row.buyer_name || row.party_name || row.company_name || row.company_account_name || "-",
+          buyer_name: row.buyer_name || "-",
         };
       }),
     ];
