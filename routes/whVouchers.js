@@ -7,7 +7,7 @@ const PDFDocument = require('pdfkit');
 const multer = require("multer");
 const XLSX = require("xlsx");
 const tradingFilterCache = new Map();
-const TRADING_FILTER_CACHE_MS = 5 * 60 * 1000;
+const TRADING_FILTER_CACHE_MS = 15 * 60 * 1000;
 
 const {
   mongoose,
@@ -3082,60 +3082,103 @@ router.get("/outstanding", (req, res) => {
 // ===========================
 // FARMERS BY ACCOUNT WITH OUTSTANDING
 // ===========================
-router.get("/farmers-by-account/:accountId", (req, res) => {
+// Fast payment farmer lookup cache. The previous implementation loaded every
+// purchase row and then ran an outstanding calculation once per farmer (N+1).
+// That made account/warehouse changes take several seconds.
+const paymentFarmerCache = new Map();
+const PAYMENT_FARMER_CACHE_MS = 60 * 1000;
+const paymentFarmerInFlight = new Map();
+
+async function getFastPaymentFarmers(req, accountId, warehouseId = "") {
+  const accountKey = String(accountId || "").trim();
+  const warehouseKey = String(warehouseId || "").trim();
+  const assigned = req.user && Array.isArray(req.user.assigned_warehouses)
+    ? req.user.assigned_warehouses.map((id) => String(id))
+    : [];
+  const key = JSON.stringify([String(req.user?.id || req.user?._id || ""), accountKey, warehouseKey, assigned.join(",")]);
+  const cached = paymentFarmerCache.get(key);
+  if (cached && Date.now() - cached.time < PAYMENT_FARMER_CACHE_MS) return cached.data;
+  if (paymentFarmerInFlight.has(key)) return paymentFarmerInFlight.get(key);
+
+  const promise = (async () => {
+    const purchaseFilter = { company_account_id: accountKey };
+    if (warehouseKey) {
+      if (assigned.length && !assigned.includes(warehouseKey)) return [];
+      purchaseFilter.warehouse_id = warehouseKey;
+    } else if (assigned.length) {
+      purchaseFilter.warehouse_id = { $in: assigned };
+    }
+
+    const grouped = await PurchaseVoucher.aggregate([
+      { $match: purchaseFilter },
+      { $match: { farmer_id: { $nin: [null, ""] } } },
+      { $group: {
+          _id: "$farmer_id",
+          total_purchase: { $sum: { $ifNull: ["$net_amount_payable", { $ifNull: ["$amount", 0] }] } },
+          warehouse_ids: { $addToSet: "$warehouse_id" },
+        }
+      },
+    ]).allowDiskUse(true);
+
+    const farmerIds = grouped.map((r) => String(r._id || "")).filter(Boolean);
+    if (!farmerIds.length) return [];
+
+    const farmers = await Farmer.find({ _id: { $in: farmerIds } })
+      .select("_id name mobile address village")
+      .lean();
+
+    // One SQL GROUP BY replaces one payment query per farmer.
+    const placeholders = farmerIds.map(() => "?").join(",");
+    const paymentParams = [...farmerIds, accountKey];
+    const paymentRows = await new Promise((resolve, reject) => {
+      db.all(
+        `SELECT CAST(farmer_id AS TEXT) AS farmer_id, COALESCE(SUM(amount),0) AS total_payment
+         FROM wh_payment_vouchers
+         WHERE CAST(farmer_id AS TEXT) IN (${placeholders})
+           AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)
+         GROUP BY CAST(farmer_id AS TEXT)`,
+        paymentParams,
+        (err, rows) => err ? reject(err) : resolve(rows || [])
+      );
+    });
+    const paymentMap = new Map(paymentRows.map((r) => [String(r.farmer_id), Number(r.total_payment || 0)]));
+    const purchaseMap = new Map(grouped.map((r) => [String(r._id), Number(r.total_purchase || 0)]));
+
+    const data = (farmers || []).map((f) => {
+      const id = String(f._id);
+      const totalPurchase = purchaseMap.get(id) || 0;
+      const totalPayment = paymentMap.get(id) || 0;
+      return {
+        id, name: f.name, mobile: f.mobile, address: f.address, village: f.village,
+        total_purchase: Number(totalPurchase.toFixed(2)),
+        total_adjusted: Number(totalPayment.toFixed(2)),
+        outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
+        warehouse_ids: (grouped.find((g) => String(g._id) === id)?.warehouse_ids || []).map(String),
+      };
+    }).filter((f) => f.outstanding > 0);
+
+    paymentFarmerCache.set(key, { time: Date.now(), data });
+    return data;
+  })().finally(() => paymentFarmerInFlight.delete(key));
+
+  paymentFarmerInFlight.set(key, promise);
+  return promise;
+}
+
+router.get("/farmers-by-account/:accountId", async (req, res) => {
   const { accountId } = req.params;
   const { warehouse_id } = req.query;
   if (!accountId) return res.status(400).json({ error: "Account ID is required" });
-
   if (mongoReady()) {
-    const filter = { company_account_id: String(accountId) };
-    const selectedWarehouseId = String(warehouse_id || "").trim();
-    const assignedWarehouses = req.user && Array.isArray(req.user.assigned_warehouses)
-      ? req.user.assigned_warehouses.map((id) => String(id))
-      : [];
-    if (selectedWarehouseId) {
-      if (assignedWarehouses.length) {
-        if (!assignedWarehouses.includes(selectedWarehouseId)) return res.json([]);
-      }
-      filter.warehouse_id = selectedWarehouseId;
-    } else if (assignedWarehouses.length) {
-      filter.warehouse_id = { $in: assignedWarehouses };
+    try {
+      const started = Date.now();
+      const result = await getFastPaymentFarmers(req, accountId, warehouse_id);
+      res.set("Server-Timing", `payment-farmers;dur=${Date.now() - started}`);
+      res.set("Cache-Control", "private, max-age=60, stale-while-revalidate=30");
+      return res.json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
     }
-
-    return PurchaseVoucher.find(filter)
-      .lean()
-      .then(async (rows) => {
-        const farmerIds = [...new Set((rows || []).map((r) => String(r.farmer_id || "")).filter(Boolean))];
-        if (!farmerIds.length) return res.json([]);
-
-        const farmers = await Farmer.find({ _id: { $in: farmerIds } })
-          .select("_id name mobile address village")
-          .lean();
-
-        const result = await Promise.all(
-          (farmers || []).map(
-            (f) =>
-              new Promise((resolve) => {
-                computeOutstandingForFarmer(String(f._id), (_err, stats = {}) => {
-                  const outstanding = Number(stats.outstanding || 0);
-                  resolve({
-                    id: String(f._id),
-                    name: f.name,
-                    mobile: f.mobile,
-                    address: f.address,
-                    village: f.village,
-                    total_purchase: Number(stats.total_purchase || 0),
-                    total_adjusted: Number(stats.total_payment || 0),
-                    outstanding: Number(outstanding.toFixed(2)),
-                  });
-                }, accountId);
-              })
-          )
-        );
-
-        return res.json(result.filter((f) => f.outstanding > 0));
-      })
-      .catch((err) => res.status(500).json({ error: err.message }));
   }
 
   const filter = assignedWarehouseFilter(req.user, "pv.warehouse_id");
@@ -4349,6 +4392,7 @@ router.get("/report/payment", (req, res) => {
 });
 
 router.get("/report/filter-options", async (req, res) => {
+  const filterStartedAt = Date.now();
   ensureTradingIndexes();
   const type = String(req.query.type || "purchase").trim().toLowerCase();
   if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Trading report filters" });
@@ -4441,7 +4485,8 @@ router.get("/report/filter-options", async (req, res) => {
       buyers: cleanNamed(buyerDocs, "buyer"),
     };
     tradingFilterCache.set(cacheKey, { time: Date.now(), data });
-    res.set("Cache-Control", "private, max-age=300, stale-while-revalidate=60");
+    res.set("Cache-Control", "private, max-age=900, stale-while-revalidate=120");
+    res.set("Server-Timing", `trading-filter;dur=${Date.now() - filterStartedAt}`);
     res.json(data);
   } catch (err) {
     console.error("Trading report filter options failed:", err);
