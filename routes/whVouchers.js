@@ -1,6980 +1,5848 @@
-import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
-import axios from "axios";
-import { useNavigate, useSearchParams } from "react-router-dom";
-import { FaFilePdf, FaWhatsapp } from "react-icons/fa";
-import PageBackCloseActions from "../components/PageBackCloseActions";
-import WarehouseTradingHeader from "./WarehouseTradingHeader";
-import WarehouseVoucherPanel from "./WarehouseVoucherPanel";
-import WarehouseReportPanel from "./WarehouseReportPanel";
-import WarehouseReportTable from "./WarehouseReportTable";
-import WarehouseBillWisePanel from "./WarehouseBillWisePanel";
-import WarehouseAdjustModal from "./WarehouseAdjustModal";
-import WarehouseSaleDeductionModal from "./WarehouseSaleDeductionModal";
-import WarehouseSalePreviewModal from "./WarehouseSalePreviewModal";
-import WarehousePurchasePreviewModal from "./WarehousePurchasePreviewModal";
-import WarehouseVoucherTable from "./WarehouseVoucherTable";
-import jsPDF from "jspdf";
-import autoTable from "jspdf-autotable";
-import { hasPermission, loadSession } from "../utils/auth";
-import { consigneeHasBuyer, getConsigneeBuyerIds } from "../utils/consigneeBuyers";
+const express = require("express");
+const router = express.Router();
+const db = require("../db");
+const { userHasPermission } = require("../middleware/auth");
+const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
+const PDFDocument = require('pdfkit');
+const multer = require("multer");
+const XLSX = require("xlsx");
+const tradingFilterCache = new Map();
+const TRADING_FILTER_CACHE_MS = 15 * 60 * 1000;
 
-const defaultForm = () => ({
-  voucher_no: "",
-  bill_no: "",
-  date: new Date().toISOString().slice(0, 10),
-  payment_mode: "on_account",
-  bill_date: new Date().toISOString().slice(0, 10),
-  unloading_date: "",
-  due_days: "",
-  add_qty: "",
-  sale_type: "direct",
-  warehouse_id: "",
-  buyer_id: "",
-  farmer_id: "",
-  company_id: "",
-  company_account_id: "",
-  consignee_id: "",
-  product_id: "",
-  po_no: "",
-  due_date: "",
-  direct_purchase_rate: "",
-  direct_purchase_amount: "",
-  against_purchase_enabled: false,
-  against_purchase_farmer_id: "",
-  reference_type: "",
-  reference_id: "",
-  lorry_no: "",
-  employee_id: "",
-  location_id: "",
-  quantity: "",
-  shortage_quantity: "",
-  unloading_qty: "",
-  rate: "",
-  amount: "",
-  claim_amount: "",
-  other_deduction: "",
-  cd_percent: "",
-  cd_amount: "",
-  adjustment_amount: "",
-  tds_amount: "",
-  net_amount: "",
-  net_receivable_amount: "",
-  fifo_rate: "",
-  fifo_amount: "",
-  packet: "",
-  gross_weight: "",
-  tare_weight: "",
-  dhalta: "",
-  less_bags_weight: "",
-  moisture: "",
-  dunki: "",
-  fungus: "",
-  discolour: "",
-  others: "",
-  transport_charge: "",
-  net_weight: "",
-  bags_claim: "",
-  labour: "",
-  total_deduct_amount: "",
-  total_qty: "",
-  total_deduction: "",
-  net_amount_payable: "",
-  round_off: "",
-  debit_account: "",
-  credit_account: "",
-  description: "",
-  journey_note: "",
-  journey_token: "",
-  reject_qty: "",
+// Fast payment-edit/outstanding indexes. These are cheap SQLite indexes and
+// prevent full-table scans when filtering by farmer + account + warehouse.
+function ensurePaymentSqliteIndexes() {
+  const statements = [
+    `CREATE INDEX IF NOT EXISTS idx_wh_payment_farmer_account_warehouse ON wh_payment_vouchers(farmer_id, company_account_id, warehouse_id, date)`,
+    `CREATE INDEX IF NOT EXISTS idx_wh_purchase_farmer_account_warehouse ON wh_purchase_vouchers(farmer_id, company_account_id, warehouse_id, date)`,
+    `CREATE INDEX IF NOT EXISTS idx_wh_payment_adjustments_purchase_payment ON wh_payment_adjustments(purchase_id, payment_id)`,
+  ];
+  statements.forEach((sql) => db.run(sql, () => {}));
+}
+setImmediate(ensurePaymentSqliteIndexes);
+
+const {
+  mongoose,
+  PurchaseVoucher,
+  SaleVoucher,
+  Warehouse,
+  Farmer,
+  Product,
+  Company,
+  CompanyAccount,
+  Consignee,
+  Employee,
+  Location,
+  SqliteMirrorRow,
+} = require("../mongo");
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Trading report indexes. Build in the background so the first HTTP request is
+// not blocked by index creation. These cover the common filter + newest-first
+// pagination path used by Purchase/Sale reports.
+let tradingIndexesStarted = false;
+function ensureTradingIndexes() {
+  if (tradingIndexesStarted || !mongoReady()) return;
+  tradingIndexesStarted = true;
+  Promise.allSettled([
+    PurchaseVoucher.collection.createIndex({ date: -1, createdAt: -1, _id: -1 }, { name: "trading_purchase_date_desc" }),
+    PurchaseVoucher.collection.createIndex({ warehouse_id: 1, company_account_id: 1, farmer_id: 1, date: -1, createdAt: -1 }, { name: "trading_purchase_filters_date" }),
+    SaleVoucher.collection.createIndex({ date: -1, createdAt: -1, _id: -1 }, { name: "trading_sale_date_desc" }),
+    SaleVoucher.collection.createIndex({ warehouse_id: 1, company_account_id: 1, farmer_id: 1, date: -1, createdAt: -1 }, { name: "trading_sale_filters_date" }),
+  ]).catch(() => {});
+}
+
+function fmtDate(value) {
+  if (!value) return "-";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+
+function fmtNum(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0.00";
+  return n.toFixed(2);
+}
+
+function toDateOnly(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const parsed = new Date(`${text}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toISOString().slice(0, 10);
+}
+
+function addDaysToDate(value, days) {
+  const base = toDateOnly(value);
+  const offset = Number(days);
+  if (!base || !Number.isFinite(offset)) return "";
+  const parsed = new Date(`${base}T00:00:00Z`);
+  parsed.setUTCDate(parsed.getUTCDate() + offset);
+  return parsed.toISOString().slice(0, 10);
+}
+
+function calculateDaysDiff(startDate, endDate) {
+  const start = toDateOnly(startDate);
+  const end = toDateOnly(endDate);
+  if (!start || !end) return 0;
+  const msPerDay = 1000 * 60 * 60 * 24;
+  return Math.max(0, Math.floor((new Date(`${end}T00:00:00Z`) - new Date(`${start}T00:00:00Z`)) / msPerDay));
+}
+
+function resolveSaleDueFields(body, fallback = {}) {
+  const explicitDueDate = toDateOnly(body?.due_date);
+  const baseDate =
+    toDateOnly(body?.unloading_date) ||
+    toDateOnly(body?.deduction_details?.unloading_date) ||
+    toDateOnly(body?.date) ||
+    toDateOnly(fallback?.unloading_date) ||
+    toDateOnly(fallback?.date);
+  const fallbackDueDays = Number(fallback?.due_days || 0);
+  const dueDaysInput = body?.due_days;
+  const hasDueDays = dueDaysInput !== undefined && dueDaysInput !== null && String(dueDaysInput).trim() !== "";
+  let dueDays = hasDueDays ? Number(dueDaysInput) : fallbackDueDays;
+  if (!Number.isFinite(dueDays)) dueDays = 0;
+
+  let dueDate = explicitDueDate;
+  if (!dueDate && baseDate && (hasDueDays || fallbackDueDays > 0)) {
+    dueDate = addDaysToDate(baseDate, dueDays);
+  }
+  if (!dueDate) {
+    dueDate = toDateOnly(fallback?.due_date) || "";
+  }
+  if (explicitDueDate && !hasDueDays && baseDate) {
+    dueDays = calculateDaysDiff(baseDate, explicitDueDate);
+  }
+  if (!dueDays && dueDate && baseDate) {
+    dueDays = calculateDaysDiff(baseDate, dueDate);
+  }
+
+  return {
+    due_date: dueDate,
+    due_days: Number.isFinite(dueDays) ? dueDays : 0,
+  };
+}
+
+function getFollowupStatusLabel(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "payment_done") return "Payment Done";
+  if (normalized === "unloading_pending") return "Unloading Pending";
+  if (normalized === "overdue") return "Overdue";
+  return "Payment Pending";
+}
+
+function resolveSaleDueDate(body, fallback = {}) {
+  return resolveSaleDueFields(body, fallback).due_date;
+}
+
+function calculateSaleFollowupMeta(row) {
+  const unloadingDate = toDateOnly(row?.unloading_date);
+  const outstanding = Number(row?.outstanding ?? row?.net_amount_payable ?? row?.net_receivable_amount ?? row?.amount ?? 0);
+  const today = toDateOnly(new Date().toISOString().slice(0, 10));
+  const dueDaysRaw = row?.due_days;
+  let dueDays = Number.isFinite(Number(dueDaysRaw)) ? Number(dueDaysRaw) : 0;
+  const rawDueDate = toDateOnly(row?.due_date);
+  const normalizedDueDate =
+    unloadingDate && dueDays > 0
+      ? addDaysToDate(unloadingDate, dueDays)
+      : rawDueDate;
+  const dueDate = normalizedDueDate || (unloadingDate && dueDays > 0 ? addDaysToDate(unloadingDate, dueDays) : "");
+  if (!dueDays && dueDate && unloadingDate) {
+    dueDays = calculateDaysDiff(unloadingDate, dueDate);
+  }
+  const daysOverdue = dueDate ? calculateDaysDiff(dueDate, today) : 0;
+
+  let followupStatus = "pending";
+  let followupPriority = 1000;
+  if (!unloadingDate) {
+    followupStatus = "unloading_pending";
+    followupPriority = 2000;
+  } else if (outstanding <= 0) {
+    followupStatus = "payment_done";
+    followupPriority = 0;
+  } else if (daysOverdue > 0) {
+    followupStatus = "overdue";
+    followupPriority = 3000 + daysOverdue;
+  }
+
+  return {
+    due_date: dueDate,
+    due_days: Number.isFinite(dueDays) ? dueDays : 0,
+    days_overdue: followupStatus === "overdue" ? daysOverdue : 0,
+    followup_status: followupStatus,
+    followup_priority: followupPriority,
+    balance: outstanding,
+  };
+}
+
+function getWarehouseScopedRows(req, res, tableName, orderBy = "date DESC") {
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const query = `
+    SELECT v.*, ca.account_name AS company_account_name
+    FROM ${tableName} v
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.${orderBy}
+  `;
+  db.all(query, filter.params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows || []);
+  });
+}
+
+function getSqliteSaleRowsForUser(user, options = {}) {
+  const filter = assignedWarehouseFilter(user, "v.warehouse_id");
+  const hasLimit = Number.isFinite(Number(options.limit));
+  const queryParams = [...filter.params];
+  if (hasLimit) {
+    queryParams.push(Number(options.limit), Number(options.offset) || 0);
+  }
+  return dbAll(
+    `
+      SELECT
+        v.*,
+        COALESCE(v.buyer_id, v.company_id) AS buyer_id,
+        b.name AS buyer_name,
+        b.email AS buyer_email,
+        b.mobile AS buyer_mobile,
+        co.name AS consignee_name,
+        co.email AS consignee_email,
+        co.mobile AS consignee_mobile,
+        ca.account_name AS company_account_name,
+        w.name AS warehouse_name,
+        p.name AS product_name,
+        v.quantity AS total_quantity,
+        v.amount AS total_amount
+      FROM wh_sale_vouchers v
+      LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(v.buyer_id, v.company_id) AS TEXT)
+      LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(v.consignee_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+      LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
+      WHERE 1 = 1 ${filter.clause}
+      ORDER BY v.date DESC, v.id DESC
+      ${hasLimit ? "LIMIT ? OFFSET ?" : ""}
+    `,
+    queryParams
+  );
+}
+
+function parseVoucherListOptions(req) {
+  const rawPage = Number.parseInt(req.query.page, 10);
+  const rawLimit = Number.parseInt(req.query.limit || req.query.page_size, 10);
+  const all = String(req.query.all || "") === "1";
+  const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
+  const limit = all ? Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 5000, 1), 5000) : Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 15, 1), 100);
+  const order = String(req.query.order || "desc").toLowerCase() === "asc" ? 1 : -1;
+  const search = String(req.query.search || "").trim();
+  const warehouseId = String(req.query.warehouse_id || "").trim();
+  const farmerId = String(req.query.farmer_id || "").trim();
+  const buyerId = String(req.query.buyer_id || "").trim();
+  const companyAccountId = String(req.query.company_account_id || "").trim();
+  const productId = String(req.query.product_id || "").trim();
+  const fromDate = toDateOnly(req.query.from_date);
+  const toDate = toDateOnly(req.query.to_date);
+  return {
+    page,
+    limit,
+    skip: all ? 0 : (page - 1) * limit,
+    all,
+    order,
+    search,
+    warehouseId,
+    farmerId,
+    buyerId,
+    companyAccountId,
+    productId,
+    fromDate,
+    toDate,
+  };
+}
+
+function applyVoucherListFilters(query, options, type) {
+  const scope = mongoPurchaseScope(query.user);
+  const filter = { ...scope };
+
+  if (options.warehouseId) filter.warehouse_id = options.warehouseId;
+  if (options.companyAccountId) filter.company_account_id = options.companyAccountId;
+  if (options.productId) filter.product_id = options.productId;
+  if (type === "purchase" && options.farmerId) filter.farmer_id = options.farmerId;
+  if (type === "sale" && options.buyerId) filter.buyer_id = options.buyerId;
+
+  if (options.fromDate || options.toDate) {
+    filter.date = {};
+    if (options.fromDate) filter.date.$gte = options.fromDate;
+    if (options.toDate) filter.date.$lte = options.toDate;
+  }
+
+  if (options.search) {
+    const safe = options.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(safe, "i");
+    const fields = type === "purchase"
+      ? ["voucher_no", "farmer_name", "product_name", "warehouse_name", "company_account_name", "description"]
+      : ["voucher_no", "bill_no", "buyer_name", "company_name", "product_name", "warehouse_name", "company_account_name", "consignee_name", "lorry_no", "po_no", "description"];
+    filter.$or = fields.map((field) => ({ [field]: rx }));
+  }
+
+  return filter;
+}
+
+function voucherListResponse(rows, total, options) {
+  const pageCount = Math.max(1, Math.ceil(total / options.limit));
+  return {
+    data: rows || [],
+    pagination: {
+      page: options.page,
+      pageSize: options.limit,
+      total,
+      totalPages: pageCount,
+      hasMore: options.page < pageCount,
+    },
+  };
+}
+
+async function getPurchaseVoucherPage(req) {
+  const options = parseVoucherListOptions(req);
+  const filter = applyVoucherListFilters({ user: req.user }, options, "purchase");
+  const [total, docs] = await Promise.all([
+    PurchaseVoucher.countDocuments(filter),
+    PurchaseVoucher.find(filter)
+      .sort({ date: options.order, _id: options.order })
+      .skip(options.skip)
+      .limit(options.limit)
+      .lean(),
+  ]);
+  const rows = await decoratePurchaseRows(docs);
+  if (options.all) return rows;
+  return voucherListResponse(rows, total, options);
+}
+
+async function getSaleVoucherPage(req) {
+  const options = parseVoucherListOptions(req);
+  const filter = applyVoucherListFilters({ user: req.user }, options, "sale");
+  const [total, docs] = await Promise.all([
+    SaleVoucher.countDocuments(filter),
+    SaleVoucher.find(filter)
+      .sort({ date: options.order, _id: options.order })
+      .skip(options.skip)
+      .limit(options.limit)
+      .lean(),
+  ]);
+  let rows;
+  try {
+    rows = await decorateSaleRows(docs);
+  } catch (decorateErr) {
+    console.error("Sale list decoration skipped:", decorateErr);
+    rows = (docs || []).map((row) => ({
+      ...(row || {}),
+      id: String(row?._id || row?.id || ""),
+      _id: String(row?._id || row?.id || ""),
+      buyer_id: String(row?.buyer_id || row?.company_id || ""),
+      total_quantity: Number(row?.quantity || row?.total_quantity || 0),
+      total_amount: Number(row?.amount || row?.total_amount || 0),
+      ...calculateSaleFollowupMeta(row || {}),
+    }));
+  }
+  // Do not make the fast MongoDB Sale list wait for the legacy SQLite Bilti
+  // table. Bilti is an auxiliary field and is loaded lazily by the relevant
+  // action. This removes an unnecessary cross-database query from every page.
+  return voucherListResponse(
+    rows.map((row) => ({ ...row, bilti_id: row.bilti_id || null, ...calculateSaleFollowupMeta(row) })),
+    total,
+    options
+  );
+}
+
+function getSaleVoucherRows(req, res) {
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is required for Warehouse Trading voucher lists" });
+  }
+  getSaleVoucherPage(req)
+    .then((payload) => res.json(payload))
+    .catch((err) => {
+      console.error("Mongo sale voucher page query failed:", err);
+      res.status(500).json({ error: err.message || "Failed to load sale vouchers" });
+    });
+}
+
+function getSaleVoucherRowsSqlite(req, res) {
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const query = `
+    SELECT
+      v.*,
+      COALESCE(v.buyer_id, v.company_id) AS buyer_id,
+        b.name AS buyer_name,
+        b.email AS buyer_email,
+        b.mobile AS buyer_mobile,
+        co.name AS consignee_name,
+        co.email AS consignee_email,
+        co.mobile AS consignee_mobile,
+        ca.account_name AS company_account_name,
+      w.name AS warehouse_name,
+      p.name AS product_name,
+      v.quantity AS total_quantity,
+      v.amount AS total_amount,
+      tb.bilti_id
+    FROM wh_sale_vouchers v
+    LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(v.buyer_id, v.company_id) AS TEXT)
+    LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(v.consignee_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
+    LEFT JOIN (
+      SELECT sale_id, MAX(id) AS bilti_id
+      FROM transport_bilti
+      WHERE sale_id IS NOT NULL
+      GROUP BY sale_id
+    ) tb ON CAST(tb.sale_id AS TEXT) = CAST(v.id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.date DESC, v.id DESC
+  `;
+  db.all(query, filter.params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json((rows || []).map((row) => ({
+      ...row,
+      ...calculateSaleFollowupMeta(row),
+      id: String(row.id),
+      _id: String(row.id),
+    })));
+  });
+}
+
+const mongoReady = () => mongoose.connection.readyState === 1;
+
+const numberFields = [
+  "quantity",
+  "rate",
+  "amount",
+  "packet",
+  "gross_weight",
+  "tare_weight",
+  "dhalta",
+  "less_bags_weight",
+  "moisture",
+  "dunki",
+  "fungus",
+  "discolour",
+  "others",
+  "transport_charge",
+  "net_weight",
+  "bags_claim",
+  "labour",
+  "claim_amount",
+  "other_deduction",
+  "cd_percent",
+  "cd_amount",
+  "adjustment_amount",
+  "tds_amount",
+  "total_deduct_amount",
+  "total_qty",
+  "total_deduction",
+  "round_off",
+  "net_amount_payable",
+];
+
+function buildPurchasePayload(body, voucherNo) {
+  const payload = {
+    voucher_no: voucherNo || body.voucher_no,
+    date: body.date,
+    warehouse_id: body.warehouse_id ? String(body.warehouse_id) : "",
+    farmer_id: body.farmer_id ? String(body.farmer_id) : "",
+    company_account_id: body.company_account_id ? String(body.company_account_id) : "",
+    product_id: body.product_id ? String(body.product_id) : "",
+    employee_id: body.employee_id ? String(body.employee_id) : "",
+    location_id: body.location_id ? String(body.location_id) : "",
+    description: body.description || "",
+  };
+
+  numberFields.forEach((field) => {
+    const value = Number(body[field]);
+    payload[field] = Number.isFinite(value) ? value : 0;
+  });
+
+  return payload;
+}
+
+
+function buildPurchaseDeductionDetails(body = {}) {
+  const n = (key) => {
+    const value = Number(body?.[key]);
+    return Number.isFinite(value) ? value : 0;
+  };
+  const claim = n("claim_amount") || n("bags_claim");
+  const rows = [
+    { key: "tds", label: "TDS", amount: n("tds_amount"), account_label: "TDS" },
+    { key: "cd", label: `CD${n("cd_percent") > 0 ? ` ${n("cd_percent")} %` : ""}`, amount: n("cd_amount"), account_label: "Cash Discount" },
+    { key: "claim", label: "Claim", amount: claim, account_label: "Claim" },
+    { key: "labour", label: "EXP", amount: n("labour"), account_label: "Labour" },
+    { key: "transport", label: "Freight", amount: n("transport_charge"), account_label: "Freight" },
+    { key: "other", label: "Other Deduction", amount: n("other_deduction"), account_label: "Other Deduction" },
+    { key: "adjustment", label: "Adjustment", amount: n("adjustment_amount"), account_label: "Adjustment" },
+  ];
+  return rows
+    .filter((row) => row.amount > 0)
+    .map((row) => ({
+      key: row.key,
+      label: row.label,
+      account_label: row.account_label,
+      amount: Number(row.amount.toFixed(2)),
+    }));
+}
+
+function purchaseDeductionTotalFromRow(row = {}) {
+  const n = (key) => Number(row?.[key]) || 0;
+  const claim = n("claim_amount") || n("bags_claim");
+  return Number((
+    claim + n("labour") + n("transport_charge") + n("cd_amount") + n("tds_amount") + n("other_deduction") + n("adjustment_amount")
+  ).toFixed(2));
+}
+
+function purchaseGrossAmountFromRow(row = {}) {
+  const qty = Number(row.total_qty || row.net_weight || row.quantity || 0) || 0;
+  const rate = Number(row.rate || 0) || 0;
+  const calculated = qty * rate;
+  return Number((calculated || row.gross_amount || row.amount || 0).toFixed(2));
+}
+
+function buildSalePayload(body, voucherNo) {
+  const purchaseLinks = Array.isArray(body.against_purchase_links)
+    ? body.against_purchase_links
+        .map((item) => {
+          const quantity = Number(item.quantity || item.adjusted_qty || 0);
+          const rate = Number(item.rate || 0);
+          const amount = Number(item.amount || quantity * rate || 0);
+          return {
+            purchase_id: item.purchase_id ? String(item.purchase_id) : "",
+            voucher_no: item.voucher_no || item.purchase_voucher_no || "",
+            farmer_id: item.farmer_id ? String(item.farmer_id) : "",
+            quantity: Number.isFinite(quantity) ? quantity : 0,
+            rate: Number.isFinite(rate) ? rate : 0,
+            amount: Number.isFinite(amount) ? amount : 0,
+          };
+        })
+        .filter((item) => item.purchase_id && item.quantity > 0)
+    : [];
+
+  const payload = {
+    voucher_no: voucherNo || body.voucher_no,
+    date: body.date,
+    unloading_date: body.unloading_date || body?.deduction_details?.unloading_date || "",
+    sale_type: body.sale_type === "direct" ? "direct" : "warehouse",
+    warehouse_id: body.warehouse_id ? String(body.warehouse_id) : "",
+    buyer_id: body.buyer_id || body.company_id ? String(body.buyer_id || body.company_id) : "",
+    company_id: body.company_id || body.buyer_id ? String(body.company_id || body.buyer_id) : "",
+    farmer_id: body.farmer_id || body.against_purchase_farmer_id ? String(body.farmer_id || body.against_purchase_farmer_id) : "",
+    company_account_id: body.company_account_id ? String(body.company_account_id) : "",
+    consignee_id: body.consignee_id ? String(body.consignee_id) : "",
+    po_no: body.po_no || "",
+    direct_purchase_rate: Number(body.direct_purchase_rate) || 0,
+    direct_purchase_amount: Number(body.direct_purchase_amount) || 0,
+    against_purchase_enabled: Boolean(body.against_purchase_enabled && purchaseLinks.length),
+    against_purchase_farmer_id: body.against_purchase_farmer_id ? String(body.against_purchase_farmer_id) : "",
+    against_purchase_links: purchaseLinks,
+    lorry_no: body.lorry_no || body.reference_id || "",
+    journey_token: body.journey_token || "",
+    product_id: body.product_id ? String(body.product_id) : "",
+    employee_id: body.employee_id ? String(body.employee_id) : "",
+    location_id: body.location_id ? String(body.location_id) : "",
+    description: body.description || "",
+    reject_qty: Number(body.reject_qty) || 0,
+  };
+
+  const saleFields = [
+    "quantity",
+    "shortage_quantity",
+    "rate",
+    "amount",
+    "packet",
+    "gross_weight",
+    "tare_weight",
+    "net_weight",
+    "unloading_qty",
+    "reject_qty",
+    "moisture",
+    "dunki",
+    "fungus",
+    "discolour",
+    "others",
+    "total_deduction",
+    "bags_claim",
+    "other_deduction",
+    "transport_charge",
+    "claim_amount",
+    "cd_percent",
+    "cd_amount",
+    "adjustment_amount",
+    "tds_amount",
+    "net_amount",
+    "net_receivable_amount",
+    "fifo_rate",
+    "fifo_amount",
+    "outstanding",
+    "round_off",
+    "net_amount_payable",
+  ];
+
+  saleFields.forEach((field) => {
+    const value = Number(body[field]);
+    payload[field] = Number.isFinite(value) ? value : 0;
+  });
+
+  const dueFields = resolveSaleDueFields(body);
+  payload.due_date = dueFields.due_date;
+  payload.due_days = dueFields.due_days;
+
+  const grossAmount = payload.amount;
+  const netAmount =
+    grossAmount -
+    payload.claim_amount -
+    payload.other_deduction -
+    payload.transport_charge -
+    payload.cd_amount -
+    payload.adjustment_amount -
+    payload.tds_amount +
+    payload.round_off;
+  const qtyForFifo = payload.unloading_qty || payload.quantity;
+  payload.net_amount = netAmount;
+  payload.net_amount_payable = netAmount;
+  payload.net_receivable_amount = netAmount;
+  payload.outstanding = netAmount;
+  payload.fifo_amount = grossAmount;
+  payload.fifo_rate = qtyForFifo > 0 ? grossAmount / qtyForFifo : 0;
+  if (payload.sale_type === "direct") {
+    payload.warehouse_id = "";
+    payload.direct_purchase_amount = Number((qtyForFifo * payload.direct_purchase_rate).toFixed(2));
+  }
+
+  return payload;
+}
+
+async function createDirectSalePurchaseVoucher(salePayload) {
+  if (salePayload.sale_type !== "direct") return null;
+  const farmerId = String(salePayload.farmer_id || salePayload.against_purchase_farmer_id || "").trim();
+  if (!farmerId) throw new Error("Farmer is required for direct sale purchase entry");
+  if (!salePayload.location_id) throw new Error("Location is required for direct sale");
+  if (!salePayload.direct_purchase_rate || salePayload.direct_purchase_rate <= 0) {
+    throw new Error("Purchase rate is required for direct sale");
+  }
+
+  const purchaseVoucherNo = await nextMongoVoucherNo("purchase");
+  const qty = Number(salePayload.unloading_qty || salePayload.quantity || 0);
+  const amount = Number((qty * Number(salePayload.direct_purchase_rate || 0)).toFixed(2));
+  const doc = await PurchaseVoucher.create({
+    voucher_no: purchaseVoucherNo,
+    date: salePayload.date,
+    warehouse_id: "",
+    farmer_id: farmerId,
+    company_account_id: salePayload.company_account_id || "",
+    product_id: salePayload.product_id || "",
+    employee_id: salePayload.employee_id || "",
+    location_id: salePayload.location_id || "",
+    quantity: qty,
+    rate: Number(salePayload.direct_purchase_rate || 0),
+    amount,
+    net_weight: qty,
+    total_qty: qty,
+    net_amount_payable: amount,
+    description: `Auto direct sale purchase against ${salePayload.voucher_no || "sale"}`,
+  });
+
+  return {
+    purchase_id: String(doc._id),
+    voucher_no: doc.voucher_no,
+    farmer_id: farmerId,
+    quantity: qty,
+    rate: Number(salePayload.direct_purchase_rate || 0),
+    amount,
+  };
+}
+
+async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = null }) {
+  const wId = String(warehouseId || "").trim();
+  const pId = String(productId || "").trim();
+  if (!wId || !pId) return 0;
+
+  if (mongoReady()) {
+    const purchaseFilter = { warehouse_id: wId, product_id: pId };
+    const saleFilter = { warehouse_id: wId, product_id: pId };
+    if (excludeSaleId && mongoose.Types.ObjectId.isValid(String(excludeSaleId))) {
+      saleFilter._id = { $ne: String(excludeSaleId) };
+    }
+    const [purchaseRows, saleRows] = await Promise.all([
+      PurchaseVoucher.find(purchaseFilter).lean(),
+      SaleVoucher.find(saleFilter).lean(),
+    ]);
+    const purchaseQty = (purchaseRows || []).reduce(
+      (sum, row) => sum + Number(row.total_qty || row.net_weight || row.quantity || 0),
+      0
+    );
+    const saleQty = (saleRows || []).reduce((sum, row) => sum + Number(row.quantity || 0), 0);
+    return Number((purchaseQty - saleQty).toFixed(4));
+  }
+
+  const purchaseQuery = `
+    SELECT COALESCE(SUM(COALESCE(NULLIF(total_qty, 0), NULLIF(net_weight, 0), quantity, 0)), 0) AS purchase_qty
+    FROM wh_purchase_vouchers
+    WHERE CAST(warehouse_id AS TEXT) = CAST(? AS TEXT) AND CAST(product_id AS TEXT) = CAST(? AS TEXT)
+  `;
+  const saleQuery = `
+    SELECT COALESCE(SUM(COALESCE(quantity, 0)), 0) AS sale_qty
+    FROM wh_sale_vouchers
+    WHERE CAST(warehouse_id AS TEXT) = CAST(? AS TEXT) AND CAST(product_id AS TEXT) = CAST(? AS TEXT)
+    ${excludeSaleId ? "AND CAST(id AS TEXT) <> CAST(? AS TEXT)" : ""}
+  `;
+  const purchaseRow = await dbGet(purchaseQuery, [wId, pId]);
+  const saleParams = excludeSaleId ? [wId, pId, String(excludeSaleId)] : [wId, pId];
+  const saleRow = await dbGet(saleQuery, saleParams);
+  const purchaseQty = Number(purchaseRow?.purchase_qty || 0);
+  const saleQty = Number(saleRow?.sale_qty || 0);
+  return Number((purchaseQty - saleQty).toFixed(4));
+}
+
+router.get("/available-sale-stock", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.view") && !userHasPermission(req.user, "warehouse.trading.sale.manage")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const { warehouse_id, product_id, exclude_sale_id } = req.query;
+  if (!warehouse_id || !product_id) {
+    return res.json({ stock_qty: null });
+  }
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+
+  try {
+    const stockQty = await getAvailableSaleStock({
+      warehouseId: warehouse_id,
+      productId: product_id,
+      excludeSaleId: exclude_sale_id || null,
+    });
+    res.json({ stock_qty: stockQty });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-const toNumber = (value) => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-};
+function dbGet(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => (err ? reject(err) : resolve(row || null)));
+  });
+}
 
-const normalizePaymentMode = (value) => {
+async function getTransportBiltiMatch({ saleId, voucherNo = "", lorryNo = "" }) {
+  const saleIdText = String(saleId || "").trim();
+  const voucherNoText = String(voucherNo || "").trim();
+  const lorryNoText = String(lorryNo || "").trim();
+
+  if (mongoose.connection?.db && SqliteMirrorRow) {
+    const mongoFilters = [];
+    if (saleIdText) {
+      mongoFilters.push({ "data.sale_id": saleIdText }, { "data.sale_id": Number(saleIdText) });
+    }
+    if (voucherNoText) {
+      mongoFilters.push({ "data.voucher_no": voucherNoText });
+    }
+    if (lorryNoText) {
+      mongoFilters.push({ "data.lorry_no": lorryNoText });
+    }
+
+    for (const filter of mongoFilters) {
+      const doc = await SqliteMirrorRow.findOne({ table: "transport_bilti", ...filter })
+        .sort({ updated_at: -1, row_id: -1 })
+        .lean();
+      if (doc?.data) {
+        const data = doc.data || {};
+        const matchedField = Object.keys(filter).find((key) => key.startsWith("data."))?.replace("data.", "") || "sale_id";
+        return {
+          ...data,
+          id: doc.row_id,
+          _id: doc._id,
+          transport_amount: Number(data.payable_amount || data.net_amount || data.gross_freight || 0),
+          source: `mongo-mirror:${matchedField}`,
+        };
+      }
+    }
+  }
+
+  if (saleIdText) {
+    const row = await dbGet(
+      `
+        SELECT tb.*, COALESCE(tb.payable_amount, tb.net_amount, tb.gross_freight, tb.transport_rate * tb.outward_qty, 0) AS transport_amount
+        FROM transport_bilti tb
+        WHERE CAST(tb.sale_id AS TEXT) = CAST(? AS TEXT)
+        ORDER BY tb.id DESC
+        LIMIT 1
+      `,
+      [saleIdText]
+    );
+    if (row) return { ...row, source: "sqlite-sale-id" };
+  }
+
+  if (voucherNoText || lorryNoText) {
+    const row = await dbGet(
+      `
+        SELECT tb.*, COALESCE(tb.payable_amount, tb.net_amount, tb.gross_freight, tb.transport_rate * tb.outward_qty, 0) AS transport_amount
+        FROM transport_bilti tb
+        WHERE (
+          CAST(tb.voucher_no AS TEXT) = CAST(? AS TEXT)
+          OR CAST(tb.lorry_no AS TEXT) = CAST(? AS TEXT)
+        )
+        ORDER BY tb.id DESC
+        LIMIT 1
+      `,
+      [voucherNoText, lorryNoText]
+    );
+    if (row) return { ...row, source: "sqlite-fallback" };
+  }
+
+  return null;
+}
+
+function dbRunPromise(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(query, params, function (err) {
+      if (err) return reject(err);
+      resolve(this);
+    });
+  });
+}
+
+function createVoucherNoPromise(type, voucherNo = "") {
+  return new Promise((resolve, reject) => {
+    createVoucherNoIfMissing(type, voucherNo, (err, generatedVoucherNo) => {
+      if (err) return reject(err);
+      resolve(generatedVoucherNo);
+    });
+  });
+}
+
+async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deductionAmount, cdAmount, tdsAmount }) {
+  const saleVoucherNo = String(sale?.voucher_no || body?.voucher_no || "").trim();
+  if (!saleVoucherNo) return [];
+
+  await dbRunPromise("DELETE FROM wh_journal_vouchers WHERE description LIKE ?", [`Auto sale deduction:${saleVoucherNo}:%`]);
+
+  const journalBase = {
+    date: body.unloading_date || body.date || sale.date,
+    warehouse_id: body.warehouse_id || sale.warehouse_id,
+    company_account_id: body.company_account_id || sale.company_account_id,
+    employee_id: body.employee_id || sale.employee_id || null,
+    location_id: body.location_id || sale.location_id || null,
+  };
+
+  const rows = [
+    { key: "shortage", label: "Shortage", amount: Number(shortageAmount || 0) },
+    { key: "claim", label: "Claim", amount: Number(deductionAmount || 0) },
+    { key: "cash_discount", label: "Cash Discount", amount: Number(cdAmount || 0) },
+    { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
+  ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
+
+  const created = [];
+  for (const row of rows) {
+    const voucherNo = await createVoucherNoPromise("journal");
+    const description = `Auto sale deduction:${saleVoucherNo}:${row.key}`;
+    const result = await dbRunPromise(
+      `
+        INSERT INTO wh_journal_vouchers
+          (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        voucherNo,
+        journalBase.date,
+        journalBase.warehouse_id,
+        journalBase.company_account_id,
+        "Sale Party",
+        row.label,
+        row.amount,
+        journalBase.employee_id,
+        journalBase.location_id,
+        description,
+      ]
+    );
+    created.push({ id: result.lastID, voucher_no: voucherNo, type: row.key, amount: row.amount });
+  }
+
+  return created;
+}
+
+function assignedWarehouseIdsForMongo(user) {
+  const ids = user?.assigned_warehouse_ids || user?.assigned_sqlite_warehouse_ids || [];
+  return ids.map((id) => String(id));
+}
+
+function mongoPurchaseScope(user) {
+  if (!user || user.role === "admin" || userHasPermission(user, "warehouses.manage")) {
+    return {};
+  }
+
+  const ids = assignedWarehouseIdsForMongo(user);
+  if (ids.length === 0) return { _id: null };
+  return { warehouse_id: { $in: ids } };
+}
+
+function mongoSaleScope(user) {
+  if (!user || user.role === "admin" || userHasPermission(user, "warehouses.manage")) {
+    return {};
+  }
+  const ids = assignedWarehouseIdsForMongo(user);
+  if (ids.length === 0) return { _id: null };
+  return { warehouse_id: { $in: ids } };
+}
+
+async function nextMongoVoucherNo(type) {
+  const shortPrefix = getVoucherPrefix(type);
+  const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const prefix = `${shortPrefix}-${datePart}-`;
+  const latest = await PurchaseVoucher.findOne({ voucher_no: new RegExp(`^${shortPrefix}-`) })
+    .sort({ createdAt: -1, _id: -1 })
+    .lean();
+  let next = 1;
+  if (latest?.voucher_no) {
+    const pieces = String(latest.voucher_no).split("-");
+    const last = Number(pieces[pieces.length - 1]);
+    if (Number.isFinite(last) && last >= 1) next = last + 1;
+  }
+  return `${prefix}${String(next).padStart(4, "0")}`;
+}
+
+function mongoIdFilter(id) {
+  const value = String(id || "");
+  return mongoose.Types.ObjectId.isValid(value) ? { _id: value } : null;
+}
+
+async function decoratePurchaseRows(rows) {
+  const warehouseIds = [...new Set(rows.map((r) => r.warehouse_id).filter(mongoose.Types.ObjectId.isValid))];
+  const farmerIds = [...new Set(rows.map((r) => r.farmer_id).filter(mongoose.Types.ObjectId.isValid))];
+  const productIds = [...new Set(rows.map((r) => r.product_id).filter(mongoose.Types.ObjectId.isValid))];
+  const accountIds = [...new Set(rows.map((r) => r.company_account_id).filter(mongoose.Types.ObjectId.isValid))];
+
+  const [warehouses, farmers, products, accounts] = await Promise.all([
+    warehouseIds.length ? Warehouse.find({ _id: { $in: warehouseIds } }).lean() : [],
+    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }).lean() : [],
+    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
+  ]);
+
+  const byId = (items) => new Map(items.map((item) => [String(item._id), item]));
+  const warehouseMap = byId(warehouses);
+  const farmerMap = byId(farmers);
+  const productMap = byId(products);
+  const accountMap = byId(accounts);
+
+  return rows.map((row) => {
+    const plain = row.toObject ? row.toObject() : row;
+    const warehouse = warehouseMap.get(String(plain.warehouse_id));
+    const farmer = farmerMap.get(String(plain.farmer_id));
+    const product = productMap.get(String(plain.product_id));
+    const account = accountMap.get(String(plain.company_account_id));
+    return {
+      ...plain,
+      id: String(plain._id),
+      _id: String(plain._id),
+      warehouse_name: warehouse?.name || plain.warehouse_name,
+      warehouse_address: warehouse?.address || plain.warehouse_address,
+      warehouse_location: warehouse?.location || plain.warehouse_location,
+      warehouse_city: warehouse?.city || plain.warehouse_city,
+      warehouse_district: warehouse?.district || plain.warehouse_district,
+      warehouse_state: warehouse?.state || plain.warehouse_state,
+      warehouse_pincode: warehouse?.pincode || plain.warehouse_pincode,
+      farmer_name: farmer?.name || plain.farmer_name,
+      farmer_mobile: farmer?.mobile || plain.farmer_mobile,
+      farmer_address: farmer?.address || plain.farmer_address,
+      farmer_village: farmer?.village || plain.farmer_village,
+      farmer_city: farmer?.city || plain.farmer_city,
+      farmer_district: farmer?.district || plain.farmer_district,
+      farmer_state: farmer?.state || plain.farmer_state,
+      farmer_pincode: farmer?.pincode || plain.farmer_pincode,
+      farmer_gst: farmer?.gst_no || farmer?.gst || plain.farmer_gst,
+      farmer_pan: farmer?.pan_no || farmer?.pan || plain.farmer_pan,
+      product_name: product?.name || plain.product_name,
+      company_account_name: account?.account_name || plain.company_account_name,
+      company_account_address: account?.address || plain.company_account_address,
+      company_account_mobile: account?.mobile || plain.company_account_mobile,
+      company_account_email: account?.email || plain.company_account_email,
+      company_account_city: account?.city || plain.company_account_city,
+      company_account_district: account?.district || plain.company_account_district,
+      company_account_state: account?.state || plain.company_account_state,
+      company_account_pincode: account?.pincode || plain.company_account_pincode,
+      company_account_gst: account?.gst_no || account?.gst || plain.company_account_gst,
+      company_account_pan: account?.pan_no || account?.pan || plain.company_account_pan,
+      total_quantity: plain.total_qty || plain.net_weight || plain.quantity || 0,
+      total_amount: plain.net_amount_payable || plain.amount || 0,
+      gross_amount: (plain.total_qty || plain.net_weight || plain.quantity || 0) * (plain.rate || 0),
+    };
+  });
+}
+
+async function sqliteRowsByIds(tableName, ids) {
+  const cleanIds = [...new Set((ids || []).map((id) => String(id || "")).filter(Boolean))];
+  if (!cleanIds.length) return new Map();
+  const placeholders = cleanIds.map(() => "?").join(",");
+  const rows = await dbAll(`SELECT * FROM ${tableName} WHERE CAST(id AS TEXT) IN (${placeholders})`, cleanIds);
+  return new Map((rows || []).map((row) => [String(row.id), row]));
+}
+
+async function decorateSaleRows(rows) {
+  const plainRows = (Array.isArray(rows) ? rows : []).map((row) => (row?.toObject ? row.toObject() : row));
+  if (!plainRows.length) return [];
+
+  const warehouseIds = [...new Set(plainRows.map((r) => String(r?.warehouse_id || "")).filter(Boolean))];
+  const productIds = [...new Set(plainRows.map((r) => String(r?.product_id || "")).filter(Boolean))];
+  const accountIds = [...new Set(plainRows.map((r) => String(r?.company_account_id || "")).filter(Boolean))];
+  const buyerIds = [...new Set(plainRows.map((r) => String(r?.buyer_id || r?.company_id || "")).filter(Boolean))];
+  const consigneeIds = [...new Set(plainRows.map((r) => String(r?.consignee_id || "")).filter(Boolean))];
+
+  const safeObjectIds = (ids) => ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const mongoWarehouseIds = safeObjectIds(warehouseIds);
+  const mongoProductIds = safeObjectIds(productIds);
+  const mongoAccountIds = safeObjectIds(accountIds);
+
+  const mirrorFilters = (table, ids) => ({
+    table,
+    row_id: { $in: ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0) },
+  });
+
+  // Reporting must never fail because one optional master/mirror collection is
+  // unavailable. Every lookup is independent and has an empty fallback.
+  const results = await Promise.allSettled([
+    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
+    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
+    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
+    buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : Promise.resolve([]),
+    consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : Promise.resolve([]),
+    // Some Sale vouchers still contain the legacy SQLite buyer id directly.
+    // Read buyer_names by TEXT id as a reliable fallback so the Sale Party
+    // Ledger never shows a blank party merely because the mirror row is stale.
+    buyerIds.length
+      ? dbAll(`SELECT * FROM buyer_names WHERE CAST(id AS TEXT) IN (${buyerIds.map(() => "?").join(",")})`, buyerIds)
+      : Promise.resolve([]),
+  ]);
+
+  const valueAt = (index) => results[index].status === "fulfilled" && Array.isArray(results[index].value) ? results[index].value : [];
+  results.forEach((result, index) => {
+    if (result.status === "rejected") console.warn(`Sale row lookup ${index} skipped:`, result.reason?.message || result.reason);
+  });
+
+  const byMongoId = (items) => new Map(items.map((item) => [String(item?._id), item]));
+  const byMirrorId = (items) => new Map(items.map((item) => [String(item?.row_id), item?.data || {}]));
+  const mongoWarehouseMap = byMongoId(valueAt(0));
+  const mongoProductMap = byMongoId(valueAt(1));
+  const mongoAccountMap = byMongoId(valueAt(2));
+  const buyerMap = byMirrorId(valueAt(3));
+  const consigneeMap = byMirrorId(valueAt(4));
+  const sqliteBuyerMap = new Map(
+    valueAt(5).map((item) => [String(item?.id || ""), item]).filter(([id]) => id)
+  );
+
+  return plainRows.map((plain) => {
+    const buyerId = String(plain?.buyer_id || plain?.company_id || "");
+    const warehouse = mongoWarehouseMap.get(String(plain?.warehouse_id || ""));
+    const product = mongoProductMap.get(String(plain?.product_id || ""));
+    const account = mongoAccountMap.get(String(plain?.company_account_id || ""));
+    const buyer = buyerMap.get(buyerId) || sqliteBuyerMap.get(buyerId) || {};
+    const consignee = consigneeMap.get(String(plain?.consignee_id || ""));
+    const totalQuantity = Number(plain?.quantity ?? plain?.total_quantity ?? Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0));
+    const totalAmount = Number(plain?.amount ?? plain?.total_amount ?? plain?.net_receivable_amount ?? 0);
+    return {
+      ...plain,
+      id: String(plain?._id || plain?.id || ""),
+      _id: String(plain?._id || plain?.id || ""),
+      buyer_id: buyerId,
+      warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
+      product_name: product?.name || plain?.product_name || "-",
+      company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
+      buyer_name: buyer?.name || buyer?.company_name || plain?.buyer_name || plain?.party_name || plain?.company_name || "-",
+      buyer_email: buyer?.email || plain?.buyer_email || "",
+      buyer_mobile: buyer?.mobile || plain?.buyer_mobile || "",
+      consignee_name: consignee?.name || plain?.consignee_name || "-",
+      consignee_email: consignee?.email || plain?.consignee_email || "",
+      consignee_mobile: consignee?.mobile || plain?.consignee_mobile || "",
+      total_quantity: Number.isFinite(totalQuantity) ? totalQuantity : 0,
+      total_amount: Number.isFinite(totalAmount) ? totalAmount : 0,
+      ...calculateSaleFollowupMeta(plain || {}),
+    };
+  });
+}
+
+function mergeSaleRows(mongoRows, sqliteRows) {
+  const mongoByVoucherNo = new Map();
+  const merged = [];
+
+  for (const row of mongoRows) {
+    const key = String(row.voucher_no || row._id || "");
+    if (key) mongoByVoucherNo.set(key, row);
+    merged.push(row);
+  }
+
+  for (const row of sqliteRows) {
+    const key = String(row.voucher_no || row.id || "");
+    if (!key || !mongoByVoucherNo.has(key)) {
+      merged.push(row);
+    }
+  }
+
+  return merged.sort((a, b) => {
+    const dateA = new Date(a.date || a.created_at || 0).getTime();
+    const dateB = new Date(b.date || b.created_at || 0).getTime();
+    if (dateA !== dateB) return dateB - dateA;
+    return String(b.voucher_no || b.id || b._id || "").localeCompare(String(a.voucher_no || a.id || a._id || ""), undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+  });
+}
+
+async function attachSaleBiltiIds(rows) {
+  const saleIds = [...new Set((rows || []).map((row) => String(row.id || row._id).trim()).filter(Boolean))];
+  if (!saleIds.length) return rows;
+
+  try {
+    const placeholders = saleIds.map(() => "?").join(",");
+    const biltiRows = await dbAll(
+      `SELECT sale_id, MAX(id) AS bilti_id FROM transport_bilti WHERE sale_id IS NOT NULL AND CAST(sale_id AS TEXT) IN (${placeholders}) GROUP BY sale_id`,
+      saleIds
+    );
+
+    const biltiMap = new Map((biltiRows || []).map((row) => [String(row.sale_id), row.bilti_id]));
+    return rows.map((row) => ({
+      ...row,
+      bilti_id: biltiMap.get(String(row.id || row._id)) || null,
+    }));
+  } catch (err) {
+    console.warn("Optional sale Bilti lookup skipped:", err?.message || err);
+    return rows;
+  }
+}
+
+function getSqlitePurchaseRows(req) {
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const fallbackFilter = assignedWarehouseFilter(req.user, "warehouse_id");
+  const query = `
+    SELECT
+      v.*,
+      (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
+      (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
+      (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
+      ca.account_name AS company_account_name
+    FROM wh_purchase_vouchers v
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.date DESC, v.id DESC
+  `;
+
+  return new Promise((resolve, reject) => {
+    db.all(query, filter.params, (err, rows) => {
+      if (!err) {
+        resolve(rows || []);
+        return;
+      }
+
+      console.error("Purchase voucher mapped query failed, falling back to base rows:", err.message);
+      const fallbackQuery = `
+        SELECT *
+        FROM wh_purchase_vouchers
+        WHERE 1 = 1 ${fallbackFilter.clause}
+        ORDER BY date DESC, id DESC
+      `;
+      db.all(fallbackQuery, fallbackFilter.params, (fallbackErr, fallbackRows) => {
+        if (fallbackErr) {
+          reject(fallbackErr);
+          return;
+        }
+        resolve(fallbackRows || []);
+      });
+    });
+  });
+}
+
+function mergePurchaseRows(mongoRows, sqliteRows) {
+  const mongoByVoucherNo = new Map();
+  const merged = [];
+
+  for (const row of mongoRows) {
+    const key = String(row.voucher_no || row._id || "");
+    if (key) mongoByVoucherNo.set(key, row);
+    merged.push(row);
+  }
+
+  for (const row of sqliteRows) {
+    const key = String(row.voucher_no || row.id || "");
+    if (!key || !mongoByVoucherNo.has(key)) {
+      merged.push(row);
+    }
+  }
+
+  return merged.sort((a, b) => {
+    const dateA = new Date(a.date || a.created_at || 0).getTime();
+    const dateB = new Date(b.date || b.created_at || 0).getTime();
+    if (dateA !== dateB) return dateB - dateA;
+    const voucherA = String(a.voucher_no || a.id || a._id || "");
+    const voucherB = String(b.voucher_no || b.id || b._id || "");
+    return voucherB.localeCompare(voucherA, undefined, { numeric: true, sensitivity: "base" });
+  });
+}
+
+function getPurchaseVoucherRows(req, res) {
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is required for Warehouse Trading voucher lists" });
+  }
+  getPurchaseVoucherPage(req)
+    .then((payload) => res.json(payload))
+    .catch((err) => {
+      console.error("Mongo purchase voucher page query failed:", err);
+      res.status(500).json({ error: err.message || "Failed to load purchase vouchers" });
+    });
+}
+
+function getPurchaseVoucherRowsSqlite(req, res) {
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const fallbackFilter = assignedWarehouseFilter(req.user, "warehouse_id");
+  const query = `
+    SELECT
+      v.*,
+      (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
+      (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
+      (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
+      ca.account_name AS company_account_name
+    FROM wh_purchase_vouchers v
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY v.date DESC, v.id DESC
+  `;
+
+  db.all(query, filter.params, (err, rows) => {
+    if (!err) {
+      return res.json(rows || []);
+    }
+
+    console.error("Purchase voucher mapped query failed, falling back to base rows:", err.message);
+    const fallbackQuery = `
+      SELECT *
+      FROM wh_purchase_vouchers
+      WHERE 1 = 1 ${fallbackFilter.clause}
+      ORDER BY date DESC, id DESC
+    `;
+    db.all(fallbackQuery, fallbackFilter.params, (fallbackErr, fallbackRows) => {
+      if (fallbackErr) return res.status(500).json({ error: fallbackErr.message });
+      res.json(fallbackRows || []);
+    });
+  });
+}
+
+async function resolveUserAccessibleLocationIds(user) {
+  const rawLocationIds = [
+    user?.location_id,
+    ...(Array.isArray(user?.location_ids) ? user.location_ids : []),
+  ].filter(Boolean);
+
+  const resolvedIds = [];
+  for (const rawLocationId of rawLocationIds) {
+    const value = String(rawLocationId || "").trim();
+    if (!value) continue;
+    if (Number.isFinite(Number(value)) && Number(value) > 0) {
+      resolvedIds.push(Number(value));
+      continue;
+    }
+
+    const doc = await Location.findById(value).lean().catch(() => null);
+    if (!doc) continue;
+    if (Number.isFinite(Number(doc.id))) {
+      resolvedIds.push(Number(doc.id));
+      continue;
+    }
+    if (doc._id && Number.isFinite(Number(doc._id))) {
+      resolvedIds.push(Number(doc._id));
+    }
+  }
+
+  return Array.from(new Set(resolvedIds));
+}
+
+async function canAccessLocation(user, locationId) {
+  const normalizedLocationId = Number(locationId);
+  if (!Number.isFinite(normalizedLocationId) || normalizedLocationId <= 0) {
+    return false;
+  }
+
+  const allowed = await resolveUserAccessibleLocationIds(user).catch(() => []);
+  if (allowed.length === 0) {
+    return true;
+  }
+  return allowed.includes(normalizedLocationId);
+}
+
+function ensureWarehouseAccess(req, res, warehouseId, locationId = null) {
+  if (warehouseId) {
+    if (!canAccessWarehouse(req.user, warehouseId)) {
+      res.status(403).json({ error: "You do not have access to this warehouse" });
+      return false;
+    }
+    return true;
+  }
+
+  if (locationId) {
+    return canAccessLocation(req.user, locationId)
+      .then((allowed) => {
+        if (!allowed) {
+          res.status(403).json({ error: "You do not have access to this location" });
+          return false;
+        }
+        return true;
+      })
+      .catch((err) => {
+        res.status(500).json({ error: err?.message || "Failed to check location access" });
+        return false;
+      });
+  }
+
+  res.status(400).json({ error: "Warehouse or location is required" });
+  return false;
+}
+
+async function getMongoPurchaseVoucherForPdf(id) {
+  const filter = mongoIdFilter(id);
+  if (!filter || !mongoReady()) return null;
+
+  const row = await PurchaseVoucher.findOne(filter).lean();
+  if (!row) return null;
+
+  const [warehouse, farmer, product, account] = await Promise.all([
+    row.warehouse_id && mongoose.Types.ObjectId.isValid(row.warehouse_id)
+      ? Warehouse.findById(row.warehouse_id).lean()
+      : null,
+    row.farmer_id && mongoose.Types.ObjectId.isValid(row.farmer_id)
+      ? Farmer.findById(row.farmer_id).lean()
+      : null,
+    row.product_id && mongoose.Types.ObjectId.isValid(row.product_id)
+      ? Product.findById(row.product_id).lean()
+      : null,
+    row.company_account_id && mongoose.Types.ObjectId.isValid(row.company_account_id)
+      ? CompanyAccount.findById(row.company_account_id).lean()
+      : null,
+  ]);
+
+  return {
+    ...row,
+    id: String(row._id),
+    warehouse_name: warehouse?.name || row.warehouse_name,
+    warehouse_address: warehouse?.address || row.warehouse_address,
+    warehouse_location: warehouse?.location || row.warehouse_location,
+    warehouse_pincode: warehouse?.pincode || row.warehouse_pincode,
+    warehouse_state: warehouse?.state || row.warehouse_state,
+    warehouse_city: warehouse?.city || row.warehouse_city,
+    warehouse_district: warehouse?.district || row.warehouse_district,
+    farmer_name: farmer?.name || row.farmer_name,
+    farmer_mobile: farmer?.mobile || row.farmer_mobile,
+    farmer_address: farmer?.address || row.farmer_address,
+    farmer_village: farmer?.village || row.farmer_village,
+    farmer_gst: farmer?.gst_no || row.farmer_gst,
+    farmer_pan: farmer?.pan_no || row.farmer_pan,
+    farmer_state: farmer?.state || row.farmer_state,
+    farmer_bank_name: farmer?.bank_name || row.farmer_bank_name,
+    farmer_bank_account_no: farmer?.bank_account_no || row.farmer_bank_account_no,
+    farmer_ifsc_code: farmer?.ifsc_code || row.farmer_ifsc_code,
+    farmer_branch_name: farmer?.branch_name || row.farmer_branch_name,
+    farmer_account_holder_name: farmer?.account_holder_name || row.farmer_account_holder_name,
+    product_name: product?.name || row.product_name,
+    company_account_name: account?.account_name || row.company_account_name,
+    company_account_mobile: account?.mobile || row.company_account_mobile,
+    company_account_pan: account?.pan_no || row.company_account_pan,
+    company_account_address: account?.address || row.company_account_address,
+  };
+}
+
+async function enrichPurchaseVoucherPdfRow(row) {
+  if (!row || !mongoReady()) return row;
+  const farmerId = String(row.farmer_id || "");
+  const farmerName = String(row.farmer_name || "").trim();
+  const farmerMobile = String(row.farmer_mobile || "").trim();
+
+  let farmer = null;
+  if (mongoose.Types.ObjectId.isValid(farmerId)) {
+    farmer = await Farmer.findById(farmerId).lean();
+  }
+  if (!farmer && farmerName) {
+    const nameFilter = { name: farmerName };
+    if (farmerMobile) {
+      farmer = await Farmer.findOne({ ...nameFilter, mobile: farmerMobile }).lean();
+    }
+    if (!farmer) {
+      farmer = await Farmer.findOne(nameFilter).lean();
+    }
+  }
+  if (!farmer && farmerMobile) {
+    farmer = await Farmer.findOne({ mobile: farmerMobile }).lean();
+  }
+  if (!farmer) return row;
+
+  return {
+    ...row,
+    farmer_name: row.farmer_name || farmer.name,
+    farmer_mobile: row.farmer_mobile || farmer.mobile,
+    farmer_address: row.farmer_address || farmer.address,
+    farmer_village: row.farmer_village || farmer.village,
+    farmer_gst: row.farmer_gst || farmer.gst_no,
+    farmer_pan: row.farmer_pan || farmer.pan_no,
+    farmer_state: row.farmer_state || farmer.state,
+    farmer_district: row.farmer_district || farmer.district || farmer.city || farmer.location,
+    farmer_pincode: row.farmer_pincode || farmer.pincode,
+    farmer_bank_name: row.farmer_bank_name || farmer.bank_name,
+    farmer_bank_account_no: row.farmer_bank_account_no || farmer.bank_account_no,
+    farmer_ifsc_code: row.farmer_ifsc_code || farmer.ifsc_code,
+    farmer_branch_name: row.farmer_branch_name || farmer.branch_name,
+    farmer_account_holder_name: row.farmer_account_holder_name || farmer.account_holder_name,
+  };
+}
+
+function sendPurchaseVoucherPdf(res, row, id) {
+  const doc = new PDFDocument({ size: "A4", margin: 20 });
+  res.setHeader("Content-Type", "application/pdf");
+  const safeName = String(row.voucher_no || id).replace(/[/\\?%*:|"<>]/g, "-");
+  res.setHeader("Content-Disposition", `attachment; filename="purchase_${safeName}.pdf"`);
+  doc.pipe(res);
+
+  const pageW = doc.page.width;
+  const pageH = doc.page.height;
+  const x = 20;
+  const y0 = 18;
+  const contentW = pageW - 40;
+  const navy = "#0f2747";
+  const green = "#4f8f2f";
+  const greenLight = "#e8f4df";
+  const navyLight = "#edf2fb";
+  const border = "#d1d5db";
+  const text = "#111827";
+  const muted = "#4b5563";
+  const soft = "#f8fafc";
+  let y = y0;
+  const accountName = row.company_account_name || "SHIVANSH";
+  const warehouseNameLine = row.warehouse_name || "-";
+  const warehouseAddressLine = row.warehouse_address || "-";
+  const warehouseCityDistrictLine = [row.warehouse_location, row.warehouse_city, row.warehouse_district]
+    .filter(Boolean)
+    .join(", ");
+  const netQty = row.total_qty || row.net_weight || row.quantity || 0;
+  const grossAmount = Number(netQty || 0) * Number(row.rate || 0);
+  const netPayable = row.net_amount_payable || row.amount || 0;
+  const fmt4 = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(4) : "0.0000";
+  };
+  const fmt2 = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(2) : "0.00";
+  };
+
+  const box = (bx, by, bw, bh, fill = "#fff", stroke = border) => {
+    doc.roundedRect(bx, by, bw, bh, 6).fillAndStroke(fill, stroke);
+  };
+  const labelValue = (label, value, tx, ty, width = 120) => {
+    doc.fillColor(text).fontSize(8.0).text(label, tx, ty, { width: width * 0.46 });
+    doc.fillColor(muted).text(":", tx + width * 0.46, ty);
+    doc.fillColor(text).text(value || "-", tx + width * 0.54, ty, { width: width * 0.46 });
+  };
+
+  doc.rect(10, 10, pageW - 20, pageH - 20).lineWidth(0.8).strokeColor(border).stroke();
+
+  // Header area
+  const leftHeaderW = 165;
+  const titleW = 235;
+  const midHeaderW = contentW - leftHeaderW - titleW - 12;
+
+  doc.roundedRect(x, y, leftHeaderW, 58, 8).fillAndStroke("#fff", border);
+  doc.fillColor(navy).fontSize(18).text(accountName, x + 14, y + 14, { width: leftHeaderW - 28 });
+  doc.moveTo(x + 14, y + 42).lineTo(x + leftHeaderW - 18, y + 42).stroke(green);
+
+  doc.roundedRect(x + leftHeaderW + 6, y, midHeaderW, 58, 8).fillAndStroke("#fff", border);
+  doc.fillColor(navy).fontSize(7.6).text("Phone", x + leftHeaderW + 18, y + 17);
+  doc.fillColor(text).fontSize(7.6).text(row.company_account_mobile || "9064348416", x + leftHeaderW + 46, y + 17);
+  doc.fillColor(navy).fontSize(7.6).text("Mobile", x + leftHeaderW + 18, y + 33);
+  doc.fillColor(text).fontSize(7.6).text(row.farmer_mobile || "9088370854", x + leftHeaderW + 60, y + 33);
+
+  doc.roundedRect(x + contentW - titleW, y, titleW, 58, 8).fillAndStroke(navy, navy);
+  doc.fillColor("#fff").fontSize(15).text("PURCHASE MEMO", x + contentW - titleW + 20, y + 20, {
+    width: titleW - 40,
+    align: "center",
+  });
+  doc.moveTo(x + contentW - 48, y + 10).lineTo(x + contentW - 20, y + 48).stroke(green);
+  doc.moveTo(x + contentW - 62, y + 10).lineTo(x + contentW - 34, y + 48).stroke("#c7d2fe");
+
+  y += 68;
+  doc.roundedRect(x, y, contentW, 24, 6).fillAndStroke("#fff", border);
+  doc.fillColor(navy).fontSize(7.8).text("Location:", x + 12, y + 8);
+  doc.fillColor(text).fontSize(7.8).text(
+    [warehouseNameLine, warehouseAddressLine, warehouseCityDistrictLine].filter(Boolean).join(" | "),
+    x + 58,
+    y + 8,
+    { width: contentW - 70 }
+  );
+  y += 32;
+  doc.roundedRect(x, y, contentW, 22, 6).fillAndStroke("#fff", border);
+  doc.fontSize(7.8).fillColor(text).text("Serial No.", x + 12, y + 7);
+  doc.fillColor(navy).fontSize(9.4).text(row.voucher_no || id, x + 72, y + 5);
+  doc.fillColor(text).fontSize(7.8).text("Date", x + contentW - 138, y + 7);
+  doc.fillColor(navy).fontSize(9.4).text(fmtDate(row.date), x + contentW - 90, y + 5);
+  y += 30;
+
+  const leftW = (contentW - 10) / 2;
+  const rightX = x + leftW + 10;
+  box(x, y, leftW, 102, "#fff");
+  box(rightX, y, leftW, 102, "#fff");
+  doc.roundedRect(x, y, leftW, 20, 6).fillAndStroke(navy, navy);
+  doc.roundedRect(rightX, y, leftW, 20, 6).fillAndStroke(green, green);
+  doc.fillColor("#fff").fontSize(9).text("PARTY INFORMATION", x + 12, y + 6);
+  doc.fillColor("#fff").text("DOCUMENT INFORMATION", rightX + 12, y + 6);
+
+  const pStart = y + 23;
+  labelValue("Name of Party", row.farmer_name, x + 10, pStart, leftW - 20);
+  labelValue("PAN", row.farmer_pan, x + 10, pStart + 13, leftW - 20);
+  labelValue("GSTIN", row.farmer_gst, x + 10, pStart + 26, leftW - 20);
+  labelValue("Phone", row.farmer_mobile, x + 10, pStart + 39, leftW - 20);
+  labelValue("State", row.farmer_state, x + 10, pStart + 52, leftW - 20);
+  labelValue("PIN No.", row.farmer_pincode, x + 10, pStart + 65, leftW - 20);
+
+  labelValue("R.S.T. No.", row.reference_id || "-", rightX + 10, pStart + 3, leftW - 20);
+  labelValue("Transport No.", "-", rightX + 10, pStart + 16, leftW - 20);
+  labelValue("Warehouse", row.warehouse_name || row.warehouse_id, rightX + 10, pStart + 29, leftW - 20);
+  labelValue("Remarks", row.description || "-", rightX + 10, pStart + 42, leftW - 20);
+  labelValue("Location", warehouseNameLine, rightX + 10, pStart + 55, leftW - 20);
+
+  y += 110;
+
+  const particulars = [
+    ["1", "Packet", fmt4(row.packet)],
+    ["2", "Gross Weight", fmt4(row.gross_weight)],
+    ["3", "Tare Weight", fmt4(row.tare_weight)],
+    ["4", "New Weight", fmt4(Math.max(Number(row.gross_weight || 0) - Number(row.tare_weight || 0), 0))],
+    ["5", "Dhalta", fmt4(row.dhalta)],
+    ["6", "Less Bags Weight", fmt4(row.less_bags_weight)],
+    ["7", "Moisture", fmt4(row.moisture)],
+    ["8", "Dunki / Fungus", fmt4(Number(row.dunki || 0) + Number(row.fungus || 0))],
+    ["9", "Discolour / Others", fmt4(Number(row.discolour || 0) + Number(row.others || 0))],
+    ["10", "Bags Claim", fmt4(row.bags_claim)],
+    ["11", "Round Off", fmt4(row.round_off)],
+  ].filter(([_, label]) => {
+    if (label === "Bags Claim") return Number(row.bags_claim || 0) !== 0;
+    return true;
+  });
+
+  const particularsHeight = 17 + particulars.length * 9.5;
+  const tableHeight = Math.max(112, particularsHeight + 16);
+
+  box(x, y, contentW, tableHeight, "#fff");
+  doc.roundedRect(x, y, contentW, 18, 6).fillAndStroke(navy, navy);
+  doc.fillColor("#fff").fontSize(9).text("PARTICULARS", x + 12, y + 5);
+  doc.fillColor("#fff").text("AMOUNT (Rs.)", x + contentW - 92, y + 5, { width: 80, align: "right" });
+  const headY = y + 18;
+  const col1 = 42;
+  const col2 = contentW - col1 - 92;
+  let rowY = headY;
+
+  particulars.forEach((ln, index) => {
+    const fill = index % 2 === 0 ? "#fbfdff" : "#f8fafc";
+    doc.rect(x + 1, rowY, contentW - 2, 10).fill(fill);
+    doc.moveTo(x, rowY + 10).lineTo(x + contentW, rowY + 10).stroke(border);
+    doc.fillColor(text).fontSize(6.5).text(ln[0], x + 10, rowY + 0.8);
+    doc.text(ln[1], x + col1 + 10, rowY + 0.8);
+    doc.text(ln[2], x + col1 + col2 + 10, rowY + 0.8, { width: 80, align: "right" });
+    rowY += 9.5;
+  });
+
+  const summaryY = y + tableHeight + 8;
+  const summaryW = 260;
+  const statsPanelW = 220;
+  const statsPanelX = x + contentW - statsPanelW;
+  const boxW = summaryW / 5;
+  [
+    ["PURCHASED KG.", fmt4(row.gross_weight)],
+    ["MAKKA QTY.", fmt4(netQty)],
+    ["BORA QTY.", fmt4(row.packet)],
+    ["LABOUR CHARGES", fmt4(row.labour)],
+    ["TOTAL", fmt2(grossAmount || netPayable)],
+  ].forEach((item, index) => {
+    const bx = x + index * boxW;
+    const fill = index === 4 ? greenLight : soft;
+    const stroke = index === 4 ? green : border;
+    doc.roundedRect(bx, summaryY, boxW - 2, 34, 4).fillAndStroke(fill, stroke);
+    doc.fillColor(index === 4 ? green : navy).fontSize(6.1).text(item[0], bx + 2, summaryY + 4, { width: boxW - 6, align: "center" });
+    doc.fillColor(text).fontSize(8.0).text(item[1], bx + 2, summaryY + 17, { width: boxW - 6, align: "center" });
+  });
+
+  doc.roundedRect(statsPanelX, summaryY, statsPanelW, 34, 4).fillAndStroke("#fff", border);
+  labelValue("Total Qty.", fmt4(netQty), statsPanelX + 8, summaryY + 3, statsPanelW - 16);
+  labelValue("Total Deductions", fmt2(row.total_deduction || row.total_deduct_amount), statsPanelX + 8, summaryY + 14, statsPanelW - 16);
+  doc.roundedRect(statsPanelX, summaryY + 24, statsPanelW, 10, 4).fillAndStroke(navy, navy);
+  doc.fillColor("#fff").fontSize(6.8).text("Net Amount Payable", statsPanelX + 8, summaryY + 27);
+  doc.fillColor("#fff").fontSize(7.2).text(fmt2(netPayable), statsPanelX + 82, summaryY + 27, { width: statsPanelW - 90, align: "right" });
+
+  y = summaryY + 44;
+  doc.roundedRect(x, y, contentW, 54, 6).fillAndStroke("#fff", border);
+  doc.roundedRect(x + 10, y - 8, 160, 16, 5).fillAndStroke(green, green);
+  doc.fillColor("#fff").fontSize(8.6).text("ADDITIONAL DETAILS", x + 27, y - 4);
+  labelValue("Bank", row.farmer_bank_name || "-", x + 12, y + 15, 180);
+  labelValue("IFSC Code", row.farmer_ifsc_code || "-", x + 12, y + 28, 180);
+  labelValue("Name of Party", row.farmer_account_holder_name || row.farmer_name, x + 240, y + 15, 180);
+  labelValue("Branch", row.farmer_branch_name || "-", x + 240, y + 28, 180);
+  labelValue("Account Number", row.farmer_bank_account_no || "-", x + 450, y + 15, 160);
+  labelValue("Transport No.", "-", x + 450, y + 28, 160);
+
+  y += 62;
+  doc.roundedRect(x + 150, y, contentW - 300, 18, 6).fillAndStroke(greenLight, green);
+  doc.fillColor(green).fontSize(6.8).text("NOTE", x + 160, y + 5);
+  doc.fillColor(text).fontSize(6.8).text("Buyer and Seller disputes will be resolved at village level.", x + 186, y + 5, { width: contentW - 372, align: "center" });
+  y += 28;
+  doc.fillColor(text).fontSize(7.2).text("Customer Signature", x + 48, y);
+  doc.moveTo(x + 42, y + 15).lineTo(x + 160, y + 15).stroke(border);
+  doc.text("Authorised Signature", x + contentW - 170, y);
+  doc.moveTo(x + contentW - 182, y + 15).lineTo(x + contentW - 54, y + 15).stroke(border);
+  doc.moveTo(x, pageH - 14).lineTo(x + contentW, pageH - 14).stroke(navy);
+  doc.moveTo(x + contentW - 28, pageH - 14).lineTo(x + contentW, pageH - 42).stroke(green);
+
+  doc.end();
+}
+
+function sendMinimalPurchaseVoucherPdf(res, row, id) {
+  const doc = new PDFDocument({ size: "A4", margin: 30 });
+  res.setHeader("Content-Type", "application/pdf");
+  const safeName = String(row.voucher_no || id).replace(/[/\\?%*:|"<>]/g, "-");
+  res.setHeader("Content-Disposition", `attachment; filename="purchase_${safeName}.pdf"`);
+  doc.pipe(res);
+  const fmt4 = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(4) : "0.0000";
+  };
+  doc.fontSize(18).fillColor("#0f766e").text("PURCHASE MEMO", { align: "center" });
+  doc.moveDown(1);
+  doc.fontSize(11).fillColor("#111827").text(`Voucher No: ${row.voucher_no || id}`);
+  doc.text(`Date: ${fmtDate(row.date)}`);
+  doc.text(`Party: ${row.farmer_name || "-"}`);
+  doc.text(`Warehouse: ${row.warehouse_name || "-"}`);
+  doc.text(`Amount: ${fmt4(row.net_amount_payable || row.amount || 0)}`);
+  doc.moveDown(1);
+  doc.fontSize(9).text("Full memo layout could not be rendered, so this compact version was generated instead.");
+  doc.end();
+}
+
+function getVoucherPrefix(type) {
+  const prefixMap = {
+    purchase: "PUR",
+    sale: "SAL",
+    payment: "PAY",
+    receipt: "REC",
+    journal: "JRN",
+  };
+  return prefixMap[type] || String(type || "").toUpperCase().slice(0, 3);
+}
+
+function getVoucherTable(type) {
+  const tableMap = {
+    purchase: "wh_purchase_vouchers",
+    sale: "wh_sale_vouchers",
+    payment: "wh_payment_vouchers",
+    receipt: "wh_receipt_vouchers",
+    journal: "wh_journal_vouchers",
+  };
+  return tableMap[type];
+}
+
+function createSequentialVoucherNo(type, callback) {
+  const table = getVoucherTable(type);
+  if (!table) return callback(new Error("Invalid voucher type"));
+  const shortPrefix = getVoucherPrefix(type);
+  const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const prefix = `${shortPrefix}-${datePart}-`;
+  const query = `SELECT voucher_no FROM ${table} WHERE voucher_no LIKE ? ORDER BY id DESC LIMIT 1`;
+  db.get(query, [`${shortPrefix}-%`], (err, row) => {
+    if (err) return callback(err);
+    let next = 1;
+    if (row && row.voucher_no) {
+      const pieces = String(row.voucher_no).split("-");
+      const last = Number(pieces[pieces.length - 1]);
+      if (Number.isFinite(last) && last >= 1) next = last + 1;
+    }
+    callback(null, `${prefix}${String(next).padStart(4, "0")}`);
+  });
+}
+
+function computeOutstandingForFarmer(farmerId, callback, companyAccountId = null) {
+  const farmerKey = String(farmerId || "").trim();
+  const accountKey = String(companyAccountId || "").trim();
+  if (!farmerKey) return callback(null, { total_purchase: 0, total_payment: 0, outstanding: 0 });
+
+  const paymentParams = [farmerKey];
+  const paymentWhere = ["CAST(farmer_id AS TEXT) = CAST(? AS TEXT)"];
+  if (accountKey) {
+    paymentWhere.push("CAST(company_account_id AS TEXT) = CAST(? AS TEXT)");
+    paymentParams.push(accountKey);
+  }
+
+  const finish = (totalPurchase) => {
+    db.get(
+      `SELECT COALESCE(SUM(amount), 0) AS total_payment FROM wh_payment_vouchers WHERE ${paymentWhere.join(" AND ")}`,
+      paymentParams,
+      (err2, payment) => {
+        if (err2) return callback(err2);
+        const totalPayment = Number(payment?.total_payment || 0);
+        callback(null, {
+          total_purchase: Number(totalPurchase || 0),
+          total_payment: totalPayment,
+          outstanding: Number((Number(totalPurchase || 0) - totalPayment).toFixed(2)),
+        });
+      }
+    );
+  };
+
+  if (mongoReady()) {
+    const filter = { farmer_id: farmerKey };
+    if (accountKey) filter.company_account_id = accountKey;
+    PurchaseVoucher.aggregate([
+      { $match: filter },
+      { $group: { _id: null, total_purchase: { $sum: { $ifNull: ["$net_amount_payable", { $ifNull: ["$amount", 0] }] } } } },
+    ])
+      .then((rows) => finish(Number(rows?.[0]?.total_purchase || 0)))
+      .catch(callback);
+    return;
+  }
+
+  const purchaseParams = [farmerKey];
+  const purchaseWhere = ["CAST(farmer_id AS TEXT) = CAST(? AS TEXT)"];
+  if (accountKey) {
+    purchaseWhere.push("CAST(company_account_id AS TEXT) = CAST(? AS TEXT)");
+    purchaseParams.push(accountKey);
+  }
+  db.get(
+    `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase FROM wh_purchase_vouchers WHERE ${purchaseWhere.join(" AND ")}`,
+    purchaseParams,
+    (err, purchase) => {
+      if (err) return callback(err);
+      finish(Number(purchase?.total_purchase || 0));
+    }
+  );
+}
+
+function computeOutstandingForCompany(companyId, callback, companyAccountId = null) {
+  const receiptSql = `SELECT COALESCE(SUM(amount), 0) AS total_receipt FROM wh_receipt_vouchers WHERE company_id = ?${companyAccountId ? " AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}`;
+  const receiptParams = [companyId];
+  if (companyAccountId) {
+    receiptParams.push(companyAccountId);
+  }
+
+  const finish = (totalSale) => {
+    db.get(receiptSql, receiptParams, (err2, receipt) => {
+      if (err2) return callback(err2);
+      const totalReceipt = receipt?.total_receipt || 0;
+      callback(null, {
+        total_sale: totalSale,
+        total_receipt: totalReceipt,
+        outstanding: Number((totalSale - totalReceipt).toFixed(2)),
+      });
+    });
+  };
+
+  if (mongoReady()) {
+    const filter = {
+      $or: [
+        { buyer_id: String(companyId) },
+        { company_id: String(companyId) },
+      ],
+    };
+    if (companyAccountId) filter.company_account_id = String(companyAccountId);
+    return SaleVoucher.find(filter)
+      .lean()
+      .then((rows) => {
+        const totalSale = (rows || []).reduce(
+          (sum, row) => sum + Number(row.net_receivable_amount || row.amount || 0),
+          0
+        );
+        finish(totalSale);
+      })
+      .catch(callback);
+  }
+
+  const saleSql = `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT)${companyAccountId ? " AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}`;
+  const saleParams = [companyId];
+  if (companyAccountId) {
+    saleParams.push(companyAccountId);
+  }
+  db.get(saleSql, saleParams, (err, sale) => {
+    if (err) return callback(err);
+    finish(sale?.total_sale || 0);
+  });
+}
+
+function createVoucherNoIfMissing(type, voucherNo, callback) {
+  if (voucherNo && String(voucherNo).trim()) return callback(null, voucherNo);
+  if (type === "purchase" && mongoReady()) {
+    nextMongoVoucherNo(type)
+      .then((nextNo) => callback(null, nextNo))
+      .catch((err) => callback(err));
+    return;
+  }
+  createSequentialVoucherNo(type, callback);
+}
+
+const normalizeImportKey = (value) => String(value || "").trim().toLowerCase();
+
+function firstValue(row, keys) {
+  for (const key of keys) {
+    if (row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== "") {
+      return row[key];
+    }
+  }
+  return "";
+}
+
+function excelDateToIso(value) {
+  if (!value) return "";
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  if (typeof value === "number") {
+    const parsed = XLSX.SSF.parse_date_code(value);
+    if (parsed) {
+      return `${parsed.y}-${String(parsed.m).padStart(2, "0")}-${String(parsed.d).padStart(2, "0")}`;
+    }
+  }
+  const raw = String(value).trim();
+  const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return `${iso[1]}-${String(iso[2]).padStart(2, "0")}-${String(iso[3]).padStart(2, "0")}`;
+  const dmy = raw.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})$/);
+  if (dmy) {
+    const yyyy = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+    return `${yyyy}-${String(dmy[2]).padStart(2, "0")}-${String(dmy[1]).padStart(2, "0")}`;
+  }
+  const date = new Date(raw);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
+}
+
+function importNumber(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  const parsed = Number(String(value).replace(/,/g, "").trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function resolveByNameOrId(map, value) {
+  const key = normalizeImportKey(value);
+  return key ? map.get(key) : null;
+}
+
+function buildImportMap(rows, nameFields = ["name"]) {
+  const map = new Map();
+  rows.forEach((row) => {
+    if (row?._id) map.set(normalizeImportKey(row._id), row);
+    if (row?.id) map.set(normalizeImportKey(row.id), row);
+    nameFields.forEach((field) => {
+      if (row?.[field]) map.set(normalizeImportKey(row[field]), row);
+    });
+  });
+  return map;
+}
+
+function purchaseImportRowsFromSheet(buffer) {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) return [];
+  return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
+}
+
+function paymentImportRowsFromSheet(buffer) {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) return [];
+  return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
+}
+
+function purchaseImportTemplateBuffer() {
+  const headers = [
+    "Date",
+    "Voucher No",
+    "Warehouse",
+    "Account",
+    "Farmer",
+    "Product",
+    "Employee",
+    "Location",
+    "Packet",
+    "Gross Wt",
+    "Tare Wt",
+    "Dhalta",
+    "Less Bags Weight",
+    "Moistur",
+    "Dunki",
+    "Fungas",
+    "Disclour",
+    "Others",
+    "Rate",
+    "Bags Claim",
+    "Labour",
+    "Round Off",
+    "Narration",
+  ];
+  const sample = [
+    new Date().toISOString().slice(0, 10),
+    "",
+    "Hemtobat Warehouse",
+    "Agri Rise Pvt Ltd",
+    "Manikul Islam",
+    "Maize",
+    "Subrajyoti Mondal",
+    "Hemtobat Hub",
+    30,
+    1.8,
+    0,
+    0.18,
+    0.0069,
+    0,
+    0,
+    0,
+    0,
+    0,
+    19900,
+    245,
+    180,
+    -0.69,
+    "",
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+  ws["!cols"] = headers.map(() => ({ wch: 18 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Purchase Import");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
+function paymentImportTemplateBuffer() {
+  const headers = [
+    "Date",
+    "Voucher No",
+    "Warehouse",
+    "Farmer No",
+    "Farmer",
+    "Account",
+    "Amount",
+    "Reference Type",
+    "Reference ID",
+    "Employee",
+    "Location",
+    "Narration",
+  ];
+  const sample = [
+    new Date().toISOString().slice(0, 10),
+    "",
+    "Hemtobat Warehouse",
+    "FARMER001",
+    "Manikul Islam",
+    "Agri Rise Pvt Ltd",
+    5000,
+    "purchase",
+    "",
+    "Subrajyoti Mondal",
+    "Hemtobat Hub",
+    "",
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+  ws["!cols"] = headers.map(() => ({ wch: 18 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Payment Import");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
+function receiptImportTemplateBuffer() {
+  const headers = [
+    "Date",
+    "Voucher No",
+    "Warehouse",
+    "Company",
+    "Account",
+    "Consignee",
+    "Amount",
+    "Reference Type",
+    "Reference ID",
+    "Employee",
+    "Location",
+    "Narration",
+  ];
+  const sample = [
+    new Date().toISOString().slice(0, 10),
+    "",
+    "Hemtobat Warehouse",
+    "Hemtobat Pvt Ltd",
+    "Agri Rise Pvt Ltd",
+    "",
+    4000,
+    "sale",
+    "",
+    "Subrajyoti Mondal",
+    "Hemtobat Hub",
+    "",
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+  ws["!cols"] = headers.map(() => ({ wch: 18 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Receipt Import");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
+// Idempotency helpers: prevent duplicate resource creation when client retries
+function getIdempotency(key, route, cb) {
+  if (!key) return cb(null, null);
+  db.get(`SELECT response_id FROM idempotency_keys WHERE key = ? AND route = ?`, [key, route], (err, row) => {
+    if (err) return cb(err);
+    cb(null, row ? row.response_id : null);
+  });
+}
+
+function saveIdempotency(key, route, responseId, cb) {
+  if (!key) return cb && cb();
+  db.run(
+    `INSERT OR REPLACE INTO idempotency_keys (key, route, response_id, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`,
+    [key, route, responseId],
+    (err) => cb && cb(err)
+  );
+}
+
+function getPaymentAdjustmentsByPurchase(callback, excludePaymentId = null) {
+  const params = [];
+  let excludeClause = "";
+  if (excludePaymentId) {
+    excludeClause = "WHERE CAST(payment_id AS TEXT) <> CAST(? AS TEXT)";
+    params.push(excludePaymentId);
+  }
+  db.all(
+    `
+      SELECT purchase_id, COALESCE(SUM(adjusted_amount), 0) AS adjusted_amount
+      FROM wh_payment_adjustments
+      ${excludeClause}
+      GROUP BY purchase_id
+    `,
+    params,
+    (err, rows) => {
+      if (err) return callback(err);
+      const map = new Map();
+      (rows || []).forEach((row) => {
+        map.set(String(row.purchase_id), Number(row.adjusted_amount || 0));
+      });
+      callback(null, map);
+    }
+  );
+}
+
+function getReceiptAdjustmentsBySale(callback, excludeReceiptId = null) {
+  const params = [];
+  let excludeClause = "";
+  if (excludeReceiptId) {
+    excludeClause = "WHERE CAST(receipt_id AS TEXT) <> CAST(? AS TEXT)";
+    params.push(excludeReceiptId);
+  }
+  db.all(
+    `
+      SELECT sale_id, COALESCE(SUM(adjusted_amount), 0) AS adjusted_amount
+      FROM wh_receipt_adjustments
+      ${excludeClause}
+      GROUP BY sale_id
+    `,
+    params,
+    (err, rows) => {
+      if (err) return callback(err);
+      const map = new Map();
+      (rows || []).forEach((row) => {
+        map.set(String(row.sale_id), Number(row.adjusted_amount || 0));
+      });
+      callback(null, map);
+    }
+  );
+}
+
+function normalizePaymentMode(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (["advance", "advance_payment"].includes(normalized)) return "advance";
   if (["new_reference", "new reference", "newref", "new-ref", "reference"].includes(normalized)) return "new_reference";
   if (["against", "against_purchase", "purchase", "bill", "billwise"].includes(normalized)) return "against";
   if (["on_account", "on-account", "account"].includes(normalized)) return "on_account";
   return "on_account";
-};
-
-const getPaymentReferenceType = (mode) => {
-  switch (mode) {
-    case "advance":
-      return "advance";
-    case "new_reference":
-      return "new_reference";
-    case "against":
-      return "purchase";
-    default:
-      return "on_account";
-  }
-};
-
-const inferPaymentMode = (voucher) => {
-  const explicitMode = String(voucher?.payment_mode || voucher?.mode || voucher?.reference_type || "").trim().toLowerCase();
-  if (["advance", "advance_payment"].includes(explicitMode)) return "advance";
-  if (["new_reference", "new reference", "newref", "new-ref", "reference"].includes(explicitMode)) return "new_reference";
-  if (["against", "against_purchase", "purchase", "bill", "billwise"].includes(explicitMode)) return "against";
-  if (Array.isArray(voucher?.adjustments) && voucher.adjustments.length > 0) return "against";
-  return "on_account";
-};
-
-const getRecordId = (value) => {
-  if (value === undefined || value === null) return "";
-  if (typeof value === "string" || typeof value === "number") return String(value);
-  return String(value._id || value.id || value.purchase_id || "").trim();
-};
-const formatDecimal4 = (value) => toNumber(value).toFixed(4);
-const formatMoney = (value) => toNumber(value).toFixed(2);
-const titleCase = (value) =>
-  String(value || "")
-    .split("-")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-const formatLedgerDate = (value) => {
-  const raw = String(value || "").trim();
-  const datePart = raw.includes("T") ? raw.split("T")[0] : raw;
-  const match = datePart.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (match) return `${match[3]}-${match[2]}-${match[1]}`;
-  return raw || "-";
-};
-
-const buildJourneyToken = () => {
-  const stamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
-  const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
-  return `JNY-${stamp}-${rand}`;
-};
-
-const diffDays = (start, end) => {
-  const s = String(start || "").trim();
-  const e = String(end || "").trim();
-  if (!s || !e) return 0;
-  const startDate = new Date(`${(s.includes("T") ? s.split("T")[0] : s)}T00:00:00Z`);
-  const endDate = new Date(`${(e.includes("T") ? e.split("T")[0] : e)}T00:00:00Z`);
-  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return 0;
-  return Math.max(0, Math.floor((endDate - startDate) / (1000 * 60 * 60 * 24)));
-};
-
-const getArrowFocusableInputs = (root) =>
-  Array.from(
-    root.querySelectorAll("input:not([type='hidden']):not([disabled]), select:not([disabled]), textarea:not([disabled])")
-  ).filter((element) => {
-    const style = window.getComputedStyle(element);
-    return style.display !== "none" && style.visibility !== "hidden";
-  });
-
-const buildLookupMap = (rows) => {
-  const map = new Map();
-  (Array.isArray(rows) ? rows : []).forEach((row) => {
-    const key = String(row?.id || row?._id || "").trim();
-    if (key) map.set(key, row);
-  });
-  return map;
-};
-
-const PAGE_SIZE = 15;
-
-const purchaseDeductionFields = [
-  { key: "less_bags_weight", label: "Less Bags Weight" },
-  { key: "moisture", label: "Moisture" },
-  { key: "dunki", label: "Dunki" },
-  { key: "fungus", label: "Fungus" },
-  { key: "discolour", label: "Discolour" },
-  { key: "others", label: "Others" },
-];
-
-const purchaseParticulars = [
-  { key: "product_id", label: "Product Name", type: "product" },
-  { key: "packet", label: "Packet" },
-  { key: "gross_weight", label: "Gross Weight" },
-  { key: "tare_weight", label: "Tear Weight" },
-  { key: "dhalta", label: "Dhalta" },
-  ...purchaseDeductionFields,
-  { key: "net_weight", label: "Net Weight", readOnly: true },
-];
-
-const paymentModeOptions = [
-  { value: "on_account", label: "On Account", description: "Post as a normal party account entry with no purchase bill adjustment." },
-  { value: "advance", label: "Advance", description: "Record an advance payment without linking it to purchase bills." },
-  { value: "new_reference", label: "New Reference", description: "Save a reference note for special-purpose payments." },
-  { value: "against", label: "Against Purchase Bills", description: "Match the payment against outstanding purchase bills exactly." },
-];
-
-function formReducer(state, action) {
-  if (typeof action === "function") {
-    return action(state);
-  }
-  if (action && action.type === "merge") {
-    return { ...state, ...action.payload };
-  }
-  if (action && action.type === "reset") {
-    return defaultForm();
-  }
-  if (action && action.type === "replace") {
-    return action.payload;
-  }
-  return state;
 }
 
-const reportUiInitialState = {
-  reportPage: 1,
-  reportFilters: {
-    farmer_id: "",
-    company_account_id: "",
-    warehouse_id: "",
-    sale_buyer_id: "",
-    sale_company_account_id: "",
-    sale_journey_token: "",
-    sale_lorry_no: "",
-    sale_bill_no: "",
-    details_of_deduction: false,
-  },
-  saleFollowupFilter: "all",
-  selectedLedgerBillId: "",
-  selectedSaleLedgerBillId: "",
-  showPurchaseBillWise: false,
-  showSaleBillWise: false,
-};
-
-function reportUiReducer(state, action) {
-  switch (action.type) {
-    case "set_report_page":
-      return { ...state, reportPage: action.value };
-    case "set_report_filters":
-      return { ...state, reportFilters: action.value };
-    case "set_sale_followup_filter":
-      return { ...state, saleFollowupFilter: action.value };
-    case "set_selected_ledger_bill_id":
-      return { ...state, selectedLedgerBillId: action.value };
-    case "set_selected_sale_ledger_bill_id":
-      return { ...state, selectedSaleLedgerBillId: action.value };
-    case "set_show_purchase_bill_wise":
-      return { ...state, showPurchaseBillWise: action.value };
-    case "set_show_sale_bill_wise":
-      return { ...state, showSaleBillWise: action.value };
-    default:
-      return state;
-  }
+function normalizePaymentAdjustments(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => ({
+      purchase_id: String(item?.purchase_id || item?.id || "").trim(),
+      adjusted_amount: Number(item?.adjusted_amount),
+      voucher_no: item?.voucher_no || item?.purchase_voucher_no || "",
+    }))
+    .filter((item) => item.purchase_id && Number.isFinite(item.adjusted_amount) && item.adjusted_amount > 0);
 }
 
-export default function WarehouseTradingPage() {
-  const { user } = loadSession();
-  const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const [activeTab, setActiveTab] = useState("vouchers");
-  const [activeVoucherType, setActiveVoucherType] = useState("purchase");
-  const [activeReport, setActiveReport] = useState("sale");
+function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments, paymentMode = "on_account", excludePaymentId = null }, callback) {
+  const cleanAdjustments = normalizePaymentAdjustments(adjustments);
+  const normalizedPaymentMode = normalizePaymentMode(paymentMode);
+  const paymentAmount = Number(amount || 0);
+  const adjustedTotal = cleanAdjustments.reduce((sum, item) => sum + item.adjusted_amount, 0);
 
-  const [warehouses, setWarehouses] = useState([]);
-  const [farmers, setFarmers] = useState([]);
-  const [accountFarmers, setAccountFarmers] = useState([]);
-  const [paymentWarehouses, setPaymentWarehouses] = useState([]);
-  const [buyerNames, setBuyerNames] = useState([]);
-  const [companies, setCompanies] = useState([]);
-  const [companyAccounts, setCompanyAccounts] = useState([]);
-  const [consignees, setConsignees] = useState([]);
-  const [products, setProducts] = useState([]);
-  const [employees, setEmployees] = useState([]);
-  const [locations, setLocations] = useState([]);
+  if (paymentAmount <= 0) return callback(new Error("Payment amount is required"));
+  if (normalizedPaymentMode === "against") {
+    if (!cleanAdjustments.length) return callback(new Error("Please adjust this payment against purchase bills"));
+    if (Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
+      return callback(new Error("Payment amount and adjustment amount must be equal"));
+    }
+  }
+  if (!cleanAdjustments.length) return callback(null, []);
+  if (normalizedPaymentMode !== "against" && Math.abs(adjustedTotal - paymentAmount) > 0.0001) {
+    return callback(new Error("Payment amount and adjustment amount must be equal"));
+  }
 
-  const [formData, setFormDataDispatch] = useReducer(formReducer, defaultForm());
-  const setFormData = (value) => {
-    if (typeof value === "function") {
-      setFormDataDispatch(value);
+  getPaymentAdjustmentsByPurchase((err, adjustedMap) => {
+    if (err) return callback(err);
+
+    const resolveWithMongo = async () => {
+      const resolved = [];
+      for (const item of cleanAdjustments) {
+        const rawId = String(item.purchase_id || "").trim();
+        const voucher = String(item.voucher_no || "").trim();
+        const ors = [];
+        if (mongoose.Types.ObjectId.isValid(rawId)) ors.push({ _id: rawId });
+        if (rawId) ors.push({ voucher_no: rawId });
+        if (voucher) ors.push({ voucher_no: voucher });
+
+        let purchase = null;
+        if (ors.length) {
+          purchase = await PurchaseVoucher.findOne({ $or: ors })
+            .select("_id voucher_no farmer_id warehouse_id net_amount_payable amount")
+            .lean();
+        }
+
+        let legacyPurchase = null;
+        if (!purchase) {
+          legacyPurchase = await dbGet(
+            `SELECT id, voucher_no, farmer_id, warehouse_id, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
+             FROM wh_purchase_vouchers
+             WHERE CAST(id AS TEXT) = CAST(? AS TEXT) OR CAST(voucher_no AS TEXT) = CAST(? AS TEXT)
+             LIMIT 1`,
+            [rawId, voucher]
+          );
+          if (legacyPurchase && legacyPurchase.voucher_no) {
+            purchase = await PurchaseVoucher.findOne({ voucher_no: String(legacyPurchase.voucher_no).trim() })
+              .select("_id voucher_no farmer_id warehouse_id net_amount_payable amount")
+              .lean();
+          }
+        }
+
+        if (purchase) {
+          const mongoId = String(purchase._id);
+          const purchaseFarmer = String(purchase.farmer_id || "");
+          const purchaseWarehouse = String(purchase.warehouse_id || "");
+          if (purchaseFarmer && purchaseFarmer !== String(farmerId || "")) {
+            throw new Error(`Purchase bill ${purchase.voucher_no || mongoId} belongs to a different farmer`);
+          }
+          if (warehouseId && purchaseWarehouse && purchaseWarehouse !== String(warehouseId)) {
+            throw new Error(`Purchase bill ${purchase.voucher_no || mongoId} belongs to a different warehouse`);
+          }
+          const legacyId = legacyPurchase?.id ? String(legacyPurchase.id) : "";
+          const billAmount = Number(purchase.net_amount_payable || purchase.amount || 0);
+          const alreadyAdjusted = Number(adjustedMap.get(mongoId) || 0) + (legacyId && legacyId !== mongoId ? Number(adjustedMap.get(legacyId) || 0) : 0);
+          const pending = Math.max(0, billAmount - alreadyAdjusted);
+          if (item.adjusted_amount - pending > 0.0001) {
+            throw new Error(`Adjustment cannot exceed pending amount for ${purchase.voucher_no || mongoId}`);
+          }
+          resolved.push({ purchase_id: mongoId, voucher_no: purchase.voucher_no || voucher, adjusted_amount: item.adjusted_amount });
+          continue;
+        }
+
+        if (legacyPurchase) {
+          const purchaseId = String(legacyPurchase.id);
+          if (legacyPurchase.farmer_id && String(legacyPurchase.farmer_id) !== String(farmerId || "")) {
+            throw new Error(`Purchase bill ${legacyPurchase.voucher_no || purchaseId} belongs to a different farmer`);
+          }
+          if (warehouseId && legacyPurchase.warehouse_id && String(legacyPurchase.warehouse_id) !== String(warehouseId)) {
+            throw new Error(`Purchase bill ${legacyPurchase.voucher_no || purchaseId} belongs to a different warehouse`);
+          }
+          const billAmount = Number(legacyPurchase.amount || 0);
+          const alreadyAdjusted = Number(adjustedMap.get(purchaseId) || 0);
+          const pending = Math.max(0, billAmount - alreadyAdjusted);
+          if (item.adjusted_amount - pending > 0.0001) {
+            throw new Error(`Adjustment cannot exceed pending amount for ${legacyPurchase.voucher_no || purchaseId}`);
+          }
+          resolved.push({ purchase_id: purchaseId, voucher_no: legacyPurchase.voucher_no || voucher, adjusted_amount: item.adjusted_amount });
+          continue;
+        }
+
+        throw new Error(`Invalid purchase adjustment target: ${rawId || voucher}`);
+      }
+      return resolved;
+    };
+
+    if (mongoReady()) {
+      resolveWithMongo().then((resolved) => callback(null, resolved)).catch(callback);
       return;
     }
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      setFormDataDispatch({ type: "merge", payload: value });
-      return;
+
+    const params = [farmerId];
+    let warehouseClause = "";
+    if (warehouseId) {
+      warehouseClause = " AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)";
+      params.push(warehouseId);
     }
-    setFormDataDispatch({ type: "replace", payload: value });
+    db.all(
+      `SELECT id, voucher_no, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount
+       FROM wh_purchase_vouchers
+       WHERE CAST(farmer_id AS TEXT) = CAST(? AS TEXT) ${warehouseClause}`,
+      params,
+      (rowsErr, rows) => {
+        if (rowsErr) return callback(rowsErr);
+        const purchaseMap = new Map();
+        (rows || []).forEach((row) => {
+          purchaseMap.set(`id:${String(row.id)}`, row);
+          if (row.voucher_no) purchaseMap.set(`voucher:${String(row.voucher_no)}`, row);
+        });
+        const resolved = [];
+        for (const item of cleanAdjustments) {
+          const rawId = String(item.purchase_id || "").trim();
+          const voucher = String(item.voucher_no || "").trim();
+          const purchase = purchaseMap.get(`id:${rawId}`) || (voucher ? purchaseMap.get(`voucher:${voucher}`) : null);
+          if (!purchase) return callback(new Error(`Invalid purchase adjustment target: ${rawId || voucher}`));
+          const purchaseId = String(purchase.id);
+          const billAmount = Number(purchase.amount || 0);
+          const alreadyAdjusted = Number(adjustedMap.get(purchaseId) || 0);
+          const pending = Math.max(0, billAmount - alreadyAdjusted);
+          if (item.adjusted_amount - pending > 0.0001) return callback(new Error(`Adjustment cannot exceed pending amount for ${purchase.voucher_no || purchaseId}`));
+          resolved.push({ purchase_id: purchaseId, voucher_no: purchase.voucher_no || voucher, adjusted_amount: item.adjusted_amount });
+        }
+        callback(null, resolved);
+      }
+    );
+  }, excludePaymentId);
+}
+
+function insertPaymentAdjustments(paymentId, adjustments, callback) {
+  if (!adjustments.length) return callback();
+  const stmt = "INSERT INTO wh_payment_adjustments (payment_id, purchase_id, adjusted_amount) VALUES (?, ?, ?)";
+  let index = 0;
+  const next = () => {
+    if (index >= adjustments.length) return callback();
+    const item = adjustments[index];
+    index += 1;
+    db.run(stmt, [paymentId, item.purchase_id, item.adjusted_amount], (err) => (err ? callback(err) : next()));
   };
-  const [editId, setEditId] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [list, setList] = useState([]);
-  const [reportData, setReportData] = useState([]);
-  const [reportFilterOptions, setReportFilterOptions] = useState({ account_ids: [], warehouse_ids: [], farmer_ids: [], buyer_ids: [] });
-  const [warehouseStockReport, setWarehouseStockReport] = useState([]);
-  const [reportPageInfo, setReportPageInfo] = useState({ page: 1, pageSize: PAGE_SIZE, hasMore: false });
-  const [availableSaleStock, setAvailableSaleStock] = useState(null);
-  const [reportUiState, reportUiDispatch] = useReducer(reportUiReducer, reportUiInitialState);
-  const {
-    reportPage,
-    reportFilters,
-    saleFollowupFilter,
-    selectedLedgerBillId,
-    selectedSaleLedgerBillId,
-    showPurchaseBillWise,
-    showSaleBillWise,
-  } = reportUiState;
-  const setReportPage = (value) => reportUiDispatch({ type: "set_report_page", value: typeof value === "function" ? value(reportUiState.reportPage) : value });
-  const setReportFilters = (value) => reportUiDispatch({ type: "set_report_filters", value: typeof value === "function" ? value(reportUiState.reportFilters) : value });
-  const setSaleFollowupFilter = (value) => reportUiDispatch({ type: "set_sale_followup_filter", value: typeof value === "function" ? value(reportUiState.saleFollowupFilter) : value });
-  const setSelectedLedgerBillId = (value) => reportUiDispatch({ type: "set_selected_ledger_bill_id", value });
-  const updateReportFilter = (field, value) => {
-    setReportFilters((prev) => {
-      if (field === "company_account_id") {
-        return {
-          ...prev,
-          company_account_id: value,
-          warehouse_id: "",
-          farmer_id: "",
-        };
+  next();
+}
+
+function buildPaymentReferenceId(adjustments, purchaseRows = []) {
+  const purchaseMap = new Map((purchaseRows || []).map((row) => [String(row.id || row._id), row]));
+  return normalizePaymentAdjustments(adjustments)
+    .map((item) => item.voucher_no || purchaseMap.get(String(item.purchase_id))?.voucher_no || item.purchase_id)
+    .filter(Boolean)
+    .join(", ");
+}
+
+function normalizeReceiptAdjustments(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => ({
+      sale_id: String(item?.sale_id || item?.id || "").trim(),
+      adjusted_amount: Number(item?.adjusted_amount),
+      voucher_no: item?.voucher_no || item?.sale_voucher_no || "",
+    }))
+    .filter((item) => item.sale_id && Number.isFinite(item.adjusted_amount) && item.adjusted_amount > 0);
+}
+
+function validateReceiptAdjustments({ companyId, amount, adjustments, excludeReceiptId = null }, callback) {
+  const cleanAdjustments = normalizeReceiptAdjustments(adjustments);
+  const receiptAmount = Number(amount || 0);
+  const adjustedTotal = cleanAdjustments.reduce((sum, item) => sum + item.adjusted_amount, 0);
+  if (receiptAmount <= 0) return callback(new Error("Receipt amount is required"));
+  if (!cleanAdjustments.length) return callback(new Error("Please adjust this receipt against sale bills"));
+  if (Math.abs(adjustedTotal - receiptAmount) > 0.0001) return callback(new Error("Receipt amount and adjustment amount must be equal"));
+
+  getReceiptAdjustmentsBySale((err, adjustedMap) => {
+    if (err) return callback(err);
+
+    if (mongoReady()) {
+      const filter = { $or: [{ buyer_id: String(companyId) }, { company_id: String(companyId) }] };
+      return SaleVoucher.find(filter).select("_id voucher_no amount net_receivable_amount").lean().then(async (rows) => {
+        const saleMap = new Map();
+        (rows || []).forEach((row) => saleMap.set(String(row._id), row));
+        const byVoucher = new Map((rows || []).filter((row) => row.voucher_no).map((row) => [String(row.voucher_no), row]));
+        const resolved = [];
+        for (const item of cleanAdjustments) {
+          const rawId = String(item.sale_id || "").trim();
+          const sale = saleMap.get(rawId) || byVoucher.get(String(item.voucher_no || "").trim());
+          if (!sale) {
+            const legacy = await dbGet(`SELECT id, voucher_no, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE CAST(id AS TEXT)=CAST(? AS TEXT) OR CAST(voucher_no AS TEXT)=CAST(? AS TEXT) LIMIT 1`, [rawId, String(item.voucher_no || "")]);
+            if (!legacy) throw new Error(`Invalid sale adjustment target: ${rawId || item.voucher_no || ""}`);
+            const legacyPending = Math.max(0, Number(legacy.amount || 0) - Number(adjustedMap.get(String(legacy.id)) || 0));
+            if (item.adjusted_amount - legacyPending > 0.0001) throw new Error(`Adjustment cannot exceed pending amount for ${legacy.voucher_no || legacy.id}`);
+            resolved.push({ sale_id: String(legacy.id), voucher_no: legacy.voucher_no || item.voucher_no || "", adjusted_amount: item.adjusted_amount });
+            continue;
+          }
+          const saleId = String(sale._id);
+          const billAmount = Number(sale.net_receivable_amount || sale.amount || 0);
+          const pending = Math.max(0, billAmount - Number(adjustedMap.get(saleId) || 0));
+          if (item.adjusted_amount - pending > 0.0001) throw new Error(`Adjustment cannot exceed pending amount for ${sale.voucher_no || saleId}`);
+          resolved.push({ sale_id: saleId, voucher_no: sale.voucher_no || item.voucher_no || "", adjusted_amount: item.adjusted_amount });
+        }
+        callback(null, resolved);
+      }).catch(callback);
+    }
+
+    const params = [companyId];
+    db.all(`SELECT id, voucher_no, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT)=CAST(? AS TEXT)`, params, (rowsErr, sales) => {
+      if (rowsErr) return callback(rowsErr);
+      const saleMap = new Map((sales || []).map((row) => [String(row.id), row]));
+      (sales || []).forEach((row) => row.voucher_no && saleMap.set(`voucher:${row.voucher_no}`, row));
+      const resolved = [];
+      for (const item of cleanAdjustments) {
+        const sale = saleMap.get(String(item.sale_id)) || saleMap.get(`voucher:${item.voucher_no || ""}`);
+        if (!sale) return callback(new Error(`Invalid sale adjustment target: ${item.sale_id || item.voucher_no || ""}`));
+        const pending = Math.max(0, Number(sale.amount || 0) - Number(adjustedMap.get(String(sale.id)) || 0));
+        if (item.adjusted_amount - pending > 0.0001) return callback(new Error(`Adjustment cannot exceed pending amount for ${sale.voucher_no || sale.id}`));
+        resolved.push({ sale_id: String(sale.id), voucher_no: sale.voucher_no || item.voucher_no || "", adjusted_amount: item.adjusted_amount });
       }
-      if (field === "warehouse_id") {
-        return {
-          ...prev,
-          warehouse_id: value,
-          farmer_id: "",
-        };
-      }
-      return { ...prev, [field]: value };
+      callback(null, resolved);
     });
-  };
-  const setSelectedSaleLedgerBillId = (value) => reportUiDispatch({ type: "set_selected_sale_ledger_bill_id", value });
-  const setShowPurchaseBillWise = (value) => reportUiDispatch({ type: "set_show_purchase_bill_wise", value });
-  const setShowSaleBillWise = (value) => reportUiDispatch({ type: "set_show_sale_bill_wise", value });
-  const [partyOutstanding, setPartyOutstanding] = useState(null);
-  const [showPaymentAdjustPopup, setShowPaymentAdjustPopup] = useState(false);
-  const [paymentAdjustments, setPaymentAdjustments] = useState([]);
-  const [selectedPaymentId, setSelectedPaymentId] = useState(null);
-  const [showReceiptAdjustPopup, setShowReceiptAdjustPopup] = useState(false);
-  const [receiptAdjustments, setReceiptAdjustments] = useState([]);
-  const [selectedReceiptId, setSelectedReceiptId] = useState(null);
-  const [stockDrilldown, setStockDrilldown] = useState(null);
-  const [stockDrilldownFromDate, setStockDrilldownFromDate] = useState("");
-  const [stockDrilldownToDate, setStockDrilldownToDate] = useState("");
-  const [importingPurchase, setImportingPurchase] = useState(false);
-  const [importingPayment, setImportingPayment] = useState(false);
-  const [importingReceipt, setImportingReceipt] = useState(false);
-  const [voucherNumberLoading, setVoucherNumberLoading] = useState(false);
-  const [showSaleDeductionModal, setShowSaleDeductionModal] = useState(false);
-  const [saleBillSearch, setSaleBillSearch] = useState("");
-  const [journeyTemplateId, setJourneyTemplateId] = useState("");
-  const [showSaleAdjustedModal, setShowSaleAdjustedModal] = useState(false);
-  const [salePurchaseRows, setSalePurchaseRows] = useState([]);
-  const [salePurchaseLinks, setSalePurchaseLinks] = useState([]);
-  const [showPurchasePreview, setShowPurchasePreview] = useState(false);
-  const [purchasePreviewRow, setPurchasePreviewRow] = useState(null);
-  const [purchasePreviewLoading, setPurchasePreviewLoading] = useState(false);
-  const [purchasePreviewOpenedFromLedger, setPurchasePreviewOpenedFromLedger] = useState(false);
-  const [purchaseBaseline, setPurchaseBaseline] = useState(null);
-  const [showSalePreview, setShowSalePreview] = useState(false);
-  const [salePreviewRow, setSalePreviewRow] = useState(null);
-  const [salePreviewSummary, setSalePreviewSummary] = useState(null);
-  const [salePreviewLoading, setSalePreviewLoading] = useState(false);
-  const [saleTransportMode, setSaleTransportMode] = useState("auto");
-  const [saleTransportManualAmount, setSaleTransportManualAmount] = useState("0.00");
-  const [showMobileVoucherHeader, setShowMobileVoucherHeader] = useState(true);
-  const [showMobileReportHeader, setShowMobileReportHeader] = useState(true);
-  const [showMobileTradingTabs, setShowMobileTradingTabs] = useState(false);
-  const [globalSearch, setGlobalSearch] = useState("");
-  const [voucherPage, setVoucherPage] = useState(1);
-  const [voucherSortAsc, setVoucherSortAsc] = useState(false);
-  const [voucherPageInfo, setVoucherPageInfo] = useState({ page: 1, pageSize: PAGE_SIZE, total: 0, totalPages: 1, hasMore: false });
-  const masterLoadTokenRef = useRef(0);
-  const masterDataLoadedRef = useRef(false);
-  const masterLoadPromiseRef = useRef(null);
-  const reportFilterCacheRef = useRef(new Map());
-  const reportFilterInFlightRef = useRef(new Map());
-  const outstandingCacheRef = useRef(new Map());
-  const outstandingInFlightRef = useRef(new Map());
-  const paymentFarmersCacheRef = useRef(new Map());
-  const paymentFarmersInFlightRef = useRef(new Map());
-  const arrowNavRootRef = useRef(null);
-  const voucherPanelRef = useRef(null);
-  const reportPanelRef = useRef(null);
-  const voucherLoadTokenRef = useRef(0);
-  const reportLoadTokenRef = useRef(0);
-  const warehouseById = useMemo(() => buildLookupMap(warehouses), [warehouses]);
-  const farmerById = useMemo(() => buildLookupMap(farmers), [farmers]);
-  const buyerById = useMemo(() => buildLookupMap(buyerNames), [buyerNames]);
-  const companyById = useMemo(() => buildLookupMap(companies), [companies]);
-  const companyAccountById = useMemo(() => buildLookupMap(companyAccounts), [companyAccounts]);
-  const consigneeById = useMemo(() => buildLookupMap(consignees), [consignees]);
-  const productById = useMemo(() => buildLookupMap(products), [products]);
-  const employeeById = useMemo(() => buildLookupMap(employees), [employees]);
-  const locationById = useMemo(() => buildLookupMap(locations), [locations]);
-  const voucherById = useMemo(() => buildLookupMap(list), [list]);
-  const selectedVoucher = voucherById.get(String(selectedPaymentId)) || null;
-  const selectedReceiptVoucher = voucherById.get(String(selectedReceiptId)) || null;
-  const selectedWarehouse = warehouseById.get(String(formData.warehouse_id)) || null;
-  const selectedManualLocation = locationById.get(String(formData.location_id)) || null;
-  const selectedWarehouseLocation = useMemo(() => {
-    const locationId = String(getRecordId(selectedWarehouse?.location_id));
-    return locationById.get(locationId)?.name || selectedManualLocation?.name || selectedWarehouse?.location || selectedWarehouse?.address || "";
-  }, [locationById, selectedManualLocation, selectedWarehouse]);
-  const selectedEmployee = employeeById.get(String(formData.employee_id)) || null;
-  const selectedFarmer = farmerById.get(String(formData.farmer_id)) || null;
-  const selectedBuyer = buyerById.get(String(formData.buyer_id || formData.company_id)) || null;
-  const selectedConsignee = consigneeById.get(String(formData.consignee_id)) || null;
-  const selectedEmployeeMobile = selectedEmployee?.mobile || selectedEmployee?.phone || selectedEmployee?.mobile_no || "";
-  const selectedFarmerMobile = selectedFarmer?.mobile || selectedFarmer?.phone || selectedFarmer?.mobile_no || "";
-  const selectedFarmerGst = selectedFarmer?.gst_no || selectedFarmer?.gst || "";
-  const selectedFarmerPan = selectedFarmer?.pan_no || selectedFarmer?.pan || "";
-  const selectedFarmerState = selectedFarmer?.state || "";
-  const selectedLocationName = selectedWarehouseLocation || selectedManualLocation?.name || "";
-  const getProductName = (item) =>
-    item?.product_name ||
-    productById.get(String(item?.product_id))?.name ||
-    item?.product ||
-    "-";
-  const getWarehouseName = (item) =>
-    item?.warehouse_name ||
-    warehouseById.get(String(item?.warehouse_id))?.name ||
-    "-";
-  const getFarmerName = (item) =>
-    item?.farmer_name ||
-    farmerById.get(String(item?.farmer_id))?.name ||
-    "-";
-  const getBuyerId = (item) => item?.buyer_id || item?.company_id || "";
-  const getBuyerName = (item) =>
-    item?.buyer_name ||
-    buyerById.get(String(getBuyerId(item)))?.name ||
-    item?.company_name ||
-    companyById.get(String(item?.company_id))?.name ||
-    "-";
-  const saleQtyFromData = (data) => {
-    const newWeight = Math.max(toNumber(data.gross_weight) - toNumber(data.tare_weight), 0);
-    return newWeight || toNumber(data.quantity) || toNumber(data.unloading_qty);
-  };
-  const saleDispatchQtyFromData = (data) => {
-    const newWeight = Math.max(toNumber(data.gross_weight) - toNumber(data.tare_weight), 0);
-    return toNumber(data.dispatch_qty) || toNumber(data.quantity) || newWeight || toNumber(data.unloading_qty);
-  };
-  const saleGrossAmountFromData = (data) => saleDispatchQtyFromData(data) * toNumber(data.rate);
-  const saleBillAmountFromData = (data) => toNumber(data.amount) || saleGrossAmountFromData(data);
-  const filteredConsignees = useMemo(() => {
-    const buyerId = String(formData.buyer_id || formData.company_id || "");
-    if (!buyerId) return consignees;
-    return consignees.filter((c) => consigneeHasBuyer(c, buyerId));
-  }, [consignees, formData.buyer_id, formData.company_id]);
-  const openStockDrilldown = (item, mode) => {
-    setStockDrilldownFromDate("");
-    setStockDrilldownToDate("");
-    setStockDrilldown({ item, mode });
-  };
-  const openSaleJourneyReport = () => {
-    setReportFilters((prev) => ({
-      ...prev,
-      sale_journey_token: formData.journey_token || selectedSalePassBill?.journey_token || "",
-      sale_lorry_no: selectedSalePassBill?.lorry_no || formData.lorry_no || "",
-      sale_bill_no: selectedSalePassBill?.voucher_no || selectedSalePassBill?.bill_no || formData.bill_no || "",
-    }));
-    setActiveTab("reports");
-    setActiveReport("sale-journey");
-  };
-  const applyAddQty = (extraQty) => {
-    setFormData((prev) => ({
-      ...prev,
-      add_qty: formatDecimal4(Math.max(toNumber(extraQty), 0)),
-    }));
-  };
-  const getJourneySourceLabel = (row) => {
-    const parts = [
-      row.warehouse_name || getWarehouseName(row),
-      row.location_name || "",
-      row.journey_note || row.description || row.reference_id || "",
-    ].map((value) => String(value || "").trim()).filter(Boolean);
-    return parts.join(" | ") || "-";
-  };
-  const purchaseDeductionTotal = purchaseDeductionFields.reduce((sum, field) => sum + toNumber(formData[field.key]), 0);
-  const purchaseNewWeight = toNumber(formData.gross_weight) - toNumber(formData.tare_weight);
-  const safePurchaseNewWeight = Math.max(purchaseNewWeight, 0);
-  const purchaseNetWeight =
-    safePurchaseNewWeight -
-    toNumber(formData.dhalta) -
-    purchaseDeductionTotal;
-  const safePurchaseNetWeight = Math.max(purchaseNetWeight, 0);
-  const purchaseGrossAmount = safePurchaseNetWeight * toNumber(formData.rate);
-  const purchaseClaimAmount = toNumber(formData.claim_amount) || toNumber(formData.bags_claim);
-  const purchaseTotalDeduction =
-    purchaseClaimAmount +
-    toNumber(formData.labour) +
-    toNumber(formData.transport_charge) +
-    toNumber(formData.cd_amount) +
-    toNumber(formData.tds_amount) +
-    toNumber(formData.other_deduction) +
-    toNumber(formData.adjustment_amount);
-  const purchaseRoundOff = toNumber(formData.round_off);
-  const purchaseNetPayable = Math.max(purchaseGrossAmount - purchaseTotalDeduction + purchaseRoundOff, 0);
-  const purchaseDeductionDefaults = purchaseBaseline || {
-    less_bags_weight: "",
-    moisture: "",
-    dunki: "",
-    fungus: "",
-    discolour: "",
-    others: "",
-    bags_claim: "",
-    labour: "",
-    transport_charge: "",
-    round_off: "",
-  };
-  const purchaseAutoFillDefaults = {
-    ...purchaseDeductionDefaults,
-    bags_claim: purchaseDeductionDefaults.bags_claim || "",
-    labour: purchaseDeductionDefaults.labour || "",
-    transport_charge: purchaseDeductionDefaults.transport_charge || "",
-    round_off: purchaseDeductionDefaults.round_off || "",
-  };
-  const paymentAdjustmentTotal = paymentAdjustments.reduce(
-    (sum, item) => sum + toNumber(item.adjusted_amount),
-    0
-  );
-  const paymentFinancialStats = partyOutstanding?.stats || {};
-  const paymentTotalBill = toNumber(
-    paymentFinancialStats.total_bill ??
-    paymentFinancialStats.total_purchase ??
-    paymentFinancialStats.bill_amount
-  );
-  const paymentTotalDeduction = toNumber(
-    paymentFinancialStats.total_deduction ??
-    paymentFinancialStats.deduction_total
-  );
-  const paymentTotalPaid = toNumber(
-    paymentFinancialStats.total_payment ??
-    paymentFinancialStats.paid ??
-    paymentFinancialStats.payment_total
-  );
-  // Keep the existing outstanding calculation as the accounting source of truth.
-  // The deduction card is informational and is not subtracted twice from an already-net payable amount.
-  const paymentTotalDue = toNumber(
-    paymentFinancialStats.outstanding ??
-    (paymentTotalBill - paymentTotalPaid)
-  );
-  const receiptAdjustmentTotal = receiptAdjustments.reduce(
-    (sum, item) => sum + toNumber(item.adjusted_amount),
-    0
-  );
-  const voucherPermissionMap = {
-    purchase: "warehouse.trading.purchase.view",
-    sale: "warehouse.trading.sale.view",
-    payment: "warehouse.trading.payment.view",
-    receipt: "warehouse.trading.receipt.view",
-    journal: "warehouse.trading.journal.view",
-  };
-  const reportPermissionMap = {
-    sale: "warehouse.trading.report.sale",
-    purchase: "warehouse.trading.report.purchase",
-    payment: "warehouse.trading.payment.view",
-    "purchase-party-ledger": "warehouse.trading.report.purchase",
-    "sale-party-ledger": "warehouse.trading.report.sale",
-    "sale-followup": "warehouse.trading.report.sale",
-    "sale-journey": "warehouse.trading.report.sale",
-    "warehouse-stock": "warehouse.trading.report.purchase",
-    "fifo-stock": "warehouse.trading.report.purchase",
-    "profit-loss": "warehouse.trading.report.profitLoss",
-  };
-  const reportEndpointMap = {
-    sale: "sale-summary",
-    purchase: "purchase-summary",
-    payment: "payment",
-    "purchase-party-ledger": "purchase-party-ledger",
-    "sale-party-ledger": "sale-party-ledger",
-    "sale-followup": "sale-followup",
-    "sale-journey": "sale-journey",
-    "warehouse-stock": "warehouse-stock",
-    "fifo-stock": "fifo-stock",
-    "profit-loss": "profit-loss",
-  };
-  const reportLabels = {
-    sale: "Sale Summary",
-    purchase: "Purchase Detail",
-    payment: "Payment Report",
-    "purchase-party-ledger": "Purchase Party Ledger",
-    "sale-party-ledger": "Sale Party Ledger",
-    "sale-followup": "Sale Follow-up",
-    "sale-journey": "Sale Journey Report",
-    "warehouse-stock": "Warehouse Stock",
-    "fifo-stock": "FIFO Stock",
-    "profit-loss": "Profit/Loss",
-  };
-  const canUseTrading = hasPermission(user, "warehouse.trading.view");
-  const canUsePurchase = hasPermission(user, "warehouse.trading.purchase.view") || hasPermission(user, "warehouse.trading.purchase.create") || hasPermission(user, "warehouse.trading.purchase.edit") || hasPermission(user, "warehouse.trading.purchase.delete");
-  const canUseSale = hasPermission(user, "warehouse.trading.sale.view") || hasPermission(user, "warehouse.trading.sale.create") || hasPermission(user, "warehouse.trading.sale.edit") || hasPermission(user, "warehouse.trading.sale.delete");
-  const canUsePayment = hasPermission(user, "warehouse.trading.payment.view") || hasPermission(user, "warehouse.trading.payment.create") || hasPermission(user, "warehouse.trading.payment.edit") || hasPermission(user, "warehouse.trading.payment.delete");
-  const canUseReceipt = hasPermission(user, "warehouse.trading.receipt.view") || hasPermission(user, "warehouse.trading.receipt.create") || hasPermission(user, "warehouse.trading.receipt.edit") || hasPermission(user, "warehouse.trading.receipt.delete");
-  const canUseJournal = hasPermission(user, "warehouse.trading.journal.view") || hasPermission(user, "warehouse.trading.journal.create") || hasPermission(user, "warehouse.trading.journal.edit") || hasPermission(user, "warehouse.trading.journal.delete");
-  const canUseWarehouseStockReport = hasPermission(user, "warehouse.trading.report.purchase") || hasPermission(user, "warehouse.trading.report.sale");
-  const allowedVoucherTypes = Object.keys(voucherPermissionMap).filter((type) => {
-    if (type === "purchase") return canUsePurchase;
-    if (type === "sale") return canUseSale;
-    if (type === "payment") return canUsePayment;
-    if (type === "receipt") return canUseReceipt;
-    if (type === "journal") return canUseJournal;
-    return false;
-  });
-  const allowedReports = Object.keys(reportPermissionMap).filter((type) => {
-    if (type === "sale" || type === "sale-party-ledger" || type === "sale-followup" || type === "sale-journey") {
-      // Sale reports must remain visible for users who can access the Sale module.
-      // Some older roles only have the Sale view permission and do not have the
-      // newer report-specific permission yet.
-      return hasPermission(user, "warehouse.trading.report.sale") || canUseSale;
-    }
-    if (type === "warehouse-stock") {
-      return canUseWarehouseStockReport;
-    }
-    if (type === "purchase" || type === "purchase-party-ledger" || type === "fifo-stock") {
-      return hasPermission(user, "warehouse.trading.report.purchase");
-    }
-    if (type === "payment") {
-      return canUsePayment;
-    }
-    if (type === "profit-loss") {
-      return hasPermission(user, "warehouse.trading.report.profitLoss");
-    }
-    return false;
-  });
-  const saleDispatchQty = toNumber(formData.dispatch_qty) || toNumber(formData.quantity) || toNumber(formData.unloading_qty);
-  const saleUnloadingQty = toNumber(formData.unloading_qty);
-  const saleRejectQty = toNumber(formData.reject_qty);
-  const saleRemainingQty = Math.max(saleDispatchQty - saleUnloadingQty, 0);
-  const saleShortageQty = saleRemainingQty;
-  const saleShortageAmount = saleShortageQty * toNumber(formData.rate);
-  const saleAddQty = Math.max(toNumber(formData.add_qty), 0);
-  const saleNextBillQty = Math.max(saleRemainingQty + saleAddQty, 0);
-  const saleTotalQtyPreview = saleNextBillQty;
-  const saleQualityDeduction =
-    toNumber(formData.moisture) +
-    toNumber(formData.dunki) +
-    toNumber(formData.fungus) +
-    toNumber(formData.discolour) +
-    toNumber(formData.others);
-  const saleTransportCharge = toNumber(formData.transport_charge);
-  const saleCashDiscountAmount = Number((saleBillAmountFromData(formData) * toNumber(formData.cd_percent) / 100).toFixed(2));
-  const partySaleTotal = list
-    .filter((item) => {
-      const sameBuyer = String(getBuyerId(item) || "") === String(formData.buyer_id || formData.company_id || "");
-      const sameAccount = String(item.company_account_id || "") === String(formData.company_account_id || "");
-      return sameBuyer && (!formData.company_account_id || sameAccount);
-    })
-    .reduce((sum, item) => sum + toNumber(item.total_amount || item.net_receivable_amount || item.net_amount || item.amount), 0);
-  const tdsEligible = partySaleTotal > 5000000;
-  const autoTdsAmount = tdsEligible
-    ? Math.max(saleBillAmountFromData(formData) - saleShortageAmount - saleQualityDeduction - saleTransportCharge - saleCashDiscountAmount - toNumber(formData.adjustment_amount), 0) * 0.001
-    : 0;
-  const selectedBuyerSaleRows = list.filter((item) => {
-    const sameBuyer = String(getBuyerId(item) || "") === String(formData.buyer_id || formData.company_id || "");
-    const sameAccount = !formData.company_account_id || String(item.company_account_id || "") === String(formData.company_account_id || "");
-    return activeVoucherType === "sale" && sameBuyer && sameAccount;
-  });
-  const selectedBuyerSaleQty = selectedBuyerSaleRows.reduce((sum, item) => sum + toNumber(item.quantity || item.total_quantity || item.unloading_qty), 0);
-  const selectedBuyerSaleAmount = selectedBuyerSaleRows.reduce((sum, item) => sum + toNumber(item.net_receivable_amount || item.net_amount || item.amount), 0);
-  const selectedBuyerPendingAmount = (partyOutstanding?.sales || []).reduce((sum, item) => sum + toNumber(item.pending_amount), 0);
-  const selectedBuyerBalanceAmount = toNumber(partyOutstanding?.stats?.outstanding ?? partyOutstanding?.outstanding ?? selectedBuyerPendingAmount);
-  const selectedWarehouseStockRow = warehouseStockReport.find((item) =>
-    String(item.warehouse_id || "") === String(formData.warehouse_id || "") &&
-    String(item.product_id || "") === String(formData.product_id || "")
-  );
-  const selectedWarehouseBalanceQty = availableSaleStock !== null
-    ? toNumber(availableSaleStock)
-    : selectedWarehouseStockRow
-      ? toNumber(selectedWarehouseStockRow.stock_qty)
-      : null;
-  const againstPurchaseRows = salePurchaseRows
-    .filter((item) => {
-      if (formData.against_purchase_farmer_id && String(item.farmer_id || "") !== String(formData.against_purchase_farmer_id)) return false;
-      if (formData.company_account_id && String(item.company_account_id || "") !== String(formData.company_account_id)) return false;
-      if (formData.product_id && String(item.product_id || "") !== String(formData.product_id)) return false;
-      if (formData.warehouse_id && String(item.warehouse_id || "") !== String(formData.warehouse_id)) return false;
-      return true;
-    })
-    .slice()
-    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
-  const againstPurchaseLinkMap = new Map(salePurchaseLinks.map((item) => [String(item.purchase_id), item]));
-  const againstPurchaseTotalQty = salePurchaseLinks.reduce((sum, item) => sum + toNumber(item.quantity), 0);
-  const againstPurchaseTotalAmount = salePurchaseLinks.reduce((sum, item) => sum + toNumber(item.amount), 0);
-  const saleNetReceivablePreview =
-    saleGrossAmountFromData(formData) -
-    toNumber(formData.claim_amount) -
-    toNumber(formData.other_deduction) -
-    saleTransportCharge -
-    saleCashDiscountAmount -
-    toNumber(formData.adjustment_amount) -
-    (tdsEligible ? autoTdsAmount : toNumber(formData.tds_amount)) +
-    toNumber(formData.round_off);
+  }, excludeReceiptId);
+}
 
-  const updateSalePurchaseLink = (purchase, quantityValue) => {
-    const purchaseId = String(purchase.id || purchase._id || "");
-    const quantity = Math.max(0, toNumber(quantityValue));
-    const rate = toNumber(purchase.rate);
-    setSalePurchaseLinks((prev) => {
-      const others = prev.filter((item) => String(item.purchase_id) !== purchaseId);
-      if (!purchaseId || quantity <= 0) return others;
-      return [
-        ...others,
-        {
-          purchase_id: purchaseId,
-          voucher_no: purchase.voucher_no || "",
-          farmer_id: String(purchase.farmer_id || formData.against_purchase_farmer_id || ""),
+function insertReceiptAdjustments(receiptId, adjustments, callback) {
+  if (!adjustments.length) return callback();
+  const stmt = "INSERT INTO wh_receipt_adjustments (receipt_id, sale_id, adjusted_amount) VALUES (?, ?, ?)";
+  let index = 0;
+  const next = () => {
+    if (index >= adjustments.length) return callback();
+    const item = adjustments[index];
+    index += 1;
+    db.run(stmt, [receiptId, item.sale_id, item.adjusted_amount], (err) => (err ? callback(err) : next()));
+  };
+  next();
+}
+
+function buildReceiptReferenceId(adjustments, saleRows = []) {
+  const saleMap = new Map((saleRows || []).map((row) => [String(row.id), row]));
+  return normalizeReceiptAdjustments(adjustments)
+    .map((item) => item.voucher_no || saleMap.get(String(item.sale_id))?.voucher_no || item.sale_id)
+    .filter(Boolean)
+    .join(", ");
+}
+
+function getPaymentRowsForUser(req, res) {
+  const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
+  const query = `
+    SELECT p.*, ca.account_name AS company_account_name, f.name AS farmer_name
+    FROM wh_payment_vouchers p
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+    LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}
+    ORDER BY p.date DESC, p.id DESC
+  `;
+  db.all(query, filter.params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    const paymentRows = rows || [];
+    if (!paymentRows.length) return res.json([]);
+    const ids = paymentRows.map((row) => row.id);
+    db.all(
+      `
+        SELECT a.*, pv.voucher_no AS purchase_voucher_no
+        FROM wh_payment_adjustments a
+        LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
+        WHERE a.payment_id IN (${ids.map(() => "?").join(",")})
+        ORDER BY a.id ASC
+      `,
+      ids,
+      async (adjErr, adjustmentRows) => {
+        if (adjErr) return res.status(500).json({ error: adjErr.message });
+        let mongoPurchaseMap = new Map();
+        if (mongoReady()) {
+          const mongoPurchaseIds = [...new Set((adjustmentRows || [])
+            .map((row) => String(row.purchase_id || ""))
+            .filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+          if (mongoPurchaseIds.length) {
+            try {
+              const mongoPurchases = await PurchaseVoucher.find({ _id: { $in: mongoPurchaseIds } }).lean();
+              mongoPurchaseMap = new Map((mongoPurchases || []).map((row) => [String(row._id), row]));
+            } catch (mongoErr) {
+              console.error("Payment adjustment purchase lookup failed:", mongoErr.message);
+            }
+          }
+        }
+        const byPayment = new Map();
+        (adjustmentRows || []).forEach((row) => {
+          const paymentId = String(row.payment_id);
+          const mongoPurchase = mongoPurchaseMap.get(String(row.purchase_id));
+          if (!byPayment.has(paymentId)) byPayment.set(paymentId, []);
+          byPayment.get(paymentId).push({
+            ...row,
+            voucher_no: row.purchase_voucher_no || mongoPurchase?.voucher_no || row.purchase_id,
+            purchase_voucher_no: row.purchase_voucher_no || mongoPurchase?.voucher_no || row.purchase_id,
+          });
+        });
+        res.json(paymentRows.map((row) => {
+          const adjustments = byPayment.get(String(row.id)) || [];
+          const adjustmentDetails = adjustments
+            .filter((item) => item.purchase_voucher_no && item.adjusted_amount)
+            .map((item) => `${item.purchase_voucher_no}: ${fmtNum(item.adjusted_amount)}`)
+            .join(", ");
+          return {
+            ...row,
+            party_name: row.company_account_name || row.farmer_name || "-",
+            adjustments,
+            reference_type: row.reference_type || "purchase",
+            reference_id: row.reference_id || adjustmentDetails || adjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", "),
+          };
+        }));
+      }
+    );
+  });
+}
+
+// ===========================
+// PURCHASE VOUCHERS
+// ===========================
+router.get("/purchase", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  getPurchaseVoucherRows(req, res);
+});
+
+router.get("/purchase/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const query = `
+    SELECT
+      v.*,
+      (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
+      (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
+      (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
+      ca.account_name AS company_account_name
+    FROM wh_purchase_vouchers v
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    WHERE CAST(v.id AS TEXT) = ?
+    LIMIT 1
+  `;
+
+  db.get(query, [id], async (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) {
+      if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+        try {
+          const purchase = await PurchaseVoucher.findById(id).lean();
+          if (purchase) {
+            const [decorated] = await decoratePurchaseRows([purchase]);
+            row = decorated || null;
+          }
+        } catch (mongoErr) {
+          console.error("Mongo purchase lookup failed:", mongoErr.message);
+        }
+      }
+    }
+
+    if (!row) {
+      const legacyQuery = `
+        SELECT
+          t.*, 
+          w.name AS warehouse_name,
+          f.name AS farmer_name,
+          p.name AS product_name,
+          t.quantity AS total_quantity,
+          t.amount AS total_amount,
+          t.amount AS net_amount_payable,
+          1 AS legacy_purchase_entry
+        FROM warehouse_trading_entries t
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(t.warehouse_id AS TEXT)
+        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(t.farmer_id AS TEXT)
+        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(t.product_id AS TEXT)
+        WHERE LOWER(COALESCE(t.transaction_type, '')) = 'purchase' AND CAST(t.id AS TEXT) = ?
+        LIMIT 1
+      `;
+
+      return db.get(legacyQuery, [id], (legacyErr, legacyRow) => {
+        if (legacyErr) return res.status(500).json({ error: legacyErr.message });
+        if (!legacyRow) return res.status(404).json({ error: "Purchase voucher not found" });
+        if (!ensureWarehouseAccess(req, res, legacyRow.warehouse_id)) return;
+
+        return res.json({
+          ...legacyRow,
+          id: String(legacyRow.id || legacyRow._id || id),
+          _id: String(legacyRow._id || legacyRow.id || id),
+        });
+      });
+    }
+
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    return res.json({
+      ...row,
+      id: String(row.id || row._id),
+      _id: String(row._id || row.id || id),
+    });
+  });
+});
+
+router.get("/purchase/import-template", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const buffer = purchaseImportTemplateBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", 'attachment; filename="purchase_voucher_import_format.xlsx"');
+  res.send(buffer);
+});
+
+router.get("/payment/import-template", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const buffer = paymentImportTemplateBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", 'attachment; filename="payment_voucher_import_format.xlsx"');
+  res.send(buffer);
+});
+
+router.post("/payment/import-xlsx", upload.single("file"), async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!req.file?.buffer) {
+    return res.status(400).json({ error: "Please upload an Excel file" });
+  }
+
+  try {
+    const rows = paymentImportRowsFromSheet(req.file.buffer);
+    if (!rows.length) return res.status(400).json({ error: "No rows found in Excel file" });
+
+    const [warehouses, farmers, accounts, employees, locations] = await Promise.all([
+      Warehouse.find({}).lean(),
+      Farmer.find({}).lean(),
+      CompanyAccount.find({}).lean(),
+      Employee.find({}).lean(),
+      Location.find({}).lean(),
+    ]);
+
+    const warehouseMap = buildImportMap(warehouses, ["name"]);
+    const farmerMap = buildImportMap(farmers, ["name", "mobile", "phone", "farmer_no", "farmer_number"]);
+    const accountMap = buildImportMap(accounts, ["account_name", "name"]);
+    const employeeMap = buildImportMap(employees, ["name", "mobile", "phone"]);
+    const locationMap = buildImportMap(locations, ["name"]);
+    const imported = [];
+    const errors = [];
+
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const rowNo = index + 2;
+      const date = excelDateToIso(firstValue(row, ["Date", "date"]));
+      const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse", "Warehouse Name", "warehouse", "warehouse_id"]));
+      const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Farmer No", "Party", "Name", "farmer", "farmer_id", "farmer_no", "farmer_number"]));
+      const account = resolveByNameOrId(accountMap, firstValue(row, ["Account", "Account Name", "company_account", "company_account_id"]));
+      const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee", "Employee Name", "employee", "employee_id"]));
+      const location = resolveByNameOrId(locationMap, firstValue(row, ["Location", "location", "location_id"]));
+      const amount = importNumber(firstValue(row, ["Amount", "amount"]));
+      const rawReferenceType = String(firstValue(row, ["Reference Type", "reference_type"]) || "").trim();
+      const referenceType = rawReferenceType.toLowerCase();
+      const referenceId = String(firstValue(row, ["Reference ID", "reference_id"]) || "").trim();
+      const narration = String(firstValue(row, ["Narration", "Description", "description"]) || "").trim();
+      const requestedVoucherNo = String(firstValue(row, ["Voucher No", "voucher_no"]) || "").trim();
+
+      const hasReference = Boolean(referenceId);
+      const normalizedReferenceType = hasReference
+        ? (
+          referenceType === "purchase" ||
+          referenceType === "purchase bill" ||
+          referenceType === "purchase_bill" ||
+          referenceType === "bill" ||
+          referenceType === "purchase invoice" ||
+          referenceType === "purchase_invoice" ||
+          referenceType === ""
+        )
+          ? "purchase"
+          : referenceType
+        : "";
+      const finalReferenceType = hasReference ? normalizedReferenceType : "on_account";
+
+      const missing = [];
+      if (!date) missing.push("Date");
+      if (!warehouse) missing.push("Warehouse");
+      if (!farmer) missing.push("Farmer");
+      if (!account) missing.push("Account");
+      if (amount <= 0) missing.push("Amount");
+      if (referenceId && !normalizedReferenceType) missing.push("Reference Type");
+      if (missing.length) {
+        errors.push({ row: rowNo, error: `Missing/invalid: ${missing.join(", ")}` });
+        continue;
+      }
+      if (!canAccessWarehouse(req.user, warehouse._id)) {
+        errors.push({ row: rowNo, error: `No access to warehouse: ${warehouse.name || warehouse._id}` });
+        continue;
+      }
+
+      let purchase = null;
+      let adjustments = [];
+      if (hasReference) {
+        if (normalizedReferenceType === "purchase") {
+          const purchaseFilter = { $or: [{ voucher_no: referenceId }] };
+          if (mongoose.Types.ObjectId.isValid(referenceId)) {
+            purchaseFilter.$or.push({ _id: referenceId });
+          }
+          if (farmer?._id) purchaseFilter.farmer_id = String(farmer._id);
+          try {
+            purchase = await PurchaseVoucher.findOne(purchaseFilter).lean();
+          } catch (findErr) {
+            errors.push({ row: rowNo, error: `Unable to lookup purchase reference: ${findErr.message}` });
+            continue;
+          }
+          if (!purchase) {
+            errors.push({ row: rowNo, error: `Invalid purchase reference: ${referenceId}` });
+            continue;
+          }
+        } else {
+          errors.push({ row: rowNo, error: `Unsupported reference type: ${rawReferenceType || referenceType}` });
+          continue;
+        }
+
+        adjustments = [{
+          purchase_id: String(purchase._id || purchase.id || purchase.id),
+          adjusted_amount: amount,
+          voucher_no: purchase.voucher_no || String(purchase._id || purchase.id),
+        }];
+      }
+
+      try {
+        const cleanAdjustments = await new Promise((resolve, reject) => {
+          validatePaymentAdjustments({ farmerId: farmer._id || farmer.id, warehouseId: warehouse._id || warehouse.id, amount, adjustments }, (validationErr, value) => (validationErr ? reject(validationErr) : resolve(value)));
+        });
+
+        const voucherNo = await new Promise((resolve, reject) => {
+          createVoucherNoIfMissing("payment", requestedVoucherNo, (err, value) => (err ? reject(err) : resolve(value)));
+        });
+
+        const insertData = {
+          voucher_no: voucherNo,
+          date,
+          warehouse_id: String(warehouse._id || warehouse.id),
+          farmer_id: String(farmer._id || farmer.id),
+          company_account_id: String(account._id || account.id),
+          amount,
+          reference_type: finalReferenceType,
+          reference_id: referenceId,
+          employee_id: employee ? String(employee._id || employee.id) : String(warehouse.employee_id || ""),
+          location_id: location ? String(location._id || location.id) : String(warehouse.location_id || ""),
+          description: narration,
+        };
+
+        const paymentId = await new Promise((resolve, reject) => {
+          db.run(
+            `INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, employee_id, location_id, description)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [insertData.voucher_no, insertData.date, insertData.warehouse_id, insertData.farmer_id, insertData.company_account_id, insertData.amount, insertData.reference_type, insertData.reference_id, insertData.employee_id, insertData.location_id, insertData.description],
+            function (err) {
+              if (err) return reject(err);
+              resolve(this.lastID);
+            }
+          );
+        });
+
+        await new Promise((resolve, reject) => {
+          insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => (adjErr ? reject(adjErr) : resolve()));
+        });
+
+        const stats = await new Promise((resolve, reject) => {
+          computeOutstandingForFarmer(String(farmer._id || farmer.id), (err2, statsData) => (err2 ? reject(err2) : resolve(statsData)));
+        });
+
+        await new Promise((resolve, reject) => {
+          db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], (updateErr) => (updateErr ? reject(updateErr) : resolve()));
+        });
+
+        imported.push({ row: rowNo, id: paymentId, voucher_no: voucherNo });
+      } catch (err) {
+        const message = err?.message || "Payment import failed";
+        errors.push({ row: rowNo, error: message });
+      }
+    }
+
+    res.json({ imported: imported.length, failed: errors.length, rows: imported, errors });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/receipt/import-template", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const buffer = receiptImportTemplateBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", 'attachment; filename="receipt_voucher_import_format.xlsx"');
+  res.send(buffer);
+});
+
+router.post("/purchase/import-xlsx", upload.single("file"), async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is not connected. Purchase import saves data in MongoDB." });
+  }
+  if (!req.file?.buffer) {
+    return res.status(400).json({ error: "Please upload an Excel file" });
+  }
+
+  try {
+    const rows = purchaseImportRowsFromSheet(req.file.buffer);
+    if (!rows.length) return res.status(400).json({ error: "No rows found in Excel file" });
+
+    const [warehouses, farmers, products, accounts, employees, locations] = await Promise.all([
+      Warehouse.find({}).lean(),
+      Farmer.find({}).lean(),
+      Product.find({}).lean(),
+      CompanyAccount.find({}).lean(),
+      Employee.find({}).lean(),
+      Location.find({}).lean(),
+    ]);
+
+    const warehouseMap = buildImportMap(warehouses, ["name"]);
+    const farmerMap = buildImportMap(farmers, ["name", "mobile", "phone"]);
+    const productMap = buildImportMap(products, ["name"]);
+    const accountMap = buildImportMap(accounts, ["account_name", "name"]);
+    const employeeMap = buildImportMap(employees, ["name", "mobile", "phone"]);
+    const locationMap = buildImportMap(locations, ["name"]);
+    const imported = [];
+    const errors = [];
+
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const rowNo = index + 2;
+      const date = excelDateToIso(firstValue(row, ["Date", "date"]));
+      const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse", "Warehouse Name", "warehouse", "warehouse_id"]));
+      const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Party", "Name", "farmer", "farmer_id"]));
+      const product = resolveByNameOrId(productMap, firstValue(row, ["Product", "Product Name", "product", "product_id"]));
+      const account = resolveByNameOrId(accountMap, firstValue(row, ["Account", "Account Name", "company_account", "company_account_id"]));
+      const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee", "Employee Name", "employee", "employee_id"]));
+      const location = resolveByNameOrId(locationMap, firstValue(row, ["Location", "location", "location_id"]));
+
+      const missing = [];
+      if (!date) missing.push("Date");
+      if (!warehouse) missing.push("Warehouse");
+      if (!farmer) missing.push("Farmer");
+      if (!product) missing.push("Product");
+      if (!account) missing.push("Account");
+      if (missing.length) {
+        errors.push({ row: rowNo, error: `Missing/invalid: ${missing.join(", ")}` });
+        continue;
+      }
+      if (!canAccessWarehouse(req.user, warehouse._id)) {
+        errors.push({ row: rowNo, error: `No access to warehouse: ${warehouse.name || warehouse._id}` });
+        continue;
+      }
+
+      const packet = importNumber(firstValue(row, ["Packet", "packet"]));
+      const grossWeight = importNumber(firstValue(row, ["Gross Wt", "Gross Weight", "gross_weight"]));
+      const tareWeight = importNumber(firstValue(row, ["Tare Wt", "Tare Weight", "Tear Weight", "tare_weight"]));
+      const dhalta = importNumber(firstValue(row, ["Dhalta", "dhalta"]));
+      const lessBagsWeight = importNumber(firstValue(row, ["Less Bags Weight", "less_bags_weight"]));
+      const moisture = importNumber(firstValue(row, ["Moistur", "Moisture", "moisture"]));
+      const dunki = importNumber(firstValue(row, ["Dunki", "dunki"]));
+      const fungus = importNumber(firstValue(row, ["Fungas", "Fungus", "fungus"]));
+      const discolour = importNumber(firstValue(row, ["Disclour", "Discolour", "discolour"]));
+      const others = importNumber(firstValue(row, ["Others", "others"]));
+      const rate = importNumber(firstValue(row, ["Rate", "rate"]));
+      const bagsClaim = importNumber(firstValue(row, ["Bags Claim", "bags_claim"]));
+      const labour = importNumber(firstValue(row, ["Labour", "labour"]));
+      const roundOff = importNumber(firstValue(row, ["Round Off", "round_off"]));
+      const newWeight = Math.max(grossWeight - tareWeight, 0);
+      const netWeight = Math.max(newWeight - dhalta - lessBagsWeight - moisture - dunki - fungus - discolour - others, 0);
+      const grossAmount = netWeight * rate;
+      const totalDeduction = bagsClaim + labour;
+      const netPayable = Math.max(grossAmount - totalDeduction + roundOff, 0);
+
+      try {
+        const requestedVoucherNo = String(firstValue(row, ["Voucher No", "voucher_no"])).trim();
+        const voucherNo = await new Promise((resolve, reject) => {
+          createVoucherNoIfMissing("purchase", requestedVoucherNo, (err, value) => (err ? reject(err) : resolve(value)));
+        });
+        const doc = await PurchaseVoucher.create({
+          voucher_no: voucherNo,
+          date,
+          warehouse_id: String(warehouse._id),
+          farmer_id: String(farmer._id),
+          company_account_id: String(account._id),
+          product_id: String(product._id),
+          employee_id: employee ? String(employee._id) : String(warehouse.employee_id || ""),
+          location_id: location ? String(location._id) : String(warehouse.location_id || ""),
+          quantity: netWeight,
+          rate,
+          amount: netPayable,
+          packet,
+          gross_weight: grossWeight,
+          tare_weight: tareWeight,
+          dhalta,
+          less_bags_weight: lessBagsWeight,
+          moisture,
+          dunki,
+          fungus,
+          discolour,
+          others,
+          net_weight: netWeight,
+          bags_claim: bagsClaim,
+          labour,
+          total_deduct_amount: 0,
+          total_qty: netWeight,
+          total_deduction: totalDeduction,
+          round_off: roundOff,
+          net_amount_payable: netPayable,
+          description: String(firstValue(row, ["Narration", "Description", "description"])).trim(),
+        });
+        imported.push({ row: rowNo, id: String(doc._id), voucher_no: doc.voucher_no });
+      } catch (err) {
+        const message = err?.code === 11000 ? "Voucher number already exists" : err.message;
+        errors.push({ row: rowNo, error: message });
+      }
+    }
+
+    res.json({
+      imported: imported.length,
+      failed: errors.length,
+      rows: imported,
+      errors,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/purchase", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const {
+    voucher_no,
+    date,
+    warehouse_id,
+    farmer_id,
+    company_account_id,
+    product_id,
+    quantity,
+    rate,
+    amount,
+    packet,
+    gross_weight,
+    tare_weight,
+    dhalta,
+    less_bags_weight,
+    moisture,
+    dunki,
+    fungus,
+    discolour,
+    others,
+    net_weight,
+    bags_claim,
+    labour,
+    total_deduct_amount,
+    total_qty,
+    total_deduction,
+    round_off,
+    net_amount_payable,
+    employee_id,
+    location_id,
+    description,
+  } = req.body;
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is not connected. Purchase data must be saved in MongoDB." });
+  }
+
+  if (mongoReady()) {
+    return createVoucherNoIfMissing("purchase", voucher_no, async (err, generatedVoucherNo) => {
+      if (err) return res.status(500).json({ error: err.message });
+      try {
+        const payload = buildPurchasePayload(req.body, generatedVoucherNo);
+        const doc = await PurchaseVoucher.create(payload);
+        const deductionDetails = buildPurchaseDeductionDetails(req.body);
+        await PurchaseVoucher.collection.updateOne(
+          { _id: doc._id },
+          { $set: { claim_amount: Number(req.body.claim_amount || req.body.bags_claim || 0), other_deduction: Number(req.body.other_deduction || 0), cd_percent: Number(req.body.cd_percent || 0), cd_amount: Number(req.body.cd_amount || 0), adjustment_amount: Number(req.body.adjustment_amount || 0), tds_amount: Number(req.body.tds_amount || 0), deduction_details: deductionDetails, total_deduction: Number(req.body.total_deduction || 0) } }
+        );
+        return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: doc.voucher_no, saved_to: "mongodb" });
+      } catch (mongoErr) {
+        if (mongoErr?.code === 11000) return res.status(400).json({ error: "Voucher number already exists" });
+        return res.status(500).json({ error: mongoErr.message });
+      }
+    });
+  }
+
+  const query = `
+    INSERT INTO wh_purchase_vouchers (
+      voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
+      packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+      discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+      total_deduction, round_off, net_amount_payable, employee_id, location_id, description
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `;
+
+  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+  if (idemKey) {
+    return getIdempotency(idemKey, "purchase", (err, existingId) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (existingId) {
+        return db.get(`SELECT * FROM wh_purchase_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+          if (e2) return res.status(500).json({ error: e2.message });
+          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+        });
+      }
+
+      createVoucherNoIfMissing("purchase", voucher_no, (err, generatedVoucherNo) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const query = `
+          INSERT INTO wh_purchase_vouchers (
+            voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
+            packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+            discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+            total_deduction, round_off, net_amount_payable, employee_id, location_id, description
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        db.run(query, [
+          generatedVoucherNo,
+          date,
+          warehouse_id,
+          farmer_id,
+          company_account_id,
+          product_id,
           quantity,
           rate,
-          amount: Number((quantity * rate).toFixed(2)),
-        },
-      ];
-    });
-  };
-  const saleVoucherPassBills = list.filter((item) => {
-    const sameWarehouse = !formData.warehouse_id || String(item.warehouse_id || "") === String(formData.warehouse_id);
-    const sameAccount = !formData.company_account_id || String(item.company_account_id || "") === String(formData.company_account_id);
-    const search = saleBillSearch.trim().toLowerCase();
-    const searchable = [
-      item.voucher_no,
-      item.lorry_no,
-      item.reference_id,
-      getBuyerName(item),
-      item.consignee_name,
-      getProductName(item),
-    ].join(" ").toLowerCase();
-    // Ensure we only show sale vouchers here. Prefer explicit `voucher_type` when available,
-    // otherwise fall back to presence of buyer/company fields which indicate sale.
-    const isSaleType = String(item.voucher_type || "").toLowerCase() === "sale" || Boolean(item.buyer_id || item.company_id);
-    return isSaleType && sameWarehouse && sameAccount && (!search || searchable.includes(search));
-  });
-  const selectedSalePassBill =
-    list.find((row) => String(row.id || row._id) === String(editId)) ||
-    saleVoucherPassBills.find((row) => String(row.id || row._id) === String(editId)) ||
-    null;
-  const selectedSalePassJourneyKey = String(
-    selectedSalePassBill?.journey_token ||
-      selectedSalePassBill?.journey_id ||
-      selectedSalePassBill?.journey_group_no ||
-      formData.journey_token ||
-      ""
-  ).trim();
-  const selectedSalePassJourneyRows = selectedSalePassJourneyKey
-    ? list.filter((row) => String(row.journey_token || row.journey_id || row.journey_group_no || "") === selectedSalePassJourneyKey)
-    : (selectedSalePassBill || formData.lorry_no)
-      ? list.filter((row) => {
-          const sameLorry = String(row.lorry_no || "") === String(selectedSalePassBill?.lorry_no || formData.lorry_no || "");
-          const sameDate = selectedSalePassBill?.date ? String(row.date || "") === String(selectedSalePassBill.date || "") : true;
-          return sameLorry && sameDate;
-        })
-      : [];
-  const selectedSalePassJourneyRemainingQty = Math.max(
-    saleDispatchQty - selectedSalePassJourneyRows.reduce((sum, row) => sum + toNumber(row.unloading_qty || row.quantity || row.total_quantity || 0), 0),
-    0
-  );
-
-  useEffect(() => {
-    if (activeTab !== "vouchers" || activeVoucherType !== "sale" || !showSaleDeductionModal) return;
-    if (editId && selectedSalePassBill) return;
-    const preferredLorry = String(formData.lorry_no || "").trim();
-    const preferredToken = String(formData.journey_token || "").trim();
-    const autoSelected =
-      saleVoucherPassBills.find((row) => preferredToken && String(row.journey_token || row.journey_id || row.journey_group_no || "") === preferredToken) ||
-      saleVoucherPassBills.find((row) => preferredLorry && String(row.lorry_no || "") === preferredLorry) ||
-      saleVoucherPassBills[0] ||
-      null;
-    if (autoSelected && String(editId || "") !== String(autoSelected.id || autoSelected._id || "")) {
-      selectSaleVoucherForPass(autoSelected.id || autoSelected._id);
-    }
-  }, [activeTab, activeVoucherType, showSaleDeductionModal, editId, selectedSalePassBill, saleVoucherPassBills, formData.lorry_no, formData.journey_token]);
-
-  const saleAdjustedBills = list.filter((item) => {
-    const sameWarehouse = !formData.warehouse_id || String(item.warehouse_id || "") === String(formData.warehouse_id);
-    const sameAccount = !formData.company_account_id || String(item.company_account_id || "") === String(formData.company_account_id);
-    const hasAdjustment =
-      toNumber(item.shortage_quantity) > 0 ||
-      toNumber(item.claim_amount) > 0 ||
-      toNumber(item.other_deduction) > 0 ||
-      toNumber(item.cd_amount) > 0 ||
-      toNumber(item.adjustment_amount) > 0 ||
-      toNumber(item.tds_amount) > 0 ||
-      Boolean(item.unloading_date);
-    const search = saleBillSearch.trim().toLowerCase();
-    const searchable = [
-      item.voucher_no,
-      item.lorry_no,
-      item.reference_id,
-      getBuyerName(item),
-      item.consignee_name,
-      getProductName(item),
-    ].join(" ").toLowerCase();
-    return sameWarehouse && sameAccount && hasAdjustment && (!search || searchable.includes(search));
-  });
-
-  // Load initial data
-  useEffect(() => {
-    const requestedType = searchParams.get("type");
-    const requestedTab = searchParams.get("tab");
-    const requestedReport = searchParams.get("report");
-    const validVoucherTypes = allowedVoucherTypes;
-    const validReports = allowedReports;
-    const nextTab = validVoucherTypes.includes(requestedType)
-      ? "vouchers"
-      : requestedTab === "reports" || validReports.includes(requestedReport)
-        ? "reports"
-        : validVoucherTypes.length
-          ? "vouchers"
-          : validReports.length
-            ? "reports"
-            : "vouchers";
-    const nextVoucherType = validVoucherTypes.includes(requestedType) ? requestedType : validVoucherTypes[0] || "purchase";
-    const nextReport = validReports.includes(requestedReport) ? requestedReport : validReports[0] || "sale";
-
-    setActiveTab(nextTab);
-    setActiveVoucherType(nextVoucherType);
-    setActiveReport(nextReport);
-    if (nextTab === "reports") {
-      setShowMobileTradingTabs(true);
-    }
-
-    // Master data is loaded only by the dedicated Vouchers effect below.
-    // This prevents the URL/search-param effect from starting a duplicate bundle.
-  }, [searchParams]);
-
-  // Load master data once when Vouchers is actually visible. Delay it slightly
-  // so the first voucher table paint is not competing with nine master requests.
-  useEffect(() => {
-    if (activeTab !== "vouchers") return;
-    const timer = window.setTimeout(() => { loadData(); }, 900);
-    return () => window.clearTimeout(timer);
-  }, [activeTab]);
-
-  // Refresh farmers whenever Purchase/New Sale voucher is opened so a farmer
-  // created in the master screen is immediately available. The master bundle
-  // intentionally uses a session cache for performance, but farmers are a
-  // frequently-created master and must not remain stale for 30 minutes.
-  useEffect(() => {
-    if (activeTab !== "vouchers") return;
-    if (!["purchase", "sale"].includes(activeVoucherType)) return;
-
-    let cancelled = false;
-    const refreshFarmers = async () => {
-      try {
-        const res = await axios.get("/api/farmers", {
-          headers: { "Cache-Control": "no-cache" },
-          params: { _refresh: Date.now() },
+          amount,
+          packet,
+          gross_weight,
+          tare_weight,
+          dhalta,
+          less_bags_weight,
+          moisture,
+          dunki,
+          fungus,
+          discolour,
+          others,
+          net_weight,
+          bags_claim,
+          labour,
+          total_deduct_amount,
+          total_qty,
+          total_deduction,
+          round_off,
+          net_amount_payable,
+          employee_id,
+          location_id,
+          description,
+        ], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+          saveIdempotency(idemKey, "purchase", this.lastID, () => {});
+          res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
         });
-        const freshFarmers = Array.isArray(res.data) ? res.data : [];
-        if (cancelled) return;
-        setFarmers(freshFarmers);
-
-        // Keep the other cached master data, but replace only the farmers list.
-        try {
-          const cached = JSON.parse(sessionStorage.getItem("warehouseTradingMasterData:v2") || "null");
-          if (cached?.data) {
-            sessionStorage.setItem("warehouseTradingMasterData:v2", JSON.stringify({
-              ...cached,
-              time: Date.now(),
-              data: { ...cached.data, farmers: freshFarmers },
-            }));
-          }
-        } catch {}
-      } catch (err) {
-        // Keep the cached farmer list if the refresh endpoint is temporarily unavailable.
-        if (!cancelled) console.warn("Fresh farmer list unavailable; using cached farmers", err);
-      }
-    };
-
-    const timer = window.setTimeout(refreshFarmers, 120);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [activeTab, activeVoucherType]);
-
-  // Load voucher list when type changes
-  useEffect(() => {
-    if (activeTab !== "vouchers") return;
-    const timer = window.setTimeout(() => {
-      loadVouchers();
-    }, 250);
-    return () => window.clearTimeout(timer);
-  }, [activeTab, activeVoucherType, voucherSortAsc, voucherPage, globalSearch]);
-
-  useEffect(() => {
-    if (activeTab === "vouchers" && activeVoucherType === "sale") {
-      loadSalePurchaseRows();
-    }
-  }, [activeTab, activeVoucherType]);
-
-  useEffect(() => {
-    if (activeTab === "vouchers") {
-      fetchNextVoucherNo(activeVoucherType);
-      setPartyOutstanding(null);
-      setPaymentAdjustments([]);
-      setSelectedPaymentId(null);
-      setShowPaymentAdjustPopup(false);
-      setReceiptAdjustments([]);
-      setSelectedReceiptId(null);
-      setShowReceiptAdjustPopup(false);
-      setSalePurchaseLinks([]);
-      setFormData((prev) => ({ ...prev, reference_type: "", reference_id: "" }));
-    }
-  }, [activeTab, activeVoucherType]);
-
-  // Report rows: page/filter changes only.
-  useEffect(() => {
-    if (activeTab !== "reports") return;
-    const timer = window.setTimeout(() => {
-      loadReport();
-    }, 40);
-    return () => window.clearTimeout(timer);
-  }, [activeTab, activeReport, reportPage, globalSearch, reportFilters.farmer_id, reportFilters.company_account_id, reportFilters.warehouse_id, reportFilters.sale_buyer_id, reportFilters.sale_company_account_id, reportFilters.sale_journey_token, reportFilters.sale_lorry_no, reportFilters.sale_bill_no, reportFilters.details_of_deduction]);
-
-  // Filter options are independent of pagination. Never reload them just
-  // because the user moves from page 1 to page 2.
-  useEffect(() => {
-    if (activeTab !== "reports") return;
-    const timer = window.setTimeout(() => {
-      loadReportFilterOptions();
-    }, 40);
-    return () => window.clearTimeout(timer);
-  }, [activeTab, activeReport, reportFilters.farmer_id, reportFilters.company_account_id, reportFilters.warehouse_id, reportFilters.sale_buyer_id]);
-
-  useEffect(() => {
-    // Keep bill-wise detail panels hidden by default. Press F5 to reveal and
-    // refresh the selected party ledger when detailed bill information is needed.
-    setShowPurchaseBillWise(false);
-    setShowSaleBillWise(false);
-  }, [activeReport]);
-
-  useEffect(() => {
-    const handleArrowNavigation = (event) => {
-      const { key, target } = event;
-      if (!target || !target.closest || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(key)) return;
-      if (!target.matches("input, select, textarea") || event.metaKey || event.ctrlKey || event.altKey) return;
-
-      const root = activeTab === "vouchers"
-        ? (voucherPanelRef.current || arrowNavRootRef.current)
-        : (reportPanelRef.current || arrowNavRootRef.current);
-      if (!root || !root.contains(target)) return;
-
-      const focusableElements = getArrowFocusableInputs(root);
-      const index = focusableElements.indexOf(target);
-      if (index === -1) return;
-
-      const currentRect = target.getBoundingClientRect();
-      const currentCenterX = currentRect.left + currentRect.width / 2;
-      const currentCenterY = currentRect.top + currentRect.height / 2;
-      let candidate = null;
-      let bestScore = Number.POSITIVE_INFINITY;
-
-      focusableElements.forEach((element, elementIndex) => {
-        if (elementIndex === index) return;
-        const rect = element.getBoundingClientRect();
-        const elementCenterX = rect.left + rect.width / 2;
-        const elementCenterY = rect.top + rect.height / 2;
-
-        let score = Number.POSITIVE_INFINITY;
-        if (key === "ArrowRight") {
-          if (rect.left <= currentRect.left + 1) return;
-          score = (rect.left - currentRect.right) + Math.abs(elementCenterY - currentCenterY) * 0.2;
-        } else if (key === "ArrowLeft") {
-          if (rect.right >= currentRect.right - 1) return;
-          score = (currentRect.left - rect.right) + Math.abs(elementCenterY - currentCenterY) * 0.2;
-        } else if (key === "ArrowDown") {
-          if (rect.top <= currentRect.top + 1) return;
-          score = (rect.top - currentRect.bottom) + Math.abs(elementCenterX - currentCenterX) * 0.15;
-        } else if (key === "ArrowUp") {
-          if (rect.bottom >= currentRect.bottom - 1) return;
-          score = (currentRect.top - rect.bottom) + Math.abs(elementCenterX - currentCenterX) * 0.15;
-        }
-
-        if (score < bestScore) {
-          bestScore = score;
-          candidate = element;
-        }
       });
+    });
+  }
 
-      if (candidate) {
-        event.preventDefault();
-        candidate.focus({ preventScroll: true });
-        if (typeof candidate.select === "function" && target.tagName !== "SELECT") {
-          candidate.select();
-        }
+  // no idempotency key, proceed normally
+  createVoucherNoIfMissing("purchase", voucher_no, (err, generatedVoucherNo) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const query = `
+      INSERT INTO wh_purchase_vouchers (
+        voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
+        packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+        discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+        total_deduction, round_off, net_amount_payable, employee_id, location_id, description
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    db.run(query, [
+      generatedVoucherNo,
+      date,
+      warehouse_id,
+      farmer_id,
+      company_account_id,
+      product_id,
+      quantity,
+      rate,
+      amount,
+      packet,
+      gross_weight,
+      tare_weight,
+      dhalta,
+      less_bags_weight,
+      moisture,
+      dunki,
+      fungus,
+      discolour,
+      others,
+      net_weight,
+      bags_claim,
+      labour,
+      total_deduct_amount,
+      total_qty,
+      total_deduction,
+      round_off,
+      net_amount_payable,
+      employee_id,
+      location_id,
+      description,
+    ], function (err) {
+      if (err) {
+        if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+        return res.status(500).json({ error: err.message });
       }
-    };
+      res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
+    });
+  });
+});
 
-    document.addEventListener("keydown", handleArrowNavigation);
-    return () => document.removeEventListener("keydown", handleArrowNavigation);
-  }, []);
+router.get("/next-voucher-no", (req, res) => {
+  const { type } = req.query;
+  if (!type) return res.status(400).json({ error: "type query param is required" });
+  if (type === "purchase" && mongoReady()) {
+    nextMongoVoucherNo(type)
+      .then((voucher_no) => res.json({ voucher_no }))
+      .catch((err) => res.status(500).json({ error: err.message }));
+    return;
+  }
+  createSequentialVoucherNo(type, (err, voucher_no) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ voucher_no });
+  });
+});
 
-  useEffect(() => {
-    const handleLedgerRefresh = (event) => {
-      if (event.key !== "F5" || activeTab !== "reports") return;
-      if (activeReport !== "purchase-party-ledger" && activeReport !== "sale-party-ledger") return;
-      event.preventDefault();
-      if (activeReport === "purchase-party-ledger") setShowPurchaseBillWise(true);
-      if (activeReport === "sale-party-ledger") setShowSaleBillWise(true);
-      loadReport();
-    };
-    window.addEventListener("keydown", handleLedgerRefresh);
-    return () => window.removeEventListener("keydown", handleLedgerRefresh);
-  }, [activeTab, activeReport, reportFilters.farmer_id, reportFilters.warehouse_id, reportFilters.company_account_id, reportFilters.sale_buyer_id, reportFilters.sale_company_account_id, reportFilters.sale_journey_token, reportFilters.sale_lorry_no, reportFilters.sale_bill_no]);
+router.get("/outstanding", (req, res) => {
+  const startedAt = Date.now();
+  const { party_type, id, warehouse_id, location_id, exclude_payment_id, company_account_id } = req.query;
+  if (!party_type || !id) return res.status(400).json({ error: "party_type and id are required" });
 
-  useEffect(() => {
-    const handleF2Key = (event) => {
-      if (event.key !== "F2" || activeTab !== "vouchers" || activeVoucherType !== "sale") return;
-      event.preventDefault();
-      setShowSaleDeductionModal(true);
-    };
-    window.addEventListener("keydown", handleF2Key);
-    return () => window.removeEventListener("keydown", handleF2Key);
-  }, [activeTab, activeVoucherType]);
+  const filters = ["1=1"];
+  const params = [id];
+  let detailsQuery;
+  let paymentsQuery;
 
-  useEffect(() => {
-    const loadSaleTransportCharge = async () => {
-      if (!showSaleDeductionModal) return;
-      const biltiId = selectedSalePassBill?.bilti_id;
-      if (!biltiId) {
-        if (!formData.transport_charge) {
-          setFormData((prev) => ({ ...prev, transport_charge: "" }));
-        }
-        return;
-      }
-      try {
-        const response = await axios.get(`/api/transport-bilti/${biltiId}`);
-        const amount = toNumber(response.data?.transport_charge || response.data?.net_amount || response.data?.payable_amount || response.data?.gross_freight || 0);
-        setFormData((prev) => ({
-          ...prev,
-          transport_charge: amount > 0 ? amount.toFixed(2) : prev.transport_charge,
-        }));
-      } catch (err) {
-        // Keep manual value if transport lookup fails.
-      }
-    };
-    loadSaleTransportCharge();
-  }, [showSaleDeductionModal, selectedSalePassBill?.bilti_id]);
-
-  useEffect(() => {
-    const loadSaleTransportFromSummary = async () => {
-      if (!showSalePreview || !salePreviewRow) return;
-      const saleId = salePreviewRow.id || salePreviewRow._id;
-      if (!saleId) return;
-      try {
-        const response = await axios.get(`/api/wh-vouchers/sale/${saleId}/summary`);
-        const transportValue = toNumber(response.data?.transport_charge || response.data?.summary?.transport_charge || 0);
-        if (transportValue > 0) {
-          setSalePreviewSummary(response.data);
-        }
-      } catch (err) {
-        // keep current preview data
-      }
-    };
-    loadSaleTransportFromSummary();
-  }, [showSalePreview, salePreviewRow]);
-
-  useEffect(() => {
-    if (!showSalePreview) return;
-    setSaleTransportMode("auto");
-    setSaleTransportManualAmount("0.00");
-  }, [showSalePreview, salePreviewRow]);
-
-  useEffect(() => {
-    const handleF5SaleKey = (event) => {
-      if (event.key !== "F5" || activeTab !== "vouchers" || activeVoucherType !== "sale") return;
-      event.preventDefault();
-      setShowSaleAdjustedModal(true);
-    };
-    window.addEventListener("keydown", handleF5SaleKey);
-    return () => window.removeEventListener("keydown", handleF5SaleKey);
-  }, [activeTab, activeVoucherType]);
-
-  useEffect(() => {
-    if (activeTab !== "vouchers" || activeVoucherType !== "sale" || formData.sale_type === "direct" || !formData.warehouse_id || !formData.product_id) {
-      setAvailableSaleStock(null);
-      return;
+  if (party_type === "farmer") {
+    if (warehouse_id) {
+      filters.push("warehouse_id = ?");
+      params.push(warehouse_id);
     }
+    if (location_id) {
+      filters.push("location_id = ?");
+      params.push(location_id);
+    }
+    if (company_account_id) {
+      filters.push("company_account_id = ?");
+      params.push(company_account_id);
+    }
+    const paymentFilters = filters.slice(1);
+    const paymentParams = [...params];
+    if (exclude_payment_id) {
+      paymentFilters.push("CAST(id AS TEXT) <> CAST(? AS TEXT)");
+      paymentParams.push(exclude_payment_id);
+    }
+    paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_payment_vouchers WHERE farmer_id = ? ${paymentFilters.length ? `AND ${paymentFilters.join(" AND ")}` : ""} ORDER BY date ASC`;
+    // The scoped stats below are authoritative for this account/warehouse.
+    // Avoid the older global farmer aggregation here; it was both slower and
+    // could produce a different balance during payment edit.
+    getPaymentAdjustmentsByPurchase((adjustErr, adjustedMap) => {
+        if (adjustErr) return res.status(500).json({ error: adjustErr.message });
 
-    let cancelled = false;
-    axios
-      .get("/api/wh-vouchers/available-sale-stock", {
-        params: {
-          warehouse_id: formData.warehouse_id,
-          product_id: formData.product_id,
-          exclude_sale_id: editId || undefined,
-        },
-      })
-      .then((res) => {
-        if (!cancelled) setAvailableSaleStock(res.data?.stock_qty ?? null);
-      })
-      .catch(() => {
-        if (!cancelled) setAvailableSaleStock(null);
-      });
+        const send = (purchaseRows) => {
+          const purchases = (purchaseRows || []).map((row) => {
+            const purchaseId = String(row.id || row._id);
+            const amount = Number(row.amount || row.net_amount_payable || row.total_amount || 0);
+            const adjusted_amount = adjustedMap.get(purchaseId) || 0;
+            return {
+              ...row,
+              id: purchaseId,
+              amount,
+              adjusted_amount,
+              pending_amount: Number(Math.max(0, amount - adjusted_amount).toFixed(2)),
+            };
+          });
 
-    return () => {
-      cancelled = true;
-    };
-  }, [activeTab, activeVoucherType, formData.sale_type, formData.warehouse_id, formData.product_id, editId]);
-
-  const loadData = async ({ force = false } = {}) => {
-    if (!force && masterDataLoadedRef.current) return;
-    if (!force && masterLoadPromiseRef.current) return masterLoadPromiseRef.current;
-
-    const run = (async () => {
-      // Reuse the master bundle between Trading page mounts. This is intentionally
-      // one in-flight request group so React effects cannot fire the same 9 calls twice.
-      if (!force) {
-        try {
-          const cached = JSON.parse(sessionStorage.getItem("warehouseTradingMasterData:v2") || "null");
-          if (cached?.data && Date.now() - Number(cached.time || 0) < 30 * 60 * 1000) {
-            const data = cached.data;
-            setWarehouses(Array.isArray(data.warehouses) ? data.warehouses : []);
-            setFarmers(Array.isArray(data.farmers) ? data.farmers : []);
-            setBuyerNames(Array.isArray(data.buyerNames) ? data.buyerNames : []);
-            setCompanies(Array.isArray(data.companies) ? data.companies : []);
-            setCompanyAccounts(Array.isArray(data.companyAccounts) ? data.companyAccounts : []);
-            setConsignees(Array.isArray(data.consignees) ? data.consignees : []);
-            setProducts(Array.isArray(data.products) ? data.products : []);
-            setEmployees(Array.isArray(data.employees) ? data.employees : []);
-            setLocations(Array.isArray(data.locations) ? data.locations : []);
-            masterDataLoadedRef.current = true;
-            return;
-          }
-        } catch {}
-      }
-
-      const token = ++masterLoadTokenRef.current;
-      try {
-        const [wRes, fRes, bRes, cRes, caRes, coRes, pRes, eRes, lRes] = await Promise.allSettled([
-          axios.get("/api/warehouses"),
-          axios.get("/api/farmers"),
-          axios.get("/api/buyer-names"),
-          axios.get("/api/companies"),
-          axios.get("/api/company-accounts"),
-          axios.get("/api/consignee-names"),
-          axios.get("/api/products"),
-          axios.get("/api/employees"),
-          axios.get("/api/locations"),
-        ]);
-        const dataOf = (result) => (result.status === "fulfilled" ? result.value.data : []);
-        if (token !== masterLoadTokenRef.current) return;
-        const data = {
-          warehouses: Array.isArray(dataOf(wRes)) ? dataOf(wRes) : [],
-          farmers: Array.isArray(dataOf(fRes)) ? dataOf(fRes) : [],
-          buyerNames: Array.isArray(dataOf(bRes)) ? dataOf(bRes) : [],
-          companies: Array.isArray(dataOf(cRes)) ? dataOf(cRes) : [],
-          companyAccounts: Array.isArray(dataOf(caRes)) ? dataOf(caRes) : [],
-          consignees: Array.isArray(dataOf(coRes)) ? dataOf(coRes) : [],
-          products: Array.isArray(dataOf(pRes)) ? dataOf(pRes) : [],
-          employees: Array.isArray(dataOf(eRes)) ? dataOf(eRes) : [],
-          locations: Array.isArray(dataOf(lRes)) ? dataOf(lRes) : [],
+          db.all(paymentsQuery, paymentParams, (err3, payments) => {
+            if (err3) return res.status(500).json({ error: err3.message });
+            const totalPurchase = purchases.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+            const totalDeduction = purchases.reduce((sum, row) => {
+              const value =
+                row.total_deduction ??
+                row.total_deduct_amount ??
+                (Number(row.bags_claim || 0) + Number(row.labour || 0) + Number(row.transport_charge || 0));
+              return sum + (Number.isFinite(Number(value)) ? Number(value) : 0);
+            }, 0);
+            const totalPayment = (payments || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
+            const scopedStats = {
+              total_bill: Number(totalPurchase.toFixed(2)),
+              total_purchase: Number(totalPurchase.toFixed(2)),
+              total_deduction: Number(totalDeduction.toFixed(2)),
+              total_payment: Number(totalPayment.toFixed(2)),
+              outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
+            };
+            res.set("Server-Timing", `outstanding;dur=${Date.now() - startedAt}`);
+            res.json({ party_type: "farmer", id, party_id: String(id), farmer_id: String(id), warehouse_id: warehouse_id ? String(warehouse_id) : "", company_account_id: company_account_id ? String(company_account_id) : "", exclude_payment_id: exclude_payment_id ? String(exclude_payment_id) : "", stats: scopedStats, purchases, payments });
+          });
         };
-        setWarehouses(data.warehouses);
-        setFarmers(data.farmers);
-        setBuyerNames(data.buyerNames);
-        setCompanies(data.companies);
-        setCompanyAccounts(data.companyAccounts);
-        setConsignees(data.consignees);
-        setProducts(data.products);
-        setEmployees(data.employees);
-        setLocations(data.locations);
-        masterDataLoadedRef.current = true;
-        try {
-          sessionStorage.setItem("warehouseTradingMasterData:v2", JSON.stringify({
-            time: Date.now(),
-            data,
-          }));
-        } catch {}
-      } catch (err) {
-        if (token === masterLoadTokenRef.current) console.error(err);
-      }
-    })();
 
-    if (!force) masterLoadPromiseRef.current = run;
-    try {
-      return await run;
-    } finally {
-      if (!force) masterLoadPromiseRef.current = null;
-    }
-  };
-
-  const loadWarehouseStockReport = async () => {
-    const token = ++reportLoadTokenRef.current;
-    try {
-      const res = await axios.get("/api/wh-vouchers/report/warehouse-stock");
-      if (token !== reportLoadTokenRef.current) return;
-      setWarehouseStockReport(Array.isArray(res.data) ? res.data : []);
-    } catch (err) {
-      if (token !== reportLoadTokenRef.current) return;
-      console.error(err);
-      setWarehouseStockReport([]);
-    }
-  };
-
-  const fetchNextVoucherNo = async (type) => {
-    try {
-      setVoucherNumberLoading(true);
-      const res = await axios.get(`/api/wh-vouchers/next-voucher-no`, { params: { type } });
-      if (res.data?.voucher_no) {
-        setFormData((prev) => ({ ...prev, voucher_no: prev.voucher_no || res.data.voucher_no }));
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setVoucherNumberLoading(false);
-    }
-  };
-
-  const loadPaymentFarmers = async (companyAccountId, warehouseId = "", excludePaymentId = "") => {
-    const account = String(companyAccountId || "").trim();
-    const warehouse = String(warehouseId || "").trim();
-    if (!account) {
-      setAccountFarmers([]);
-      setPaymentWarehouses([]);
-      return [];
-    }
-    const excludePayment = String(excludePaymentId || "").trim();
-    const key = `${account}::${warehouse}::${excludePayment}`;
-    const cached = paymentFarmersCacheRef.current.get(key);
-    if (cached && Date.now() - cached.time < 60000) {
-      setAccountFarmers(cached.farmers || []);
-      if (!warehouse && Array.isArray(cached.warehouse_ids)) {
-        const ids = new Set(cached.warehouse_ids.map(String));
-        setPaymentWarehouses(warehouses.filter((w) => ids.has(String(w.id || w._id))));
-      }
-      return cached.farmers || [];
-    }
-    const inFlight = paymentFarmersInFlightRef.current.get(key);
-    if (inFlight) return inFlight;
-    const request = axios.get(`/api/wh-vouchers/farmers-by-account/${account}`, {
-      params: {
-        ...(warehouse ? { warehouse_id: warehouse } : {}),
-        ...(excludePayment ? { exclude_payment_id: excludePayment } : {}),
-      },
-    })
-      .then((res) => {
-        const farmersResult = Array.isArray(res.data) ? res.data : [];
-        const warehouseIds = [...new Set(farmersResult.flatMap((f) => Array.isArray(f.warehouse_ids) ? f.warehouse_ids : []))];
-        const data = { farmers: farmersResult, warehouse_ids: warehouseIds, time: Date.now() };
-        paymentFarmersCacheRef.current.set(key, data);
-        setAccountFarmers(farmersResult);
-        if (!warehouse) {
-          const ids = new Set(warehouseIds.map(String));
-          setPaymentWarehouses(warehouses.filter((w) => ids.has(String(w.id || w._id))));
+        if (mongoReady()) {
+          const filter = { farmer_id: String(id || "") };
+          if (warehouse_id) filter.warehouse_id = String(warehouse_id);
+          if (company_account_id) filter.company_account_id = String(company_account_id);
+          PurchaseVoucher.find(filter)
+            .sort({ date: 1, createdAt: 1, _id: 1 })
+            .lean()
+            .then((rows) => decoratePurchaseRows(rows || []))
+            .then((rows) => send(rows.map((row) => ({
+              ...row,
+              amount: Number(row.total_amount || row.net_amount_payable || row.amount || 0),
+            }))))
+            .catch((mongoErr) => res.status(500).json({ error: mongoErr.message }));
+          return;
         }
-        return farmersResult;
-      })
-      .finally(() => paymentFarmersInFlightRef.current.delete(key));
-    paymentFarmersInFlightRef.current.set(key, request);
-    return request;
-  };
 
-  const loadOutstanding = async (partyType, partyId, warehouseId = null, excludePaymentId = null, companyAccountId = null) => {
-    if (!partyType || !partyId) {
-      setPartyOutstanding(null);
-      return null;
-    }
-
-    const warehouse = warehouseId || formData.warehouse_id || "";
-    const key = JSON.stringify({
-      partyType,
-      partyId: String(partyId),
-      warehouse: String(warehouse),
-      excludePaymentId: String(excludePaymentId || ""),
-      companyAccountId: String(companyAccountId || ""),
-    });
-
-    const cached = outstandingCacheRef.current.get(key);
-    if (cached && Date.now() - cached.time < 10000) {
-      setPartyOutstanding(cached.data || null);
-      return cached.data || null;
-    }
-
-    const inFlight = outstandingInFlightRef.current.get(key);
-    if (inFlight) return inFlight;
-
-    const request = (async () => {
-      try {
-        const params = { party_type: partyType, id: partyId };
-        if (warehouse) params.warehouse_id = warehouse;
-        if (excludePaymentId) params.exclude_payment_id = excludePaymentId;
-        if (companyAccountId) params.company_account_id = companyAccountId;
-        const res = await axios.get(`/api/wh-vouchers/outstanding`, { params });
-        const data = res.data || null;
-        outstandingCacheRef.current.set(key, { time: Date.now(), data });
-        setPartyOutstanding(data);
-        return data;
-      } catch (err) {
-        console.error(err);
-        setPartyOutstanding(null);
-        return null;
-      } finally {
-        outstandingInFlightRef.current.delete(key);
-      }
-    })();
-
-    outstandingInFlightRef.current.set(key, request);
-    return request;
-  };
-
-  const loadVouchers = async () => {
-    const token = ++voucherLoadTokenRef.current;
-    try {
-      if (!hasPermission(user, voucherPermissionMap[activeVoucherType])) {
-        if (token !== voucherLoadTokenRef.current) return;
-        setList([]);
-        setVoucherPageInfo({ page: 1, pageSize: PAGE_SIZE, total: 0, totalPages: 1, hasMore: false });
-        return;
-      }
-
-      const params = {
-        page: voucherPage,
-        limit: PAGE_SIZE,
-        order: voucherSortAsc ? "asc" : "desc",
-      };
-      const search = String(globalSearch || "").trim();
-      if (search) params.search = search;
-
-      const res = await axios.get(`/api/wh-vouchers/${activeVoucherType}`, { params });
-      if (token !== voucherLoadTokenRef.current) return;
-
-      const payload = res.data || {};
-      const rows = Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
-      const pagination = Array.isArray(payload) ? null : payload.pagination;
-      setList(rows);
-      setVoucherPageInfo({
-        page: pagination?.page || voucherPage,
-        pageSize: pagination?.pageSize || PAGE_SIZE,
-        total: Number(pagination?.total ?? rows.length),
-        totalPages: Math.max(1, Number(pagination?.totalPages || Math.ceil(Number(pagination?.total ?? rows.length) / PAGE_SIZE))),
-        hasMore: Boolean(pagination?.hasMore),
-      });
-    } catch (err) {
-      if (token !== voucherLoadTokenRef.current) return;
-      console.error(err);
-      setList([]);
-      setVoucherPageInfo({ page: voucherPage, pageSize: PAGE_SIZE, total: 0, totalPages: 1, hasMore: false });
-    }
-  };
-
-  const loadSalePurchaseRows = async () => {
-    try {
-      if (!hasPermission(user, voucherPermissionMap.purchase)) {
-        setSalePurchaseRows([]);
-        return;
-      }
-      // This is a form lookup, not the main voucher table. Keep it explicit so
-      // the table itself remains strictly paginated.
-      const res = await axios.get("/api/wh-vouchers/purchase", { params: { page: 1, limit: 100, lookup: 1, order: "asc", warehouse_id: formData.warehouse_id || undefined, farmer_id: formData.against_purchase_farmer_id || undefined, company_account_id: formData.company_account_id || undefined, product_id: formData.product_id || undefined } });
-      const payload = res.data || {};
-      const rows = Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
-      setSalePurchaseRows(rows);
-    } catch (err) {
-      console.error(err);
-      setSalePurchaseRows([]);
-    }
-  };
-
-  const loadReportFilterOptions = async (reportType = activeReport, filters = reportFilters) => {
-    const supported = ["purchase", "purchase-party-ledger", "sale", "sale-party-ledger", "sale-followup", "sale-journey"].includes(reportType);
-    if (!supported) {
-      setReportFilterOptions({ account_ids: [], warehouse_ids: [], farmer_ids: [], buyer_ids: [], accounts: [], warehouses: [], farmers: [], buyers: [] });
-      return;
-    }
-    try {
-      const params = {};
-      if (filters.company_account_id) params.company_account_id = filters.company_account_id;
-      if (filters.warehouse_id) params.warehouse_id = filters.warehouse_id;
-      if (filters.farmer_id) params.farmer_id = filters.farmer_id;
-      if (filters.sale_buyer_id) params.buyer_id = filters.sale_buyer_id;
-
-      const cacheKey = JSON.stringify({ reportType, params });
-      const cached = reportFilterCacheRef.current.get(cacheKey);
-      if (cached && Date.now() - cached.time < 5 * 60 * 1000) {
-        setReportFilterOptions(cached.data);
-        return;
-      }
-
-      const inFlight = reportFilterInFlightRef.current.get(cacheKey);
-      if (inFlight) {
-        const data = await inFlight;
-        if (data) setReportFilterOptions(data);
-        return;
-      }
-
-      const request = axios
-        .get("/api/wh-vouchers/report/filter-options", { params: { ...params, type: reportType } })
-        .then((res) => {
-          const nextData = {
-            account_ids: Array.isArray(res.data?.account_ids) ? res.data.account_ids : [],
-            warehouse_ids: Array.isArray(res.data?.warehouse_ids) ? res.data.warehouse_ids : [],
-            farmer_ids: Array.isArray(res.data?.farmer_ids) ? res.data.farmer_ids : [],
-            buyer_ids: Array.isArray(res.data?.buyer_ids) ? res.data.buyer_ids : [],
-            accounts: Array.isArray(res.data?.accounts) ? res.data.accounts : [],
-            warehouses: Array.isArray(res.data?.warehouses) ? res.data.warehouses : [],
-            farmers: Array.isArray(res.data?.farmers) ? res.data.farmers : [],
-            buyers: Array.isArray(res.data?.buyers) ? res.data.buyers : [],
-          };
-          reportFilterCacheRef.current.set(cacheKey, { time: Date.now(), data: nextData });
-          return nextData;
-        })
-        .finally(() => {
-          reportFilterInFlightRef.current.delete(cacheKey);
+        detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount FROM wh_purchase_vouchers WHERE farmer_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+        db.all(detailsQuery, params, (err2, purchases) => {
+          if (err2) return res.status(500).json({ error: err2.message });
+          send(purchases || []);
         });
+      }, exclude_payment_id);
+    return;
+  }
 
-      reportFilterInFlightRef.current.set(cacheKey, request);
-      const nextData = await request;
-      setReportFilterOptions(nextData);
-    } catch (err) {
-      console.error("Failed to load Trading report filters:", err);
-      setReportFilterOptions({ account_ids: [], warehouse_ids: [], farmer_ids: [], buyer_ids: [], accounts: [], warehouses: [], farmers: [], buyers: [] });
+  if (party_type === "company") {
+    if (warehouse_id) {
+      filters.push("warehouse_id = ?");
+      params.push(warehouse_id);
     }
-  };
-
-  const loadReport = async (reportType = activeReport, page = reportPage, filters = reportFilters) => {
-    const token = ++reportLoadTokenRef.current;
-    // Keep report-type flags outside try/catch. The previous v8.9 build
-    // declared isSaleReport inside try and then referenced it from catch,
-    // which caused: "isSaleReport is not defined" and hid the real API error.
-    const isPurchaseReport = ["purchase", "purchase-party-ledger"].includes(reportType);
-    const isSaleReport = ["sale", "sale-party-ledger", "sale-followup", "sale-journey"].includes(reportType);
-    const hasActivePurchaseFilters = Boolean(filters.farmer_id || filters.warehouse_id || filters.company_account_id);
-    const normalizedSearch = String(globalSearch || "").trim();
-
-    // Do not keep stale Purchase rows visible while Sale Report is loading.
-    if (token === reportLoadTokenRef.current) {
-      setReportData([]);
+    if (location_id) {
+      filters.push("location_id = ?");
+      params.push(location_id);
+    }
+    if (company_account_id) {
+      filters.push("CAST(company_account_id AS TEXT) = CAST(? AS TEXT)");
+      params.push(company_account_id);
     }
 
-    try {
-      if (!hasPermission(user, reportPermissionMap[reportType])) {
-        if (token !== reportLoadTokenRef.current) return;
-        setReportData([]);
-        setWarehouseStockReport([]);
-        return;
+    const getSaleRows = (callback) => {
+      if (mongoReady()) {
+        const filter = {
+          $or: [
+            { buyer_id: String(id || "") },
+            { company_id: String(id || "") },
+          ],
+        };
+        if (warehouse_id) filter.warehouse_id = String(warehouse_id);
+        if (company_account_id) filter.company_account_id = String(company_account_id);
+        return SaleVoucher.find(filter)
+          .sort({ date: 1, createdAt: 1, _id: 1 })
+          .lean()
+          .then((rows) => callback(null, (rows || []).map((row) => ({
+            ...row,
+            id: String(row._id),
+            amount: Number(row.net_receivable_amount || row.amount || 0),
+          })))).catch(callback);
       }
-      const endpoint = reportEndpointMap[reportType] || reportType;
-      const params = {};
-      if (isPurchaseReport || isSaleReport) {
-        if (filters.farmer_id) params.farmer_id = filters.farmer_id;
-        if (filters.warehouse_id) params.warehouse_id = filters.warehouse_id;
-        if (filters.company_account_id) params.company_account_id = filters.company_account_id;
-      }
-      if (isSaleReport && filters.sale_buyer_id) {
-        params.buyer_id = filters.sale_buyer_id;
-      }
-      if (reportType === "purchase-party-ledger" && filters.details_of_deduction) {
-        params.details_of_deduction = 1;
-      }
-      // Search must be executed by MongoDB before pagination. Otherwise the
-      // old UI searched only the currently loaded 15 rows.
-      if ((reportType === "sale" || reportType === "purchase") && normalizedSearch) {
-        params.search = normalizedSearch;
-      }
-      if (reportType === "sale-journey") {
-        if (filters.sale_journey_token) params.journey_token = filters.sale_journey_token;
-        if (filters.sale_lorry_no) params.lorry_no = filters.sale_lorry_no;
-        if (filters.sale_bill_no) params.bill_no = filters.sale_bill_no;
-      }
-      if (!params.company_account_id && filters.sale_company_account_id) {
-        params.company_account_id = filters.sale_company_account_id;
-      }
-      const serverPagedReport = reportType === "sale" || reportType === "purchase" || reportType === "warehouse-stock";
-      if (serverPagedReport) {
-        params.page = page;
-        params.page_size = PAGE_SIZE;
-      }
-      const res = await axios.get(`/api/wh-vouchers/report/${endpoint}`, { params });
-      if (token !== reportLoadTokenRef.current) return;
-      const payload = res.data || [];
-      const rows = Array.isArray(payload) ? payload : Array.isArray(payload.data) ? payload.data : [];
-      const pagination = Array.isArray(payload) ? null : payload.pagination || null;
-      if (reportType === "warehouse-stock") {
-        setWarehouseStockReport(rows);
-        setReportData(rows);
-        setReportPageInfo({
-          page: pagination?.page || page,
-          pageSize: pagination?.pageSize || PAGE_SIZE,
-          total: pagination?.total ?? rows.length,
-          hasMore: Boolean(pagination?.hasMore),
-        });
-        return;
-      }
-      if (reportType === "purchase" && rows.length === 0 && hasActivePurchaseFilters && hasPermission(user, voucherPermissionMap.purchase)) {
-        setReportData([]);
-        return;
-      }
-      setReportData(rows);
-      if (serverPagedReport) {
-        setReportPageInfo({
-          page: pagination?.page || page,
-          pageSize: pagination?.pageSize || PAGE_SIZE,
-          total: pagination?.total ?? rows.length,
-          hasMore: Boolean(pagination?.hasMore),
-        });
-      }
-    } catch (err) {
-      if (token !== reportLoadTokenRef.current) return;
-      console.error(err);
-      if (reportType === "warehouse-stock") {
-        setWarehouseStockReport([]);
-        setReportData([]);
-        return;
-      }
-      if (reportType === "purchase" && hasPermission(user, voucherPermissionMap.purchase) && !hasActivePurchaseFilters) {
-        try {
-          const fallbackRes = await axios.get("/api/wh-vouchers/purchase", { params: { page: 1, limit: PAGE_SIZE, order: "desc" } });
-          if (token !== reportLoadTokenRef.current) return;
-          const fallbackPayload = fallbackRes.data || [];
-          setReportData(Array.isArray(fallbackPayload) ? fallbackPayload : (fallbackPayload.data || []));
-          return;
-        } catch (fallbackErr) {
-          console.error(fallbackErr);
-        }
-      }
-      if (reportType === "sale" && canUseSale) {
-        try {
-          // Only Sale Summary uses the sale-voucher fallback. Do not use it
-          // for Party Ledger/Follow-up/Journey because those endpoints have
-          // different response shapes.
-          const fallbackRes = await axios.get("/api/wh-vouchers/sale", {
-            params: { page: page || 1, limit: PAGE_SIZE, order: "desc", ...params },
-          });
-          if (token !== reportLoadTokenRef.current) return;
-          const fallbackPayload = fallbackRes.data || [];
-          const fallbackRows = Array.isArray(fallbackPayload) ? fallbackPayload : (fallbackPayload.data || []);
-          setReportData(fallbackRows);
-          const fallbackPagination = Array.isArray(fallbackPayload) ? null : fallbackPayload.pagination;
-          setReportPageInfo({
-            page: fallbackPagination?.page || page || 1,
-            pageSize: fallbackPagination?.pageSize || PAGE_SIZE,
-            total: fallbackPagination?.total ?? fallbackRows.length,
-            hasMore: Boolean(fallbackPagination?.hasMore),
-          });
-          return;
-        } catch (fallbackSaleErr) {
-          console.error("Sale report fallback failed:", fallbackSaleErr);
-        }
-      }
-      setReportData([]);
-    }
-  };
 
-  const handlePaymentModeChange = async (nextMode, opts = {}) => {
-    const normalizedMode = normalizePaymentMode(nextMode);
-    const amountVal = opts.amount !== undefined ? opts.amount : formData.amount;
-    const farmerVal = opts.farmer_id !== undefined ? opts.farmer_id : formData.farmer_id;
-    const warehouseVal = opts.warehouse_id !== undefined ? opts.warehouse_id : formData.warehouse_id;
-    const companyAccountVal = opts.company_account_id !== undefined ? opts.company_account_id : formData.company_account_id;
+      detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT) ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+      db.all(detailsQuery, params, (err2, sales) => (err2 ? callback(err2) : callback(null, sales || [])));
+    };
 
-    setFormData((prev) => ({
-      ...prev,
-      payment_mode: normalizedMode,
-      reference_type: getPaymentReferenceType(normalizedMode),
-      reference_id: normalizedMode === "new_reference" ? prev.reference_id : "",
-    }));
-    setPaymentAdjustments([]);
-    setShowPaymentAdjustPopup(false);
+    paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
+    computeOutstandingForCompany(id, (err, stats) => {
+      if (err) return res.status(500).json({ error: err.message });
+      getReceiptAdjustmentsBySale((adjustErr, adjustedMap) => {
+        if (adjustErr) return res.status(500).json({ error: adjustErr.message });
 
-    // Selecting "Against Purchase Bills" must not make a network request or
-    // open the adjustment panel automatically. The user explicitly opens it.
-    // Keep the values local until Open Adjustment is clicked.
-  };
+        getSaleRows((err2, sales) => {
+          if (err2) return res.status(500).json({ error: err2.message });
 
-  const handleChange = (e) => {
-    const { name, type, checked, value } = e.target;
-    const fieldValue = type === "checkbox" ? checked : value;
+          const receiptsFilter = filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : "";
+          const receiptExcludeClause = exclude_payment_id ? `AND CAST(id AS TEXT) <> CAST(? AS TEXT)` : "";
+          const receiptParams = [...params];
+          if (exclude_payment_id) receiptParams.push(exclude_payment_id);
+          const receiptsQuery = `${paymentsQuery} ${receiptExcludeClause}`.trim();
 
-    if (activeVoucherType === "payment" && name === "payment_mode") {
-      handlePaymentModeChange(value, { amount: formData.amount, farmer_id: formData.farmer_id, warehouse_id: formData.warehouse_id, company_account_id: formData.company_account_id });
-      return;
-    }
+          db.all(receiptsQuery, receiptParams, (err3, receipts) => {
+            if (err3) return res.status(500).json({ error: err3.message });
 
-    setFormData((prev) => {
-      const next = { ...prev, [name]: fieldValue };
-      if (name === "warehouse_id") {
-        const warehouse = warehouses.find((w) => String(w.id || w._id) === String(value));
-        next.location_id = getRecordId(warehouse?.location_id);
-        next.employee_id = getRecordId(warehouse?.employee_id) || prev.employee_id || "";
-      }
-      if (activeVoucherType === "sale" && name === "buyer_id") {
-        next.company_id = value;
-        next.consignee_id = "";
-      }
-      if (activeVoucherType === "sale" && name === "consignee_id") {
-        const consignee = consignees.find((c) => String(c.id || c._id) === String(value));
-        const linkedBuyerIds = getConsigneeBuyerIds(consignee);
-        if (linkedBuyerIds.length) {
-          const currentBuyer = String(prev.buyer_id || prev.company_id || "");
-          const nextBuyer = linkedBuyerIds.includes(currentBuyer) ? currentBuyer : linkedBuyerIds[0];
-          next.buyer_id = nextBuyer;
-          next.company_id = nextBuyer;
-        }
-      }
-      if (name === "voucher_no") {
-        next.bill_no = value;
-      }
-      if (name === "date") {
-        next.bill_date = value;
-      }
-      if (name === "description") {
-        next.journey_note = value;
-      }
-      if (name === "lorry_no" && !next.journey_token && editId) {
-        next.journey_token = buildJourneyToken();
-      }
-      if ((name === "date" || name === "bill_date") && !next.journey_token && editId) {
-        next.journey_token = buildJourneyToken();
-      }
-      if (activeVoucherType === "sale" && name === "unloading_date") {
-        const dueDays = toNumber(prev.due_days);
-        if (value && dueDays > 0) {
-          const parsed = new Date(`${value}T00:00:00Z`);
-          if (!Number.isNaN(parsed.getTime())) {
-            parsed.setUTCDate(parsed.getUTCDate() + dueDays);
-            next.due_date = parsed.toISOString().slice(0, 10);
-          }
-        } else if (!dueDays) {
-          next.due_date = "";
-        }
-      }
-      if (activeVoucherType === "sale" && name === "due_days") {
-        const unloadingDate = prev.unloading_date || "";
-        next.due_date = unloadingDate && value ? (() => {
-          const parsed = new Date(`${unloadingDate}T00:00:00Z`);
-          if (Number.isNaN(parsed.getTime())) return unloadingDate;
-          parsed.setUTCDate(parsed.getUTCDate() + toNumber(value));
-          return parsed.toISOString().slice(0, 10);
-        })() : next.due_date;
-      }
-      if (
-        activeVoucherType === "sale" &&
-        ["dispatch_qty", "gross_weight", "tare_weight", "quantity", "unloading_qty", "shortage_quantity", "rate"].includes(name)
-      ) {
-        const derivedDispatchQty = saleDispatchQtyFromData(next);
-        const derivedShortageQty = Math.max(derivedDispatchQty - toNumber(next.unloading_qty), 0);
-        next.shortage_quantity = formatDecimal4(derivedShortageQty);
-        next.shortage_amount = formatMoney(derivedShortageQty * toNumber(next.rate));
-        if (!editId) {
-          next.amount = saleGrossAmountFromData(next).toFixed(2);
-        }
-      }
-      if (activeVoucherType === "sale" && name === "cd_percent") {
-        const gross = saleGrossAmountFromData(next);
-        next.cd_amount = (gross * toNumber(value) / 100).toFixed(2);
-      }
-      if (activeVoucherType === "sale" && name === "sale_type") {
-        next.against_purchase_enabled = false;
-        next.against_purchase_farmer_id = "";
-        if (value === "direct") next.warehouse_id = "";
-      }
-      return next;
-    });
-
-    if (
-      activeVoucherType === "sale" &&
-      ["sale_type", "against_purchase_enabled", "against_purchase_farmer_id", "company_account_id", "product_id", "warehouse_id"].includes(name)
-    ) {
-      setSalePurchaseLinks([]);
-    }
-
-    if (activeVoucherType === "payment" && name === "company_account_id") {
-      if (value) {
-        loadPaymentFarmers(value, "", editId).catch((err) => {
-          console.error("Failed to load payment account filters:", err);
-          setAccountFarmers([]);
-          setPaymentWarehouses([]);
-        });
-        setFormData((prev) => ({ ...prev, warehouse_id: "", farmer_id: "" }));
-        setPartyOutstanding(null);
-        setPaymentAdjustments([]);
-        setShowPaymentAdjustPopup(false);
-      } else {
-        setAccountFarmers([]);
-        setPaymentWarehouses([]);
-        setPartyOutstanding(null);
-        setPaymentAdjustments([]);
-        setShowPaymentAdjustPopup(false);
-      }
-    }
-    if (activeVoucherType === "payment" && name === "warehouse_id") {
-      if (value && formData.company_account_id) {
-        const selected = warehouses.find((w) => String(w.id || w._id) === String(value));
-        if (selected) {
-          setFormData((prev) => ({
-            ...prev,
-            location_id: prev.location_id || selected.location_id || "",
-            employee_id: prev.employee_id || selected.employee_id || "",
-            farmer_id: "",
-          }));
-        }
-        loadPaymentFarmers(formData.company_account_id, value, editId).catch(() => setAccountFarmers([]));
-        setPartyOutstanding(null);
-        setPaymentAdjustments([]);
-        setShowPaymentAdjustPopup(false);
-      } else if (!value) {
-        setAccountFarmers([]);
-        setPartyOutstanding(null);
-        setPaymentAdjustments([]);
-        setShowPaymentAdjustPopup(false);
-      }
-    }
-    if (activeVoucherType === "payment" && name === "farmer_id") {
-      if (value) {
-        loadOutstanding("farmer", value, formData.warehouse_id, editId, formData.company_account_id);
-      } else {
-        setPartyOutstanding(null);
-      }
-    }
-    if (activeVoucherType === "receipt" && name === "company_id") {
-      if (value) {
-        loadOutstanding("company", value, formData.warehouse_id, null, formData.company_account_id).then(() => {
-          if (toNumber(formData.amount) > 0) {
-            setShowReceiptAdjustPopup(true);
-          }
-        });
-      } else {
-        setPartyOutstanding(null);
-        setReceiptAdjustments([]);
-        setShowReceiptAdjustPopup(false);
-      }
-    }
-    if (activeVoucherType === "sale" && (name === "buyer_id" || name === "company_id")) {
-      if (value) {
-        loadOutstanding("company", value, formData.warehouse_id, null, formData.company_account_id);
-      } else {
-        setPartyOutstanding(null);
-      }
-    }
-    if (name === "warehouse_id") {
-      if (activeVoucherType === "payment" && formData.farmer_id && value) {
-        loadOutstanding("farmer", formData.farmer_id, value, editId, formData.company_account_id);
-      }
-      if (activeVoucherType === "receipt" && formData.company_id) {
-        loadOutstanding("company", formData.company_id, value, null, formData.company_account_id);
-      }
-      if (activeVoucherType === "sale" && (formData.buyer_id || formData.company_id)) {
-        loadOutstanding("company", formData.buyer_id || formData.company_id, value, null, formData.company_account_id);
-      }
-    }
-    if ((activeVoucherType === "receipt" || activeVoucherType === "sale") && name === "company_account_id" && (formData.company_id || formData.buyer_id)) {
-      loadOutstanding("company", formData.company_id || formData.buyer_id, formData.warehouse_id, null, value);
-    }
-    if (activeVoucherType === "payment" && name === "amount") {
-      // Amount entry must stay local. Do not open the adjustment panel or
-      // trigger any report/ledger request automatically. The user can click
-      // "Open Adjustment" when ready; Auto Adjust remains available there.
-      if (toNumber(value) <= 0) {
-        setPaymentAdjustments([]);
-        setShowPaymentAdjustPopup(false);
-      }
-    }
-    if (activeVoucherType === "receipt" && name === "amount") {
-      if (toNumber(value) > 0 && formData.company_id) {
-        setShowReceiptAdjustPopup(true);
-      } else {
-        setReceiptAdjustments([]);
-        setShowReceiptAdjustPopup(false);
-      }
-    }
-  };
-
-  const buildWhatsappShareUrl = (message) => `https://wa.me/?text=${encodeURIComponent(message)}`;
-
-  const sharePurchasePdfOnWhatsapp = async (voucherId, voucherNo, voucherDate) => {
-    const response = await axios.get(`/api/wh-vouchers/purchase/${voucherId}/pdf`, {
-      responseType: "blob",
-    });
-    const pdfBlob = new Blob([response.data], { type: "application/pdf" });
-    const fileName = `Purchase-Voucher-${voucherNo || voucherId}.pdf`;
-    const pdfFile = new File([pdfBlob], fileName, { type: "application/pdf" });
-    const whatsappMessage = [
-      "Purchase voucher attached.",
-      `Voucher No: ${voucherNo || voucherId}`,
-      `Date: ${formatLedgerDate(voucherDate)}`,
-    ].join("\n");
-
-    const pdfUrl = window.URL.createObjectURL(pdfBlob);
-    const link = document.createElement("a");
-    link.href = pdfUrl;
-    link.download = fileName;
-    document.body.appendChild(link);
-    link.click();
-    link.parentNode.removeChild(link);
-    window.open(buildWhatsappShareUrl(`${whatsappMessage}\nPlease attach the downloaded PDF in WhatsApp.`), "_blank", "noopener,noreferrer");
-    window.URL.revokeObjectURL(pdfUrl);
-  };
-
-  const saveVoucher = async () => {
-    if (!formData.voucher_no || !formData.date) {
-      alert("Voucher no. and date are required");
-      return;
-    }
-    if (activeVoucherType === "payment") {
-      const paymentAmount = toNumber(formData.amount);
-      const paymentMode = normalizePaymentMode(formData.payment_mode);
-      if (!formData.farmer_id) {
-        alert("Please select farmer");
-        return;
-      }
-      if (paymentAmount <= 0) {
-        alert("Please enter payment amount first");
-        return;
-      }
-      if (paymentMode === "against" && Math.abs(paymentAdjustmentTotal - paymentAmount) > 0.0001) {
-        setShowPaymentAdjustPopup(true);
-        alert("Payment amount and adjustment amount must match before saving");
-        return;
-      }
-    }
-    if (activeVoucherType === "receipt") {
-      const receiptAmount = toNumber(formData.amount);
-      if (!formData.company_id) {
-        alert("Please select company");
-        return;
-      }
-      if (receiptAmount <= 0) {
-        alert("Please enter receipt amount first");
-        return;
-      }
-      if (Math.abs(receiptAdjustmentTotal - receiptAmount) > 0.0001) {
-        setShowReceiptAdjustPopup(true);
-        alert("Receipt amount and adjustment amount must match before saving");
-        return;
-      }
-    }
-    if (activeVoucherType === "sale") {
-      if (formData.sale_type !== "direct" && !formData.warehouse_id) {
-        alert("Please select warehouse");
-        return;
-      }
-      if (formData.sale_type === "direct") {
-        if (!formData.location_id) {
-          alert("Please select location for direct sale");
-          return;
-        }
-        if (!formData.farmer_id) {
-          alert("Please select farmer for direct sale purchase entry");
-          return;
-        }
-        if (toNumber(formData.direct_purchase_rate) <= 0) {
-          alert("Please enter purchase rate for direct sale");
-          return;
-        }
-      }
-      if (!formData.company_account_id) {
-        alert("Please select account");
-        return;
-      }
-      if (formData.sale_type !== "direct" && formData.against_purchase_enabled) {
-        if (!formData.against_purchase_farmer_id) {
-          alert("Please select farmer for Against Purchase Bill");
-          return;
-        }
-        if (salePurchaseLinks.length === 0 || againstPurchaseTotalQty <= 0) {
-          alert("Please enter quantity against at least one farmer purchase bill");
-          return;
-        }
-        const saleQty = saleDispatchQtyFromData(formData);
-        if (againstPurchaseTotalQty > saleQty + 0.0001) {
-          alert("Against purchase quantity cannot exceed sale quantity");
-          return;
-        }
-      }
-    }
-    setLoading(true);
-    try {
-      const numericFields = [
-        "quantity",
-        "dispatch_qty",
-        "shortage_quantity",
-        "unloading_qty",
-        "rate",
-        "amount",
-        "claim_amount",
-        "other_deduction",
-        "cd_percent",
-        "cd_amount",
-        "adjustment_amount",
-        "tds_amount",
-        "direct_purchase_rate",
-        "direct_purchase_amount",
-        "net_receivable_amount",
-        "fifo_rate",
-        "fifo_amount",
-        "packet",
-        "gross_weight",
-        "tare_weight",
-        "dhalta",
-        "less_bags_weight",
-        "moisture",
-        "dunki",
-        "fungus",
-        "discolour",
-        "others",
-        "transport_charge",
-        "net_weight",
-        "bags_claim",
-        "labour",
-        "total_deduct_amount",
-        "total_qty",
-        "total_deduction",
-        "net_amount_payable",
-        "round_off",
-      ];
-      const payload = { ...formData };
-      numericFields.forEach((field) => {
-        payload[field] = formData[field] ? Number(formData[field]) : 0;
-      });
-      if (activeVoucherType === "purchase") {
-        payload.quantity = safePurchaseNetWeight;
-        payload.net_weight = safePurchaseNetWeight;
-        payload.total_qty = safePurchaseNetWeight;
-        payload.claim_amount = purchaseClaimAmount;
-        payload.bags_claim = purchaseClaimAmount;
-        payload.cd_amount = toNumber(formData.cd_amount);
-        payload.tds_amount = toNumber(formData.tds_amount);
-        payload.other_deduction = toNumber(formData.other_deduction);
-        payload.adjustment_amount = toNumber(formData.adjustment_amount);
-        payload.transport_charge = toNumber(formData.transport_charge);
-        payload.total_deduct_amount = purchaseTotalDeduction;
-        payload.total_deduction = purchaseTotalDeduction;
-        payload.amount = purchaseNetPayable;
-        payload.net_amount_payable = purchaseNetPayable;
-        payload.location_id = payload.location_id || selectedWarehouse?.location_id || "";
-      }
-      if (activeVoucherType === "sale") {
-        payload.buyer_id = payload.buyer_id || payload.company_id || "";
-        payload.company_id = payload.buyer_id;
-        payload.dispatch_qty = saleDispatchQtyFromData(formData);
-        payload.quantity = payload.dispatch_qty;
-        payload.unloading_qty = payload.quantity;
-        payload.amount = saleGrossAmountFromData(formData);
-        const grossAmount = payload.amount;
-        const claimAmount = Number(formData.claim_amount) || 0;
-        const otherDeduction = Number(formData.other_deduction) || 0;
-        const cdAmount = Number(payload.cd_amount) || Number((grossAmount * (Number(formData.cd_percent) || 0) / 100).toFixed(2)) || 0;
-        const adjustmentAmount = Number(formData.adjustment_amount) || 0;
-        const tdsAmount = Number(formData.tds_amount) || 0;
-        const roundOff = Number(formData.round_off) || 0;
-        payload.cd_amount = cdAmount;
-        const netAmount = grossAmount - claimAmount - otherDeduction - cdAmount - adjustmentAmount - tdsAmount + roundOff;
-        payload.net_amount = netAmount;
-        payload.net_amount_payable = netAmount;
-        payload.net_receivable_amount = netAmount;
-        payload.outstanding = netAmount;
-        const qtyForFifo = Number(payload.unloading_qty || payload.quantity) || 0;
-        payload.fifo_rate = qtyForFifo > 0 ? grossAmount / qtyForFifo : 0;
-        payload.fifo_amount = grossAmount;
-        payload.sale_type = formData.sale_type === "direct" ? "direct" : "warehouse";
-        payload.direct_purchase_amount = payload.sale_type === "direct"
-          ? Number((payload.quantity * toNumber(formData.direct_purchase_rate)).toFixed(2))
-          : 0;
-        payload.against_purchase_enabled = payload.sale_type !== "direct" && Boolean(formData.against_purchase_enabled && salePurchaseLinks.length);
-        payload.against_purchase_farmer_id = payload.sale_type === "direct" ? formData.farmer_id : (formData.against_purchase_farmer_id || "");
-        payload.against_purchase_links = payload.against_purchase_enabled ? salePurchaseLinks : [];
-        payload.create_against_purchase = payload.sale_type === "direct" && !editId;
-        if (payload.sale_type === "direct") payload.warehouse_id = "";
-      }
-      if (activeVoucherType === "payment") {
-        const paymentMode = normalizePaymentMode(formData.payment_mode);
-        const paymentAdjustmentsPayload = paymentAdjustments
-          .filter((item) => toNumber(item.adjusted_amount) > 0)
-          .map((item) => ({
-            purchase_id: item.purchase_id,
-            voucher_no: item.voucher_no || item.purchase_voucher_no || "",
-            adjusted_amount: toNumber(item.adjusted_amount),
-          }));
-        payload.payment_mode = paymentMode;
-        payload.adjustments = paymentMode === "against" ? paymentAdjustmentsPayload : [];
-        payload.reference_type = getPaymentReferenceType(paymentMode);
-        payload.reference_id = paymentMode === "against"
-          ? paymentAdjustments
-            .map((item) => item.voucher_no || item.purchase_voucher_no || item.purchase_id)
-            .filter(Boolean)
-            .join(", ")
-          : paymentMode === "new_reference"
-            ? formData.reference_id || ""
-            : "";
-      }
-      if (activeVoucherType === "receipt") {
-        payload.adjustments = receiptAdjustments
-          .filter((item) => toNumber(item.adjusted_amount) > 0)
-          .map((item) => ({
-            sale_id: item.sale_id,
-            voucher_no: item.voucher_no || item.sale_voucher_no || "",
-            adjusted_amount: toNumber(item.adjusted_amount),
-          }));
-        payload.reference_type = "sale";
-        payload.reference_id = receiptAdjustments
-          .map((item) => item.voucher_no || item.sale_voucher_no || item.sale_id)
-          .filter(Boolean)
-          .join(", ");
-      }
-      
-      const isEdit = editId && String(editId).trim();
-      const url = isEdit ? `/api/wh-vouchers/${activeVoucherType}/${editId}` : `/api/wh-vouchers/${activeVoucherType}`;
-      const requestHeaders = typeof window !== "undefined" && localStorage.getItem("token")
-        ? { Authorization: `Bearer ${localStorage.getItem("token")}` }
-        : {};
-      const res = isEdit
-        ? await axios.put(url, payload, { headers: requestHeaders })
-        : await axios.post(url, payload, { headers: requestHeaders });
-      
-      alert(`Voucher ${isEdit ? "updated" : "saved"} successfully`);
-      if (res.data?.stats) {
-        setPartyOutstanding(res.data.stats);
-      }
-      setFormData(defaultForm());
-      setPaymentAdjustments([]);
-      setReceiptAdjustments([]);
-      setSalePurchaseLinks([]);
-      setPartyOutstanding(null);
-      setShowPaymentAdjustPopup(false);
-      setShowReceiptAdjustPopup(false);
-      setEditId(null);
-      setVoucherPage(1);
-      await loadVouchers();
-      if (!isEdit) fetchNextVoucherNo(activeVoucherType);
-
-      if (activeVoucherType === "purchase") {
-        const shouldShare = window.confirm("Purchase voucher saved. Do you want to send the PDF on WhatsApp?");
-        if (shouldShare) {
-          try {
-            await sharePurchasePdfOnWhatsapp(res.data?.id || res.data?.voucher_id || res.data?.insertId || formData.voucher_no, formData.voucher_no, formData.date);
-          } catch (shareErr) {
-            console.error("WhatsApp share failed:", shareErr);
-            alert("Voucher saved, but WhatsApp share could not be completed.");
-          }
-        }
-        if (purchasePreviewRow) {
-          const nextFilters = {
-            ...reportFilters,
-            farmer_id: purchasePreviewRow.farmer_id || reportFilters.farmer_id,
-            warehouse_id: purchasePreviewRow.warehouse_id || reportFilters.warehouse_id,
-            company_account_id:
-              purchasePreviewRow.company_account_id || purchasePreviewRow.account_id || reportFilters.company_account_id,
-          };
-          setShowPurchasePreview(false);
-          setPurchasePreviewRow(null);
-          setPurchasePreviewOpenedFromLedger(false);
-          setActiveTab("reports");
-          if (purchasePreviewOpenedFromLedger) {
-            setActiveReport("purchase-party-ledger");
-            setReportPage(1);
-            setReportFilters(nextFilters);
-            await loadReport("purchase-party-ledger", 1, nextFilters);
-          } else {
-            setActiveReport("purchase");
-            await loadReport("purchase", 1, nextFilters);
-          }
-          return;
-        }
-      }
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || `Failed to ${editId ? "update" : "save"} voucher`);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleFormKeyDown = (event) => {
-    if (event.key !== "Enter") return;
-
-    const target = event.target;
-    const isButtonTarget = target?.tagName === "BUTTON" || target?.closest("button");
-    const isSubmitButton = isButtonTarget && (target?.type === "submit" || target?.closest("button[type='submit']"));
-
-    if (isSubmitButton || isButtonTarget) {
-      return;
-    }
-
-    if (target && ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
-  };
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    // For purchase vouchers we allow direct save from the form (preview is optional)
-    await saveVoucher();
-  };
-
-  const isPurchaseVoucher = activeVoucherType === "purchase";
-  const isPaymentVoucher = activeVoucherType === "payment";
-  const isReceiptVoucher = activeVoucherType === "receipt";
-  const isSaleVoucher = activeVoucherType === "sale";
-  const activePaymentMode = normalizePaymentMode(formData.payment_mode);
-
-  const handleDeleteVoucher = async (voucherId) => {
-    if (!window.confirm("Are you sure you want to delete this voucher?")) return;
-    try {
-      await axios.delete(`/api/wh-vouchers/${activeVoucherType}/${voucherId}`);
-      alert("Voucher deleted successfully");
-      loadVouchers();
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Failed to delete voucher");
-    }
-  };
-
-  const handleEditVoucher = async (voucherId) => {
-    const voucher = list.find((v) => String(v.id || v._id) === String(voucherId));
-    if (!voucher) return;
-
-    try {
-      if (activeVoucherType === "receipt") {
-        setLoading(true);
-        const res = await axios.get(`/api/wh-vouchers/receipt/${voucherId}`);
-        const receipt = res.data;
-        setFormData({ ...defaultForm(), ...receipt });
-        const existingAdjustments = Array.isArray(receipt.adjustments)
-          ? receipt.adjustments.map((item) => ({
-              sale_id: String(item.sale_id || item.id || ""),
-              voucher_no: item.voucher_no || item.sale_voucher_no || "",
-              adjusted_amount: toNumber(item.adjusted_amount),
-            })).filter((item) => item.sale_id && item.adjusted_amount > 0)
-          : [];
-        setReceiptAdjustments(existingAdjustments);
-        if (receipt.company_id) {
-          loadOutstanding("company", receipt.company_id, receipt.warehouse_id, null, receipt.company_account_id);
-        }
-      } else {
-        setFormData({
-          ...defaultForm(),
-          ...voucher,
-          due_date: voucher.due_date || voucher.unloading_date || "",
-        });
-        if (activeVoucherType === "sale") {
-          const existingLinks = Array.isArray(voucher.against_purchase_links)
-            ? voucher.against_purchase_links.map((item) => ({
-                purchase_id: String(item.purchase_id || item.id || ""),
-                voucher_no: item.voucher_no || item.purchase_voucher_no || "",
-                farmer_id: String(item.farmer_id || voucher.against_purchase_farmer_id || ""),
-                quantity: toNumber(item.quantity),
-                rate: toNumber(item.rate),
-                amount: toNumber(item.amount),
-              })).filter((item) => item.purchase_id && item.quantity > 0)
-            : [];
-          setSalePurchaseLinks(existingLinks);
-        }
-        if (activeVoucherType === "payment") {
-          setLoading(true);
-          try {
-            const res = await axios.get(`/api/wh-vouchers/payment/${voucherId}`);
-            const payment = res.data;
-            const paymentMode = inferPaymentMode(payment);
-            const existingAdjustments = Array.isArray(payment.adjustments)
-              ? payment.adjustments.map((item) => ({
-                  purchase_id: String(item.purchase_id || item.id || ""),
-                  voucher_no: item.purchase_voucher_no || item.voucher_no || item.purchase_voucher_no || "",
-                  adjusted_amount: toNumber(item.adjusted_amount),
-                })).filter((item) => item.purchase_id && item.adjusted_amount > 0)
-              : [];
-            setFormData({
-              ...defaultForm(),
-              ...payment,
-              payment_mode: paymentMode,
-              reference_type: getPaymentReferenceType(paymentMode),
-              reference_id: paymentMode === "new_reference" ? payment.reference_id || "" : "",
+            const decoratedSales = (sales || []).map((row) => {
+              const saleId = String(row.id || row._id);
+              const amount = Number(row.amount || 0);
+              const adjusted_amount = adjustedMap.get(saleId) || 0;
+              return {
+                ...row,
+                id: saleId,
+                amount,
+                adjusted_amount,
+                pending_amount: Number(Math.max(0, amount - adjusted_amount).toFixed(2)),
+              };
             });
-            setPaymentAdjustments(paymentMode === "against" ? existingAdjustments : []);
-            if (payment.company_account_id) {
-              try {
-                // Edit mode must use the same account + warehouse + exclude-current-payment
-                // lookup as the normal Pending Farmer selector. This prevents the old
-                // filter-options request from selecting the wrong farmer/balance.
-                await loadPaymentFarmers(
-                  payment.company_account_id,
-                  payment.warehouse_id || "",
-                  voucherId
-                );
-              } catch (farmerErr) {
-                console.error("Failed to load payment farmers for edit:", farmerErr);
-                setAccountFarmers([]);
-                setPaymentWarehouses([]);
-              }
-            }
-            // Ensure farmer appears in account-specific farmer list so dropdown shows it
-            if (payment.company_account_id && payment.farmer_id) {
-              const fid = String(payment.farmer_id || "");
-              const loadedFarmers = await loadPaymentFarmers(
-                payment.company_account_id,
-                payment.warehouse_id || "",
-                voucherId
-              ).catch(() => []);
-              const existsInAccount = (loadedFarmers || []).some((f) => String(f.id || f._id) === fid);
-              if (!existsInAccount) {
-                const farmerFromAll = (farmers || []).find((f) => String(f.id || f._id) === fid);
-                if (farmerFromAll) {
-                  setAccountFarmers((prev) => (Array.isArray(prev) ? [...prev, farmerFromAll] : [farmerFromAll]));
-                } else {
-                  setAccountFarmers((prev) => (Array.isArray(prev) ? [...prev, { id: fid, name: String(payment.farmer_name || "Unknown farmer").trim() }] : [{ id: fid, name: String(payment.farmer_name || "Unknown farmer").trim() }]));
-                }
-              }
-            }
 
-            if (payment.farmer_id) {
-              await loadOutstanding("farmer", payment.farmer_id, payment.warehouse_id, voucherId, payment.company_account_id);
-              if (paymentMode === "against") {
-                setShowPaymentAdjustPopup(true);
-              }
-            }
-          } catch (err) {
-            console.error(err);
-            alert(err?.response?.data?.error || "Failed to load payment voucher for edit");
-            setLoading(false);
-            return;
-          } finally {
-            setLoading(false);
+            res.json({ party_type: "company", id, stats, sales: decoratedSales, receipts });
+          });
+        });
+      }, exclude_payment_id);
+    });
+    return;
+  }
+
+  res.status(400).json({ error: "Unsupported party_type" });
+});
+
+// ===========================
+// FARMERS BY ACCOUNT WITH OUTSTANDING
+// ===========================
+// Fast payment farmer lookup cache. The previous implementation loaded every
+// purchase row and then ran an outstanding calculation once per farmer (N+1).
+// That made account/warehouse changes take several seconds.
+const paymentFarmerCache = new Map();
+const PAYMENT_FARMER_CACHE_MS = 60 * 1000;
+const paymentFarmerInFlight = new Map();
+
+async function getFastPaymentFarmers(req, accountId, warehouseId = "", excludePaymentId = "") {
+  const accountKey = String(accountId || "").trim();
+  const warehouseKey = String(warehouseId || "").trim();
+  const excludePaymentKey = String(excludePaymentId || "").trim();
+  const assigned = req.user && Array.isArray(req.user.assigned_warehouses)
+    ? req.user.assigned_warehouses.map((id) => String(id))
+    : [];
+  const key = JSON.stringify([String(req.user?.id || req.user?._id || ""), accountKey, warehouseKey, excludePaymentKey, assigned.join(",")]);
+  const cached = paymentFarmerCache.get(key);
+  if (cached && Date.now() - cached.time < PAYMENT_FARMER_CACHE_MS) return cached.data;
+  if (paymentFarmerInFlight.has(key)) return paymentFarmerInFlight.get(key);
+
+  const promise = (async () => {
+    const purchaseFilter = { company_account_id: accountKey };
+    if (warehouseKey) {
+      if (assigned.length && !assigned.includes(warehouseKey)) return [];
+      purchaseFilter.warehouse_id = warehouseKey;
+    } else if (assigned.length) {
+      purchaseFilter.warehouse_id = { $in: assigned };
+    }
+
+    const grouped = await PurchaseVoucher.aggregate([
+      { $match: purchaseFilter },
+      { $match: { farmer_id: { $nin: [null, ""] } } },
+      { $group: {
+          _id: "$farmer_id",
+          total_purchase: { $sum: { $ifNull: ["$net_amount_payable", { $ifNull: ["$amount", 0] }] } },
+          warehouse_ids: { $addToSet: "$warehouse_id" },
+        }
+      },
+    ]).allowDiskUse(true);
+
+    const farmerIds = grouped.map((r) => String(r._id || "")).filter(Boolean);
+    if (!farmerIds.length) return [];
+
+    const farmers = await Farmer.find({ _id: { $in: farmerIds } })
+      .select("_id name mobile address village")
+      .lean();
+
+    // One SQL GROUP BY replaces one payment query per farmer.
+    const placeholders = farmerIds.map(() => "?").join(",");
+    const paymentParams = [...farmerIds, accountKey];
+    const paymentWhere = [
+      `CAST(farmer_id AS TEXT) IN (${placeholders})`,
+      `CAST(company_account_id AS TEXT) = CAST(? AS TEXT)`,
+    ];
+    if (warehouseKey) {
+      paymentWhere.push(`CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)`);
+      paymentParams.push(warehouseKey);
+    }
+    if (excludePaymentKey) {
+      paymentWhere.push(`CAST(id AS TEXT) <> CAST(? AS TEXT)`);
+      paymentParams.push(excludePaymentKey);
+    }
+    const paymentRows = await new Promise((resolve, reject) => {
+      db.all(
+        `SELECT CAST(farmer_id AS TEXT) AS farmer_id, COALESCE(SUM(amount),0) AS total_payment
+         FROM wh_payment_vouchers
+         WHERE ${paymentWhere.join(" AND ")}
+         GROUP BY CAST(farmer_id AS TEXT)`,
+        paymentParams,
+        (err, rows) => err ? reject(err) : resolve(rows || [])
+      );
+    });
+    const paymentMap = new Map(paymentRows.map((r) => [String(r.farmer_id), Number(r.total_payment || 0)]));
+    const purchaseMap = new Map(grouped.map((r) => [String(r._id), Number(r.total_purchase || 0)]));
+
+    const data = (farmers || []).map((f) => {
+      const id = String(f._id);
+      const totalPurchase = purchaseMap.get(id) || 0;
+      const totalPayment = paymentMap.get(id) || 0;
+      return {
+        id, name: f.name, mobile: f.mobile, address: f.address, village: f.village,
+        total_purchase: Number(totalPurchase.toFixed(2)),
+        total_adjusted: Number(totalPayment.toFixed(2)),
+        outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
+        warehouse_ids: (grouped.find((g) => String(g._id) === id)?.warehouse_ids || []).map(String),
+      };
+    }).filter((f) => f.outstanding > 0);
+
+    paymentFarmerCache.set(key, { time: Date.now(), data });
+    return data;
+  })().finally(() => paymentFarmerInFlight.delete(key));
+
+  paymentFarmerInFlight.set(key, promise);
+  return promise;
+}
+
+router.get("/farmers-by-account/:accountId", async (req, res) => {
+  const { accountId } = req.params;
+  const { warehouse_id, exclude_payment_id } = req.query;
+  if (!accountId) return res.status(400).json({ error: "Account ID is required" });
+  if (mongoReady()) {
+    try {
+      const started = Date.now();
+      const result = await getFastPaymentFarmers(req, accountId, warehouse_id, exclude_payment_id);
+      res.set("Server-Timing", `payment-farmers;dur=${Date.now() - started}`);
+      res.set("Cache-Control", "private, max-age=60, stale-while-revalidate=30");
+      return res.json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  const filter = assignedWarehouseFilter(req.user, "pv.warehouse_id");
+  const filters = ["1=1"];
+  const params = [];
+  
+  if (warehouse_id) {
+    filters.push("pv.warehouse_id = ?");
+    params.push(warehouse_id);
+  }
+
+  const query = `
+    SELECT DISTINCT f.id, f.name, f.mobile, f.address, f.village
+    FROM wh_purchase_vouchers pv
+    INNER JOIN farmers f ON CAST(f.id AS TEXT) = CAST(pv.farmer_id AS TEXT)
+    WHERE CAST(pv.company_account_id AS TEXT) = CAST(? AS TEXT) ${filter.clause} ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""}
+    ORDER BY f.name ASC
+  `;
+
+  db.all(query, [accountId, ...filter.params, ...params], (err, farmers) => {
+    if (err) return res.status(500).json({ error: err.message });
+    
+    if (!farmers || !farmers.length) return res.json([]);
+
+    const farmerIds = farmers.map((f) => f.id);
+    const adjustSql = `
+      SELECT pv.farmer_id, SUM(COALESCE(pa.adjusted_amount, 0)) as total_adjusted
+      FROM wh_payment_adjustments pa
+      INNER JOIN wh_payment_vouchers pv ON pa.payment_id = pv.id
+      WHERE CAST(pv.company_account_id AS TEXT) = CAST(? AS TEXT) AND pv.farmer_id IN (${farmerIds.map(() => "?").join(",")})
+      GROUP BY pv.farmer_id
+    `;
+
+    const purchaseSql = `
+      SELECT farmer_id, SUM(COALESCE(NULLIF(net_amount_payable, 0), amount, 0)) as total_purchase
+      FROM wh_purchase_vouchers
+      WHERE CAST(company_account_id AS TEXT) = CAST(? AS TEXT) AND farmer_id IN (${farmerIds.map(() => "?").join(",")})
+      GROUP BY farmer_id
+    `;
+
+    db.all(adjustSql, [accountId, ...farmerIds], (adjErr, adjRows) => {
+      if (adjErr) console.error("Adjustment query error:", adjErr);
+      db.all(purchaseSql, [accountId, ...farmerIds], (purErr, purRows) => {
+        if (purErr) console.error("Purchase query error:", purErr);
+        
+        const adjustMap = new Map((adjRows || []).map((r) => [String(r.farmer_id), Number(r.total_adjusted || 0)]));
+        const purchaseMap = new Map((purRows || []).map((r) => [String(r.farmer_id), Number(r.total_purchase || 0)]));
+        
+        const result = farmers.map((f) => {
+          const totalPurchase = purchaseMap.get(String(f.id)) || 0;
+          const totalAdjusted = adjustMap.get(String(f.id)) || 0;
+          const outstanding = Math.max(0, totalPurchase - totalAdjusted);
+          
+          return {
+            ...f,
+            total_purchase: Number(totalPurchase.toFixed(2)),
+            total_adjusted: Number(totalAdjusted.toFixed(2)),
+            outstanding: Number(outstanding.toFixed(2)),
+          };
+        });
+        
+        res.json(result.filter((f) => f.outstanding > 0));
+      });
+    });
+  });
+});
+
+// ===========================
+// SALE VOUCHERS
+// ===========================
+router.get("/sale", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  getSaleVoucherRows(req, res);
+});
+
+router.post("/sale", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is not connected. Sale data must be saved in MongoDB." });
+  }
+
+  const { voucher_no } = req.body;
+  const isDirectSale = req.body?.sale_type === "direct";
+  if (!isDirectSale && !req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
+  if (isDirectSale && !req.body?.location_id) return res.status(400).json({ error: "Location is required for direct sale" });
+  if (isDirectSale && !(req.body?.farmer_id || req.body?.against_purchase_farmer_id)) return res.status(400).json({ error: "Farmer is required for direct sale" });
+  if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
+  if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
+  if (!isDirectSale && !ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
+
+  if (mongoReady()) {
+    return createVoucherNoIfMissing("sale", voucher_no, async (err, generatedVoucherNo) => {
+      if (err) return res.status(500).json({ error: err.message });
+      try {
+        const payload = buildSalePayload(req.body, generatedVoucherNo);
+        const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
+        if (!isDirectSale) {
+          const availableQty = await getAvailableSaleStock({
+            warehouseId: payload.warehouse_id,
+            productId: payload.product_id,
+          });
+          if (saleQty > availableQty + 0.0001) {
+            return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+          }
+        } else if (req.body?.create_against_purchase === true) {
+          const directPurchase = await createDirectSalePurchaseVoucher(payload);
+          payload.against_purchase_enabled = Boolean(directPurchase);
+          payload.against_purchase_farmer_id = directPurchase?.farmer_id || payload.against_purchase_farmer_id || "";
+          payload.against_purchase_links = directPurchase ? [directPurchase] : [];
+        } else {
+          payload.against_purchase_enabled = false;
+          payload.against_purchase_farmer_id = "";
+          payload.against_purchase_links = [];
+        }
+        const doc = await SaleVoucher.create(payload);
+        return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: doc.voucher_no, saved_to: "mongodb" });
+      } catch (mongoErr) {
+        if (mongoErr?.code === 11000) return res.status(400).json({ error: "Voucher number already exists" });
+        return res.status(500).json({ error: mongoErr.message });
+      }
+    });
+  }
+});
+
+router.put("/sale/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.edit")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const deductionOnly = Boolean(req.body?.deduction_only);
+  const isDirectSale = req.body?.sale_type === "direct";
+  if (!isDirectSale && !req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
+  if (isDirectSale && !req.body?.location_id) return res.status(400).json({ error: "Location is required for direct sale" });
+  if (!isDirectSale && !ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
+
+  if (mongoReady() && mongoose.Types.ObjectId.isValid(id)) {
+    return (async () => {
+      try {
+        if (deductionOnly) {
+          const existing = await SaleVoucher.findById(id);
+          if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
+          const dueFields = resolveSaleDueFields(req.body, existing);
+          const manualClaimValue = Number(req.body.claim_amount !== undefined ? req.body.claim_amount : existing.claim_amount) || 0;
+          const adjustmentValue = Number(req.body.adjustment_amount !== undefined ? req.body.adjustment_amount : existing.adjustment_amount) || 0;
+          const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
+          const roundOffValue = Number(req.body.round_off !== undefined ? req.body.round_off : existing.round_off) || 0;
+          const transportChargeValue = Number(req.body.transport_charge !== undefined ? req.body.transport_charge : existing.transport_charge) || 0;
+          const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
+          const saleQty = Number(existing.quantity || 0);
+          const grossAmount = Number(existing.amount || 0);
+          const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : existing.unloading_qty || req.body.quantity || existing.quantity) || 0;
+
+          const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
+          const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
+
+          const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : shortageAmount;
+          const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
+          const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
+          const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
+
+          const netAmount = grossAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+
+          existing.unloading_date = req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date;
+          existing.due_date = dueFields.due_date || existing.due_date || "";
+          existing.due_days = dueFields.due_days;
+          existing.unloading_qty = unloadingQtyValue;
+          existing.shortage_quantity = shortageQty;
+          existing.moisture = Number(req.body.moisture !== undefined ? req.body.moisture : existing.moisture) || 0;
+          existing.dunki = Number(req.body.dunki !== undefined ? req.body.dunki : existing.dunki) || 0;
+          existing.fungus = Number(req.body.fungus !== undefined ? req.body.fungus : existing.fungus) || 0;
+          existing.discolour = Number(req.body.discolour !== undefined ? req.body.discolour : existing.discolour) || 0;
+          existing.others = Number(req.body.others !== undefined ? req.body.others : existing.others) || 0;
+          existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : existing.total_deduction) || 0;
+          existing.transport_charge = transportChargeValue;
+          existing.claim_amount = claimValue;
+          existing.other_deduction = otherDeductionValue;
+          existing.cd_percent = cdPercentValue;
+          existing.cd_amount = cdAmountValue;
+          existing.adjustment_amount = adjustmentValue;
+          existing.tds_amount = tdsValue;
+          existing.round_off = roundOffValue;
+          existing.net_amount = netAmount;
+          existing.net_receivable_amount = netAmount;
+          existing.net_amount_payable = netAmount;
+          existing.outstanding = netAmount;
+          const saved = await existing.save();
+          const journals = await recreateSaleDeductionJournals({
+            sale: saved,
+            body: req.body,
+            shortageAmount,
+            deductionAmount: otherDeductionValue + adjustmentValue,
+            cdAmount: cdAmountValue,
+            tdsAmount: tdsValue,
+          });
+          return res.json({ id: String(saved._id), updated: 1, voucher_no: saved.voucher_no, deduction_only: true, saved_to: "mongodb", shortage_qty: existing.shortage_quantity, shortage_amount: shortageAmount, journals });
+        }
+        if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
+        if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
+        const payload = buildSalePayload(req.body);
+        const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
+        if (payload.sale_type !== "direct") {
+          const availableQty = await getAvailableSaleStock({
+            warehouseId: payload.warehouse_id,
+            productId: payload.product_id,
+            excludeSaleId: id,
+          });
+          if (saleQty > availableQty + 0.0001) {
+            return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
           }
         }
+        const doc = await SaleVoucher.findByIdAndUpdate(id, payload, { new: true });
+        if (!doc) return res.status(404).json({ error: "Sale voucher not found" });
+        return res.json({ id: String(doc._id), updated: 1, voucher_no: doc.voucher_no, saved_to: "mongodb" });
+      } catch (mongoErr) {
+        return res.status(500).json({ error: mongoErr.message });
       }
-      setEditId(voucherId);
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Failed to load voucher for edit");
-    } finally {
-      setLoading(false);
-    }
-  };
+    })();
+  }
 
-  const handleEditPurchaseReport = (voucher) => {
-    const voucherId = voucher?.purchase_id || voucher?.id || voucher?._id;
-    if (!voucherId) return;
-    setActiveTab("vouchers");
-    setActiveVoucherType("purchase");
-    setPurchasePreviewRow(voucher || null);
-    setShowPurchasePreview(false);
-    const nextForm = { ...defaultForm(), ...voucher };
-    setFormData(nextForm);
-    setPurchaseBaseline({
-      less_bags_weight: nextForm.less_bags_weight || "",
-      moisture: nextForm.moisture || "",
-      dunki: nextForm.dunki || "",
-      fungus: nextForm.fungus || "",
-      discolour: nextForm.discolour || "",
-      others: nextForm.others || "",
-      bags_claim: nextForm.bags_claim || "",
-      labour: nextForm.labour || "",
-      transport_charge: nextForm.transport_charge || "",
-      round_off: nextForm.round_off || "",
-    });
-    setEditId(voucherId);
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
+  const { voucher_no, date, unloading_date, warehouse_id, buyer_id, company_id, company_account_id, consignee_id, po_no, due_date, against_purchase_enabled, against_purchase_farmer_id, against_purchase_links, lorry_no, product_id, quantity, shortage_quantity, unloading_qty, rate, amount, claim_amount, other_deduction, cd_percent, cd_amount, adjustment_amount, tds_amount, round_off, employee_id, location_id, description } = req.body;
+  if (!deductionOnly && !company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
+  if (!deductionOnly && !product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
 
-  const handleGeneratePDF = async (voucherId) => {
-    try {
-      const response = await axios.get(`/api/wh-vouchers/${activeVoucherType}/${voucherId}/pdf`, {
-        responseType: "blob",
-      });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", `${activeVoucherType === "sale" ? "Sale" : "Purchase"}-Voucher-${voucherId}.pdf`);
-      document.body.appendChild(link);
-      link.click();
-      link.parentNode.removeChild(link);
-    } catch (err) {
-      console.error(err);
-      alert("Failed to generate PDF");
-    }
-  };
-
-  const handlePurchaseReportPDF = async (voucherId) => {
-    try {
-      const response = await axios.get(`/api/wh-vouchers/purchase/${voucherId}/pdf`, {
-        responseType: "blob",
-      });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", `Purchase-Memo-${voucherId}.pdf`);
-      document.body.appendChild(link);
-      link.click();
-      link.parentNode.removeChild(link);
-    } catch (err) {
-      console.error(err);
-      alert("Failed to generate PDF");
-    }
-  };
-
-  const handleDownloadPurchasePdfFromPreview = async () => {
-    const voucherId = purchasePreviewRow?.purchase_id || purchasePreviewRow?.id || purchasePreviewRow?._id;
-    if (!voucherId) return;
-    await handlePurchaseReportPDF(voucherId);
-  };
-
-  const showPurchaseReportPreview = async (voucher, fromLedger = false) => {
-    const recordId = getRecordId(voucher);
-    const baseRow = voucher || null;
-    setPurchasePreviewRow(baseRow);
-    setPurchasePreviewOpenedFromLedger(fromLedger);
-    setShowPurchasePreview(true);
-    setPurchasePreviewLoading(Boolean(recordId));
-
-    if (!recordId) return;
-
-    try {
-      const res = await axios.get(`/api/wh-vouchers/purchase/${recordId}`);
-      if (res?.data) {
-        setPurchasePreviewRow(res.data);
+  if (deductionOnly) {
+    const adjustmentValue = Number(req.body.adjustment_amount) || 0;
+    const tdsValue = Number(req.body.tds_amount) || 0;
+    const roundOffValue = Number(req.body.round_off) || 0;
+    return db.get("SELECT * FROM wh_sale_vouchers WHERE id = ?", [id], async (findErr, existing) => {
+      if (findErr) return res.status(500).json({ error: findErr.message });
+      if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
+      const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
+      const saleQty = Number(existing.quantity || 0);
+      const grossAmount = Number(existing.amount || 0);
+      const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : existing.unloading_qty || req.body.quantity || existing.quantity) || 0;
+      const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
+      const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
+      const claimValue = req.body.claim_amount !== undefined ? Number(req.body.claim_amount) || 0 : shortageAmount;
+      const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
+      const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
+      const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
+      const totalDeductionValue = Number(req.body.total_deduction) || 0;
+      const netAmount = grossAmount - claimValue - otherDeductionValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+      const deductionQuery = `
+        UPDATE wh_sale_vouchers SET
+          unloading_date=?, shortage_quantity=?, unloading_qty=?, moisture=?, dunki=?, fungus=?, discolour=?, others=?, total_deduction=?,
+          claim_amount=?, other_deduction=?, cd_percent=?, cd_amount=?, adjustment_amount=?, tds_amount=?, round_off=?,
+          net_amount=?, net_receivable_amount=?, net_amount_payable=?, outstanding=?
+        WHERE id = ?
+      `;
+      try {
+        await dbRunPromise(deductionQuery, [
+          req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date,
+          shortageQty,
+          unloadingQtyValue,
+          Number(req.body.moisture) || 0,
+          Number(req.body.dunki) || 0,
+          Number(req.body.fungus) || 0,
+          Number(req.body.discolour) || 0,
+          Number(req.body.others) || 0,
+          totalDeductionValue,
+          claimValue,
+          otherDeductionValue,
+          cdPercentValue,
+          cdAmountValue,
+          adjustmentValue,
+          tdsValue,
+          roundOffValue,
+          netAmount,
+          netAmount,
+          netAmount,
+          netAmount,
+          id,
+        ]);
+        const journals = await recreateSaleDeductionJournals({
+          sale: existing,
+          body: req.body,
+          shortageAmount,
+          deductionAmount: otherDeductionValue + adjustmentValue,
+          cdAmount: cdAmountValue,
+          tdsAmount: tdsValue,
+        });
+        return res.json({ id, updated: 1, voucher_no: existing.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount, shortage_quantity: shortageQty, shortage_amount: shortageAmount, journals });
+      } catch (updateErr) {
+        return res.status(500).json({ error: updateErr.message });
       }
-    } catch (err) {
-      console.error("Failed to load full purchase voucher preview:", err);
-      setPurchasePreviewRow(baseRow);
-    } finally {
-      setPurchasePreviewLoading(false);
-    }
-  };
-
-  const showSaleReportPreview = (voucher) => {
-    setSalePreviewRow(voucher);
-    setSalePreviewSummary(null);
-    setShowSalePreview(true);
-  };
-
-  const resetPurchaseDeductions = () => {
-    setFormData((prev) => ({
-      ...prev,
-      ...purchaseAutoFillDefaults,
-    }));
-  };
-
-  const capturePurchaseDeductionsAsDefault = () => {
-    setPurchaseBaseline({
-      less_bags_weight: formData.less_bags_weight || "",
-      moisture: formData.moisture || "",
-      dunki: formData.dunki || "",
-      fungus: formData.fungus || "",
-      discolour: formData.discolour || "",
-      others: formData.others || "",
-      bags_claim: formData.bags_claim || "",
-      labour: formData.labour || "",
-      transport_charge: formData.transport_charge || "",
-      round_off: formData.round_off || "",
     });
+  }
+
+  const amountValue = Number(amount) || 0;
+  const claimValue = Number(claim_amount) || 0;
+  const otherDeductionValue = Number(other_deduction) || 0;
+  const transportChargeValue = Number(transport_charge) || 0;
+  const cdPercentValue = Number(cd_percent) || 0;
+  const cdAmountValue = Number(cd_amount) || 0;
+  const adjustmentValue = Number(adjustment_amount) || 0;
+  const tdsValue = Number(tds_amount) || 0;
+  const roundOffValue = Number(round_off) || 0;
+  const netAmount = amountValue - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+  const netReceivableValue = netAmount;
+
+  if (!deductionOnly) {
+    const saleQtyValue = Number(unloading_qty) || Number(quantity) || 0;
+    return getAvailableSaleStock({
+      warehouseId: warehouse_id,
+      productId: product_id,
+      excludeSaleId: id,
+    })
+      .then((availableQty) => {
+        if (saleQtyValue > availableQty + 0.0001) {
+          return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
+        }
+        const query = `
+          UPDATE wh_sale_vouchers SET
+            voucher_no=?, date=?, unloading_date=?, warehouse_id=?, buyer_id=?, company_id=?, company_account_id=?, consignee_id=?,
+            po_no=?, due_date=?, against_purchase_enabled=?, against_purchase_farmer_id=?, against_purchase_links=?, lorry_no=?, product_id=?,
+            quantity=?, shortage_quantity=?, unloading_qty=?, rate=?, amount=?, claim_amount=?, other_deduction=?, transport_charge=?, cd_percent=?, cd_amount=?,
+            adjustment_amount=?, tds_amount=?, round_off=?, net_amount=?, net_receivable_amount=?, net_amount_payable=?, fifo_rate=?, fifo_amount=?,
+            outstanding=?, employee_id=?, location_id=?, description=?
+          WHERE id = ?
+        `;
+
+        return db.run(query, [
+          voucher_no, date, unloading_date, warehouse_id, buyer_id || company_id, company_id || buyer_id, company_account_id, consignee_id,
+          po_no || "", due_date || "", against_purchase_enabled ? 1 : 0, against_purchase_farmer_id || "", JSON.stringify(Array.isArray(against_purchase_links) ? against_purchase_links : []), lorry_no || req.body.reference_id || "", product_id,
+          quantity, shortage_quantity, unloading_qty, rate, amountValue, claimValue, otherDeductionValue, transportChargeValue, cdPercentValue, cdAmountValue,
+          adjustmentValue, tdsValue, roundOffValue, netAmount, netReceivableValue, netAmount, fifoRateValue, fifoAmountValue,
+          netAmount, employee_id, location_id, description, id
+        ], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+          res.json({ id, updated: 1, net_amount: netAmount, net_receivable_amount: netReceivableValue, outstanding: netAmount });
+        });
+      })
+      .catch((e) => res.status(500).json({ error: e.message }));
+  }
+
+});
+
+router.delete("/sale/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.delete")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+
+  if (mongoReady() && mongoose.Types.ObjectId.isValid(id)) {
+    return (async () => {
+      try {
+        const doc = await SaleVoucher.findByIdAndDelete(id);
+        if (!doc) return res.status(404).json({ error: "Sale voucher not found" });
+        return res.json({ deleted: 1, deleted_from: "mongodb" });
+      } catch (mongoErr) {
+        return res.status(500).json({ error: mongoErr.message });
+      }
+    })();
+  }
+
+  db.get("SELECT warehouse_id FROM wh_sale_vouchers WHERE id = ?", [id], (findErr, row) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!row) return res.status(404).json({ error: "Voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    db.run("DELETE FROM wh_sale_vouchers WHERE id = ?", [id], function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ deleted: 1 });
+    });
+  });
+});
+
+// ===========================
+// PAYMENT VOUCHERS
+// ===========================
+router.get("/payment", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  getPaymentRowsForUser(req, res);
+});
+
+router.get("/payment/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const query = `
+    SELECT p.*, ca.account_name AS company_account_name, f.name AS farmer_name
+    FROM wh_payment_vouchers p
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+    LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
+    WHERE CAST(p.id AS TEXT) = ?
+    LIMIT 1
+  `;
+
+  db.get(query, [id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: "Payment voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    db.all(
+      `
+        SELECT a.*, pv.voucher_no AS purchase_voucher_no
+        FROM wh_payment_adjustments a
+        LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
+        WHERE a.payment_id = ?
+        ORDER BY a.id ASC
+      `,
+      [id],
+      async (adjErr, adjustmentRows) => {
+        if (adjErr) return res.status(500).json({ error: adjErr.message });
+        const rawAdjustments = (adjustmentRows || []).map((item) => ({
+          purchase_id: String(item.purchase_id || ""),
+          voucher_no: item.purchase_voucher_no || "",
+          adjusted_amount: Number(item.adjusted_amount || 0),
+        }));
+        const missingVoucherIds = rawAdjustments.filter((item) => !item.voucher_no).map((item) => item.purchase_id).filter(Boolean);
+        const mongoVoucherMap = new Map();
+        if (mongoReady() && missingVoucherIds.length) {
+          try {
+            const mongoRows = await PurchaseVoucher.find({
+              _id: { $in: missingVoucherIds.filter((value) => mongoose.Types.ObjectId.isValid(value)) },
+            }).select("_id voucher_no").lean();
+            (mongoRows || []).forEach((purchase) => mongoVoucherMap.set(String(purchase._id), purchase.voucher_no || ""));
+          } catch (mongoErr) {
+            console.error("Payment edit adjustment Mongo lookup failed:", mongoErr.message);
+          }
+        }
+        const adjustments = rawAdjustments.map((item) => ({
+          ...item,
+          voucher_no: item.voucher_no || mongoVoucherMap.get(String(item.purchase_id)) || item.purchase_id || "",
+        }));
+        return res.json({
+          ...row,
+          id: String(row.id || row._id),
+          _id: String(row.id || row._id),
+          adjustments,
+        });
+      }
+    );
+  });
+});
+
+router.post("/payment", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description, adjustments } = req.body;
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+  if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
+
+  const finalPaymentMode = normalizePaymentMode(payment_mode || (adjustments && adjustments.length ? "against" : "on_account"));
+  validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, paymentMode: finalPaymentMode }, (validationErr, cleanAdjustments) => {
+    if (validationErr) return res.status(400).json({ error: validationErr.message });
+
+    const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+    if (idemKey) {
+      return getIdempotency(idemKey, "payment", (err, existingId) => {
+        if (err) return res.status(500).json({ error: err.message });
+      if (existingId) {
+        return db.get(`SELECT * FROM wh_payment_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+          if (e2) return res.status(500).json({ error: e2.message });
+          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+        });
+      }
+
+      createVoucherNoIfMissing("payment", voucher_no, (err, generatedVoucherNo) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const query = `
+          INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
+        const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
+        db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, finalPaymentMode, employee_id, location_id, description], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+
+            const paymentId = this.lastID;
+            insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => {
+              if (adjErr) return res.status(500).json({ error: adjErr.message });
+              saveIdempotency(idemKey, "payment", paymentId, () => {});
+              computeOutstandingForFarmer(farmer_id, (err2, stats) => {
+                if (err2) return res.status(500).json({ error: err2.message });
+                db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
+                  res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+                });
+              });
+            });
+        });
+      });
+    });
+    }
+
+    createVoucherNoIfMissing("payment", voucher_no, (err, generatedVoucherNo) => {
+      if (err) return res.status(500).json({ error: err.message });
+
+      const query = `
+        INSERT INTO wh_payment_vouchers (voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
+
+      const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
+      const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
+      db.run(query, [generatedVoucherNo, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, finalPaymentMode, employee_id, location_id, description], function (err) {
+        if (err) {
+          if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+          return res.status(500).json({ error: err.message });
+        }
+
+        const paymentId = this.lastID;
+        insertPaymentAdjustments(paymentId, cleanAdjustments, (adjErr) => {
+          if (adjErr) return res.status(500).json({ error: adjErr.message });
+          computeOutstandingForFarmer(farmer_id, (err2, stats) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+            db.run("UPDATE wh_payment_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, paymentId], () => {
+              res.json({ id: paymentId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+router.put("/payment/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.edit")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = String(req.params.id || "").trim();
+  const { voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, reference_type, reference_id, payment_mode, employee_id, location_id, description, adjustments } = req.body;
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+  if (!farmer_id) return res.status(400).json({ error: "Farmer is required for payment vouchers" });
+
+  db.get("SELECT * FROM wh_payment_vouchers WHERE CAST(id AS TEXT) = CAST(? AS TEXT)", [id], (findErr, oldRow) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!oldRow) return res.status(404).json({ error: "Payment voucher not found" });
+    if (!ensureWarehouseAccess(req, res, oldRow.warehouse_id)) return;
+
+    const finalPaymentMode = normalizePaymentMode(payment_mode || (adjustments && adjustments.length ? "against" : "on_account"));
+    validatePaymentAdjustments({ farmerId: farmer_id, warehouseId: warehouse_id, amount, adjustments, paymentMode: finalPaymentMode, excludePaymentId: id }, (validationErr, cleanAdjustments) => {
+      if (validationErr) return res.status(400).json({ error: validationErr.message });
+
+      const finalReferenceType = reference_type || (cleanAdjustments.length ? "purchase" : "on_account");
+      const finalReferenceId = reference_id || buildPaymentReferenceId(cleanAdjustments);
+      const query = `
+        UPDATE wh_payment_vouchers SET
+          voucher_no=?, date=?, warehouse_id=?, farmer_id=?, company_account_id=?, amount=?,
+          reference_type=?, reference_id=?, payment_mode=?, employee_id=?, location_id=?, description=?, updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+      `;
+
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION", (beginErr) => {
+          if (beginErr) return res.status(500).json({ error: beginErr.message });
+          db.run(query, [voucher_no, date, warehouse_id, farmer_id, company_account_id, amount, finalReferenceType, finalReferenceId, finalPaymentMode, employee_id, location_id, description, id], function (err) {
+            if (err) {
+              db.run("ROLLBACK");
+              if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+              return res.status(500).json({ error: err.message });
+            }
+
+            db.run("DELETE FROM wh_payment_adjustments WHERE payment_id = ?", [id], (deleteErr) => {
+              if (deleteErr) {
+                db.run("ROLLBACK");
+                return res.status(500).json({ error: deleteErr.message });
+              }
+
+              insertPaymentAdjustments(id, cleanAdjustments, (adjErr) => {
+                if (adjErr) {
+                  db.run("ROLLBACK");
+                  return res.status(500).json({ error: adjErr.message });
+                }
+
+                db.run("COMMIT", (commitErr) => {
+                  if (commitErr) return res.status(500).json({ error: commitErr.message });
+
+                  // The voucher is already committed. Do not run the old global
+                  // farmer aggregation here; it was slower and could fail/return a
+                  // balance from another warehouse/account during edit. The UI will
+                  // refresh the scoped outstanding endpoint after save.
+                  return res.json({
+                    id,
+                    updated: 1,
+                    voucher_no,
+                    stats: null,
+                    adjustments: cleanAdjustments,
+                    reference_id: finalReferenceId,
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+router.delete("/payment/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.delete")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  db.get("SELECT * FROM wh_payment_vouchers WHERE id = ?", [id], (findErr, row) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!row) return res.status(404).json({ error: "Payment voucher not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION");
+      db.run("DELETE FROM wh_payment_adjustments WHERE payment_id = ?", [id], (adjErr) => {
+        if (adjErr) {
+          db.run("ROLLBACK");
+          return res.status(500).json({ error: adjErr.message });
+        }
+        db.run("DELETE FROM wh_payment_vouchers WHERE id = ?", [id], function (deleteErr) {
+          if (deleteErr) {
+            db.run("ROLLBACK");
+            return res.status(500).json({ error: deleteErr.message });
+          }
+          computeOutstandingForFarmer(row.farmer_id, (statsErr, stats) => {
+            if (statsErr) {
+              db.run("ROLLBACK");
+              return res.status(500).json({ error: statsErr.message });
+            }
+            db.run("COMMIT", (commitErr) => {
+              if (commitErr) return res.status(500).json({ error: commitErr.message });
+              res.json({ deleted: 1, stats });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+// ===========================
+// RECEIPT VOUCHERS
+// ===========================
+router.get("/receipt", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  getWarehouseScopedRows(req, res, "wh_receipt_vouchers");
+});
+
+router.get("/receipt/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
+    ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id).then((ok) => {
+      if (!ok) return;
+
+    // Join with wh_sale_vouchers to fetch voucher_no for each adjusted sale
+    db.all(
+      `SELECT r.sale_id, sv.voucher_no, r.adjusted_amount
+       FROM wh_receipt_adjustments r
+       LEFT JOIN wh_sale_vouchers sv ON CAST(sv.id AS TEXT) = CAST(r.sale_id AS TEXT)
+       WHERE r.receipt_id = ?`,
+      [id],
+      (adjErr, adjustments) => {
+        if (adjErr) return res.status(500).json({ error: adjErr.message });
+        res.json({ ...row, adjustments: adjustments || [] });
+      }
+    );
+    });
+  });
+});
+
+router.post("/receipt", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
+  ensureWarehouseAccess(req, res, warehouse_id, location_id).then((ok) => {
+  if (!ok) return;
+  if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
+
+  validateReceiptAdjustments({ companyId: company_id, amount, adjustments }, (validationErr, cleanAdjustments) => {
+    if (validationErr) return res.status(400).json({ error: validationErr.message });
+
+    const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+    if (idemKey) {
+      return getIdempotency(idemKey, "receipt", (err, existingId) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (existingId) {
+          return db.get(`SELECT * FROM wh_receipt_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+            if (e2) return res.status(500).json({ error: e2.message });
+            return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+          });
+        }
+
+        createVoucherNoIfMissing("receipt", voucher_no, (err, generatedVoucherNo) => {
+          if (err) return res.status(500).json({ error: err.message });
+
+          const query = `
+            INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `;
+
+          const finalReferenceType = reference_type || "sale";
+          const finalReferenceId = reference_id || buildReceiptReferenceId(cleanAdjustments);
+          db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, company_account_id, consignee_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
+            if (err) {
+              if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+              return res.status(500).json({ error: err.message });
+            }
+
+            const receiptId = this.lastID;
+            insertReceiptAdjustments(receiptId, cleanAdjustments, (adjErr) => {
+              if (adjErr) return res.status(500).json({ error: adjErr.message });
+              saveIdempotency(idemKey, "receipt", receiptId, () => {});
+              computeOutstandingForCompany(company_id, (err2, stats) => {
+                if (err2) return res.status(500).json({ error: err2.message });
+                db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
+                  res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    createVoucherNoIfMissing("receipt", voucher_no, (err, generatedVoucherNo) => {
+      if (err) return res.status(500).json({ error: err.message });
+
+      const query = `
+        INSERT INTO wh_receipt_vouchers (voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
+
+      const finalReferenceType = reference_type || "sale";
+      const finalReferenceId = reference_id || buildReceiptReferenceId(cleanAdjustments);
+      db.run(query, [generatedVoucherNo, date, warehouse_id, company_id, company_account_id, consignee_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description], function (err) {
+        if (err) {
+          if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+          return res.status(500).json({ error: err.message });
+        }
+
+        const receiptId = this.lastID;
+        insertReceiptAdjustments(receiptId, cleanAdjustments, (adjErr) => {
+          if (adjErr) return res.status(500).json({ error: adjErr.message });
+          computeOutstandingForCompany(company_id, (err2, stats) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+            db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, receiptId], () => {
+              res.json({ id: receiptId, voucher_no: generatedVoucherNo, stats, adjustments: cleanAdjustments });
+            });
+          });
+        });
+      });
+    });
+  });
+  });
+});
+
+router.put("/receipt/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.edit")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
+  if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
+
+  db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (findErr, oldRow) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!oldRow) return res.status(404).json({ error: "Receipt voucher not found" });
+    if (!ensureWarehouseAccess(req, res, oldRow.warehouse_id)) return;
+
+    validateReceiptAdjustments({ companyId: company_id, amount, adjustments }, (validationErr, cleanAdjustments) => {
+      if (validationErr) return res.status(400).json({ error: validationErr.message });
+
+      const finalReferenceType = reference_type || "sale";
+      const finalReferenceId = reference_id || buildReceiptReferenceId(cleanAdjustments);
+      const query = `
+        UPDATE wh_receipt_vouchers SET
+          voucher_no=?, date=?, warehouse_id=?, company_id=?, company_account_id=?, consignee_id=?, amount=?,
+          reference_type=?, reference_id=?, employee_id=?, location_id=?, description=?, updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+      `;
+
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION");
+        db.run(query, [voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, finalReferenceType, finalReferenceId, employee_id, location_id, description, id], function (err) {
+          if (err) {
+            db.run("ROLLBACK");
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+
+          db.run("DELETE FROM wh_receipt_adjustments WHERE receipt_id = ?", [id], (deleteErr) => {
+            if (deleteErr) {
+              db.run("ROLLBACK");
+              return res.status(500).json({ error: deleteErr.message });
+            }
+
+            insertReceiptAdjustments(id, cleanAdjustments, (adjErr) => {
+              if (adjErr) {
+                db.run("ROLLBACK");
+                return res.status(500).json({ error: adjErr.message });
+              }
+              computeOutstandingForCompany(company_id, (statsErr, stats) => {
+                if (statsErr) {
+                  db.run("ROLLBACK");
+                  return res.status(500).json({ error: statsErr.message });
+                }
+                db.run("UPDATE wh_receipt_vouchers SET outstanding_after = ? WHERE id = ?", [stats.outstanding, id], (outErr) => {
+                  if (outErr) {
+                    db.run("ROLLBACK");
+                    return res.status(500).json({ error: outErr.message });
+                  }
+                  db.run("COMMIT", (commitErr) => {
+                    if (commitErr) return res.status(500).json({ error: commitErr.message });
+                    res.json({ id, updated: 1, voucher_no, stats, adjustments: cleanAdjustments, reference_id: finalReferenceId });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+router.delete("/receipt/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.delete")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (findErr, row) => {
+    if (findErr) return res.status(500).json({ error: findErr.message });
+    if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
+    ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id).then((ok) => {
+      if (!ok) return;
+
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION");
+      db.run("DELETE FROM wh_receipt_adjustments WHERE receipt_id = ?", [id], (adjErr) => {
+        if (adjErr) {
+          db.run("ROLLBACK");
+          return res.status(500).json({ error: adjErr.message });
+        }
+        db.run("DELETE FROM wh_receipt_vouchers WHERE id = ?", [id], function (deleteErr) {
+          if (deleteErr) {
+            db.run("ROLLBACK");
+            return res.status(500).json({ error: deleteErr.message });
+          }
+          computeOutstandingForCompany(row.company_id, (statsErr, stats) => {
+            if (statsErr) {
+              db.run("ROLLBACK");
+              return res.status(500).json({ error: statsErr.message });
+            }
+            db.run("COMMIT", (commitErr) => {
+              if (commitErr) return res.status(500).json({ error: commitErr.message });
+              res.json({ deleted: 1, stats });
+            });
+          });
+        });
+      });
+    });
+    });
+  });
+});
+
+// ===========================
+// JOURNAL VOUCHERS
+// ===========================
+router.get("/journal", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.journal.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  getWarehouseScopedRows(req, res, "wh_journal_vouchers");
+});
+
+router.post("/journal", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.journal.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const { voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description } = req.body;
+  ensureWarehouseAccess(req, res, warehouse_id, location_id).then((ok) => {
+  if (!ok) return;
+
+  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
+  if (idemKey) {
+    return getIdempotency(idemKey, "journal", (err, existingId) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (existingId) {
+        return db.get(`SELECT * FROM wh_journal_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
+          if (e2) return res.status(500).json({ error: e2.message });
+          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
+        });
+      }
+
+      createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const query = `
+          INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
+          if (err) {
+            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+            return res.status(500).json({ error: err.message });
+          }
+          saveIdempotency(idemKey, "journal", this.lastID, () => {});
+          res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
+        });
+      });
+    });
+  }
+
+  createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const query = `
+      INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
+      if (err) {
+        if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+        return res.status(500).json({ error: err.message });
+      }
+      res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
+    });
+  });
+  });
+});
+
+function dbAll(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => (err ? reject(err) : resolve(rows || [])));
+  });
+}
+
+async function getPurchaseReportRowsForUser(user, options = {}) {
+  if (mongoReady()) {
+    const filter = { ...mongoPurchaseScope(user) };
+    if (options.farmerId) filter.farmer_id = String(options.farmerId);
+    if (options.warehouseId) filter.warehouse_id = String(options.warehouseId);
+    if (options.companyAccountId) filter.company_account_id = String(options.companyAccountId);
+    if (options.productId) filter.product_id = String(options.productId);
+    if (options.fromDate || options.toDate) {
+      filter.date = {};
+      if (options.fromDate) filter.date.$gte = String(options.fromDate);
+      if (options.toDate) filter.date.$lte = String(options.toDate);
+    }
+    const query = PurchaseVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+    if (Number.isFinite(Number(options.limit))) {
+      query.skip(Number(options.offset) || 0).limit(Number(options.limit));
+    }
+    const rows = await query;
+    return decoratePurchaseRows(rows);
+  }
+
+  const filter = assignedWarehouseFilter(user, "v.warehouse_id");
+  return dbAll(
+    `
+      SELECT
+        v.*,
+        w.name AS warehouse_name,
+        ca.account_name AS company_account_name,
+        f.name AS farmer_name,
+        p.name AS product_name,
+        (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
+        COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
+        COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+      FROM wh_purchase_vouchers v
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+      LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(v.farmer_id AS TEXT)
+      LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
+      WHERE 1 = 1 ${filter.clause}
+      ORDER BY v.date DESC, v.id DESC
+    `,
+    filter.params
+  );
+}
+
+async function getSaleReportRowsForUser(user, options = {}) {
+  if (mongoReady()) {
+    const filter = {};
+    const scope = mongoSaleScope(user);
+    Object.assign(filter, scope);
+    if (options.buyerId) {
+      filter.$or = [
+        { buyer_id: String(options.buyerId) },
+        { company_id: String(options.buyerId) },
+      ];
+    }
+    if (options.farmerId) filter.farmer_id = String(options.farmerId);
+    if (options.warehouseId) filter.warehouse_id = String(options.warehouseId);
+    if (options.companyAccountId) filter.company_account_id = String(options.companyAccountId);
+    if (options.productId) filter.product_id = String(options.productId);
+    if (options.fromDate || options.toDate) {
+      filter.date = {};
+      if (options.fromDate) filter.date.$gte = String(options.fromDate);
+      if (options.toDate) filter.date.$lte = String(options.toDate);
+    }
+    if (options.journeyToken) filter.journey_token = String(options.journeyToken);
+    if (options.lorryNo) filter.lorry_no = String(options.lorryNo);
+    if (options.billNo) filter.$or = [...(filter.$or || []), { voucher_no: String(options.billNo) }, { bill_no: String(options.billNo) }];
+    const query = SaleVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+    if (Number.isFinite(Number(options.limit))) {
+      query.skip(Number(options.offset) || 0).limit(Number(options.limit));
+    }
+    const rows = await query;
+    try {
+      return await decorateSaleRows(rows);
+    } catch (decorateErr) {
+      console.error("Sale report decoration failed; returning raw Mongo rows:", decorateErr);
+      return (rows || []).map((row) => ({
+        ...(row || {}),
+        id: String(row?._id || row?.id || ""),
+        _id: String(row?._id || row?.id || ""),
+        buyer_id: String(row?.buyer_id || row?.company_id || ""),
+        total_quantity: Number(row?.quantity || row?.total_quantity || 0),
+        total_amount: Number(row?.amount || row?.total_amount || 0),
+        ...calculateSaleFollowupMeta(row || {}),
+      }));
+    }
+  }
+  return getSqliteSaleRowsForUser(user, options);
+}
+
+async function enrichLedgerRowsWithPartyDetails(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!mongoReady() || !list.length) return list;
+
+  const farmerIds = [...new Set(list.map((row) => String(row?.farmer_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+  const accountIds = [...new Set(list.map((row) => String(row?.company_account_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+  const [farmers, accounts] = await Promise.all([
+    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
+    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
+  ]);
+  const farmerMap = new Map(farmers.map((item) => [String(item._id), item]));
+  const accountMap = new Map(accounts.map((item) => [String(item._id), item]));
+
+  return list.map((row) => {
+    const farmer = farmerMap.get(String(row?.farmer_id || ""));
+    const account = accountMap.get(String(row?.company_account_id || ""));
+    return {
+      ...row,
+      farmer_name: row?.farmer_name || farmer?.name,
+      farmer_mobile: row?.farmer_mobile || farmer?.mobile,
+      farmer_address: row?.farmer_address || farmer?.address,
+      farmer_village: row?.farmer_village || farmer?.village,
+      farmer_city: row?.farmer_city || farmer?.city,
+      farmer_district: row?.farmer_district || farmer?.district,
+      farmer_state: row?.farmer_state || farmer?.state,
+      farmer_pincode: row?.farmer_pincode || farmer?.pincode,
+      farmer_gst: row?.farmer_gst || farmer?.gst_no || farmer?.gst,
+      farmer_pan: row?.farmer_pan || farmer?.pan_no || farmer?.pan,
+      company_account_name: row?.company_account_name || account?.account_name,
+      company_account_address: row?.company_account_address || account?.address,
+      company_account_mobile: row?.company_account_mobile || account?.mobile,
+      company_account_email: row?.company_account_email || account?.email,
+      company_account_city: row?.company_account_city || account?.city,
+      company_account_district: row?.company_account_district || account?.district,
+      company_account_state: row?.company_account_state || account?.state,
+      company_account_pincode: row?.company_account_pincode || account?.pincode,
+      company_account_gst: row?.company_account_gst || account?.gst_no || account?.gst,
+      company_account_pan: row?.company_account_pan || account?.pan_no || account?.pan,
+    };
+  });
+}
+
+function buildLedgerRows(rows, getPartyId, getPartyName) {
+  const balances = new Map();
+  return rows
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+    .map((row) => {
+      const key = getPartyId(row) || "unknown";
+      const previous = balances.get(key) || 0;
+      const debit = Number(row.debit || 0);
+      const credit = Number(row.credit || 0);
+      const balance = previous + debit - credit;
+      balances.set(key, balance);
+      return {
+        ...row,
+        party_id: key,
+        party_name: getPartyName(row),
+        debit,
+        credit,
+        balance: Number(balance.toFixed(2)),
+      };
+    })
+    .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+}
+
+function groupStock(purchases, sales) {
+  const groups = new Map();
+  const keyOf = (row) => `${row.warehouse_id || ""}::${row.company_account_id || ""}::${row.product_id || ""}`;
+  const ensure = (row) => {
+    const key = keyOf(row);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        warehouse_id: row.warehouse_id,
+        warehouse_name: row.warehouse_name || "",
+        company_account_id: row.company_account_id || "",
+        company_account_name: row.company_account_name || "",
+        product_id: row.product_id,
+        product_name: row.product_name || "",
+        purchase_qty: 0,
+        sale_qty: 0,
+        purchase_amount: 0,
+        sale_amount: 0,
+        purchase_details: [],
+        sale_details: [],
+      });
+    }
+    const item = groups.get(key);
+    item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
+    item.company_account_name = item.company_account_name || row.company_account_name || "";
+    item.product_name = item.product_name || row.product_name || "";
+    return item;
   };
 
-  const getPurchasePreviewData = () => ({
-    voucherNo: formData.voucher_no || "-",
-    date: formatLedgerDate(formData.date),
-    party: selectedFarmer?.name || "-",
-    warehouse: selectedWarehouse?.name || "-",
-    account: getAccountName({ company_account_id: formData.company_account_id }),
-    product: getProductName({ product_id: formData.product_id }),
-    packet: formatDecimal4(formData.packet),
-    grossWeight: formatDecimal4(formData.gross_weight),
-    tareWeight: formatDecimal4(formData.tare_weight),
-    newWeight: formatDecimal4(safePurchaseNewWeight),
-    netQty: formatDecimal4(safePurchaseNetWeight),
-    rate: formatMoney(formData.rate),
-    grossAmount: formatMoney(purchaseGrossAmount),
-    totalDeduction: formatMoney(purchaseTotalDeduction),
-    netPayable: formatMoney(purchaseNetPayable),
+  purchases.forEach((row) => {
+    const item = ensure(row);
+    const grossLessTare = Number(row.gross_weight || 0) - Number(row.tare_weight || 0);
+    const fallbackQty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+    const qty = grossLessTare > 0 ? grossLessTare : fallbackQty;
+    const amount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+    item.purchase_qty += qty;
+    item.purchase_amount += amount;
+    item.purchase_details.push({
+      date: row.date || "",
+      voucher_no: row.voucher_no || "",
+      party_name: row.farmer_name || row.party_name || "",
+      qty: Number(qty.toFixed(4)),
+      rate: Number(row.rate || 0),
+      amount,
+    });
   });
 
-  const getPurchasePreviewDataForRow = (row) => {
-    const newWeight = Math.max(toNumber(row?.gross_weight) - toNumber(row?.tare_weight), 0);
-    const netQty = toNumber(row?.total_qty || row?.total_quantity || row?.net_weight || row?.quantity || 0);
-    const grossAmount = toNumber(row?.gross_amount || row?.amount || 0);
-    const totalDeduction =
-      toNumber(row?.total_deduction) ||
-      toNumber(row?.less_bags_weight) +
-        toNumber(row?.moisture) +
-        toNumber(row?.dunki) +
-        toNumber(row?.fungus) +
-        toNumber(row?.discolour) +
-        toNumber(row?.others) +
-        toNumber(row?.bags_claim) +
-        toNumber(row?.labour);
+  sales.forEach((row) => {
+    const item = ensure(row);
+    const qty = Number(row.quantity || row.total_quantity || 0);
+    const amount = Number(row.amount || row.total_amount || 0);
+    item.sale_qty += qty;
+    item.sale_amount += amount;
+    item.sale_details.push({
+      date: row.date || "",
+      voucher_no: row.voucher_no || "",
+      party_name: row.company_name || row.consignee_name || row.party_name || "",
+      qty: Number(qty.toFixed(4)),
+      rate: Number(row.rate || 0),
+      amount,
+    });
+  });
 
+  return Array.from(groups.values()).map((item) => {
+    const stockQty = item.purchase_qty - item.sale_qty;
+    const avgRate = item.purchase_qty > 0 ? item.purchase_amount / item.purchase_qty : 0;
     return {
-      voucherNo: row?.voucher_no || "-",
-      date: formatLedgerDate(row?.date),
-      party: row?.farmer_name || getFarmerName(row) || "-",
-      warehouse: getWarehouseName(row),
-      account: getAccountName(row),
-      product: getProductName(row),
-      packet: formatDecimal4(row?.packet),
-      grossWeight: formatDecimal4(row?.gross_weight),
-      tareWeight: formatDecimal4(row?.tare_weight),
-      newWeight: formatDecimal4(row?.new_weight || newWeight),
-      netQty: formatDecimal4(netQty),
-      rate: formatMoney(row?.rate),
-      grossAmount: formatMoney(grossAmount || netQty * toNumber(row?.rate)),
-      totalDeduction: formatMoney(totalDeduction),
-      netPayable: formatMoney(row?.net_amount_payable || row?.total_amount || row?.amount || grossAmount - totalDeduction),
-      lessBagsWeight: formatMoney(row?.less_bags_weight),
-      moisture: formatMoney(row?.moisture),
-      dunki: formatMoney(row?.dunki),
-      fungus: formatMoney(row?.fungus),
-      discolour: formatMoney(row?.discolour),
-      others: formatMoney(row?.others),
-      transportCharge: formatMoney(row?.transport_charge),
-      bagsClaim: formatMoney(row?.bags_claim),
-      labour: formatMoney(row?.labour),
+      ...item,
+      purchase_qty: Number(item.purchase_qty.toFixed(4)),
+      sale_qty: Number(item.sale_qty.toFixed(4)),
+      stock_qty: Number(stockQty.toFixed(4)),
+      avg_rate: Number(avgRate.toFixed(2)),
+      stock_amount: Number((stockQty * avgRate).toFixed(2)),
+      purchase_amount: Number(item.purchase_amount.toFixed(2)),
+      sale_amount: Number(item.sale_amount.toFixed(2)),
+      purchase_details: item.purchase_details.sort((a, b) => String(a.date || "").localeCompare(String(b.date || ""))),
+      sale_details: item.sale_details.sort((a, b) => String(a.date || "").localeCompare(String(b.date || ""))),
     };
-  };
+  });
+}
 
-  const getSalePreviewDataForRow = (row) => {
-    const grossAmount = toNumber(row?.amount || row?.gross_amount || 0);
-    const saleQty = toNumber(row?.quantity || row?.unloading_qty || row?.total_quantity || 0);
-    const grossWeight = toNumber(row?.gross_weight || row?.dispatch_qty || saleQty || 0);
-    const netQty = toNumber(row?.unloading_qty || row?.quantity || row?.total_quantity || saleQty || 0);
-    const claimAmount = toNumber(row?.claim_amount || 0);
-    const shortageAmount = toNumber(row?.shortage_amount || 0);
-    const otherDeduction = toNumber(row?.other_deduction || 0);
-    const cdAmount = toNumber(row?.cd_amount || 0);
-    const adjustmentAmount = toNumber(row?.adjustment_amount || 0);
-    const tdsAmount = toNumber(row?.tds_amount || 0);
-    const roundOff = toNumber(row?.round_off || 0);
-    const totalDeduction = toNumber(row?.total_deduction || (claimAmount + otherDeduction + cdAmount + adjustmentAmount + tdsAmount - roundOff));
-    const netPayable = toNumber(row?.net_amount_payable || row?.net_receivable_amount || row?.outstanding || grossAmount - totalDeduction + roundOff);
-    const purchaseLinks = Array.isArray(row?.against_purchase_links) ? row.against_purchase_links : [];
-    const directPurchaseAmount = toNumber(row?.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + toNumber(item.amount || 0), 0));
-    const directPurchaseRate = toNumber(row?.direct_purchase_rate || purchaseLinks[0]?.rate || 0);
-    const directPurchaseQty = toNumber(row?.total_qty || row?.total_quantity || row?.quantity || purchaseLinks.reduce((sum, item) => sum + toNumber(item.quantity || 0), 0));
+function buildFifoStock(purchases, sales) {
+  const lotsByKey = new Map();
+  const keyOf = (row) => `${row.warehouse_id || ""}::${row.product_id || ""}`;
 
-    return {
-      voucherNo: row?.voucher_no || "-",
-      date: formatLedgerDate(row?.date),
-      unloadingDate: formatLedgerDate(row?.unloading_date || row?.date),
-      saleType: titleCase(row?.sale_type || "direct"),
-      party: getBuyerName(row) || row?.party_name || row?.company_name || "-",
-      farmer: row?.farmer_name || getFarmerName(row) || "-",
-      location: row?.location_name || selectedLocationName || getWarehouseName(row) || "-",
-      warehouse: getWarehouseName(row) || "-",
-      product: getProductName(row) || "-",
-      account: getAccountName(row) || row?.company_account_name || "-",
-      lorryNo: row?.lorry_no || row?.reference_id || "-",
-      consignee: row?.consignee_name || selectedConsignee?.name || "-",
-      quantity: formatDecimal4(saleQty),
-      grossWeight: formatDecimal4(grossWeight),
-      rate: formatMoney(row?.rate || 0),
-      grossAmount: formatMoney(grossAmount),
-      claimAmount: formatMoney(claimAmount),
-      shortageAmount: formatMoney(shortageAmount),
-      otherDeduction: formatMoney(otherDeduction),
-      cdAmount: formatMoney(cdAmount),
-      adjustmentAmount: formatMoney(adjustmentAmount),
-      tdsAmount: formatMoney(tdsAmount),
-      roundOff: formatMoney(roundOff),
-      totalDeduction: formatMoney(totalDeduction),
-      netPayable: formatMoney(netPayable),
-      netReceivable: formatMoney(row?.net_receivable_amount || netPayable),
-      directPurchaseQty: formatDecimal4(directPurchaseQty),
-      directPurchaseRate: formatMoney(directPurchaseRate),
-      directPurchaseAmount: formatMoney(directPurchaseAmount),
-      paymentDetails: Array.isArray(row?.payment_details) ? row.payment_details : [],
-      journalDetails: Array.isArray(row?.journal_details) ? row.journal_details : [],
-      purchaseLinks,
-      profitLoss: formatMoney(netPayable - directPurchaseAmount),
-      profitLossLabel: netPayable - directPurchaseAmount >= 0 ? "Net Profit" : "Net Loss",
-    };
-  };
-
-  useEffect(() => {
-    const loadSalePreviewSummary = async () => {
-      if (!showSalePreview || !salePreviewRow) return;
-      const saleId = salePreviewRow.id || salePreviewRow._id;
-      if (!saleId) {
-        setSalePreviewSummary(salePreviewRow);
-        return;
-      }
-      setSalePreviewLoading(true);
-      try {
-        const response = await axios.get(`/api/wh-vouchers/sale/${saleId}/summary`);
-        setSalePreviewSummary(response.data || salePreviewRow);
-      } catch (err) {
-        setSalePreviewSummary(salePreviewRow);
-      } finally {
-        setSalePreviewLoading(false);
-      }
-    };
-    loadSalePreviewSummary();
-  }, [showSalePreview, salePreviewRow]);
-
-  const downloadPurchaseImportTemplate = async () => {
-    try {
-      const response = await axios.get("/api/wh-vouchers/purchase/import-template", {
-        responseType: "blob",
-      });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", "purchase_voucher_import_format.xlsx");
-      document.body.appendChild(link);
-      link.click();
-      link.parentNode.removeChild(link);
-      window.URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Failed to download import format");
-    }
-  };
-
-  const handlePurchaseExcelImport = async (event) => {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    const fileName = file.name.toLowerCase();
-    if (!fileName.endsWith(".xlsx") && !fileName.endsWith(".xls")) {
-      alert("Please select an Excel file (.xlsx or .xls)");
-      return;
-    }
-    const uploadForm = new FormData();
-    uploadForm.append("file", file);
-    setImportingPurchase(true);
-    try {
-      const res = await axios.post("/api/wh-vouchers/purchase/import-xlsx", uploadForm, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-      const imported = Number(res.data?.imported || 0);
-      const failed = Number(res.data?.failed || 0);
-      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
-      const errorText = errors
-        .slice(0, 8)
-        .map((item) => `Row ${item.row}: ${item.error}`)
-        .join("\n");
-      alert(`Purchase import complete.\nImported: ${imported}\nFailed: ${failed}${errorText ? `\n\n${errorText}` : ""}`);
-      setActiveVoucherType("purchase");
-      await loadVouchers();
-      if (activeTab === "reports") await loadReport();
-      fetchNextVoucherNo("purchase");
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Purchase import failed");
-    } finally {
-      setImportingPurchase(false);
-    }
-  };
-
-  const downloadPaymentImportTemplate = async () => {
-    try {
-      const response = await axios.get("/api/wh-vouchers/payment/import-template", {
-        responseType: "blob",
-      });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", "payment_voucher_import_format.xlsx");
-      document.body.appendChild(link);
-      link.click();
-      link.parentNode.removeChild(link);
-      window.URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Failed to download payment format");
-    }
-  };
-
-  const handlePaymentExcelImport = async (event) => {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    const fileName = file.name.toLowerCase();
-    if (!fileName.endsWith(".xlsx") && !fileName.endsWith(".xls")) {
-      alert("Please select an Excel file (.xlsx or .xls)");
-      return;
-    }
-    const uploadForm = new FormData();
-    uploadForm.append("file", file);
-    setImportingPayment(true);
-    try {
-      const res = await axios.post("/api/wh-vouchers/payment/import-xlsx", uploadForm, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-      const imported = Number(res.data?.imported || 0);
-      const failed = Number(res.data?.failed || 0);
-      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
-      const errorText = errors
-        .slice(0, 8)
-        .map((item) => `Row ${item.row}: ${item.error}`)
-        .join("\n");
-      alert(`Payment import complete.\nImported: ${imported}\nFailed: ${failed}${errorText ? `\n\n${errorText}` : ""}`);
-      setActiveVoucherType("payment");
-      await loadVouchers();
-      if (activeTab === "reports") await loadReport();
-      fetchNextVoucherNo("payment");
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Payment import failed");
-    } finally {
-      setImportingPayment(false);
-    }
-  };
-
-  const downloadReceiptImportTemplate = async () => {
-    try {
-      const response = await axios.get("/api/wh-vouchers/receipt/import-template", {
-        responseType: "blob",
-      });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", "receipt_voucher_import_format.xlsx");
-      document.body.appendChild(link);
-      link.click();
-      link.parentNode.removeChild(link);
-      window.URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Failed to download receipt format");
-    }
-  };
-
-  const handleReceiptExcelImport = async (event) => {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    const fileName = file.name.toLowerCase();
-    if (!fileName.endsWith(".xlsx") && !fileName.endsWith(".xls")) {
-      alert("Please select an Excel file (.xlsx or .xls)");
-      return;
-    }
-    const uploadForm = new FormData();
-    uploadForm.append("file", file);
-    setImportingReceipt(true);
-    try {
-      const res = await axios.post("/api/wh-vouchers/receipt/import-xlsx", uploadForm, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-      const imported = Number(res.data?.imported || 0);
-      const failed = Number(res.data?.failed || 0);
-      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
-      const errorText = errors
-        .slice(0, 8)
-        .map((item) => `Row ${item.row}: ${item.error}`)
-        .join("\n");
-      alert(`Receipt import complete.\nImported: ${imported}\nFailed: ${failed}${errorText ? `\n\n${errorText}` : ""}`);
-      setActiveVoucherType("receipt");
-      await loadVouchers();
-      if (activeTab === "reports") await loadReport();
-      fetchNextVoucherNo("receipt");
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Receipt import failed");
-    } finally {
-      setImportingReceipt(false);
-    }
-  };
-
-  const openPaymentAdjustmentPopup = async () => {
-    if (activeVoucherType !== "payment") return;
-    if (toNumber(formData.amount) <= 0) {
-      alert("Please enter amount first");
-      return;
-    }
-    if (!formData.farmer_id) {
-      alert("Please select farmer");
-      return;
-    }
-    const outstandingMatchesSelection =
-      partyOutstanding &&
-      String(partyOutstanding?.party_id || partyOutstanding?.farmer_id || partyOutstanding?.id || "") === String(formData.farmer_id) &&
-      String(partyOutstanding?.warehouse_id || "") === String(formData.warehouse_id || "") &&
-      String(partyOutstanding?.company_account_id || "") === String(formData.company_account_id || "") &&
-      String(partyOutstanding?.exclude_payment_id || "") === String(editId || "") &&
-      Array.isArray(partyOutstanding?.purchases);
-    if (!outstandingMatchesSelection) {
-      await loadOutstanding("farmer", formData.farmer_id, formData.warehouse_id, editId, formData.company_account_id);
-    }
-    setShowPaymentAdjustPopup(true);
-  };
-
-  const openReceiptAdjustmentPopup = async () => {
-    if (activeVoucherType !== "receipt") return;
-    if (toNumber(formData.amount) <= 0) {
-      alert("Please enter amount first");
-      return;
-    }
-    if (!formData.company_id) {
-      alert("Please select company");
-      return;
-    }
-    await loadOutstanding("company", formData.company_id, formData.warehouse_id, null, formData.company_account_id);
-    setShowReceiptAdjustPopup(true);
-  };
-
-  const selectSaleVoucherForPass = (voucherId) => {
-    const voucher = list.find((item) => String(item.id || item._id) === String(voucherId));
-    if (!voucher) return;
-
-    const billDate = voucher.bill_date || voucher.date || "";
-    const loadingDate = voucher.date || billDate || "";
-    const existingUnloadingDate = voucher.unloading_date || "";
-    const existingDueDays = voucher.due_days !== undefined && voucher.due_days !== null && String(voucher.due_days).trim() !== ""
-      ? toNumber(voucher.due_days)
-      : "";
-    const rawDueDate = voucher.due_date || "";
-    const computedDueDate = existingUnloadingDate && existingDueDays > 0
-      ? (() => {
-          const parsed = new Date(`${existingUnloadingDate}T00:00:00Z`);
-          if (Number.isNaN(parsed.getTime())) return rawDueDate;
-          parsed.setUTCDate(parsed.getUTCDate() + existingDueDays);
-          return parsed.toISOString().slice(0, 10);
-        })()
-      : rawDueDate;
-    const derivedDueDays = existingDueDays !== "" ? existingDueDays : (computedDueDate && existingUnloadingDate ? diffDays(existingUnloadingDate, computedDueDate) : "");
-
-    const selectedDispatchQty = saleDispatchQtyFromData(voucher);
-    const selectedAmount = (voucher.amount !== undefined && voucher.amount !== null && String(voucher.amount).trim() !== "")
-      ? voucher.amount
-      : (voucher.total_amount !== undefined && voucher.total_amount !== null && String(voucher.total_amount).trim() !== "")
-        ? voucher.total_amount
-        : saleGrossAmountFromData(voucher).toFixed(2);
-    const cdPercent = voucher.cd_percent || "";
-    const cdAmount = voucher.cd_amount !== undefined && voucher.cd_amount !== null && String(voucher.cd_amount).trim() !== ""
-      ? voucher.cd_amount
-      : cdPercent
-        ? Number((Number(selectedAmount) * toNumber(cdPercent) / 100).toFixed(2))
-        : "";
-
-    setFormData({
-      ...defaultForm(),
-      ...voucher,
-      date: loadingDate,
-      bill_date: billDate,
-      voucher_no: voucher.voucher_no || voucher.bill_no || "",
-      bill_no: voucher.bill_no || voucher.voucher_no || "",
-      journey_token: voucher.journey_token || "",
-      buyer_id: voucher.buyer_id || voucher.company_id || "",
-      company_id: voucher.company_id || voucher.buyer_id || "",
-      lorry_no: voucher.lorry_no || voucher.reference_id || "",
-      dispatch_qty: formatDecimal4(selectedDispatchQty),
-      amount: selectedAmount,
-      unloading_qty: voucher.unloading_qty !== undefined && voucher.unloading_qty !== null ? voucher.unloading_qty : "",
-      unloading_date: existingUnloadingDate || "",
-      due_days: derivedDueDays,
-      due_date: computedDueDate || "",
-      moisture: voucher.moisture || "",
-      dunki: voucher.dunki || "",
-      fungus: voucher.fungus || "",
-      discolour: voucher.discolour || "",
-      others: voucher.others || "",
-      claim_amount: voucher.claim_amount !== undefined && voucher.claim_amount !== null && String(voucher.claim_amount).trim() !== ""
-        ? voucher.claim_amount
-        : voucher.shortage_amount !== undefined && voucher.shortage_amount !== null && String(voucher.shortage_amount).trim() !== ""
-          ? voucher.shortage_amount
-          : "",
-      other_deduction: voucher.other_deduction !== undefined && voucher.other_deduction !== null && String(voucher.other_deduction).trim() !== ""
-        ? voucher.other_deduction
-        : voucher.adjustment_amount !== undefined && voucher.adjustment_amount !== null && String(voucher.adjustment_amount).trim() !== ""
-          ? voucher.adjustment_amount
-          : "",
-      cd_percent: cdPercent,
-      cd_amount: cdAmount,
-      tds_amount: voucher.tds_amount !== undefined && voucher.tds_amount !== null && String(voucher.tds_amount).trim() !== "" ? voucher.tds_amount : "",
-      transport_charge: voucher.transport_charge !== undefined && voucher.transport_charge !== null && String(voucher.transport_charge).trim() !== "" ? voucher.transport_charge : "",
-      journey_note: voucher.journey_note || voucher.description || "",
-    });
-    setEditId(voucher.id || voucher._id);
-  };
-
-  const applyJourneyTemplate = (templateId) => {
-    setJourneyTemplateId(templateId);
-    const template = selectedSalePassJourneyRows.find((row) => String(row.id || row._id) === String(templateId));
-    if (!template) return;
-
-    setFormData((prev) => ({
-      ...prev,
-      buyer_id: template.buyer_id || template.company_id || prev.buyer_id || prev.company_id || "",
-      company_id: template.company_id || template.buyer_id || prev.company_id || prev.buyer_id || "",
-      consignee_id: template.consignee_id || prev.consignee_id || "",
-      lorry_no: template.lorry_no || template.reference_id || prev.lorry_no || "",
-      rate: template.rate || prev.rate || "",
-      dispatch_qty: formatDecimal4(toNumber(template.dispatch_qty || template.quantity || template.total_quantity || template.unloading_qty || saleDispatchQty)),
-      unloading_qty: template.unloading_qty || "",
-    }));
-  };
-
-  const saveSaleVoucherPass = async () => {
-    if (!editId) {
-      alert("Please select sale bill");
-      return;
-    }
-    if (!formData.unloading_date) {
-      alert("Please enter unloading date");
-      return;
-    }
-    if (saleUnloadingQty <= 0) {
-      alert("Please enter unloading weight");
-      return;
-    }
-
-    const finalTdsAmount = tdsEligible ? autoTdsAmount : toNumber(formData.tds_amount);
-    const finalCdAmount = Number((saleBillAmountFromData(formData) * toNumber(formData.cd_percent) / 100).toFixed(2));
-    const unloadingDate = formData.unloading_date || "";
-    const dueDays = formData.due_days !== undefined && formData.due_days !== null && String(formData.due_days).trim() !== "" ? toNumber(formData.due_days) : "";
-    const dueDate = formData.due_date || (unloadingDate && dueDays !== "" ? (() => {
-      const parsed = new Date(`${unloadingDate}T00:00:00Z`);
-      if (Number.isNaN(parsed.getTime())) return "";
-      parsed.setUTCDate(parsed.getUTCDate() + toNumber(dueDays));
-      return parsed.toISOString().slice(0, 10);
-    })() : "");
-    const payload = {
-      ...formData,
-      deduction_only: true,
-      voucher_no: formData.voucher_no || null,
-      date: formData.date || null,
-      bill_no: formData.bill_no || formData.voucher_no || null,
-      bill_date: formData.bill_date || formData.date || null,
-      journey_token: formData.journey_token || buildJourneyToken(),
-      unloading_date: unloadingDate,
-      due_days: dueDays,
-      due_date: dueDate,
-      unloading_qty: saleUnloadingQty,
-      shortage_quantity: saleShortageQty,
-      shortage_amount: saleShortageAmount,
-      claim_amount: saleShortageAmount,
-      other_deduction: saleQualityDeduction,
-      transport_charge: saleTransportCharge,
-      cd_amount: finalCdAmount,
-      total_deduction: saleQualityDeduction + saleTransportCharge + finalCdAmount,
-      tds_amount: finalTdsAmount,
-      reject_qty: toNumber(formData.reject_qty),
-      amount: saleBillAmountFromData(formData),
-    };
-
-    setLoading(true);
-    try {
-      await axios.put(`/api/wh-vouchers/sale/${editId}`, payload);
-      alert("Sale voucher pass saved successfully");
-      const remainingQtyAfterSave = Math.max(saleDispatchQty - saleUnloadingQty, 0);
-      const nextVoucherNo = await axios
-        .get(`/api/wh-vouchers/next-voucher-no`, { params: { type: "sale" } })
-        .then((res) => res.data?.voucher_no || "")
-        .catch(() => "");
-      setShowSaleDeductionModal(false);
-      setFormData({
-        ...defaultForm(),
-        warehouse_id: formData.warehouse_id || "",
-        company_account_id: "",
-        employee_id: formData.employee_id || "",
-        location_id: formData.location_id || "",
-        lorry_no: formData.lorry_no || "",
-        journey_token: formData.journey_token || buildJourneyToken(),
-        bill_no: nextVoucherNo || "",
-        voucher_no: nextVoucherNo || "",
-        bill_date: new Date().toISOString().slice(0, 10),
-        date: new Date().toISOString().slice(0, 10),
-      dispatch_qty: remainingQtyAfterSave > 0 ? remainingQtyAfterSave.toFixed(4) : "",
-      add_qty: "",
-      unloading_qty: "",
-        company_id: "",
-        buyer_id: "",
-        consignee_id: "",
-        product_id: "",
-        rate: "",
-        unloading_date: "",
-        due_days: "",
-        due_date: "",
-      });
-      setEditId(null);
-      await loadVouchers();
-      if (activeTab === "reports") await loadReport();
-      fetchNextVoucherNo(activeVoucherType);
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Failed to save sale voucher pass");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const saveSaleVoucherPassAndNew = async () => {
-    if (!editId) {
-      alert("Please select sale bill");
-      return;
-    }
-    if (!formData.unloading_date) {
-      alert("Please enter unloading date");
-      return;
-    }
-    if (saleUnloadingQty <= 0) {
-      alert("Please enter unloading weight");
-      return;
-    }
-
-    const finalTdsAmount = tdsEligible ? autoTdsAmount : toNumber(formData.tds_amount);
-    const finalCdAmount = Number((saleBillAmountFromData(formData) * toNumber(formData.cd_percent) / 100).toFixed(2));
-    const unloadingDate = formData.unloading_date || "";
-    const dueDays = formData.due_days !== undefined && formData.due_days !== null && String(formData.due_days).trim() !== "" ? toNumber(formData.due_days) : "";
-    const dueDate = formData.due_date || (unloadingDate && dueDays !== "" ? (() => {
-      const parsed = new Date(`${unloadingDate}T00:00:00Z`);
-      if (Number.isNaN(parsed.getTime())) return "";
-      parsed.setUTCDate(parsed.getUTCDate() + toNumber(dueDays));
-      return parsed.toISOString().slice(0, 10);
-    })() : "");
-    const payload = {
-      ...formData,
-      deduction_only: true,
-      voucher_no: formData.voucher_no || null,
-      date: formData.date || null,
-      bill_no: formData.bill_no || formData.voucher_no || null,
-      bill_date: formData.bill_date || formData.date || null,
-      journey_token: formData.journey_token || buildJourneyToken(),
-      unloading_date: unloadingDate,
-      due_days: dueDays,
-      due_date: dueDate,
-      unloading_qty: saleUnloadingQty,
-      shortage_quantity: saleShortageQty,
-      shortage_amount: saleShortageAmount,
-      claim_amount: saleShortageAmount,
-      other_deduction: saleQualityDeduction,
-      transport_charge: saleTransportCharge,
-      cd_amount: finalCdAmount,
-      total_deduction: saleQualityDeduction + saleTransportCharge + finalCdAmount,
-      tds_amount: finalTdsAmount,
-      reject_qty: toNumber(formData.reject_qty),
-      amount: saleBillAmountFromData(formData),
-    };
-
-    setLoading(true);
-    try {
-      await axios.put(`/api/wh-vouchers/sale/${editId}`, payload);
-      alert("Sale voucher pass saved successfully");
-      const remainingQtyAfterSave = Math.max(saleDispatchQty - saleUnloadingQty, 0);
-      const addQty = Math.max(toNumber(formData.add_qty), 0);
-      const nextDispatchQty = Math.max(remainingQtyAfterSave + addQty, 0);
-      const nextRate = toNumber(formData.rate);
-      const nextAmount = Number((nextDispatchQty * nextRate).toFixed(2));
-      const nextVoucherNo = await axios
-        .get(`/api/wh-vouchers/next-voucher-no`, { params: { type: "sale" } })
-        .then((res) => res.data?.voucher_no || "")
-        .catch(() => "");
-
-      if (nextDispatchQty <= 0) {
-        alert("Sale voucher pass saved successfully. No remaining quantity left to create the next bill.");
-        setShowSaleDeductionModal(false);
-        setEditId(null);
-        setFormData(defaultForm());
-        await loadVouchers();
-        if (activeTab === "reports") await loadReport();
-        fetchNextVoucherNo(activeVoucherType);
-        return;
-      }
-
-      const nextPayload = {
-        ...formData,
-        voucher_no: nextVoucherNo || "",
-        bill_no: nextVoucherNo || "",
-        bill_date: new Date().toISOString().slice(0, 10),
-        date: new Date().toISOString().slice(0, 10),
-        unloading_date: "",
-        due_days: "",
-        due_date: "",
-        unloading_qty: "",
-        shortage_quantity: "",
-        shortage_amount: "",
-        claim_amount: "",
-        other_deduction: "",
-        cd_percent: "",
-        cd_amount: "",
-        adjustment_amount: "",
-        tds_amount: "",
-        round_off: "",
-        add_qty: "",
-        dispatch_qty: formatDecimal4(nextDispatchQty),
-        quantity: formatDecimal4(nextDispatchQty),
-        rate: formData.rate || "",
-        amount: nextAmount,
-        buyer_id: formData.buyer_id || formData.company_id || "",
-        company_id: formData.company_id || formData.buyer_id || "",
-        consignee_id: formData.consignee_id || "",
-        buyer_name: formData.buyer_name || "",
-        consignee_name: formData.consignee_name || "",
-        company_account_id: formData.company_account_id || "",
-        product_id: formData.product_id || "",
-        warehouse_id: formData.warehouse_id || "",
-        location_id: formData.location_id || "",
-        employee_id: formData.employee_id || "",
-        lorry_no: formData.lorry_no || "",
-        journey_token: formData.journey_token || buildJourneyToken(),
-      };
-      const createRes = await axios.post("/api/wh-vouchers/sale", nextPayload);
-      setFormData((prev) => ({
-        ...nextPayload,
-        warehouse_id: prev.warehouse_id || "",
-        company_account_id: prev.company_account_id || "",
-        employee_id: prev.employee_id || "",
-        location_id: prev.location_id || "",
-        lorry_no: selectedSalePassBill?.lorry_no || prev.lorry_no || "",
-        journey_token: prev.journey_token || buildJourneyToken(),
-        bill_no: nextVoucherNo || "",
-        voucher_no: nextVoucherNo || "",
-        bill_date: new Date().toISOString().slice(0, 10),
-        date: new Date().toISOString().slice(0, 10),
-        dispatch_qty: nextDispatchQty > 0 ? nextDispatchQty.toFixed(4) : "",
-        quantity: nextDispatchQty > 0 ? nextDispatchQty.toFixed(4) : "",
-        add_qty: "",
-        rate: formData.rate || "",
-        amount: nextAmount,
-        unloading_qty: "",
-        company_id: formData.company_id || formData.buyer_id || "",
-        buyer_id: formData.buyer_id || formData.company_id || "",
-        consignee_id: formData.consignee_id || "",
-        unloading_date: "",
-        due_days: "",
-        due_date: "",
-      }));
-      setEditId(createRes.data?.id || createRes.data?._id || editId);
-      await loadVouchers();
-      if (activeTab === "reports") await loadReport();
-      fetchNextVoucherNo(activeVoucherType);
-    } catch (err) {
-      console.error(err);
-      alert(err?.response?.data?.error || "Failed to save sale voucher pass");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const setPaymentAdjustmentAmount = (purchase, value) => {
-    const purchaseId = String(purchase.id || purchase._id);
-    const amount = Math.max(0, toNumber(value));
-    const pending = toNumber(purchase.pending_amount ?? purchase.amount);
-    const safeAmount = Math.min(amount, pending);
-    setPaymentAdjustments((prev) => {
-      const others = prev.filter((item) => String(item.purchase_id) !== purchaseId);
-      if (safeAmount <= 0) return others;
-      return [
-        ...others,
-        {
-          purchase_id: purchaseId,
-          voucher_no: purchase.voucher_no,
-          adjusted_amount: safeAmount,
-        },
-      ];
-    });
-  };
-
-  const autoFillPaymentAdjustments = () => {
-    let remaining = toNumber(formData.amount);
-    const next = [];
-    (partyOutstanding?.purchases || [])
-      .filter((row) => toNumber(row.pending_amount) > 0)
-      .forEach((row) => {
-        if (remaining <= 0) return;
-        const adjusted = Math.min(remaining, toNumber(row.pending_amount));
-        if (adjusted > 0) {
-          next.push({
-            purchase_id: String(row.id || row._id),
-            voucher_no: row.voucher_no,
-            adjusted_amount: adjusted,
-          });
-          remaining -= adjusted;
-        }
-      });
-    setPaymentAdjustments(next);
-  };
-
-  const selectedAdjustmentFor = (purchaseId) =>
-    paymentAdjustments.find((item) => String(item.purchase_id) === String(purchaseId))?.adjusted_amount || "";
-
-  const setReceiptAdjustmentAmount = (sale, value) => {
-    const saleId = String(sale.id || sale._id);
-    const amount = Math.max(0, toNumber(value));
-    const pending = toNumber(sale.pending_amount ?? sale.amount);
-    const safeAmount = Math.min(amount, pending);
-    setReceiptAdjustments((prev) => {
-      const others = prev.filter((item) => String(item.sale_id) !== saleId);
-      if (safeAmount <= 0) return others;
-      return [
-        ...others,
-        {
-          sale_id: saleId,
-          voucher_no: sale.voucher_no,
-          adjusted_amount: safeAmount,
-        },
-      ];
-    });
-  };
-
-  const autoFillReceiptAdjustments = () => {
-    let remaining = toNumber(formData.amount);
-    const next = [];
-    (partyOutstanding?.sales || [])
-      .filter((row) => toNumber(row.pending_amount) > 0)
-      .forEach((row) => {
-        if (remaining <= 0) return;
-        const adjusted = Math.min(remaining, toNumber(row.pending_amount));
-        if (adjusted > 0) {
-          next.push({
-            sale_id: String(row.id || row._id),
-            voucher_no: row.voucher_no,
-            adjusted_amount: adjusted,
-          });
-          remaining -= adjusted;
-        }
-      });
-    setReceiptAdjustments(next);
-  };
-
-  const selectedAdjustmentForReceipt = (saleId) =>
-    receiptAdjustments.find((item) => String(item.sale_id) === String(saleId))?.adjusted_amount || "";
-
-  const renderAccountSelect = (style = inp) => (
-    <select name="company_account_id" value={formData.company_account_id} onChange={handleChange} style={style}>
-      <option value="">Select Account</option>
-      {companyAccounts.map((account) => (
-        <option key={account.id || account._id} value={account.id || account._id}>
-          {account.account_name || account.name}
-        </option>
-      ))}
-    </select>
-  );
-
-  const getAccountName = (item) => {
-    const accountId = String(item.company_account_id || item.account_id || item.companyAccountId || "");
-    const account = companyAccounts.find((account) => String(account.id || account._id) === accountId);
-    return account?.account_name || account?.name || item.company_account_name || item.account_name || item.account || "-";
-  };
-
-  const getCompanyName = (item) =>
-    item?.company_name ||
-    companies.find((c) => String(c.id || c._id) === String(item?.company_id))?.name ||
-    "-";
-
-  const reportColumns = {
-    purchase: [
-      ["sl", "S.L No", (_item, i) => i + 1],
-      ["date", "Date", (item) => item.date || "-"],
-      ["voucher_no", "Voucher No", (item) => item.voucher_no || "-"],
-      ["warehouse", "Warehouse", (item) => getWarehouseName(item)],
-      ["account", "Account", (item) => getAccountName(item)],
-      ["farmer", "Farmer", (item) => item.farmer_name || getFarmerName(item)],
-      ["product", "Product", (item) => getProductName(item)],
-      ["packet", "Packet", (item) => formatDecimal4(item.packet || 0)],
-      ["gross_weight", "Gross Wt", (item) => formatDecimal4(item.gross_weight || 0)],
-      ["tare_weight", "Tare Wt", (item) => formatDecimal4(item.tare_weight || 0)],
-      ["new_weight", "New Wt", (item) => formatDecimal4(Math.max(toNumber(item.gross_weight) - toNumber(item.tare_weight), 0))],
-      ["dhalta", "Dhalta", (item) => formatDecimal4(item.dhalta || 0)],
-      ["gross_amount", "Gross Amount", (item) => formatMoney(item.gross_amount || 0)],
-      ["deduction", "Deduction", (item) => formatMoney(item.total_deduction || 0)],
-      ["total_quantity", "Net Qty", (item) => formatDecimal4(item.total_quantity || 0)],
-      ["total_amount", "Net Payable", (item) => formatMoney(item.total_amount || item.net_amount_payable || 0)],
-      ["actions", "Actions", (item) =>
-        item.legacy_purchase_entry ? (
-          <span style={{ color: "#64748b" }}>Old Entry</span>
-        ) : (
-          <div style={{ display: "flex", gap: 6 }}>
-            <button type="button" onClick={() => showPurchaseReportPreview(item)} style={{ ...btnAction, background: "#315f7d" }} title="View">View</button>
-            <button type="button" onClick={() => handleEditPurchaseReport(item)} style={btnAction} title="Edit">Edit</button>
-            <button type="button" onClick={() => handlePurchaseReportPDF(item.id || item._id)} style={{ ...btnAction, background: "#ea580c" }} title="Download PDF">PDF</button>
-          </div>
-        )
-      ],
-    ],
-    sale: [
-      ["date", "Date", (item) => formatLedgerDate(item.date)],
-      ["voucher_no", "Voucher No", (item) => item.voucher_no || "-"],
-      ["po_no", "P.O No", (item) => item.po_no || "-"],
-      ["due_date", "Due Date", (item) => formatLedgerDate(item.due_date)],
-      ["buyer", "Buyer", (item) => getBuyerName(item)],
-      ["consignee", "Consignee", (item) => item.consignee_name || consignees.find((c) => String(c.id || c._id) === String(item.consignee_id))?.name || "-"],
-      ["account", "Account", (item) => getAccountName(item)],
-      ["warehouse", "Warehouse", (item) => getWarehouseName(item)],
-      ["product", "Product", (item) => getProductName(item)],
-      ["against_purchase", "Against Purchase", (item) => item.against_purchase_enabled ? `${item.against_purchase_links?.length || 0} bill` : "-"],
-      ["total_quantity", "Total Quantity", (item) => formatDecimal4(item.total_quantity || 0)],
-      ["total_amount", "Total Amount", (item) => formatMoney(item.total_amount || 0)],
-    ],
-    payment: [
-      ["date", "Date", (item) => formatLedgerDate(item.date)],
-      ["voucher_no", "Voucher No", (item) => item.voucher_no || "-"],
-      ["party", "Party", (item) => item.party_name || item.farmer_name || "-"],
-      ["account", "Account", (item) => item.company_account_name || getAccountName(item)],
-      ["warehouse", "Warehouse", (item) => item.warehouse_name || getWarehouseName(item)],
-      ["amount", "Amount", (item) => formatMoney(item.amount || 0)],
-      ["adjusted", "Adjusted", (item) => formatMoney((item.adjustments || []).reduce((sum, entry) => sum + toNumber(entry.adjusted_amount), 0))],
-      ["reference", "Reference", (item) => item.reference_id || item.reference_type || "-"],
-      ["description", "Narration", (item) => item.description || "-"],
-    ],
-    "purchase-party-ledger": [
-      ["date", "Date", (item) => (item.row_type === "closing" ? "" : formatLedgerDate(item.date))],
-      ["voucher_type", "Type", (item) => (item.row_type === "closing" ? "" : (item.voucher_type || "-"))],
-      ["voucher_no", "Voucher No", (item) => (item.row_type === "closing" ? "" : (item.voucher_no || "-"))],
-      ["particulars", "Particulars", (item) => (item.row_type === "closing" ? "" : (item.particulars || "-"))],
-      ["adjustment_details", "Adjustment Details", (item) => (item.row_type === "closing" ? "" : (item.adjustment_details || "-"))],
-      ["warehouse", "Warehouse", (item) => (item.row_type === "closing" ? "" : getWarehouseName(item))],
-      ["debit", "Debit", (item) => formatMoney(item.debit || 0)],
-      ["credit", "Credit", (item) => {
-        if (item.row_type === "closing") {
-          return formatMoney(item.credit || 0);
-        }
-        const amount = formatMoney(item.credit || 0);
-        if (item.voucher_type !== "Purchase") {
-          return amount;
-        }
-        return (
-          <button
-            type="button"
-            onClick={() => showPurchaseReportPreview(item, true)}
-            style={{
-              border: "none",
-              background: "transparent",
-              color: "#0f766e",
-              cursor: "pointer",
-              textDecoration: "underline",
-              padding: 0,
-              font: "inherit",
-            }}
-            title="Open purchase details"
-          >
-            {amount}
-          </button>
-        );
-      }],
-      ["balance", "Balance", (item) => {
-        return formatMoney(Math.abs(item.balance || 0));
-      }],
-    ],
-    "sale-party-ledger": [
-      ["date", "Date", (item) => (item.row_type === "closing" ? "" : formatLedgerDate(item.date))],
-      ["party", "Party", (item) => (item.row_type === "closing" ? `Closing Balance (${item.closing_side})` : (item.party_name || item.buyer_name || item.company_name || item.consignee_name || "-"))],
-      ["account", "Account", (item) => (item.row_type === "closing" ? "" : getAccountName(item))],
-      ["voucher_type", "Type", (item) => (item.row_type === "closing" ? "" : (item.voucher_type || "-"))],
-      ["voucher_no", "Voucher No", (item) => (item.row_type === "closing" ? "" : (item.voucher_no || "-"))],
-      ["due_date", "Due Date", (item) => (item.row_type === "closing" ? "" : formatLedgerDate(item.due_date || item.unloading_date || ""))],
-      ["due_days", "Due Days", (item) => (item.row_type === "closing" ? "" : (item.due_days !== undefined ? item.due_days : ""))],
-      ["days_overdue", "Days Overdue", (item) => (item.row_type === "closing" ? "" : (item.days_overdue || ""))],
-      ["followup_status_label", "Status", (item) => (item.row_type === "closing" ? "" : (item.followup_status_label || item.followup_status || "-"))],
-      ["adjustment_details", "Adjustment Details", (item) => (item.row_type === "closing" ? "" : (item.adjustment_details || "-"))],
-      ["warehouse", "Warehouse", (item) => (item.row_type === "closing" ? "" : getWarehouseName(item))],
-      ["debit", "Debit", (item) => formatMoney(item.debit || 0)],
-      ["credit", "Credit", (item) => formatMoney(item.credit || 0)],
-      ["balance", "Balance", (item) => formatMoney(Math.abs(item.balance || 0))],
-    ],
-    "sale-followup": [
-      ["date", "Date", (item) => formatLedgerDate(item.date)],
-      ["party", "Buyer", (item) => (item.party_name || item.buyer_name || item.company_name || "-")],
-      ["account", "Account", (item) => getAccountName(item)],
-      ["voucher_no", "Voucher No", (item) => (item.voucher_no || "-")],
-      ["unloading_date", "Unloading Date", (item) => formatLedgerDate(item.unloading_date || "")],
-      ["due_date", "Due Date", (item) => formatLedgerDate(item.due_date || item.unloading_date || "")],
-      ["due_days", "Due Days", (item) => (item.due_days !== undefined ? item.due_days : diffDays(item.unloading_date, item.due_date))],
-      ["days_overdue", "Days Overdue", (item) => (item.days_overdue !== undefined ? item.days_overdue : diffDays(item.due_date, new Date().toISOString().slice(0, 10)))],
-      ["followup_status_label", "Status", (item) => (item.followup_status_label || item.followup_status || "-")],
-      ["balance", "Balance", (item) => formatMoney(Math.abs(item.balance || item.bill_balance || item.outstanding || 0))],
-      ["actions", "Actions", (item) => {
-        const email = String(item.contact_email || item.buyer_email || item.consignee_email || "").trim();
-        const mobileRaw = String(item.contact_mobile || item.buyer_mobile || item.consignee_mobile || "").trim();
-        const mobile = mobileRaw.replace(/\D/g, "");
-        const whatsappNumber = mobile.length === 10 ? `91${mobile}` : mobile;
-        const dueDate = item.due_date || item.unloading_date || "";
-        const body = encodeURIComponent(
-          [
-            `Dear ${item.party_name || item.buyer_name || item.company_name || "Party"},`,
-            "",
-            `Your outstanding balance is ${formatMoney(Math.abs(item.balance || 0))}.`,
-            dueDate ? `Due Date: ${formatLedgerDate(dueDate)}` : "",
-            item.due_days !== undefined ? `Due Days: ${item.due_days}` : "",
-            item.days_overdue !== undefined ? `Days Overdue: ${item.days_overdue}` : "",
-            "",
-            "Please clear the pending amount at the earliest.",
-            `Voucher No: ${item.voucher_no || "-"}`,
-          ].filter(Boolean).join("\n")
-        );
-        return (
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            <a
-              href={email ? `mailto:${email}?subject=${encodeURIComponent(`Outstanding follow-up for ${item.voucher_no || ""}`.trim())}&body=${body}` : "#"}
-              onClick={(event) => {
-                if (!email) event.preventDefault();
-              }}
-              style={{
-                ...btnAction,
-                background: email ? "#0f766e" : "#cbd5e1",
-                padding: "6px 10px",
-                textDecoration: "none",
-                color: "#fff",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              Mail
-            </a>
-            <a
-              href={whatsappNumber ? `https://wa.me/${whatsappNumber}?text=${encodeURIComponent([
-                `Dear ${item.party_name || item.buyer_name || item.company_name || "Party"},`,
-                `Your outstanding balance is ${formatMoney(Math.abs(item.balance || 0))}.`,
-                dueDate ? `Due Date: ${formatLedgerDate(dueDate)}` : "",
-                item.due_days !== undefined ? `Due Days: ${item.due_days}` : "",
-                item.days_overdue !== undefined ? `Days Overdue: ${item.days_overdue}` : "",
-                `Voucher No: ${item.voucher_no || "-"}`,
-              ].filter(Boolean).join(" "))}` : "#"}
-              onClick={(event) => {
-                if (!whatsappNumber) event.preventDefault();
-              }}
-              target="_blank"
-              rel="noreferrer"
-              style={{
-                ...btnAction,
-                background: whatsappNumber ? "#15803d" : "#cbd5e1",
-                padding: "6px 10px",
-                textDecoration: "none",
-                color: "#fff",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              WhatsApp
-            </a>
-          </div>
-        );
-      }],
-    ],
-    "warehouse-stock": [
-      ["warehouse", "Warehouse", (item) => getWarehouseName(item)],
-      ["account", "Account Name", (item) => getAccountName(item)],
-      ["product", "Product", (item) => getProductName(item)],
-      ["purchase_qty", "Purchase Qty", (item) => (
-        <button type="button" onClick={() => openStockDrilldown(item, "purchase")} style={linkButtonStyle}>
-          {formatDecimal4(item.purchase_qty || 0)}
-        </button>
-      )],
-      ["sale_qty", "Sale Qty", (item) => (
-        <button type="button" onClick={() => openStockDrilldown(item, "sale")} style={linkButtonStyle}>
-          {formatDecimal4(item.sale_qty || 0)}
-        </button>
-      )],
-      ["stock_qty", "Stock Qty", (item) => (
-        <button type="button" onClick={() => openStockDrilldown(item, "stock")} style={linkButtonStyle}>
-          {formatDecimal4(item.stock_qty || 0)}
-        </button>
-      )],
-      ["avg_rate", "Avg Rate", (item) => formatMoney(item.avg_rate || 0)],
-      ["stock_amount", "Stock Amount", (item) => formatMoney(item.stock_amount || 0)],
-    ],
-    "fifo-stock": [
-      ["date", "Purchase Date", (item) => item.date || "-"],
-      ["voucher_no", "Voucher No", (item) => item.voucher_no || "-"],
-      ["warehouse", "Warehouse", (item) => getWarehouseName(item)],
-      ["product", "Product", (item) => getProductName(item)],
-      ["purchase_qty", "Purchase Qty", (item) => formatDecimal4(item.purchase_qty || 0)],
-      ["remaining_qty", "FIFO Balance Qty", (item) => formatDecimal4(item.remaining_qty || 0)],
-      ["gross_weight", "Gross Wt", (item) => formatDecimal4(item.gross_weight || 0)],
-      ["rate", "FIFO Rate", (item) => formatMoney(item.rate || 0)],
-      ["amount", "FIFO Amount", (item) => formatMoney(item.amount || 0)],
-    ],
-    "profit-loss": [
-      ["warehouse", "Warehouse", (item) => item.warehouse_name || getWarehouseName(item)],
-      ["sale_amount", "Sale Amount", (item) => formatMoney(item.sale_amount || 0)],
-      ["purchase_amount", "Purchase Amount", (item) => formatMoney(item.purchase_amount || 0)],
-      ["profit_loss", "Profit/Loss", (item) => (
-        <span style={{ color: Number(item.profit_loss || 0) >= 0 ? "#16a34a" : "#dc2626" }}>
-          {formatMoney(item.profit_loss || 0)}
-        </span>
-      )],
-    ],
-  };
-
-  const activeReportColumns = reportColumns[activeReport] || (activeReport === "sale-journey" ? reportColumns["sale-party-ledger"] : reportColumns.sale);
-  const currentReportRows = activeReport === "warehouse-stock" ? warehouseStockReport : reportData;
-  const displayReportData = useMemo(() => {
-    if (activeReport === "sale-followup") {
-      const rows = Array.isArray(reportData) ? reportData : [];
-      if (saleFollowupFilter === "all") return rows;
-      return rows.filter((row) => String(row.followup_status || "pending").toLowerCase() === saleFollowupFilter);
-    }
-    if (activeReport !== "purchase-party-ledger" && activeReport !== "sale-party-ledger") return Array.isArray(currentReportRows) ? currentReportRows : [];
-    const entries = (Array.isArray(reportData) ? reportData : []).filter((row) => row.row_type !== "closing");
-    const ledgerPartyName = (row) => activeReport === "purchase-party-ledger"
-      ? (row.farmer_name || getFarmerName(row) || "Unknown Farmer")
-      : (row.party_name || row.buyer_name || row.company_name || row.consignee_name || "Unknown Party");
-    const ledgerGroupKey = (row) => `${ledgerPartyName(row)}::${row.company_account_id || row.company_account_name || row.account_name || ""}`;
-    const sorted = entries.slice().sort((a, b) => {
-      const leftParty = ledgerGroupKey(a);
-      const rightParty = ledgerGroupKey(b);
-      const partyCmp = String(leftParty).localeCompare(String(rightParty));
-      if (partyCmp) return partyCmp;
-      const dateCmp = String(a.date || "").localeCompare(String(b.date || ""));
-      if (dateCmp) return dateCmp;
-      return String(a.voucher_no || "").localeCompare(String(b.voucher_no || ""));
-    });
-    const grouped = [];
-    let currentGroup = null;
-    let currentParty = null;
-    let currentAccount = null;
-    let running = 0;
-    let farmerDebit = 0;
-    let farmerCredit = 0;
-    const pushClosing = () => {
-      if (!currentGroup) return;
-      grouped.push({
-        row_type: "closing",
-        farmer_name: currentParty,
-        party_name: currentParty,
-        company_account_name: currentAccount,
-        debit: farmerDebit,
-        credit: farmerCredit,
-        balance: running,
-        closing_side: running > 0 ? "DR" : "CR",
-      });
-    };
-    sorted.forEach((row) => {
-      const partyName = ledgerPartyName(row);
-      const groupKey = ledgerGroupKey(row);
-      if (currentGroup && groupKey !== currentGroup) {
-        pushClosing();
-        running = 0;
-        farmerDebit = 0;
-        farmerCredit = 0;
-      }
-      currentGroup = groupKey;
-      currentParty = partyName;
-      currentAccount = getAccountName(row);
-      const debit = toNumber(row.debit || 0);
-      const credit = toNumber(row.credit || 0);
-      running += debit - credit;
-      farmerDebit += debit;
-      farmerCredit += credit;
-      grouped.push({
+  purchases
+    .slice()
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+    .forEach((row) => {
+      const key = keyOf(row);
+      const netQty = Number(row.total_quantity || row.total_qty || row.net_weight || row.quantity || 0);
+      const grossQty = Number(row.gross_weight || 0);
+      const qty = grossQty > 0 ? grossQty : netQty;
+      const amount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+      if (!lotsByKey.has(key)) lotsByKey.set(key, []);
+      lotsByKey.get(key).push({
         ...row,
-        farmer_name: activeReport === "purchase-party-ledger" ? partyName : row.farmer_name,
-        party_name: activeReport === "sale-party-ledger" ? partyName : row.party_name,
-        balance: Number(running.toFixed(4)),
-        row_type: "entry",
+        purchase_qty: qty,
+        remaining_qty: qty,
+        fifo_rate: qty > 0 ? amount / qty : Number(row.rate || 0),
       });
     });
-    pushClosing();
-    return grouped;
-  }, [activeReport, currentReportRows, reportData, farmers, buyerNames, companyAccounts, saleFollowupFilter]);
-  const saleFollowupRows = activeReport === "sale-followup" ? displayReportData : [];
-  const purchasePartyLedgerCompanyAccounts = useMemo(() => {
-    if (Array.isArray(reportFilterOptions.accounts) && reportFilterOptions.accounts.length) {
-      return reportFilterOptions.accounts;
-    }
-    const ids = new Set((reportFilterOptions.account_ids || []).map(String));
-    return companyAccounts.filter((account) => ids.has(String(account.id || account._id || "")));
-  }, [companyAccounts, reportFilterOptions.account_ids, reportFilterOptions.accounts]);
 
-  const purchasePartyLedgerWarehouses = useMemo(() => {
-    if (Array.isArray(reportFilterOptions.warehouses) && reportFilterOptions.warehouses.length) {
-      return reportFilterOptions.warehouses;
-    }
-    const ids = new Set((reportFilterOptions.warehouse_ids || []).map(String));
-    return warehouses.filter((warehouse) => ids.has(String(warehouse.id || warehouse._id || "")));
-  }, [warehouses, reportFilterOptions.warehouse_ids, reportFilterOptions.warehouses]);
-
-  const purchasePartyLedgerFarmers = useMemo(() => {
-    if (Array.isArray(reportFilterOptions.farmers) && reportFilterOptions.farmers.length) {
-      return reportFilterOptions.farmers;
-    }
-    const ids = new Set((reportFilterOptions.farmer_ids || []).map(String));
-    return farmers.filter((farmer) => ids.has(String(farmer.id || farmer._id || "")));
-  }, [farmers, reportFilterOptions.farmer_ids, reportFilterOptions.farmers]);
-
-  const saleReportAccounts = purchasePartyLedgerCompanyAccounts;
-  const saleReportWarehouses = purchasePartyLedgerWarehouses;
-  const saleReportFarmers = purchasePartyLedgerFarmers;
-  const saleReportBuyers = useMemo(() => {
-    if (Array.isArray(reportFilterOptions.buyers) && reportFilterOptions.buyers.length) {
-      return reportFilterOptions.buyers;
-    }
-    const ids = new Set((reportFilterOptions.buyer_ids || []).map(String));
-    return buyerNames.filter((buyer) => ids.has(String(buyer.id || buyer._id || "")));
-  }, [buyerNames, reportFilterOptions.buyer_ids, reportFilterOptions.buyers]);
-
-  const normalizedGlobalSearch = String(globalSearch || "").trim().toLowerCase();
-  const matchesGlobalSearch = (value) =>
-    !normalizedGlobalSearch || String(value ?? "").toLowerCase().includes(normalizedGlobalSearch);
-  const matchesAnyValue = (values) => values.some((value) => matchesGlobalSearch(value));
-  // Voucher table data is already filtered, sorted and paginated by MongoDB.
-  // Do not run a second client-side filter/sort/slice over the complete dataset.
-  const filteredVoucherListAll = list;
-  const filteredVoucherList = list;
-
-  const filteredReportDataAll = useMemo(() => {
-    const serverPagedReport = activeReport === "sale" || activeReport === "purchase" || activeReport === "warehouse-stock";
-    // Sale/Purchase search is already applied in MongoDB before pagination.
-    if (serverPagedReport || !normalizedGlobalSearch) return displayReportData;
-    return displayReportData.filter((item) =>
-      matchesAnyValue([
-        item.voucher_no,
-        item.bill_no,
-        item.date,
-        item.party_name,
-        item.farmer_name,
-        getFarmerName(item),
-        item.buyer_name,
-        item.company_name,
-        item.company_account_name,
-        item.warehouse_name,
-        getWarehouseName(item),
-        item.location_name,
-        item.product_name,
-        item.description,
-        item.reference_id,
-        item.lorry_no,
-        item.po_no,
-        item.due_date,
-        item.quantity,
-        item.total_qty,
-        item.amount,
-        item.net_amount,
-        item.net_receivable_amount,
-        item.outstanding,
-      ])
-    );
-  }, [displayReportData, normalizedGlobalSearch]);
-  const filteredReportData = useMemo(() => {
-    const serverPagedReport = activeReport === "sale" || activeReport === "purchase" || activeReport === "warehouse-stock";
-    if (serverPagedReport) return filteredReportDataAll;
-    const start = (reportPage - 1) * PAGE_SIZE;
-    return filteredReportDataAll.slice(start, start + PAGE_SIZE);
-  }, [filteredReportDataAll, reportPage]);
-  useEffect(() => {
-    setVoucherPage(1);
-  }, [activeVoucherType, normalizedGlobalSearch]);
-  useEffect(() => {
-    setReportPage(1);
-    }, [activeReport, normalizedGlobalSearch, saleFollowupFilter, reportFilters.farmer_id, reportFilters.warehouse_id, reportFilters.company_account_id, reportFilters.sale_buyer_id, reportFilters.sale_company_account_id, reportFilters.sale_journey_token, reportFilters.sale_lorry_no, reportFilters.sale_bill_no]);
-  useEffect(() => {
-    setVoucherPage((current) => Math.min(current, Math.max(1, Number(voucherPageInfo.totalPages || 1))));
-  }, [voucherPageInfo.totalPages]);
-  useEffect(() => {
-    const serverPagedReport = activeReport === "sale" || activeReport === "purchase" || activeReport === "warehouse-stock";
-    const totalPages = serverPagedReport
-      ? Math.max(1, Math.ceil(Number(reportPageInfo.total || 0) / Number(reportPageInfo.pageSize || PAGE_SIZE)))
-      : Math.max(1, Math.ceil(filteredReportDataAll.length / PAGE_SIZE));
-    setReportPage((current) => Math.min(current, totalPages));
-  }, [activeReport, reportPageInfo.total, reportPageInfo.pageSize, filteredReportDataAll.length]);
-  const saleFollowupCounts = useMemo(() => {
-    const counts = { all: filteredReportDataAll.length, payment_done: 0, unloading_pending: 0, pending: 0, overdue: 0 };
-    filteredReportDataAll.forEach((row) => {
-      const status = String(row.followup_status || "pending").toLowerCase();
-      if (counts[status] !== undefined) counts[status] += 1;
-    });
-    return counts;
-  }, [filteredReportData]);
-
-  const purchaseReportRows = useMemo(() => {
-    const rows = Array.isArray(filteredReportDataAll) ? filteredReportDataAll : [];
-    return rows.filter((row) => row && (row.id || row._id || row.voucher_no));
-  }, [filteredReportDataAll]);
-
-  const currentPurchasePreviewIndex = purchasePreviewRow
-    ? purchaseReportRows.findIndex((row) => String(getRecordId(row)) === String(getRecordId(purchasePreviewRow)))
-    : -1;
-
-  const navigatePurchasePreview = (direction) => {
-    if (currentPurchasePreviewIndex < 0) return;
-    const targetIndex = currentPurchasePreviewIndex + direction;
-    const targetRow = purchaseReportRows[targetIndex];
-    if (targetRow) {
-      setPurchasePreviewRow(targetRow);
-    }
-  };
-  const totalVoucherPages = Math.max(1, Number(voucherPageInfo.totalPages || 1));
-  const totalReportPages = activeReport === "sale" || activeReport === "purchase" || activeReport === "warehouse-stock"
-    ? (reportPageInfo.hasMore ? reportPage + 1 : reportPage)
-    : Math.max(1, Math.ceil(filteredReportDataAll.length / PAGE_SIZE));
-  const renderPaginationBar = (page, totalPages, onPrev, onNext, totalItems, label = "rows") => {
-    if (totalPages <= 1) return null;
-    const start = totalItems === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
-    const end = Math.min(page * PAGE_SIZE, totalItems);
-    return (
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap", marginTop: 12, fontSize: 13, color: "#475569", padding: "12px", background: "#f8fafc", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
-        <div style={{ fontWeight: 600, color: "#0f172a" }}>
-          Total: <span style={{ fontWeight: 700, color: "#1e40af" }}>{totalItems}</span> {label} | Pages: <span style={{ fontWeight: 700, color: "#1e40af" }}>{totalPages}</span>
-        </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button type="button" onClick={onPrev} disabled={page <= 1} style={{ ...btnAction, background: page <= 1 ? "#cbd5e1" : "#64748b", color: page <= 1 ? "#64748b" : "#fff", cursor: page <= 1 ? "not-allowed" : "pointer", padding: "6px 12px" }}>
-            ← Prev
-          </button>
-          <div style={{ alignSelf: "center", padding: "0 12px", fontWeight: 700, color: "#0f172a", whiteSpace: "nowrap", background: "#fff", border: "1px solid #cbd5e1", borderRadius: "6px", padding: "6px 12px" }}>
-            Showing {totalItems === 0 ? 0 : `${start}-${end}`} | Page {page} / {totalPages}
-          </div>
-          <button type="button" onClick={onNext} disabled={page >= totalPages} style={{ ...btnAction, background: page >= totalPages ? "#cbd5e1" : "#0f766e", color: page >= totalPages ? "#64748b" : "#fff", cursor: page >= totalPages ? "not-allowed" : "pointer", padding: "6px 12px" }}>
-            Next →
-          </button>
-        </div>
-      </div>
-    );
-  };
-  const saleFollowupStatusMeta = {
-    all: { label: "All Bills", bg: "#0f172a", color: "#fff" },
-    payment_done: { label: "Payment Done", bg: "#dcfce7", color: "#166534" },
-    unloading_pending: { label: "Unloading Pending", bg: "#fef3c7", color: "#92400e" },
-    pending: { label: "Payment Pending", bg: "#dbeafe", color: "#1d4ed8" },
-    overdue: { label: "Overdue", bg: "#fee2e2", color: "#b91c1c" },
-  };
-  const purchaseBillRows = activeReport === "purchase-party-ledger"
-    ? displayReportData.filter((row) => row.row_type === "entry" && row.voucher_type === "Purchase")
-    : [];
-  const selectedBill = purchaseBillRows.find((row) => String(row.purchase_id || row.voucher_no) === String(selectedLedgerBillId)) || purchaseBillRows[0] || null;
-  const saleBillRows = activeReport === "sale-party-ledger"
-    ? displayReportData.filter((row) => row.row_type === "entry" && row.voucher_type === "Sale")
-    : [];
-  const saleJourneyRows = activeReport === "sale-journey"
-    ? (Array.isArray(reportData) ? reportData : [])
-    : [];
-  const selectedSaleBill = saleBillRows.find((row) => String(row.sale_id || row.voucher_no) === String(selectedSaleLedgerBillId)) || saleBillRows[0] || null;
-  const selectedSaleJourneySeed = activeReport === "sale-journey" ? (saleJourneyRows[0] || null) : selectedSaleBill;
-  const selectedSaleJourneyKey = String(selectedSaleJourneySeed?.journey_token || selectedSaleJourneySeed?.journey_id || selectedSaleJourneySeed?.journey_group_no || "").trim();
-  const selectedSaleJourneyRows = activeReport === "sale-journey"
-    ? (selectedSaleJourneyKey
-      ? saleJourneyRows.filter((row) => String(row.journey_token || row.journey_id || row.journey_group_no || "") === selectedSaleJourneyKey)
-      : saleJourneyRows)
-    : (selectedSaleJourneyKey
-      ? saleBillRows.filter((row) => String(row.journey_token || row.journey_id || row.journey_group_no || "") === selectedSaleJourneyKey)
-      : selectedSaleBill
-        ? saleBillRows.filter((row) => String(row.lorry_no || "") === String(selectedSaleBill.lorry_no || "") && String(row.date || "") === String(selectedSaleBill.date || ""))
-        : []);
-  const selectedSaleJourneyTotalQty = selectedSaleJourneyRows.reduce((sum, row) => sum + toNumber(row.quantity || row.total_quantity || row.unloading_qty || 0), 0);
-  const selectedSaleJourneyTotalAmount = selectedSaleJourneyRows.reduce((sum, row) => sum + toNumber(row.amount || row.total_amount || row.net_receivable_amount || 0), 0);
-  const selectedSaleJourneyBalanceQty = Math.max(
-    toNumber(selectedSaleBill?.total_quantity || selectedSaleBill?.quantity || selectedSaleBill?.unloading_qty || 0) - selectedSaleJourneyTotalQty,
-    0
-  );
-
-  const getAccountDetails = (item) => {
-    const accountId = String(item.company_account_id || item.account_id || item.companyAccountId || "");
-    return companyAccounts.find((account) => String(account.id || account._id) === accountId) || {};
-  };
-
-  const getLedgerPartyDetails = (row, ledgerType = activeReport) => {
-    if (row.row_type === "closing") return { name: row.party_name || row.farmer_name || "-", address: "", mobile: "", email: "", gst: "", pan: "" };
-    if (ledgerType === "purchase-party-ledger") {
-      const farmerId = String(row.farmer_id || "");
-      const farmer = farmers.find((item) => String(item.id || item._id) === farmerId) || {};
-      return {
-        name: row.farmer_name || farmer.name || getFarmerName(row) || "-",
-        address: row.farmer_address || farmer.address || "",
-        village: row.farmer_village || farmer.village || "",
-        city: row.farmer_city || farmer.city || "",
-        district: row.farmer_district || farmer.district || "",
-        state: row.farmer_state || farmer.state || "",
-        pincode: row.farmer_pincode || farmer.pincode || "",
-        mobile: row.farmer_mobile || farmer.mobile || "",
-        email: row.farmer_email || farmer.email || "",
-        gst: row.farmer_gst || farmer.gst_no || farmer.gst || "",
-        pan: row.farmer_pan || farmer.pan_no || farmer.pan || "",
-      };
-    }
-    const buyerId = String(row.buyer_id || row.company_id || "");
-    const buyer = buyerNames.find((item) => String(item.id || item._id) === buyerId) || {};
-    return {
-      name: row.party_name || row.buyer_name || row.company_name || buyer.name || "-",
-      address: row.buyer_address || row.company_address || buyer.address || buyer.location || "",
-      village: row.buyer_village || buyer.village || "",
-      city: row.buyer_city || buyer.city || "",
-      district: row.buyer_district || buyer.district || "",
-      state: row.buyer_state || buyer.state || "",
-      pincode: row.buyer_pincode || buyer.pincode || "",
-      mobile: row.buyer_mobile || row.company_mobile || buyer.mobile || "",
-      email: row.buyer_email || row.company_email || buyer.email || "",
-      gst: row.buyer_gst || row.company_gst || buyer.gst_no || buyer.gst || "",
-      pan: row.buyer_pan || row.company_pan || buyer.pan_no || buyer.pan || "",
-    };
-  };
-
-  const getLedgerAccountDetails = (row) => {
-    const account = getAccountDetails(row);
-    return {
-      name: getAccountName(row),
-      address: row.company_account_address || row.account_address || account.address || "",
-      city: row.company_account_city || account.city || "",
-      district: row.company_account_district || account.district || "",
-      state: row.company_account_state || account.state || "",
-      pincode: row.company_account_pincode || account.pincode || "",
-      mobile: row.company_account_mobile || row.account_mobile || account.mobile || "",
-      email: row.company_account_email || row.account_email || account.email || "",
-      gst: row.company_account_gst || row.account_gst || account.gst_no || account.gst || "",
-      pan: row.company_account_pan || row.account_pan || account.pan_no || account.pan || "",
-    };
-  };
-
-  const formatLedgerContact = ({ address, mobile, email, gst, pan }) =>
-    [
-      address ? `Address: ${address}` : "",
-      mobile ? `Phone: ${mobile}` : "",
-      email ? `Mail: ${email}` : "",
-      gst ? `GST: ${gst}` : "",
-      pan ? `PAN: ${pan}` : "",
-    ].filter(Boolean).join(" | ") || "-";
-
-  const buildLedgerPdf = (ledgerType) => {
-    const isPurchaseLedger = ledgerType === "purchase-party-ledger";
-    const isSaleLedger = ledgerType === "sale-party-ledger";
-    const title = isSaleLedger ? "Sale Party Ledger" : "Purchase Party Ledger";
-    const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
-    const pageWidth = doc.internal.pageSize.getWidth();
-    const pageHeight = doc.internal.pageSize.getHeight();
-    const firstEntry = (displayReportData || []).find((row) => row.row_type !== "closing") || {};
-    const reportParty = getLedgerPartyDetails(firstEntry, ledgerType);
-    const reportAccount = getLedgerAccountDetails(firstEntry);
-
-    // Keep the report data readable on mobile PDF viewers: use the full page
-    // width, smaller margins and no heavy cell borders.
-    const left = 10;
-    const right = 10;
-    const usableWidth = pageWidth - left - right;
-
-    const joinAddress = (details) => {
-      const parts = [
-        details.address,
-        details.village,
-        details.city,
-        details.district,
-        details.state,
-        details.pincode,
-      ].map((v) => String(v || "").trim()).filter(Boolean);
-      return [...new Set(parts)].join(", ");
-    };
-
-    const accountAddress = joinAddress({
-      address: reportAccount.address,
-      city: reportAccount.city,
-      district: reportAccount.district,
-      state: reportAccount.state,
-      pincode: reportAccount.pincode,
-    });
-    const farmerAddress = joinAddress({
-      address: reportParty.address,
-      village: reportParty.village,
-      city: reportParty.city,
-      district: reportParty.district,
-      state: reportParty.state,
-      pincode: reportParty.pincode,
+  sales
+    .slice()
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+    .forEach((row) => {
+      const lots = lotsByKey.get(keyOf(row)) || [];
+      let saleQty = Number(row.quantity || row.total_quantity || 0);
+      for (const lot of lots) {
+        if (saleQty <= 0) break;
+        const used = Math.min(lot.remaining_qty, saleQty);
+        lot.remaining_qty -= used;
+        saleQty -= used;
+      }
     });
 
-    const contactLine = (details, address) => [
-      address ? `Address: ${address}` : "",
-      details.mobile ? `Phone: ${details.mobile}` : "",
-      details.email ? `Email: ${details.email}` : "",
-      details.gst ? `GST: ${details.gst}` : "",
-      details.pan ? `PAN: ${details.pan}` : "",
-    ].filter(Boolean).join("  |  ");
+  return Array.from(lotsByKey.values())
+    .flat()
+    .filter((lot) => lot.remaining_qty > 0.0001)
+    .map((lot) => ({
+      date: lot.date,
+      voucher_no: lot.voucher_no,
+      warehouse_id: lot.warehouse_id,
+      warehouse_name: lot.warehouse_name,
+      product_id: lot.product_id,
+      product_name: lot.product_name,
+      purchase_qty: Number(lot.purchase_qty.toFixed(4)),
+      remaining_qty: Number(lot.remaining_qty.toFixed(4)),
+      rate: Number(lot.fifo_rate.toFixed(4)),
+      amount: Number((lot.remaining_qty * lot.fifo_rate).toFixed(4)),
+      gross_weight: Number((Number(lot.gross_weight || lot.purchase_qty || 0)).toFixed(4)),
+    }));
+}
 
-    const drawInfoCard = (x, y, w, label, details, address, accent) => {
-      const h = 25;
-      doc.setFillColor(248, 250, 252);
-      doc.setDrawColor(226, 232, 240);
-      doc.roundedRect(x, y, w, h, 2, 2, "FD");
-      doc.setFillColor(...accent);
-      doc.roundedRect(x, y, 2.5, h, 1.2, 1.2, "F");
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(6.8);
-      doc.setTextColor(...accent);
-      doc.text(label.toUpperCase(), x + 6, y + 5.2);
-      doc.setFontSize(9.5);
-      doc.setTextColor(15, 23, 42);
-      doc.text(String(details.name || "-").slice(0, 100), x + 6, y + 10.2);
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(6.3);
-      doc.setTextColor(71, 85, 105);
-      const line = contactLine(details, address) || "Address: -";
-      const wrapped = doc.splitTextToSize(line, w - 12).slice(0, 3);
-      doc.text(wrapped, x + 6, y + 14.2, { lineHeightFactor: 1.15 });
-      return y + h;
-    };
+// ===========================
+// REPORTS
+// ===========================
+router.get("/report/payment", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.payment.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
 
-    // Header
-    doc.setFillColor(15, 118, 110);
-    doc.rect(0, 0, pageWidth, 7, "F");
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(15);
-    doc.setTextColor(15, 23, 42);
-    doc.text(title, left, 17);
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(7);
-    doc.setTextColor(100, 116, 139);
-    doc.text(`Generated: ${formatLedgerDate(new Date().toISOString().slice(0, 10))}`, pageWidth - right, 17, { align: "right" });
+  getPaymentRowsForUser(req, res);
+});
 
-    let contentStartY = 22;
-    if (isPurchaseLedger) {
-      const accountBottom = drawInfoCard(left, contentStartY, usableWidth, "Account Details", reportAccount, accountAddress, [15, 118, 110]);
-      const farmerBottom = drawInfoCard(left, accountBottom + 3, usableWidth, "Farmer Details", reportParty, farmerAddress, [37, 99, 235]);
-      contentStartY = farmerBottom + 5;
-    } else if (isSaleLedger) {
-      const gap = 4;
-      const cardW = (usableWidth - gap) / 2;
-      const accountBottom = drawInfoCard(left, contentStartY, cardW, "Account Details", reportAccount, accountAddress, [15, 118, 110]);
-      const partyBottom = drawInfoCard(left + cardW + gap, contentStartY, cardW, `${isSaleLedger ? "Party" : "Farmer"} Details`, reportParty, farmerAddress, [37, 99, 235]);
-      contentStartY = Math.max(accountBottom, partyBottom) + 5;
+router.get("/report/filter-options", async (req, res) => {
+  const filterStartedAt = Date.now();
+  ensureTradingIndexes();
+  const type = String(req.query.type || "purchase").trim().toLowerCase();
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Trading report filters" });
+
+  const isSale = type === "sale" || type === "sale-party-ledger" || type === "sale-followup" || type === "sale-journey";
+  const isPurchase = type === "purchase" || type === "purchase-party-ledger" || type === "fifo-stock";
+  if (!isSale && !isPurchase) return res.status(400).json({ error: "Unsupported report type" });
+
+  const accountId = String(req.query.company_account_id || "").trim();
+  const warehouseId = String(req.query.warehouse_id || "").trim();
+  const farmerId = String(req.query.farmer_id || "").trim();
+  const buyerId = String(req.query.buyer_id || "").trim();
+  const cacheKey = JSON.stringify([
+    req.user?.id || req.user?._id || "", type, accountId, warehouseId, farmerId, buyerId,
+  ]);
+  const cached = tradingFilterCache.get(cacheKey);
+  if (cached && Date.now() - cached.time < TRADING_FILTER_CACHE_MS) {
+    return res.json(cached.data);
+  }
+
+  try {
+    const base = isPurchase ? { ...mongoPurchaseScope(req.user) } : { ...mongoSaleScope(req.user) };
+    if (accountId) base.company_account_id = accountId;
+    if (warehouseId) base.warehouse_id = warehouseId;
+    if (farmerId) base.farmer_id = farmerId;
+
+    let accountIds = [];
+    let warehouseIds = [];
+    let farmerIds = [];
+    let buyerIds = [];
+
+    if (isPurchase) {
+      [accountIds, warehouseIds, farmerIds] = await Promise.all([
+        PurchaseVoucher.distinct("company_account_id", { ...mongoPurchaseScope(req.user), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
+        PurchaseVoucher.distinct("warehouse_id", { ...mongoPurchaseScope(req.user), ...(accountId ? { company_account_id: accountId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
+        PurchaseVoucher.distinct("farmer_id", { ...mongoPurchaseScope(req.user), ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}) }),
+      ]);
+    } else {
+      const saleScope = { ...mongoSaleScope(req.user) };
+      const buyerFilter = buyerId ? { $or: [{ buyer_id: buyerId }, { company_id: buyerId }] } : {};
+      [accountIds, warehouseIds, farmerIds, buyerIds] = await Promise.all([
+        SaleVoucher.distinct("company_account_id", { ...saleScope, ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}), ...buyerFilter }),
+        SaleVoucher.distinct("warehouse_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}), ...buyerFilter }),
+        SaleVoucher.distinct("farmer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...buyerFilter }),
+        SaleVoucher.distinct("buyer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
+      ]);
     }
 
-    const allRows = Array.isArray(displayReportData) ? displayReportData : [];
-    const entryRows = allRows.filter((row) => row.row_type !== "closing");
-    const totalDebit = entryRows.reduce((sum, row) => sum + toNumber(row.debit || 0), 0);
-    const totalCredit = entryRows.reduce((sum, row) => sum + toNumber(row.credit || 0), 0);
-    const closingBalance = Number((totalDebit - totalCredit).toFixed(2));
-    const closingSide = closingBalance >= 0 ? "DR" : "CR";
-    const closingAmount = Math.abs(closingBalance);
+    const clean = (values) => [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))];
+    const validIds = (values) => clean(values).filter((value) => mongoose.Types.ObjectId.isValid(value));
 
-    const summary = [
-      ["Entries", String(entryRows.length)],
-      ["Debit", `Rs.${formatMoney(totalDebit)}`],
-      ["Credit", `Rs.${formatMoney(totalCredit)}`],
-      ["Closing Due", `Rs.${formatMoney(closingAmount)}`],
-    ];
-    const summaryW = (usableWidth - 9) / 4;
-    summary.forEach(([label, value], i) => {
-      const x = left + i * (summaryW + 3);
-      doc.setFillColor(i === 3 ? 239 : 248, i === 3 ? 246 : 250, i === 3 ? 255 : 252);
-      doc.setDrawColor(226, 232, 240);
-      doc.roundedRect(x, contentStartY, summaryW, 14, 2, 2, "FD");
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(6.5);
-      doc.setTextColor(71, 85, 105);
-      doc.text(label, x + 4, contentStartY + 5);
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(8.5);
-      doc.setTextColor(15, 23, 42);
-      doc.text(value, x + 4, contentStartY + 10.8);
-    });
+    const cleanAccountIds = validIds(accountIds);
+    const cleanWarehouseIds = validIds(warehouseIds);
+    const cleanFarmerIds = validIds(farmerIds);
+    const cleanBuyerIds = validIds(buyerIds);
 
-    const tableStartY = contentStartY + 18;
-    const columns = isSaleLedger
-      ? ["Date", "Type", "Voucher No", "Adjustment & Details", "Particulars", "Due Date", "Due Days", "Overdue", "Dr", "Cr", "Balance"]
-      : ["Date", "Type", "Voucher No", "Particulars", "Adjustment Details", "Warehouse", "Due Date", "Due Days", "Overdue", "Dr", "Cr", "Balance"];
+    // Return labels together with IDs so Reports do not need to load the
+    // entire nine-table master bundle just to populate filter dropdowns.
+    const [accountDocs, warehouseDocs, farmerDocs, buyerDocs] = await Promise.all([
+      cleanAccountIds.length ? CompanyAccount.find({ _id: { $in: cleanAccountIds } }).select("_id account_name name").lean() : [],
+      cleanWarehouseIds.length ? Warehouse.find({ _id: { $in: cleanWarehouseIds } }).select("_id name").lean() : [],
+      cleanFarmerIds.length ? Farmer.find({ _id: { $in: cleanFarmerIds } }).select("_id name").lean() : [],
+      cleanBuyerIds.length ? SqliteMirrorRow.find({
+        table: "buyer_names",
+        row_id: { $in: cleanBuyerIds.map((value) => Number(value)).filter(Number.isFinite) },
+      }).select("row_id data").lean() : [],
+    ]);
 
-    const bodyRowTypes = entryRows.map((row) => row.row_type || "entry");
-    const body = entryRows.map((row) => {
-      if (isSaleLedger) {
-        const saleDetails = [
-          `Qty: ${formatDecimal4(row.quantity || row.unloading_qty || 0)}`,
-          `Rate: ${formatMoney(row.rate || 0)}`,
-          `Lorry: ${row.lorry_no || row.reference_id || "-"}`,
-        ].join("\n");
-        return [
-          formatLedgerDate(row.date), row.voucher_type || "-", row.voucher_no || "-", saleDetails,
-          row.particulars || row.adjustment_details || row.description || "-",
-          formatLedgerDate(row.due_date || row.unloading_date || ""), row.due_days ?? "", row.days_overdue ?? "",
-          formatMoney(row.debit || 0), formatMoney(row.credit || 0), formatMoney(Math.abs(row.balance || 0)),
+    const cleanNamed = (docs, type) => {
+      if (type === "buyer") {
+        return (docs || []).map((doc) => ({
+          id: String(doc.row_id),
+          name: String(doc?.data?.name || doc?.data?.company_name || "").trim(),
+        })).filter((item) => item.id && item.name);
+      }
+      return (docs || []).map((doc) => ({
+        id: String(doc._id),
+        name: String(doc.account_name || doc.name || "").trim(),
+      })).filter((item) => item.id && item.name);
+    };
+
+    const data = {
+      account_ids: clean(accountIds),
+      warehouse_ids: clean(warehouseIds),
+      farmer_ids: clean(farmerIds),
+      buyer_ids: clean(buyerIds),
+      accounts: cleanNamed(accountDocs),
+      warehouses: cleanNamed(warehouseDocs),
+      farmers: cleanNamed(farmerDocs),
+      buyers: cleanNamed(buyerDocs, "buyer"),
+    };
+    tradingFilterCache.set(cacheKey, { time: Date.now(), data });
+    res.set("Cache-Control", "private, max-age=900, stale-while-revalidate=120");
+    res.set("Server-Timing", `trading-filter;dur=${Date.now() - filterStartedAt}`);
+    res.json(data);
+  } catch (err) {
+    console.error("Trading report filter options failed:", err);
+    res.status(500).json({ error: err.message || "Failed to load report filters" });
+  }
+});
+
+router.get("/report/sale-summary", async (req, res) => {
+  ensureTradingIndexes();
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
+  const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
+  const options = {
+    buyerId: String(req.query.buyer_id || "").trim(),
+    farmerId: String(req.query.farmer_id || "").trim(),
+    warehouseId: String(req.query.warehouse_id || "").trim(),
+    companyAccountId: String(req.query.company_account_id || "").trim(),
+    productId: String(req.query.product_id || "").trim(),
+    search: String(req.query.search || "").trim(),
+  };
+
+  try {
+    if (mongoReady()) {
+      const filter = { ...mongoSaleScope(req.user) };
+      if (options.buyerId) filter.$or = [{ buyer_id: options.buyerId }, { company_id: options.buyerId }];
+      if (options.farmerId) filter.farmer_id = options.farmerId;
+      if (options.warehouseId) filter.warehouse_id = options.warehouseId;
+      if (options.companyAccountId) filter.company_account_id = options.companyAccountId;
+      if (options.productId) filter.product_id = options.productId;
+      if (options.search) {
+        const safe = options.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const rx = new RegExp(safe, "i");
+        filter.$and = [
+          ...(filter.$and || []),
+          { $or: [
+            { voucher_no: rx },
+            { bill_no: rx },
+            { po_no: rx },
+            { buyer_name: rx },
+            { company_name: rx },
+            { product_name: rx },
+            { warehouse_name: rx },
+            { company_account_name: rx },
+            { consignee_name: rx },
+            { lorry_no: rx },
+            { description: rx },
+          ] },
         ];
       }
-      return [
-        formatLedgerDate(row.date), row.voucher_type || "-", row.voucher_no || "-", row.particulars || "-",
-        row.adjustment_details || "-", getWarehouseName(row), formatLedgerDate(row.due_date || row.unloading_date || ""),
-        row.due_days ?? "", row.days_overdue ?? "", formatMoney(row.debit || 0), formatMoney(row.credit || 0),
-        formatMoney(Math.abs(row.balance || 0)),
-      ];
-    });
+      const query = SaleVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+      const countPromise = usePaging ? SaleVoucher.countDocuments(filter).exec() : Promise.resolve(0);
+      if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
+      const [rows, total] = await Promise.all([query.exec(), countPromise]);
+      let decorated;
+      try {
+        decorated = await decorateSaleRows(rows || []);
+      } catch (decorateErr) {
+        // Reporting must not fail because an optional master/mirror record is
+        // missing. MongoDB voucher data is still valid and should be returned.
+        console.error("Sale report decoration skipped:", decorateErr);
+        decorated = (rows || []).map((row) => ({
+          ...(row?.toObject ? row.toObject() : row),
+          id: String(row?._id || row?.id || ""),
+          _id: String(row?._id || row?.id || ""),
+          total_quantity: Number(row?.quantity || row?.total_quantity || 0),
+          total_amount: Number(row?.amount || row?.total_amount || 0),
+          ...calculateSaleFollowupMeta(row || {}),
+        }));
+      }
+      const data = decorated.map((row) => ({
+        ...row,
+        total_quantity: Number(Number(row.quantity || row.total_quantity || 0).toFixed(4)),
+        total_amount: Number(Number(row.amount || row.total_amount || 0).toFixed(2)),
+      }));
+      return res.json(usePaging ? { data, pagination: { page, pageSize, total: Number(total || 0), totalPages: Math.max(1, Math.ceil(Number(total || 0) / pageSize)), hasMore: page * pageSize < Number(total || 0) } } : data);
+    }
 
-    // ONE closing row, always at the absolute end of the ledger.
-    body.push([
-      "", `Closing (${closingSide})`, "", "", "", "", "", "", "",
-      formatMoney(totalDebit), formatMoney(totalCredit), formatMoney(closingAmount),
+    const rows = await getSaleReportRowsForUser(req.user, options);
+    const data = usePaging ? rows.slice((page - 1) * pageSize, page * pageSize) : rows;
+    return res.json(usePaging ? { data, pagination: { page, pageSize, total: rows.length, totalPages: Math.max(1, Math.ceil(rows.length / pageSize)), hasMore: page * pageSize < rows.length } } : data);
+  } catch (err) {
+    console.error("Mongo sale report query failed:", err);
+    res.status(500).json({ error: err.message || "Failed to load sale report" });
+  }
+});
+
+router.get("/report/purchase-summary", (req, res) => {
+  ensureTradingIndexes();
+  if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 25, 1), 200);
+  const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
+  const farmerId = String(req.query.farmer_id || "").trim();
+  const warehouseId = String(req.query.warehouse_id || "").trim();
+  const companyAccountId = String(req.query.company_account_id || "").trim();
+
+  if (mongoReady()) {
+    const query = PurchaseVoucher.find(mongoPurchaseScope(req.user)).sort({ date: -1, createdAt: -1, _id: -1 });
+    if (farmerId) query.where("farmer_id").equals(farmerId);
+    if (warehouseId) query.where("warehouse_id").equals(warehouseId);
+    if (companyAccountId) query.where("company_account_id").equals(companyAccountId);
+    const countPromise = usePaging ? PurchaseVoucher.countDocuments(query.getQuery()).exec() : Promise.resolve(null);
+    if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
+    const rowsPromise = query.lean().exec();
+
+    return Promise.all([rowsPromise, countPromise])
+      .then(async ([rows, totalCount]) => {
+        const decoratedRows = await decoratePurchaseRows(rows || []);
+        const total = usePaging ? Number(totalCount || 0) : decoratedRows.length;
+        return res.json(
+          usePaging
+            ? {
+                data: decoratedRows || [],
+                pagination: {
+                  page,
+                  pageSize,
+                  total,
+                  hasMore: page * pageSize < total,
+                },
+              }
+            : (decoratedRows || [])
+        );
+      })
+      .catch((err) => {
+        console.error("Mongo purchase report query failed, falling back to SQLite:", err.message);
+        res.status(500).json({ error: err.message });
+      });
+  }
+
+  const filter = assignedWarehouseFilter(req.user, "v.warehouse_id");
+  const legacyFilter = assignedWarehouseFilter(req.user, "t.warehouse_id");
+  const purchaseFilterParams = [...filter.params];
+  const legacyPurchaseFilterParams = [...legacyFilter.params];
+  let purchaseFilterClause = "";
+  let legacyPurchaseFilterClause = "";
+  if (farmerId) {
+    purchaseFilterClause += " AND CAST(v.farmer_id AS TEXT) = CAST(? AS TEXT)";
+    legacyPurchaseFilterClause += " AND CAST(t.farmer_id AS TEXT) = CAST(? AS TEXT)";
+    purchaseFilterParams.push(farmerId);
+    legacyPurchaseFilterParams.push(farmerId);
+  }
+  if (warehouseId) {
+    purchaseFilterClause += " AND CAST(v.warehouse_id AS TEXT) = CAST(? AS TEXT)";
+    legacyPurchaseFilterClause += " AND CAST(t.warehouse_id AS TEXT) = CAST(? AS TEXT)";
+    purchaseFilterParams.push(warehouseId);
+    legacyPurchaseFilterParams.push(warehouseId);
+  }
+  if (companyAccountId) {
+    purchaseFilterClause += " AND CAST(v.company_account_id AS TEXT) = CAST(? AS TEXT)";
+    legacyPurchaseFilterClause += " AND CAST(t.company_account_id AS TEXT) = CAST(? AS TEXT)";
+    purchaseFilterParams.push(companyAccountId);
+    legacyPurchaseFilterParams.push(companyAccountId);
+  }
+  const query = `
+    SELECT
+      v.*,
+      w.name AS warehouse_name,
+      ca.account_name AS company_account_name,
+      f.name AS farmer_name,
+      p.name AS product_name,
+      (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
+      COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
+      COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+    FROM wh_purchase_vouchers v
+    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(v.warehouse_id AS TEXT)
+    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(v.company_account_id AS TEXT)
+    LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(v.farmer_id AS TEXT)
+    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(v.product_id AS TEXT)
+    WHERE 1 = 1 ${filter.clause}${purchaseFilterClause}
+    ORDER BY v.date DESC, v.id DESC
+  `;
+  const queryParams = usePaging ? [...purchaseFilterParams, pageSize, (page - 1) * pageSize] : purchaseFilterParams;
+  const pagedQuery = usePaging ? `${query}\nLIMIT ? OFFSET ?` : query;
+  db.all(pagedQuery, queryParams, (err, rows) => {
+    const sendRowsWithLegacy = (purchaseRows) => {
+      const legacyQuery = `
+        SELECT
+          t.id,
+          t.date,
+          t.warehouse_id,
+          t.farmer_id,
+          t.product_id,
+          t.quantity,
+          t.amount,
+          t.description,
+          t.created_at,
+          w.name AS warehouse_name,
+          f.name AS farmer_name,
+          p.name AS product_name,
+          t.quantity AS total_quantity,
+          t.amount AS total_amount,
+          t.amount AS net_amount_payable,
+          1 AS legacy_purchase_entry
+        FROM warehouse_trading_entries t
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(t.warehouse_id AS TEXT)
+        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(t.farmer_id AS TEXT)
+        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(t.product_id AS TEXT)
+        WHERE LOWER(COALESCE(t.transaction_type, '')) = 'purchase' ${legacyFilter.clause}${legacyPurchaseFilterClause}
+        ORDER BY t.date DESC, t.id DESC
+      `;
+
+      db.all(legacyQuery, legacyPurchaseFilterParams, (legacyErr, legacyRows) => {
+        if (legacyErr) {
+          console.error("Legacy purchase report query failed:", legacyErr.message);
+          return res.json(purchaseRows || []);
+        }
+        const merged = [...(purchaseRows || []), ...(legacyRows || [])];
+        return res.json(usePaging ? { data: merged, pagination: { page, pageSize, hasMore: merged.length === pageSize } } : merged);
+      });
+    };
+
+    if (err) {
+      console.error("Purchase report mapped query failed, falling back to base rows:", err.message);
+      const fallbackQuery = `
+        SELECT
+          v.*,
+          (SELECT name FROM warehouses WHERE CAST(id AS TEXT) = CAST(v.warehouse_id AS TEXT) LIMIT 1) AS warehouse_name,
+          (SELECT name FROM farmers WHERE CAST(id AS TEXT) = CAST(v.farmer_id AS TEXT) LIMIT 1) AS farmer_name,
+          (SELECT name FROM products WHERE CAST(id AS TEXT) = CAST(v.product_id AS TEXT) LIMIT 1) AS product_name,
+          (COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) * COALESCE(v.rate, 0)) AS gross_amount,
+          COALESCE(NULLIF(v.total_qty, 0), NULLIF(v.net_weight, 0), v.quantity) AS total_quantity,
+          COALESCE(NULLIF(v.net_amount_payable, 0), v.amount) AS total_amount
+        FROM wh_purchase_vouchers v
+        WHERE 1 = 1 ${filter.clause}${purchaseFilterClause}
+        ORDER BY v.date DESC, v.id DESC
+      `;
+      return db.all(fallbackQuery, purchaseFilterParams, (fallbackErr, fallbackRows) => {
+        if (fallbackErr) return res.status(500).json({ error: fallbackErr.message });
+        sendRowsWithLegacy(fallbackRows || []);
+      });
+    }
+    sendRowsWithLegacy(rows || []);
+  });
+});
+
+router.get("/report/profit-loss", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.profitLoss")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const [purchases, sales] = await Promise.all([
+      getPurchaseReportRowsForUser(req.user),
+      getSaleReportRowsForUser(req.user),
     ]);
+    const rows = new Map();
+    const ensure = (row) => {
+      const key = String(row.warehouse_id || "");
+      if (!rows.has(key)) {
+        rows.set(key, {
+          id: row.warehouse_id,
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name || "",
+          sale_amount: 0,
+          purchase_amount: 0,
+          profit_loss: 0,
+        });
+      }
+      const item = rows.get(key);
+      item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
+      return item;
+    };
 
-    const purchaseWidths = [17, 18, 25, 37, 40, 31, 20, 12, 15, 20, 20, 22];
-    const saleWidths = [17, 18, 25, 40, 40, 20, 13, 15, 22, 22, 25];
-    const widths = isSaleLedger ? saleWidths : purchaseWidths;
-
-    autoTable(doc, {
-      startY: tableStartY,
-      margin: { left, right },
-      tableWidth: usableWidth,
-      theme: "plain",
-      styles: {
-        fontSize: 6.2,
-        cellPadding: { top: 1.6, right: 1.5, bottom: 1.6, left: 1.5 },
-        overflow: "linebreak",
-        valign: "middle",
-        textColor: [15, 23, 42],
-        lineColor: [226, 232, 240],
-        lineWidth: 0.15,
-      },
-      headStyles: {
-        fillColor: [15, 118, 110],
-        textColor: [255, 255, 255],
-        fontStyle: "bold",
-        fontSize: 6.1,
-        lineWidth: 0,
-      },
-      alternateRowStyles: { fillColor: [248, 250, 252] },
-      head: [columns],
-      body,
-      columnStyles: Object.fromEntries(widths.map((w, i) => [i, { cellWidth: w }])),
-      didParseCell: (data) => {
-        // Last row is the single closing row. Make it visually distinct and
-        // remove its cell borders while keeping all values aligned.
-        if (data.section === "body" && data.row.index === body.length - 1) {
-          data.cell.styles.fillColor = [239, 246, 255];
-          data.cell.styles.fontStyle = "bold";
-          data.cell.styles.textColor = [15, 23, 42];
-          data.cell.styles.lineWidth = 0;
-        }
-        // Amount columns are right aligned for clean accounting presentation.
-        if (data.section === "body" && data.column.index >= (isSaleLedger ? 8 : 9)) {
-          data.cell.styles.halign = "right";
-        }
-      },
-      didDrawCell: (data) => {
-        if (data.section === "body" && data.row.index < body.length - 1) {
-          doc.setDrawColor(226, 232, 240);
-          doc.setLineWidth(0.12);
-          doc.line(data.cell.x, data.cell.y + data.cell.height, data.cell.x + data.cell.width, data.cell.y + data.cell.height);
-        }
-      },
-      didDrawPage: (data) => {
-        doc.setFont("helvetica", "normal");
-        doc.setFontSize(6.5);
-        doc.setTextColor(100, 116, 139);
-        doc.text(`Warehouse Trading • ${title}`, left, pageHeight - 6);
-        doc.text(`Page ${data.pageNumber} / ${doc.internal.getNumberOfPages()}`, pageWidth - right, pageHeight - 6, { align: "right" });
-      },
+    purchases.forEach((row) => {
+      const item = ensure(row);
+      item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
     });
-    return { doc, title };
-  };
+    sales.forEach((row) => {
+      const item = ensure(row);
+      item.sale_amount += Number(row.amount || row.total_amount || 0);
+    });
 
-  const downloadLedgerPdf = (ledgerType = activeReport) => {
-    if ((ledgerType !== "purchase-party-ledger" && ledgerType !== "sale-party-ledger") || !displayReportData.length) {
-      alert("No ledger data available");
-      return;
+    res.json(
+      Array.from(rows.values()).map((row) => ({
+        ...row,
+        sale_amount: Number(row.sale_amount.toFixed(2)),
+        purchase_amount: Number(row.purchase_amount.toFixed(2)),
+        profit_loss: Number((row.sale_amount - row.purchase_amount).toFixed(2)),
+      }))
+    );
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/purchase-party-ledger", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const farmerId = String(req.query.farmer_id || "").trim();
+    const warehouseId = String(req.query.warehouse_id || "").trim();
+    const companyAccountId = String(req.query.company_account_id || "").trim();
+    const detailsOfDeduction = ["1", "true", "yes", "details"].includes(String(req.query.details_of_deduction || "").trim().toLowerCase());
+    const purchasePromise = getPurchaseReportRowsForUser(req.user, { farmerId, warehouseId, companyAccountId });
+
+    const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
+    const paymentParams = [...filter.params];
+    let farmerClause = "";
+    let warehouseClause = "";
+    let accountClause = "";
+    if (farmerId) {
+      farmerClause = " AND CAST(p.farmer_id AS TEXT) = CAST(? AS TEXT)";
+      paymentParams.push(farmerId);
     }
-    const { doc } = buildLedgerPdf(ledgerType);
-    doc.save(`${ledgerType}-${new Date().toISOString().slice(0, 10)}.pdf`);
-  };
-
-  const downloadPurchaseLedgerPdf = () => downloadLedgerPdf("purchase-party-ledger");
-  const downloadSaleLedgerPdf = () => downloadLedgerPdf("sale-party-ledger");
-
-  const shareLedgerWhatsapp = async (ledgerType = activeReport) => {
-    if ((ledgerType !== "purchase-party-ledger" && ledgerType !== "sale-party-ledger") || !displayReportData.length) {
-      alert("No ledger data available");
-      return;
+    if (warehouseId) {
+      warehouseClause = " AND CAST(p.warehouse_id AS TEXT) = CAST(? AS TEXT)";
+      paymentParams.push(warehouseId);
     }
-    const title = ledgerType === "sale-party-ledger" ? "Sale Party Ledger" : "Purchase Party Ledger";
-    const closingRows = displayReportData.filter((row) => row.row_type === "closing");
-    const summary = closingRows
-      .map((row) => {
-        if (ledgerType === "purchase-party-ledger") {
-          return `Closing Balance: ${row.closing_side} ${formatMoney(Math.abs(row.balance || 0))}`;
-        }
-        const party = getLedgerPartyDetails(row, ledgerType);
-        const account = getLedgerAccountDetails(row);
-        return `${party.name} | ${account.name}: ${row.closing_side} ${formatMoney(Math.abs(row.balance || 0))}`;
-      })
-      .join("\n");
-    const detailLines = displayReportData
-      .filter((row) => row.row_type !== "closing")
-      .slice(0, 20)
-      .map((row) => {
-        if (ledgerType === "purchase-party-ledger") {
-          const party = getLedgerPartyDetails(row, ledgerType);
-          const account = getLedgerAccountDetails(row);
-          return [
-            `${formatLedgerDate(row.date)} ${row.voucher_no || ""} ${row.voucher_type || ""}`,
-            `Account: ${account.name || "-"}`,
-            `Account Address: ${account.address || "-"}`,
-            `Farmer: ${party.name || "-"}`,
-            `Farmer Address: ${party.address || "-"}`,
-            `Warehouse: ${getWarehouseName(row)}`,
-            `Adjustment: ${row.adjustment_details || row.particulars || "-"}`,
-            `Dr ${formatMoney(row.debit || 0)} Cr ${formatMoney(row.credit || 0)} Bal ${formatMoney(Math.abs(row.balance || 0))}`,
-          ].join("\n");
-        }
-        const party = getLedgerPartyDetails(row, ledgerType);
-        const account = getLedgerAccountDetails(row);
-        return [
-          `${formatLedgerDate(row.date)} ${row.voucher_no || ""} ${row.voucher_type || ""}`,
-          `${party.name} (${formatLedgerContact(party)})`,
-          `Account: ${account.name} (${formatLedgerContact(account)})`,
-          `Dr ${formatMoney(row.debit || 0)} Cr ${formatMoney(row.credit || 0)} Bal ${formatMoney(Math.abs(row.balance || 0))}`,
-        ].join("\n");
-      })
-      .join("\n\n");
-    const firstEntryForShare = (displayReportData || []).find((row) => row.row_type !== "closing") || {};
-    const shareParty = getLedgerPartyDetails(firstEntryForShare, ledgerType);
-    const shareAccount = getLedgerAccountDetails(firstEntryForShare);
-    const headerDetails = [
-      `Account: ${shareAccount.name || "-"}`,
-      `Account Address: ${shareAccount.address || "-"}`,
-      `Farmer: ${shareParty.name || "-"}`,
-      `Farmer Address: ${shareParty.address || "-"}`,
-    ].join("\n");
-    const message = `${title}\n\n${headerDetails}\n\nSummary\n${summary || "No closing rows"}\n\nDetails\n${detailLines || "No ledger rows"}`;
-
-    const { doc } = buildLedgerPdf(ledgerType);
-    const fileName = `${ledgerType}-${new Date().toISOString().slice(0, 10)}.pdf`;
-    const pdfBlob = doc.output("blob");
-    const pdfFile = new File([pdfBlob], fileName, { type: "application/pdf" });
-    if (navigator.canShare?.({ files: [pdfFile] })) {
-      await navigator.share({ title, text: message, files: [pdfFile] });
-      return;
+    if (companyAccountId) {
+      accountClause = " AND CAST(p.company_account_id AS TEXT) = CAST(? AS TEXT)";
+      paymentParams.push(companyAccountId);
     }
 
-    doc.save(fileName);
-    window.open(`https://wa.me/?text=${encodeURIComponent(message)}`, "_blank");
-  };
+    const paymentsPromise = dbAll(
+      `
+        SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name, ca.account_name AS company_account_name
+        FROM wh_payment_vouchers p
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
+        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
+        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+        WHERE 1 = 1 ${filter.clause} ${farmerClause} ${warehouseClause} ${accountClause}
+      `,
+      paymentParams
+    );
 
-  const sharePurchaseLedgerWhatsapp = () => shareLedgerWhatsapp("purchase-party-ledger");
-  const shareSaleLedgerWhatsapp = () => shareLedgerWhatsapp("sale-party-ledger");
+    const [purchases, payments] = await Promise.all([purchasePromise, paymentsPromise]);
+    const paymentIds = payments.map((row) => row.id);
+    const sqliteAdjustments = paymentIds.length
+      ? await dbAll(
+          `
+            SELECT a.*, pv.voucher_no AS purchase_voucher_no
+            FROM wh_payment_adjustments a
+            LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
+            WHERE a.payment_id IN (${paymentIds.map(() => "?").join(",")})
+            ORDER BY a.id ASC
+          `,
+          paymentIds
+        )
+      : [];
 
-  const stockPurchaseRows = useMemo(() => stockDrilldown?.item?.purchase_details || [], [stockDrilldown]);
-  const stockSaleRows = useMemo(() => stockDrilldown?.item?.sale_details || [], [stockDrilldown]);
-  const stockDrilldownAllRows = useMemo(() => {
-    if (!stockDrilldown?.item) return [];
+    const purchaseMap = new Map(purchases.map((row) => [String(row.id || row._id), row]));
+    const paymentMap = new Map(payments.map((row) => [String(row.id), row]));
+    const adjustmentsByPayment = new Map();
+    const adjustmentsByPurchase = new Map();
+
+    sqliteAdjustments.forEach((item) => {
+      const paymentId = String(item.payment_id);
+      const purchaseId = String(item.purchase_id);
+      const purchase = purchaseMap.get(purchaseId);
+      const payment = paymentMap.get(paymentId);
+      const voucherNo = item.purchase_voucher_no || purchase?.voucher_no || item.purchase_id;
+      const detail = {
+        ...item,
+        purchase_voucher_no: voucherNo,
+        payment_date: payment?.date || "",
+        payment_voucher_no: payment?.voucher_no || "",
+        payment_amount: Number(payment?.amount || 0),
+      };
+      if (!adjustmentsByPayment.has(paymentId)) adjustmentsByPayment.set(paymentId, []);
+      adjustmentsByPayment.get(paymentId).push(detail);
+      if (!adjustmentsByPurchase.has(purchaseId)) adjustmentsByPurchase.set(purchaseId, []);
+      adjustmentsByPurchase.get(purchaseId).push(detail);
+    });
 
     const rows = [
-      ...stockPurchaseRows.map((row) => ({
-        ...row,
-        type: "Purchase",
-        inward_qty: toNumber(row.qty),
-        outward_qty: 0,
-        inward_rate: toNumber(row.rate),
-        outward_rate: 0,
-        inward_amount: toNumber(row.amount),
-        outward_amount: 0,
-      })),
-      ...stockSaleRows.map((row) => ({
-        ...row,
-        type: "Sale",
-        inward_qty: 0,
-        outward_qty: toNumber(row.qty),
-        inward_rate: 0,
-        outward_rate: toNumber(row.rate),
-        inward_amount: 0,
-        outward_amount: toNumber(row.amount),
-      })),
-    ].sort((a, b) => {
-      const dateCmp = String(a.date || "").localeCompare(String(b.date || ""));
-      if (dateCmp) return dateCmp;
-      const typeCmp = a.type === b.type ? 0 : a.type === "Purchase" ? -1 : 1;
-      if (typeCmp) return typeCmp;
-      return String(a.voucher_no || "").localeCompare(String(b.voucher_no || ""));
-    });
+      ...purchases.flatMap((row) => {
+        const purchaseId = String(row.id || row._id);
+        const paymentDetails = adjustmentsByPurchase.get(purchaseId) || [];
+        const netPurchaseAmount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+        const grossPurchaseAmount = purchaseGrossAmountFromRow(row);
+        const purchaseAmount = detailsOfDeduction ? grossPurchaseAmount : netPurchaseAmount;
+        const paymentAmount = paymentDetails.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
+        const base = {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Purchase",
+          particulars: `Purchase Bill ${row.voucher_no || ""}`.trim(),
+          adjustment_details: paymentDetails
+            .map((item) => `${item.payment_date || "-"} ${item.payment_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`)
+            .join("; "),
+          payment_details: paymentDetails,
+          purchase_id: purchaseId,
+          purchase_amount: Number(purchaseAmount.toFixed(2)),
+          gross_purchase_amount: Number(grossPurchaseAmount.toFixed(2)),
+          net_purchase_amount: Number(netPurchaseAmount.toFixed(2)),
+          payment_amount: Number(paymentAmount.toFixed(2)),
+          journal_amount: 0,
+          receipt_amount: 0,
+          bill_balance: Number((purchaseAmount - paymentAmount).toFixed(2)),
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name,
+          farmer_id: row.farmer_id,
+          farmer_name: row.farmer_name,
+          company_account_id: row.company_account_id,
+          company_account_name: row.company_account_name,
+          debit: 0,
+          credit: purchaseAmount,
+        };
+        if (!detailsOfDeduction) return [base];
+        const deductions = Array.isArray(row.deduction_details) && row.deduction_details.length
+          ? row.deduction_details
+          : buildPurchaseDeductionDetails(row);
+        const deductionRows = deductions.map((detail) => {
+          const amount = Number(detail.amount || 0);
+          const label = String(detail.label || detail.account_label || detail.key || "Deduction");
+          const particular = detail.key === "labour"
+            ? `EXP - Labour - ${fmtNum(amount)}`
+            : `${label} - ${fmtNum(amount)}`;
+          return {
+            ...base,
+            id: `${purchaseId}-deduction-${detail.key}`,
+            row_type: "deduction",
+            voucher_type: "Deduction",
+            particulars: particular,
+            adjustment_details: detail.account_label || label,
+            deduction_type: detail.key,
+            deduction_label: label,
+            deduction_amount: Number(amount.toFixed(2)),
+            debit: Number(amount.toFixed(2)),
+            credit: 0,
+            payment_details: [],
+            purchase_amount: 0,
+            bill_balance: 0,
+          };
+        });
+        return [base, ...deductionRows];
+      }),
+      ...payments.map((row) => {
+        const paymentAdjustments = adjustmentsByPayment.get(String(row.id)) || [];
+        const adjustmentDetails = paymentAdjustments
+          .map((item) => `${item.purchase_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`)
+          .join("; ");
+        const isOnAccount = !paymentAdjustments.length && !String(row.reference_id || "").trim();
+        return {
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Payment",
+          particulars: isOnAccount
+            ? "Unadjusted on account"
+            : `Payment adjusted against ${paymentAdjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", ") || row.reference_id || "purchase bill"}`,
+          adjustment_details: adjustmentDetails,
+          reference_id: row.reference_id || paymentAdjustments.map((item) => item.purchase_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name,
+          farmer_id: row.farmer_id,
+          farmer_name: row.farmer_name,
+          company_account_id: row.company_account_id,
+          company_account_name: row.company_account_name,
+          debit: Number(row.amount || 0),
+          credit: 0,
+        };
+      }),
+    ];
 
-    let runningQty = 0;
-    let runningPurchaseQty = 0;
-    let runningPurchaseAmount = 0;
-    return rows.map((row) => {
-      runningQty += toNumber(row.inward_qty) - toNumber(row.outward_qty);
-      runningPurchaseQty += toNumber(row.inward_qty);
-      runningPurchaseAmount += toNumber(row.inward_amount);
-      const avgRate = runningPurchaseQty > 0 ? runningPurchaseAmount / runningPurchaseQty : 0;
-      return {
-        ...row,
-        balance_qty: Number(runningQty.toFixed(4)),
-        day_avg_rate: Number(avgRate.toFixed(2)),
-        stock_value: Number((runningQty * avgRate).toFixed(2)),
+    const enrichedRows = await enrichLedgerRowsWithPartyDetails(rows);
+    return res.json(buildLedgerRows(
+      enrichedRows,
+      (row) => `${row.farmer_id || "unknown"}::${row.company_account_id || "no-account"}`,
+      (row) => row.farmer_name || row.company_account_name || "Unknown Farmer"
+    ));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/sale-party-ledger", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  try {
+    const buyerId = String(req.query.buyer_id || "").trim();
+    const farmerId = String(req.query.farmer_id || "").trim();
+    const warehouseId = String(req.query.warehouse_id || "").trim();
+    const companyAccountId = String(req.query.company_account_id || "").trim();
+    const sales = await getSaleReportRowsForUser(req.user, { buyerId, farmerId, warehouseId, companyAccountId });
+
+    // Sale Party Ledger must still render when receipt/adjustment mirror data is
+    // temporarily unavailable. The sale rows themselves are the primary ledger
+    // source; receipts are optional detail rows.
+    let receipts = [];
+    let adjustmentRows = [];
+    const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
+    const receiptParams = [...filter.params];
+    const clauses = [];
+    if (buyerId) { clauses.push(" AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(buyerId); }
+    if (warehouseId) { clauses.push(" AND CAST(r.warehouse_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(warehouseId); }
+    if (companyAccountId) { clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(companyAccountId); }
+    try {
+      receipts = await dbAll(`
+        SELECT
+          r.*,
+          ca.account_name AS company_account_name,
+          b.name AS buyer_name
+        FROM wh_receipt_vouchers r
+        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
+        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(r.company_id AS TEXT)
+        WHERE 1=1 ${filter.clause} ${clauses.join(" ")}
+        ORDER BY r.date DESC, r.id DESC
+      `, receiptParams);
+
+      const receiptIds = receipts.map((row) => row.id);
+      adjustmentRows = receiptIds.length ? await dbAll(`
+        SELECT a.*, rv.voucher_no AS receipt_voucher_no
+        FROM wh_receipt_adjustments a
+        LEFT JOIN wh_receipt_vouchers rv ON CAST(rv.id AS TEXT) = CAST(a.receipt_id AS TEXT)
+        WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
+        ORDER BY a.id ASC
+      `, receiptIds) : [];
+    } catch (receiptErr) {
+      console.warn("Sale Party Ledger receipt details unavailable; rendering sale rows only:", receiptErr.message);
+      receipts = [];
+      adjustmentRows = [];
+    }
+
+    const saleMap = new Map((sales || []).map((row) => [String(row.id || row._id), row]));
+    const receiptMap = new Map((receipts || []).map((row) => [String(row.id), row]));
+    const bySale = new Map();
+    const byReceipt = new Map();
+    (adjustmentRows || []).forEach((item) => {
+      const saleId = String(item.sale_id || "");
+      const receiptId = String(item.receipt_id || "");
+      const sale = saleMap.get(saleId);
+      const receipt = receiptMap.get(receiptId);
+      const detail = {
+        ...item,
+        sale_voucher_no: sale?.voucher_no || item.sale_voucher_no || item.sale_id,
+        receipt_date: receipt?.date || "",
+        receipt_voucher_no: receipt?.voucher_no || item.receipt_voucher_no || "",
+        receipt_amount: Number(receipt?.amount || 0),
       };
+      if (!bySale.has(saleId)) bySale.set(saleId, []);
+      bySale.get(saleId).push(detail);
+      if (!byReceipt.has(receiptId)) byReceipt.set(receiptId, []);
+      byReceipt.get(receiptId).push(detail);
     });
-  }, [stockDrilldown, stockPurchaseRows, stockSaleRows]);
 
-  const stockDrilldownRows = stockDrilldownAllRows.filter((row) => {
-    if (stockDrilldown?.mode === "purchase" && row.type !== "Purchase") return false;
-    if (stockDrilldown?.mode === "sale" && row.type !== "Sale") return false;
-    const date = String(row.date || "").slice(0, 10);
-    if (stockDrilldownFromDate && date < stockDrilldownFromDate) return false;
-    if (stockDrilldownToDate && date > stockDrilldownToDate) return false;
-    return true;
-  });
-
-  const stockDrilldownTotals = stockDrilldownRows.reduce(
-    (acc, row) => {
-      acc.inward_qty += toNumber(row.inward_qty);
-      acc.outward_qty += toNumber(row.outward_qty);
-      acc.inward_amount += toNumber(row.inward_amount);
-      acc.outward_amount += toNumber(row.outward_amount);
-      acc.balance_qty = toNumber(row.balance_qty);
-      acc.avg_rate = toNumber(row.day_avg_rate);
-      acc.stock_value = toNumber(row.stock_value);
-      return acc;
-    },
-    { inward_qty: 0, outward_qty: 0, inward_amount: 0, outward_amount: 0, balance_qty: 0, avg_rate: 0, stock_value: 0 }
-  );
-
-  const stockDrilldownTitle =
-    stockDrilldown?.mode === "purchase"
-      ? "Purchase Qty / Inward Details"
-      : stockDrilldown?.mode === "sale"
-        ? "Sale Qty / Outward Details"
-        : "Stock Qty Full Details";
-  const isStockDrilldownPurchase = stockDrilldown?.mode === "purchase";
-  const isStockDrilldownSale = stockDrilldown?.mode === "sale";
-  const isStockDrilldownCombined = !isStockDrilldownPurchase && !isStockDrilldownSale;
-
-  const downloadStockDrilldownPdf = () => {
-    if (!stockDrilldown) return;
-    const doc = new jsPDF({ orientation: "landscape" });
-    const title = stockDrilldownTitle;
-    const subtitle = `${getWarehouseName(stockDrilldown.item)} | ${getAccountName(stockDrilldown.item)} | ${getProductName(stockDrilldown.item)}`;
-    doc.setFontSize(14);
-    doc.text(title, 14, 14);
-    doc.setFontSize(9);
-    doc.text(subtitle, 14, 20);
-    const filterText = [
-      stockDrilldownFromDate ? `From: ${formatLedgerDate(stockDrilldownFromDate)}` : "",
-      stockDrilldownToDate ? `To: ${formatLedgerDate(stockDrilldownToDate)}` : "",
-    ].filter(Boolean).join("  ");
-    if (filterText) doc.text(filterText, 14, 26);
-
-    const headRow = [
-      "Date",
-      "Type",
-      "Voucher No",
-      "Party",
-      ...(isStockDrilldownSale ? [] : ["Inward Qty", "In Rate", "In Value"]),
-      ...(isStockDrilldownPurchase ? [] : ["Outward Qty", "Out Rate", "Out Value"]),
-      isStockDrilldownCombined ? "Stock Qty" : "Balance Qty",
-      "Purchase Avg Rate",
-      "Stock Value",
+    const rows = [
+      ...(sales || []).map((row) => {
+        const saleId = String(row.id || row._id);
+        const details = bySale.get(saleId) || [];
+        const saleAmount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+        const receiptAmount = details.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
+        return {
+          ...row,
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Sale",
+          particulars: `Sale Bill ${row.voucher_no || ""}`.trim(),
+          adjustment_details: details.map((item) => `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+          receipt_details: details,
+          sale_id: saleId,
+          sale_amount: Number(saleAmount.toFixed(2)),
+          receipt_amount: Number(receiptAmount.toFixed(2)),
+          journal_amount: 0,
+          bill_balance: Number((saleAmount - receiptAmount).toFixed(2)),
+          debit: saleAmount,
+          credit: 0,
+          party_id: String(row.buyer_id || row.company_id || ""),
+          party_name: row.buyer_name || row.company_name || "-",
+        };
+      }),
+      ...(receipts || []).map((row) => {
+        const details = byReceipt.get(String(row.id)) || [];
+        const isOnAccount = !details.length && !String(row.reference_id || "").trim();
+        return {
+          ...row,
+          date: row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Receipt",
+          particulars: isOnAccount ? "Unadjusted on account" : `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
+          adjustment_details: details.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+          reference_id: row.reference_id || details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
+          receipt_details: details,
+          debit: 0,
+          credit: Number(row.amount || 0),
+          party_id: String(row.company_id || ""),
+          party_name: row.buyer_name || row.party_name || row.company_name || row.company_account_name || "-",
+          buyer_name: row.buyer_name || "-",
+        };
+      }),
     ];
-    const bodyRows = stockDrilldownRows.map((row) => [
-      formatLedgerDate(row.date),
-      row.type,
-      row.voucher_no || "-",
-      row.party_name || "-",
-      ...(isStockDrilldownSale ? [] : [
-        row.inward_qty ? formatDecimal4(row.inward_qty) : "",
-        row.inward_rate ? formatMoney(row.inward_rate) : "",
-        row.inward_amount ? formatMoney(row.inward_amount) : "",
-      ]),
-      ...(isStockDrilldownPurchase ? [] : [
-        row.outward_qty ? formatDecimal4(row.outward_qty) : "",
-        row.outward_rate ? formatMoney(row.outward_rate) : "",
-        row.outward_amount ? formatMoney(row.outward_amount) : "",
-      ]),
-      formatDecimal4(row.balance_qty),
-      formatMoney(row.day_avg_rate),
-      formatMoney(row.stock_value),
+
+    return res.json(buildLedgerRows(rows, (row) => `${row.party_id || "unknown"}::${row.company_account_id || "no-account"}`, (row) => row.party_name || row.company_account_name || "Unknown Party"));
+  } catch (err) {
+    console.error("Sale party ledger failed:", err);
+    res.status(500).json({ error: err.message || "Failed to load sale party ledger" });
+  }
+});
+
+router.get("/report/sale-followup", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const companyAccountId = String(req.query.company_account_id || "").trim();
+    const buyerId = String(req.query.company_id || req.query.buyer_id || "").trim();
+    const statusFilter = String(req.query.status || "").trim().toLowerCase();
+
+    const rows = (await getSaleReportRowsForUser(req.user))
+      .filter((row) => {
+        if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
+        if (buyerId && String(row.buyer_id || row.company_id || "") !== buyerId) return false;
+        if (statusFilter && String(row.followup_status || "").toLowerCase() !== statusFilter) return false;
+        return true;
+      })
+      .map((row) => ({
+        ...row,
+        buyer_email: row.buyer_email || row.consignee_email || "",
+        buyer_mobile: row.buyer_mobile || row.consignee_mobile || "",
+        party_name: row.party_name || row.buyer_name || row.company_name || "-",
+        balance: Number(row.balance || row.bill_balance || row.outstanding || row.sale_amount || 0),
+        due_days: Number.isFinite(Number(row.due_days)) ? Number(row.due_days) : calculateDaysDiff(row.unloading_date || row.date, row.due_date),
+        days_overdue: Number.isFinite(Number(row.days_overdue)) ? Number(row.days_overdue) : calculateDaysDiff(row.due_date, new Date().toISOString().slice(0, 10)),
+        contact_email: row.buyer_email || row.consignee_email || "",
+        contact_mobile: row.buyer_mobile || row.consignee_mobile || "",
+        followup_status_label: getFollowupStatusLabel(row.followup_status),
+      }))
+      .sort((a, b) => {
+        if (a.followup_priority !== b.followup_priority) return a.followup_priority - b.followup_priority;
+        const dateA = new Date(a.due_date || a.date || 0).getTime();
+        const dateB = new Date(b.due_date || b.date || 0).getTime();
+        if (dateA !== dateB) return dateA - dateB;
+        return String(a.voucher_no || "").localeCompare(String(b.voucher_no || ""), undefined, {
+          numeric: true,
+          sensitivity: "base",
+        });
+      });
+
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/sale-journey", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const journeyToken = String(req.query.journey_token || "").trim();
+    const lorryNo = String(req.query.lorry_no || "").trim().toLowerCase();
+    const billNo = String(req.query.bill_no || req.query.voucher_no || "").trim().toLowerCase();
+
+    let rows = await getSaleReportRowsForUser(req.user);
+    rows = rows.filter((row) => {
+      const rowJourney = String(row.journey_token || row.journey_id || row.journey_group_no || "").trim();
+      const rowLorry = String(row.lorry_no || row.reference_id || "").trim().toLowerCase();
+      const rowBill = String(row.voucher_no || row.bill_no || "").trim().toLowerCase();
+      if (journeyToken) return rowJourney === journeyToken;
+      if (lorryNo) return rowLorry === lorryNo;
+      if (billNo) return rowBill === billNo;
+      return false;
+    });
+
+    rows = rows
+      .sort((a, b) => {
+        const dateSort = String(a.date || "").localeCompare(String(b.date || ""));
+        if (dateSort) return dateSort;
+        return Number(a.id || 0) - Number(b.id || 0);
+      })
+      .map((row, index, arr) => {
+        const dispatchQty = Number(row.dispatch_qty || row.quantity || row.total_quantity || row.unloading_qty || 0);
+        const unloadQty = Number(row.unloading_qty || 0);
+        const remainAfter = Math.max(dispatchQty - unloadQty, 0);
+        return {
+          ...row,
+          journey_leg: index + 1,
+          journey_running_total: arr.slice(0, index + 1).reduce((sum, item) => sum + Number(item.dispatch_qty || item.quantity || item.total_quantity || item.unloading_qty || 0), 0),
+          journey_running_unloaded: arr.slice(0, index + 1).reduce((sum, item) => sum + Number(item.unloading_qty || 0), 0),
+          journey_remain_after_leg: remainAfter,
+        };
+      });
+
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/warehouse-stock", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.purchase") && !userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const view = String(req.query.view || "").toLowerCase();
+    if (view === "details") {
+      const [purchases, sales] = await Promise.all([
+        getPurchaseReportRowsForUser(req.user),
+        getSaleReportRowsForUser(req.user),
+      ]);
+      return res.json(groupStock(purchases, sales));
+    }
+
+    const currentDate = new Date().toISOString().slice(0, 10);
+    const sql = `
+      WITH adjusted AS (
+        SELECT inward_id, SUM(qty) AS adjusted_qty
+        FROM adjustment
+        GROUP BY inward_id
+      )
+      SELECT
+        COALESCE(w.name, 'Unknown') AS warehouse,
+        COALESCE(c.name, ca.account_name, 'Unknown') AS party,
+        COALESCE(l.name, '') AS location,
+        COUNT(i.id) AS rows_count,
+        SUM(COALESCE(i.weight, 0)) AS gross_qty,
+        SUM(COALESCE(adj.adjusted_qty, 0)) AS already_adjusted_qty,
+        SUM(
+          CASE
+            WHEN COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) IS NULL THEN
+              COALESCE(i.weight, 0) * (
+                0.02 * (
+                  CASE
+                    WHEN CAST((julianday(?) - julianday(i.date)) AS INTEGER) <= 0 THEN 1
+                    ELSE CAST((CAST((julianday(?) - julianday(i.date)) AS INTEGER) - 1) / 30 AS INTEGER) + 1
+                  END
+                )
+              )
+            ELSE
+              COALESCE(i.weight, 0) * (COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) / 100.0)
+          END
+        ) AS shortage_qty,
+        SUM(
+          COALESCE(i.weight, 0)
+          - (
+            CASE
+              WHEN COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) IS NULL THEN
+                COALESCE(i.weight, 0) * (
+                  0.02 * (
+                    CASE
+                      WHEN CAST((julianday(?) - julianday(i.date)) AS INTEGER) <= 0 THEN 1
+                      ELSE CAST((CAST((julianday(?) - julianday(i.date)) AS INTEGER) - 1) / 30 AS INTEGER) + 1
+                    END
+                  )
+                )
+              ELSE
+                COALESCE(i.weight, 0) * (COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) / 100.0)
+            END
+          )
+          - COALESCE(adj.adjusted_qty, 0)
+        ) AS available_balance_qty
+      FROM inward i
+      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
+      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
+      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
+      LEFT JOIN locations l ON CAST(l.id AS TEXT) = CAST(w.location_id AS TEXT)
+      LEFT JOIN adjusted adj ON CAST(adj.inward_id AS TEXT) = CAST(i.id AS TEXT)
+      GROUP BY COALESCE(w.name, 'Unknown'), COALESCE(c.name, ca.account_name, 'Unknown'), COALESCE(l.name, '')
+      ORDER BY warehouse ASC, party ASC, location ASC
+    `;
+
+    const rows = await dbAll(sql, [currentDate, currentDate, currentDate, currentDate]);
+    return res.json(
+      (rows || []).map((row) => ({
+        warehouse: row.warehouse,
+        party: row.party,
+        location: row.location,
+        stock: Number(Number(row.available_balance_qty || 0).toFixed(4)),
+        rows_count: Number(row.rows_count || 0),
+        gross_qty: Number(Number(row.gross_qty || 0).toFixed(4)),
+        already_adjusted_qty: Number(Number(row.already_adjusted_qty || 0).toFixed(4)),
+        shortage_qty: Number(Number(row.shortage_qty || 0).toFixed(4)),
+      }))
+    );
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/fifo-stock", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.report.purchase") && !userHasPermission(req.user, "warehouse.trading.report.sale")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const [purchases, sales] = await Promise.all([
+      getPurchaseReportRowsForUser(req.user),
+      getSaleReportRowsForUser(req.user),
     ]);
-    const footRow = [
-      "Total",
-      "",
-      "",
-      "",
-      ...(isStockDrilldownSale ? [] : [
-        formatDecimal4(stockDrilldownTotals.inward_qty),
-        "",
-        formatMoney(stockDrilldownTotals.inward_amount),
-      ]),
-      ...(isStockDrilldownPurchase ? [] : [
-        formatDecimal4(stockDrilldownTotals.outward_qty),
-        "",
-        formatMoney(stockDrilldownTotals.outward_amount),
-      ]),
-      formatDecimal4(stockDrilldownTotals.balance_qty),
-      formatMoney(stockDrilldownTotals.avg_rate),
-      formatMoney(stockDrilldownTotals.stock_value),
-    ];
+    res.json(buildFifoStock(purchases, sales));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    autoTable(doc, {
-      startY: filterText ? 31 : 26,
-      styles: { fontSize: 7, cellPadding: 1.8, overflow: "linebreak" },
-      headStyles: { fillColor: [8, 122, 115], textColor: 255 },
-      footStyles: { fillColor: [239, 246, 255], textColor: 15, fontStyle: "bold" },
-      head: [headRow],
-      body: bodyRows,
-      foot: [footRow],
-      columnStyles: {
-        3: { cellWidth: 42 },
+// PDF download for purchase voucher - available to authenticated users
+router.get("/purchase/:id/pdf", (req, res) => {
+  const id = req.params.id;
+  const q = `
+    SELECT
+      p.*,
+      w.name AS warehouse_name,
+      w.address AS warehouse_address,
+      l.name AS warehouse_location,
+      ca.account_name AS company_account_name,
+      ca.mobile AS company_account_mobile,
+      ca.pan_no AS company_account_pan,
+      ca.address AS company_account_address,
+      f.name AS farmer_name,
+      f.mobile AS farmer_mobile,
+      f.address AS farmer_address,
+      f.village AS farmer_village,
+      f.gst_no AS farmer_gst,
+      f.pan_no AS farmer_pan,
+      f.state AS farmer_state,
+      f.location AS farmer_district,
+      NULL AS farmer_pincode,
+      NULL AS farmer_bank_name,
+      NULL AS farmer_bank_account_no,
+      NULL AS farmer_ifsc_code,
+      NULL AS farmer_branch_name,
+      NULL AS farmer_account_holder_name,
+      pr.name AS product_name
+    FROM wh_purchase_vouchers p
+    LEFT JOIN warehouses w ON w.id = p.warehouse_id
+    LEFT JOIN locations l ON l.id = w.location_id
+    LEFT JOIN company_accounts ca ON ca.id = p.company_account_id
+    LEFT JOIN farmers f ON f.id = p.farmer_id
+    LEFT JOIN products pr ON pr.id = p.product_id
+    WHERE p.id = ?
+  `;
+  db.get(q, [id], async (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) {
+      try {
+        row = await getMongoPurchaseVoucherForPdf(id);
+      } catch (mongoErr) {
+        console.error("Mongo purchase PDF lookup failed:", mongoErr.message);
+        return res.status(500).json({ error: mongoErr.message });
+      }
+    }
+
+    if (!row) return res.status(404).json({ error: "Not found" });
+    if (!req.user) return res.status(403).json({ error: "Authentication required" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    try {
+      row = await enrichPurchaseVoucherPdfRow(row);
+    } catch (enrichErr) {
+      console.error("Purchase PDF enrichment failed:", enrichErr.message);
+    }
+
+    try {
+      sendPurchaseVoucherPdf(res, row, id);
+    } catch (pdfErr) {
+      console.error("Purchase PDF render failed:", pdfErr.stack || pdfErr.message || pdfErr);
+      try {
+        return sendMinimalPurchaseVoucherPdf(res, row, id);
+      } catch (fallbackErr) {
+        console.error("Purchase PDF fallback failed:", fallbackErr.stack || fallbackErr.message || fallbackErr);
+        return res.status(500).json({ error: "Failed to render purchase PDF" });
+      }
+    }
+  });
+});
+
+router.get("/sale/:id/pdf", async (req, res) => {
+  const id = req.params.id;
+  try {
+    if (!req.user) return res.status(403).json({ error: "Authentication required" });
+
+    let row = null;
+    if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+      const doc = await SaleVoucher.findById(id).lean();
+      if (doc) {
+        const decorated = await decorateSaleRows([doc]);
+        row = decorated[0] || null;
+      }
+    }
+
+    if (!row) {
+      const q = `
+      SELECT
+          s.*,
+          COALESCE(s.buyer_id, s.company_id) AS buyer_id,
+          tb.bilti_id AS bilti_id,
+          w.name AS warehouse_name,
+          c.name AS company_name,
+          b.name AS buyer_name,
+          co.name AS consignee_name,
+          p.name AS product_name
+        FROM wh_sale_vouchers s
+        LEFT JOIN (
+          SELECT sale_id, MAX(id) AS bilti_id
+          FROM transport_bilti
+          WHERE sale_id IS NOT NULL
+          GROUP BY sale_id
+        ) tb ON CAST(tb.sale_id AS TEXT) = CAST(s.id AS TEXT)
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+        LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(s.buyer_id, s.company_id) AS TEXT)
+        LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
+        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
+        WHERE CAST(s.id AS TEXT) = CAST(? AS TEXT)
+      `;
+      row = await dbGet(q, [id]);
+    }
+
+    if (!row) return res.status(404).json({ error: "Not found" });
+    if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
+
+    const purchaseLinks = Array.isArray(row.against_purchase_links)
+      ? row.against_purchase_links
+      : (() => {
+          try {
+            return row.against_purchase_links ? JSON.parse(row.against_purchase_links) : [];
+          } catch {
+            return [];
+          }
+        })();
+    const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
+    const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+    const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
+    const profitLoss = netAmount - directPurchaseAmount;
+
+    const doc = new PDFDocument({ size: "A4", margin: 36 });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="sale_${row.voucher_no || id}.pdf"`);
+    doc.pipe(res);
+
+    doc.fontSize(18).text("DIRECT SALE BILL", { align: "center" });
+    doc.moveDown(0.4);
+    doc.fontSize(10).text(`Voucher No: ${row.voucher_no || "-"}`);
+    doc.text(`Sale Date: ${fmtDate(row.date)}    Unloading Date: ${fmtDate(row.unloading_date)}`);
+    doc.text(`Location: ${row.location_name || row.location_id || "-"}    Warehouse: ${row.warehouse_name || row.warehouse_id || "-"}`);
+    doc.text(`Farmer: ${row.farmer_name || row.farmer_id || "-"}    Buyer: ${row.buyer_name || row.company_name || "-"}`);
+    doc.text(`Product: ${row.product_name || "-"}    Lorry No: ${row.lorry_no || row.reference_id || "-"}`);
+
+    doc.moveDown(0.5);
+    doc.fontSize(12).text("Sale Details", { underline: true });
+    doc.fontSize(10);
+    doc.text(`Quantity: ${fmtNum(row.quantity || row.unloading_qty || 0)}`);
+    doc.text(`Rate: ${fmtNum(row.rate)}`);
+    doc.text(`Gross Amount: ${fmtNum(row.amount)}`);
+    doc.text(`Net Receivable: ${fmtNum(netAmount)}`);
+
+    doc.moveDown(0.4);
+    doc.fontSize(12).text("Deduction / Journal", { underline: true });
+    doc.fontSize(10);
+    doc.text(`Claim: ${fmtNum(row.claim_amount)}`);
+    doc.text(`Shortage: ${fmtNum(row.shortage_amount || row.claim_amount)}`);
+    doc.text(`Cash Discount: ${fmtNum(row.cd_amount)}`);
+    doc.text(`Other Deduction: ${fmtNum(row.other_deduction)}`);
+    doc.text(`Adjustment: ${fmtNum(row.adjustment_amount)}`);
+    doc.text(`TDS: ${fmtNum(row.tds_amount)}`);
+    doc.text(`Round Off: ${fmtNum(row.round_off)}`);
+    doc.text(`Total Deduction: ${fmtNum(totalDeduction)}`);
+
+    doc.moveDown(0.4);
+    doc.fontSize(12).text("Auto Purchase Entry", { underline: true });
+    doc.fontSize(10);
+    doc.text(`Purchase Qty: ${fmtNum(row.total_qty || row.quantity || 0)}`);
+    doc.text(`Purchase Rate: ${fmtNum(row.direct_purchase_rate || row.rate)}`);
+    doc.text(`Purchase Amount: ${fmtNum(directPurchaseAmount)}`);
+    doc.text(`Linked Purchase Rows: ${fmtNum(purchaseLinks.length)}`);
+
+    doc.moveDown(0.4);
+    doc.fontSize(12).text("Payment / Receipt / Profit", { underline: true });
+    doc.fontSize(10);
+    doc.text(`Receipt Adjusted: ${fmtNum((Array.isArray(row.payment_details) ? row.payment_details : []).reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0))}`);
+    doc.text(`Journal Count: ${fmtNum((Array.isArray(row.journal_details) ? row.journal_details : []).length)}`);
+    doc.text(`Net Profit / Loss: ${fmtNum(profitLoss)}`);
+    doc.text(`Follow-up Status: ${getFollowupStatusLabel(row.followup_status)}`);
+
+    if (row.description) {
+      doc.moveDown(0.4);
+      doc.text(`Remarks: ${row.description}`);
+    }
+
+    doc.end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/sale/:id/summary", async (req, res) => {
+  const id = req.params.id;
+  try {
+    if (!req.user) return res.status(403).json({ error: "Authentication required" });
+
+    let row = null;
+    if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+      const doc = await SaleVoucher.findById(id).lean();
+      if (doc) {
+        const decorated = await decorateSaleRows([doc]);
+        row = decorated[0] || null;
+      }
+    }
+
+    if (!row) {
+      const q = `
+      SELECT
+          s.*,
+          COALESCE(s.buyer_id, s.company_id) AS buyer_id,
+          tb.bilti_id AS bilti_id,
+          w.name AS warehouse_name,
+          c.name AS company_name,
+          b.name AS buyer_name,
+          co.name AS consignee_name,
+          p.name AS product_name
+        FROM wh_sale_vouchers s
+        LEFT JOIN (
+          SELECT sale_id, MAX(id) AS bilti_id
+          FROM transport_bilti
+          WHERE sale_id IS NOT NULL
+          GROUP BY sale_id
+        ) tb ON CAST(tb.sale_id AS TEXT) = CAST(s.id AS TEXT)
+        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
+        LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
+        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(COALESCE(s.buyer_id, s.company_id) AS TEXT)
+        LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
+        LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
+        WHERE CAST(s.id AS TEXT) = CAST(? AS TEXT)
+      `;
+      row = await dbGet(q, [id]);
+    }
+
+    if (!row) return res.status(404).json({ error: "Not found" });
+    if (!(await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id))) return;
+
+    const purchaseLinks = Array.isArray(row.against_purchase_links)
+      ? row.against_purchase_links
+      : (() => {
+          try {
+            return row.against_purchase_links ? JSON.parse(row.against_purchase_links) : [];
+          } catch {
+            return [];
+          }
+        })();
+    const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
+    const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
+    const resolvedTransportRow = await getTransportBiltiMatch({
+      saleId: row._id || row.id,
+      voucherNo: row.voucher_no || row.bill_no || "",
+      lorryNo: row.lorry_no || "",
+    });
+    const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
+    const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+    const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
+
+    res.json({
+      sale: row,
+      purchase_links: purchaseLinks,
+      payment_details: paymentDetails,
+      journal_details: journalDetails,
+      transport_charge: Number(resolvedTransportRow?.transport_amount || resolvedTransportRow?.payable_amount || resolvedTransportRow?.net_amount || resolvedTransportRow?.gross_freight || 0),
+      transport_bilti_no: resolvedTransportRow?.bilti_no || "",
+      transport_bilti_id: resolvedTransportRow?.id ? String(resolvedTransportRow.id) : "",
+      transport_debug: {
+        sale_id: String(row.id || row._id || ""),
+        matched_source: resolvedTransportRow?.source || "none",
+        matched_sale_id: String(resolvedTransportRow?.sale_id || ""),
+        matched_bilti_id: resolvedTransportRow?.id ? String(resolvedTransportRow.id) : "",
+        matched_bilti_no: resolvedTransportRow?.bilti_no || "",
+        matched_payable_amount: Number(resolvedTransportRow?.transport_amount || resolvedTransportRow?.payable_amount || resolvedTransportRow?.net_amount || resolvedTransportRow?.gross_freight || 0),
+        matched_voucher_no: resolvedTransportRow?.voucher_no || "",
+        matched_lorry_no: resolvedTransportRow?.lorry_no || "",
+      },
+      summary: {
+        gross_amount: Number(row.amount || 0),
+        total_deduction: totalDeduction,
+        net_payable: netAmount,
+        net_receivable: Number(row.net_receivable_amount || netAmount),
+        direct_purchase_amount: directPurchaseAmount,
+        profit_loss: netAmount - directPurchaseAmount,
       },
     });
-    doc.save(`stock-qty-details-${new Date().toISOString().slice(0, 10)}.pdf`);
-  };
-
-  return (
-    <>
-      <style>{paymentResponsiveCss}</style>
-      <div ref={arrowNavRootRef} className="warehouse-trading-page" style={{ fontFamily: "Segoe UI, Arial, sans-serif", padding: "16px" }}>
-      <style>{`
-  .warehouse-trading-page { max-width: 100%; box-sizing: border-box; }
-  .payment-mobile-shell { width: 100%; margin: 0 auto 14px; box-sizing: border-box; }
-  @media (max-width: 820px) {
-    .warehouse-trading-page { padding: 8px !important; }
-    .payment-mobile-shell { width: 100%; padding: 11px !important; border-radius: 12px !important; }
-    .payment-financial-summary { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
-    .payment-selector-grid { grid-template-columns: 1fr !important; }
-    .payment-entry-row { grid-template-columns: 1fr !important; }
-    .payment-adjustment-action { justify-content: flex-start; }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  @media (max-width: 480px) {
-    .payment-financial-summary { grid-template-columns: 1fr 1fr !important; }
-    .payment-stat-value { font-size: 11.5px !important; }
-    .payment-selected-bar { display: grid !important; grid-template-columns: 1fr !important; }
+});
+
+// Update purchase voucher
+router.put("/purchase/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.edit")) {
+    return res.status(403).json({ error: "Permission denied" });
   }
-`}</style>
-      <WarehouseTradingHeader
-        activeTab={activeTab}
-        activeTabStyle={activeTabStyle}
-        globalSearch={globalSearch}
-        onGlobalSearchChange={setGlobalSearch}
-        showMobileTradingTabs={showMobileTradingTabs}
-        onToggleTradingTabs={() => setShowMobileTradingTabs((prev) => !prev)}
-        onShowVouchers={() => setActiveTab("vouchers")}
-        onShowReports={() => setActiveTab("reports")}
-        subtitleStyle={subtitleStyle}
-        tabRow={tabRow}
-        tabStyle={tabStyle}
-        titleStyle={titleStyle}
-      />
 
-      {activeTab === "vouchers" ? (
-        <div ref={voucherPanelRef}>
-          <WarehouseVoucherPanel
-            navigate={navigate}
-            user={user}
-            isPurchaseVoucher={isPurchaseVoucher}
-            isPaymentVoucher={isPaymentVoucher}
-            isReceiptVoucher={isReceiptVoucher}
-            activeVoucherType={activeVoucherType}
-            allowedVoucherTypes={allowedVoucherTypes}
-            activeVoucherButtonStyle={activeVoucherButtonStyle}
-            voucherButtonStyle={voucherButtonStyle}
-            voucherTypeRow={voucherTypeRow}
-            card={card}
-            btnAction={btnAction}
-            importingPurchase={importingPurchase}
-            importingPayment={importingPayment}
-            importingReceipt={importingReceipt}
-            onDownloadPurchaseTemplate={downloadPurchaseImportTemplate}
-            onDownloadPaymentTemplate={downloadPaymentImportTemplate}
-            onDownloadReceiptTemplate={downloadReceiptImportTemplate}
-            onImportPurchase={handlePurchaseExcelImport}
-            onImportPayment={handlePaymentExcelImport}
-            onImportReceipt={handleReceiptExcelImport}
-            onChangeActiveVoucherType={setActiveVoucherType}
-            editId={editId}
-          >
-            <form onSubmit={handleSubmit} onKeyDown={handleFormKeyDown}>
-              {isPurchaseVoucher ? (
-                <div className="purchase-voucher-mobile-form" style={erpShell}>
-                  <div className="purchase-voucher-titlebar" style={erpTitleBar}>
-                    <div className="purchase-voucher-title-left" style={erpTitleLeft}>
-                      <span className="purchase-voucher-doc-icon" style={erpDocIcon}>P</span>
-                      <span className="purchase-voucher-title" style={erpTitleText}>Purchase</span>
-                    </div>
-                    <div className="purchase-voucher-meta" style={erpMetaLine}>
-                      <span>Subdocument : <strong>Purchase</strong></span>
-                      <span>Type : <strong>{editId ? "Regular [ Edit ]" : "Regular [ New ]"}</strong></span>
-                      <span>Location</span>
-                      <input value={selectedLocationName || ""} readOnly style={{ ...erpInput, width: 120 }} />
-                    </div>
-                  </div>
+  const id = req.params.id;
+  const {
+    voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
+    packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+    discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+    total_deduction, round_off, net_amount_payable, employee_id, location_id, description
+  } = req.body;
 
-                  <div className="purchase-voucher-top-grid" style={erpTopGrid}>
-                    <div className="purchase-voucher-panel" style={erpPanelWide}>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>Name</label>
-                        <select name="farmer_id" value={formData.farmer_id} onChange={handleChange} style={{ ...erpInput, ...erpFocusInput }}>
-                          <option value="">Select Party</option>
-                          {farmers.map((f) => (
-                            <option key={f.id || f._id} value={f.id || f._id}>{f.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>Account</label>
-                        {renderAccountSelect(erpInput)}
-                      </div>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>GSTIN</label>
-                        <input value={selectedFarmerGst} readOnly style={erpInput} />
-                        <label style={{ ...erpLabel, width: 42, textAlign: "right" }}>State</label>
-                        <input value={selectedFarmerState} readOnly style={{ ...erpInput, width: 90 }} />
-                      </div>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>PAN No.</label>
-                        <input value={selectedFarmerPan} readOnly style={erpInput} />
-                        <label style={{ ...erpLabel, width: 50, textAlign: "right" }}>Mobile</label>
-                        <input value={selectedFarmerMobile} readOnly style={{ ...erpInput, width: 110 }} />
-                      </div>
-                    </div>
+  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
-                    <div className="purchase-voucher-panel" style={erpPanelWide}>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>Warehouse Name</label>
-                        <select name="warehouse_id" value={formData.warehouse_id} onChange={handleChange} style={erpInput}>
-                          <option value="">Select Warehouse</option>
-                          {warehouses.map((w) => (
-                            <option key={w.id || w._id} value={w.id || w._id}>{w.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>Employee Name</label>
-                        <select name="employee_id" value={formData.employee_id} onChange={handleChange} style={erpInput}>
-                          <option value="">Select Employee</option>
-                          {employees.map((e) => (
-                            <option key={e.id || e._id} value={e.id || e._id}>{e.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>Employee Mobile</label>
-                        <input value={selectedEmployeeMobile} readOnly style={erpInput} />
-                      </div>
-                    </div>
-
-                    <div className="purchase-voucher-panel purchase-voucher-doc-panel" style={erpDocPanel}>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>Number</label>
-                        <input name="voucher_no" value={formData.voucher_no} onChange={handleChange} placeholder="Voucher No *" style={erpInput} required />
-                      </div>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>Date</label>
-                        <input name="date" type="date" value={formData.date} onChange={handleChange} style={erpInput} required />
-                      </div>
-                      <div className="purchase-voucher-row" style={erpRow}>
-                        <label style={erpLabel}>R. S. T No</label>
-                        <input name="reference_id" value={formData.reference_id} onChange={handleChange} placeholder="R. S. T No" style={erpInput} />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="purchase-voucher-section-label" style={erpSectionLabel}>GOODS PURCHASE DETAILS</div>
-                  <div className="purchase-voucher-table-wrap" style={erpGridWrap}>
-                    <table style={erpItemsTable}>
-                      <thead>
-                        <tr>
-                          <th style={{ ...erpTh, width: 54 }}>S.L No</th>
-                          <th style={{ ...erpTh, minWidth: 250 }}>Product</th>
-                          <th style={erpTh}>Packet</th>
-                          <th style={erpTh}>Gross Wt</th>
-                          <th style={erpTh}>Tare Wt</th>
-                          <th style={erpTh}>New Wt</th>
-                          <th style={erpTh}>Dhalta</th>
-                          {purchaseDeductionFields.map((field) => (
-                            <th key={field.key} style={erpTh}>{field.label}</th>
-                          ))}
-                          <th style={erpTh}>Net Qty (Auto)</th>
-                          <th style={erpTh}>Rate</th>
-                          <th style={erpTh}>Amount</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr>
-                          <td style={{ ...erpTd, textAlign: "center", fontWeight: 700 }}>1</td>
-                          <td style={erpTd}>
-                            <select name="product_id" value={formData.product_id} onChange={handleChange} style={erpCellInput}>
-                              <option value="">Select Product</option>
-                              {products.map((p) => (
-                                <option key={p.id || p._id} value={p.id || p._id}>{p.name}</option>
-                              ))}
-                            </select>
-                          </td>
-                          <td style={erpTd}><input name="packet" type="number" step="0.0001" value={formData.packet} onChange={handleChange} style={erpCellInput} /></td>
-                          <td style={erpTd}><input name="gross_weight" type="number" step="0.0001" value={formData.gross_weight} onChange={handleChange} style={erpCellInput} /></td>
-                          <td style={erpTd}><input name="tare_weight" type="number" step="0.0001" value={formData.tare_weight} onChange={handleChange} style={erpCellInput} /></td>
-                          <td style={erpTd}><input value={formatDecimal4(safePurchaseNewWeight)} readOnly style={{ ...erpCellInput, ...erpReadOnlyCell }} /></td>
-                          <td style={erpTd}><input name="dhalta" type="number" step="0.0001" value={formData.dhalta} onChange={handleChange} style={erpCellInput} /></td>
-                          {purchaseDeductionFields.map((field) => (
-                            <td key={field.key} style={erpTd}>
-                              <input name={field.key} type="number" step="0.0001" value={formData[field.key]} onChange={handleChange} style={erpCellInput} />
-                            </td>
-                          ))}
-                          <td style={erpTd}><input value={formatDecimal4(safePurchaseNetWeight)} readOnly style={{ ...erpCellInput, ...erpReadOnlyCell }} /></td>
-                          <td style={erpTd}><input name="rate" type="number" step="0.0001" value={formData.rate} onChange={handleChange} style={erpCellInput} /></td>
-                          <td style={erpTd}><input value={formatMoney(purchaseGrossAmount)} readOnly style={{ ...erpCellInput, ...erpReadOnlyCell }} /></td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <div className="purchase-voucher-middle-bar" style={erpMiddleBar}>
-                      <span></span>
-                      <strong>Total Quantity : {formatDecimal4(safePurchaseNetWeight)}</strong>
-                  </div>
-
-                  <div className="purchase-voucher-bottom-grid" style={erpBottomGrid}>
-                    <div className="purchase-voucher-bottom-panel" style={{ display: "grid", gap: 12 }}>
-                      <div style={{ border: "1px solid #dbe4ef", borderRadius: 10, background: "#fff", overflow: "hidden" }}>
-                        <div style={{ padding: "10px 12px", background: "#0b2a5b", color: "#fff", fontWeight: 800 }}>Journal / Deduction Details</div>
-                        <div style={{ overflowX: "auto" }}>
-                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                            <thead>
-                              <tr>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>Claim</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>Labour</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>Freight</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>CD %</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>CD Amount</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>TDS</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>Other</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>Adjustment</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>Round Off</th>
-                                <th style={{ ...erpTh, background: "#eef4ff", textAlign: "center" }}>Total Deduction</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              <tr>
-                                <td style={erpTd}><input name="claim_amount" type="number" step="0.01" value={formData.claim_amount || formData.bags_claim} onChange={(e) => { handleChange(e); }} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input name="labour" type="number" step="0.01" value={formData.labour} onChange={handleChange} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input name="transport_charge" type="number" step="0.01" value={formData.transport_charge} onChange={handleChange} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input name="cd_percent" type="number" step="0.01" value={formData.cd_percent} onChange={handleChange} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input name="cd_amount" type="number" step="0.01" value={formData.cd_amount} onChange={handleChange} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input name="tds_amount" type="number" step="0.01" value={formData.tds_amount} onChange={handleChange} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input name="other_deduction" type="number" step="0.01" value={formData.other_deduction} onChange={handleChange} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input name="adjustment_amount" type="number" step="0.01" value={formData.adjustment_amount} onChange={handleChange} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input name="round_off" type="number" step="0.01" value={formData.round_off} onChange={handleChange} style={{ ...erpInput, width: "100%" }} /></td>
-                                <td style={erpTd}><input value={formatMoney(purchaseTotalDeduction)} readOnly style={{ ...erpInput, width: "100%", background: "#f8fafc", fontWeight: 800 }} /></td>
-                              </tr>
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-
-                      <div style={{ border: "1px solid #dbe4ef", borderRadius: 10, background: "#fff", overflow: "hidden" }}>
-                        <div style={{ padding: "10px 12px", background: "#f3f4f6", borderBottom: "1px solid #dbe4ef", fontWeight: 800 }}>Payment / Receipt Details</div>
-                        <div style={{ padding: 12, display: "grid", gap: 10, color: "#64748b", fontSize: 13 }}>
-                          <div>Purchase payment / receipt adjustment can be posted from voucher actions after save.</div>
-                          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
-                            <div style={smartInfoBoxStyle}><span>Gross Amount</span><strong>{formatMoney(purchaseGrossAmount)}</strong></div>
-                            <div style={smartInfoBoxStyle}><span>Total Deduction</span><strong>{formatMoney(purchaseTotalDeduction)}</strong></div>
-                            <div style={smartInfoBoxStyle}><span>Net Payable</span><strong>{formatMoney(purchaseNetPayable)}</strong></div>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div style={{ border: "1px solid #dbe4ef", borderRadius: 10, background: "#fff", overflow: "hidden" }}>
-                        <div style={{ padding: "10px 12px", background: "#f3f4f6", borderBottom: "1px solid #dbe4ef", fontWeight: 800 }}>ERP Summary</div>
-                        <div style={{ padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
-                          <div style={smartInfoBoxStyle}><span>Gross Amount</span><strong>{formatMoney(purchaseGrossAmount)}</strong></div>
-                          <div style={smartInfoBoxStyle}><span>Total Deduction</span><strong>{formatMoney(purchaseTotalDeduction)}</strong></div>
-                          <div style={smartInfoBoxStyle}><span>Round Off</span><strong>{formatMoney(purchaseRoundOff)}</strong></div>
-                          <div style={{ ...smartInfoBoxStyle, background: "#0b2a5b", color: "#fff", borderColor: "#0b2a5b" }}><span>Net Amount Payable</span><strong>{formatMoney(purchaseNetPayable)}</strong></div>
-                        </div>
-                      </div>
-
-                      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                        <button type="button" onClick={resetPurchaseDeductions} style={{ ...btnAction, background: "#64748b" }}>
-                          Auto Fill / Reset
-                        </button>
-                        <button type="button" onClick={capturePurchaseDeductionsAsDefault} style={{ ...btnAction, background: "#0f766e" }}>
-                          Save as Current
-                        </button>
-                      </div>
-
-                      <div className="purchase-voucher-remarks" style={erpRemarksRow}>
-                        <label style={erpLabel}>Narration</label>
-                        <textarea name="description" value={formData.description} onChange={handleChange} rows={2} style={erpTextarea} />
-                      </div>
-                    </div>
-
-                    <div className="purchase-voucher-bottom-panel">
-                      <table style={erpMiniTable}>
-                        <thead>
-                          <tr><th style={erpTh}>Purchase Summary</th><th style={erpTh}>Amount</th></tr>
-                        </thead>
-                        <tbody>
-                          <tr><td style={erpTd}>Gross Amount</td><td style={erpTd}>{formatMoney(purchaseGrossAmount)}</td></tr>
-                          <tr><td style={erpTd}>Total Deduction</td><td style={erpTd}>{formatMoney(purchaseTotalDeduction)}</td></tr>
-                          <tr><td style={erpTd}>Round Off</td><td style={erpTd}>{formatMoney(purchaseRoundOff)}</td></tr>
-                          <tr><td style={erpTd}>Net Amount Payable</td><td style={erpTd}>{formatMoney(purchaseNetPayable)}</td></tr>
-                        </tbody>
-                      </table>
-
-                      <div className="purchase-voucher-total-panel" style={erpTotalPanel}>
-                        <span style={erpTotalLabel}>T O T A L</span>
-                        <strong style={erpTotalAmount}>{formatMoney(purchaseNetPayable)}</strong>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : isSaleVoucher ? (
-                <div className="sale-voucher-mobile-form purchase-voucher-mobile-form" style={erpShell}>
-                  <div className="purchase-voucher-titlebar sale-voucher-titlebar" style={erpTitleBar}>
-                    <div style={erpTitleLeft}>
-                      <span style={erpDocIcon}>S</span>
-                      <span style={erpTitleText}>Sale</span>
-                    </div>
-                    <div style={erpMetaLine}>
-                      <span>Subdocument : <strong>Sale</strong></span>
-                      <span>Type : <strong>{editId ? "Regular [ Edit ]" : "Regular [ New ]"}</strong></span>
-                      <span>Location</span>
-                      <input value={selectedLocationName || ""} readOnly style={{ ...erpInput, width: 120 }} />
-                    </div>
-                  </div>
-
-                  <div className="purchase-voucher-top-grid" style={erpTopGrid}>
-                    <div style={erpPanelWide}>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Buyer Name</label>
-                        <select name="buyer_id" value={formData.buyer_id || formData.company_id} onChange={handleChange} style={{ ...erpInput, ...erpFocusInput }}>
-                          <option value="">Select Buyer</option>
-                          {buyerNames.map((buyer) => (
-                            <option key={buyer.id || buyer._id} value={buyer.id || buyer._id}>{buyer.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Account</label>
-                        {renderAccountSelect(erpInput)}
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Consignee</label>
-                        <select name="consignee_id" value={formData.consignee_id} onChange={handleChange} style={erpInput}>
-                          <option value="">{formData.buyer_id || formData.company_id ? "Select Consignee" : "Select Buyer First"}</option>
-                          {filteredConsignees.map((c) => (
-                            <option key={c.id || c._id} value={c.id || c._id}>{c.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>GSTIN</label>
-                        <input value={selectedBuyer?.gst_no || selectedConsignee?.gst_no || ""} readOnly style={erpInput} />
-                        <label style={{ ...erpLabel, width: 42, textAlign: "right" }}>State</label>
-                        <input value={selectedBuyer?.state || selectedConsignee?.state || ""} readOnly style={{ ...erpInput, width: 90 }} />
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>PAN No.</label>
-                        <input value={selectedBuyer?.pan_no || selectedConsignee?.pan_no || ""} readOnly style={erpInput} />
-                        <label style={{ ...erpLabel, width: 50, textAlign: "right" }}>Mobile</label>
-                        <input value={selectedBuyer?.mobile || selectedConsignee?.mobile || ""} readOnly style={{ ...erpInput, width: 110 }} />
-                      </div>
-                      {formData.sale_type === "direct" && (
-                        <>
-                          <div style={erpRow}>
-                            <label style={erpLabel}>Location</label>
-                            <select name="location_id" value={formData.location_id} onChange={handleChange} style={erpInput}>
-                              <option value="">Select Location</option>
-                              {locations.map((location) => (
-                                <option key={location.id || location._id} value={location.id || location._id}>{location.name}</option>
-                              ))}
-                            </select>
-                          </div>
-                          <div style={erpRow}>
-                            <label style={erpLabel}>Farmer</label>
-                            <select name="farmer_id" value={formData.farmer_id} onChange={handleChange} style={erpInput}>
-                              <option value="">Select Farmer</option>
-                              {farmers.map((farmer) => (
-                                <option key={farmer.id || farmer._id} value={farmer.id || farmer._id}>{farmer.name}</option>
-                              ))}
-                            </select>
-                          </div>
-                          <div style={erpRow}>
-                            <label style={erpLabel}>Purchase Rate</label>
-                            <input name="direct_purchase_rate" type="number" step="0.0001" value={formData.direct_purchase_rate} onChange={handleChange} style={erpInput} />
-                          </div>
-                          <div style={erpRow}>
-                            <label style={erpLabel}>Purchase Amount</label>
-                            <input value={formatMoney(saleDispatchQtyFromData(formData) * toNumber(formData.direct_purchase_rate))} readOnly style={erpInput} />
-                          </div>
-                        </>
-                      )}
-                    </div>
-
-                    <div style={erpPanelWide}>
-                      {formData.sale_type !== "direct" && (
-                        <div style={erpRow}>
-                          <label style={erpLabel}>Warehouse Name</label>
-                          <select name="warehouse_id" value={formData.warehouse_id} onChange={handleChange} style={erpInput}>
-                            <option value="">Select Warehouse</option>
-                            {warehouses.map((w) => (
-                              <option key={w.id || w._id} value={w.id || w._id}>{w.name}</option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Employee Name</label>
-                        <select name="employee_id" value={formData.employee_id} onChange={handleChange} style={erpInput}>
-                          <option value="">Select Employee</option>
-                          {employees.map((e) => (
-                            <option key={e.id || e._id} value={e.id || e._id}>{e.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Employee Mobile</label>
-                        <input value={selectedEmployeeMobile} readOnly style={erpInput} />
-                      </div>
-                    </div>
-
-                    <div style={erpDocPanel}>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Sale Type</label>
-                        <select name="sale_type" value={formData.sale_type || "direct"} onChange={handleChange} style={erpInput}>
-                          <option value="direct">Direct Farmer Loading Sale</option>
-                          <option value="warehouse">Warehouse Sale</option>
-                        </select>
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Number</label>
-                        <input name="voucher_no" value={formData.voucher_no} onChange={handleChange} placeholder="Voucher No *" style={erpInput} required />
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Date</label>
-                        <input name="date" type="date" value={formData.date} onChange={handleChange} style={erpInput} required />
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Unloading Date</label>
-                        <input name="unloading_date" type="date" value={formData.unloading_date} onChange={handleChange} style={erpInput} />
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Due Days</label>
-                        <input name="due_days" type="number" min="0" value={formData.due_days} onChange={handleChange} style={erpInput} />
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>P.O No</label>
-                        <input name="po_no" value={formData.po_no} onChange={handleChange} style={erpInput} />
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>Due Date</label>
-                        <input name="due_date" type="date" value={formData.due_date} onChange={handleChange} style={erpInput} />
-                      </div>
-                      <div style={erpRow}>
-                        <label style={erpLabel}>R. S. T No</label>
-                        <input name="reference_id" value={formData.reference_id} onChange={handleChange} placeholder="R. S. T No" style={erpInput} />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="purchase-voucher-section-label" style={erpSectionLabel}>GOODS SALE DETAILS</div>
-                  <div className="purchase-voucher-table-wrap" style={erpGridWrap}>
-                    <table style={erpItemsTable}>
-                      <thead>
-                        <tr>
-                          <th style={{ ...erpTh, width: 54 }}>S.L No</th>
-                          <th style={{ ...erpTh, minWidth: 250 }}>Product</th>
-                          <th style={erpTh}>Packet</th>
-                          <th style={erpTh}>Gross Wt</th>
-                          <th style={erpTh}>Tare Wt</th>
-                          <th style={erpTh}>New Wt</th>
-                          <th style={erpTh}>Net Qty (Auto)</th>
-                          <th style={erpTh}>Rate</th>
-                          <th style={erpTh}>Amount</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr>
-                          <td style={{ ...erpTd, textAlign: "center", fontWeight: 700 }}>1</td>
-                          <td style={erpTd}>
-                            <select name="product_id" value={formData.product_id} onChange={handleChange} style={erpCellInput}>
-                              <option value="">Select Product</option>
-                              {products.map((p) => (
-                                <option key={p.id || p._id} value={p.id || p._id}>{p.name}</option>
-                              ))}
-                            </select>
-                          </td>
-                          <td style={erpTd}><input name="packet" type="number" step="0.0001" value={formData.packet} onChange={handleChange} style={erpCellInput} /></td>
-                          <td style={erpTd}><input name="gross_weight" type="number" step="0.0001" value={formData.gross_weight} onChange={handleChange} style={erpCellInput} /></td>
-                          <td style={erpTd}><input name="tare_weight" type="number" step="0.0001" value={formData.tare_weight} onChange={handleChange} style={erpCellInput} /></td>
-                          <td style={erpTd}><input value={formatDecimal4(toNumber(formData.gross_weight) - toNumber(formData.tare_weight))} readOnly style={{ ...erpCellInput, ...erpReadOnlyCell }} /></td>
-                          <td style={erpTd}><input value={formatDecimal4(saleQtyFromData(formData))} readOnly style={{ ...erpCellInput, ...erpReadOnlyCell }} /></td>
-                          <td style={erpTd}><input name="rate" type="number" step="0.0001" value={formData.rate} onChange={handleChange} style={erpCellInput} /></td>
-                          <td style={erpTd}><input value={formatMoney(saleGrossAmountFromData(formData))} readOnly style={{ ...erpCellInput, ...erpReadOnlyCell }} /></td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <div style={erpMiddleBar}>
-                      <span></span>
-                      <strong>Sale Date : {formData.date || "Not Set"}</strong>
-                  </div>
-
-                  <div style={erpBottomGrid}>
-                    <div>
-                      <table style={erpMiniTable}>
-                        <thead>
-                          <tr><th style={erpTh}>Particulars</th><th style={erpTh}>Amount</th></tr>
-                        </thead>
-                        <tbody>
-                          <tr><td style={erpTd}>Lorry No</td><td style={erpTd}><input name="lorry_no" value={formData.lorry_no} onChange={handleChange} style={erpCellInput} /></td></tr>
-                          <tr><td style={erpTd}>Add Mall Qty</td><td style={erpTd}><input
-                            name="add_qty"
-                            type="number"
-                            step="0.0001"
-                            value={formData.add_qty}
-                            onChange={handleChange}
-                            style={erpCellInput}
-                            placeholder="Manual add qty"
-                          /></td></tr>
-                          <tr><td style={erpTd}>Other Deduction</td><td style={erpTd}><input name="other_deduction" type="number" step="0.0001" value={formData.other_deduction} onChange={handleChange} style={erpCellInput} /></td></tr>
-                          <tr>
-                            <td style={erpTd}>CD %</td>
-                            <td style={erpTd}>
-                              <div style={{ display: "grid", gridTemplateColumns: "80px 1fr", gap: 6 }}>
-                                <input name="cd_percent" type="number" step="0.0001" value={formData.cd_percent} onChange={handleChange} style={erpCellInput} />
-                                <input value={formatMoney(saleCashDiscountAmount)} readOnly style={{ ...erpCellInput, ...erpReadOnlyCell }} />
-                              </div>
-                            </td>
-                          </tr>
-                          <tr><td style={erpTd}>Claim/TDS</td><td style={erpTd}><input name="claim_amount" type="number" step="0.0001" value={formData.claim_amount} onChange={handleChange} style={erpCellInput} /></td></tr>
-                          <tr><td style={{ ...erpTd, fontWeight: 700 }}>Total Deduction</td><td style={{ ...erpTd, fontWeight: 700 }}>{formatMoney(toNumber(formData.other_deduction) + toNumber(formData.claim_amount) + saleCashDiscountAmount)}</td></tr>
-                          <tr><td style={erpTd}>Round Off</td><td style={erpTd}><input name="round_off" type="number" step="0.0001" value={formData.round_off} onChange={handleChange} style={erpCellInput} /></td></tr>
-                          <tr><td style={erpTd}>F2 Voucher Pass</td><td style={erpTd}><button type="button" onClick={() => setShowSaleDeductionModal(true)} style={{ ...btnAction, background: "#0f766e", width: "100%" }}>F2 Voucher Pass</button></td></tr>
-                        </tbody>
-                      </table>
-                      <div style={erpRemarksRow}>
-                        <label style={erpLabel}>Narration</label>
-                        <textarea name="description" value={formData.description} onChange={handleChange} rows={2} style={erpTextarea} />
-                      </div>
-                      {activeVoucherType === "sale" && (
-                        <div style={smartInfoGridStyle}>
-                          <div style={smartInfoBoxStyle}>
-                            <span>Buyer Sale Qty</span>
-                            <strong>{formatDecimal4(selectedBuyerSaleQty)}</strong>
-                          </div>
-                          <div style={smartInfoBoxStyle}>
-                            <span>Balance Amount</span>
-                            <strong>{formatMoney(selectedBuyerBalanceAmount)}</strong>
-                          </div>
-                          <div style={smartInfoBoxStyle}>
-                            <span>Pending Amount</span>
-                            <strong>{formatMoney(selectedBuyerPendingAmount)}</strong>
-                          </div>
-                          {formData.sale_type !== "direct" && (
-                            <div style={smartInfoBoxStyle}>
-                              <span>Warehouse Balance Qty</span>
-                              <strong>{selectedWarehouseBalanceQty === null ? "-" : formatDecimal4(selectedWarehouseBalanceQty)}</strong>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-
-                    <div>
-                      <table style={erpMiniTable}>
-                        <thead>
-                          <tr><th style={erpTh}>Sale Summary</th><th style={erpTh}>Amount</th></tr>
-                        </thead>
-                        <tbody>
-                          <tr><td style={erpTd}>Gross Amount</td><td style={erpTd}>{formatMoney(saleGrossAmountFromData(formData))}</td></tr>
-                          <tr><td style={erpTd}>Cash Discount</td><td style={erpTd}>{formatMoney(saleCashDiscountAmount)}</td></tr>
-                          <tr><td style={erpTd}>Total Deduction</td><td style={erpTd}>{formatMoney(toNumber(formData.other_deduction) + toNumber(formData.claim_amount) + saleCashDiscountAmount)}</td></tr>
-                          <tr><td style={erpTd}>Round Off</td><td style={erpTd}>{formatMoney(toNumber(formData.round_off))}</td></tr>
-                          <tr><td style={erpTd}>Net Amount Payable</td><td style={erpTd}>{formatMoney(saleNetReceivablePreview)}</td></tr>
-                        </tbody>
-                      </table>
-
-                      <div style={erpTotalPanel}>
-                        <span style={erpTotalLabel}>T O T A L</span>
-                        <strong style={erpTotalAmount}>{formatMoney(saleNetReceivablePreview)}</strong>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div>
-                  {activeVoucherType === "payment" && (
-                    <div className="payment-mobile-shell" style={paymentHeroCard}>
-                      <div style={paymentHeroHeader}>
-                        <div>
-                          <div style={paymentEyebrow}>PAYMENT VOUCHER</div>
-                          <h3 style={paymentHeroTitle}>Smart Payment Entry</h3>
-                          <p style={paymentHeroSubtitle}>Select account, warehouse and pending farmer, then adjust purchase bills.</p>
-                        </div>
-                        <div style={paymentBadge}>⚡ Smart Entry</div>
-                      </div>
-
-                      <div style={paymentModeRow}>
-                        {paymentModeOptions.map((option) => {
-                          const isActive = activePaymentMode === option.value;
-                          return (
-                            <button
-                              key={option.value}
-                              type="button"
-                              onClick={() =>
-                                handlePaymentModeChange(option.value, {
-                                  amount: formData.amount,
-                                  farmer_id: formData.farmer_id,
-                                  warehouse_id: formData.warehouse_id,
-                                  company_account_id: formData.company_account_id,
-                                })
-                              }
-                              style={{
-                                ...paymentModeButton,
-                                ...(isActive ? paymentModeButtonActive : {}),
-                              }}
-                            >
-                              {option.label}
-                            </button>
-                          );
-                        })}
-                      </div>
-
-                      <div style={paymentSelectorGrid}>
-                        <SearchableSelect
-                          label="Account"
-                          value={formData.company_account_id}
-                          options={companyAccounts.map((a) => ({
-                            value: a.id || a._id,
-                            label: a.account_name || a.name,
-                          }))}
-                          onChange={(value) => handleChange({ target: { name: "company_account_id", value } })}
-                          placeholder="Choose account"
-                        />
-                        <SearchableSelect
-                          label="Warehouse"
-                          value={formData.warehouse_id}
-                          options={paymentWarehouses.map((w) => ({
-                            value: w.id || w._id,
-                            label: w.name,
-                          }))}
-                          onChange={(value) => handleChange({ target: { name: "warehouse_id", value } })}
-                          placeholder={formData.company_account_id ? "Choose warehouse" : "Choose account first"}
-                          disabled={!formData.company_account_id}
-                        />
-                        <SearchableSelect
-                          label="Pending Farmer"
-                          value={formData.farmer_id}
-                          options={accountFarmers.map((f) => ({
-                            value: f.id || f._id,
-                            label: `${f.name}${f.outstanding !== undefined ? ` — Due Rs.${formatMoney(f.outstanding)}` : ""}`,
-                          }))}
-                          onChange={(value) => handleChange({ target: { name: "farmer_id", value } })}
-                          placeholder={formData.warehouse_id ? "Choose pending farmer" : "Choose warehouse first"}
-                          disabled={!formData.warehouse_id}
-                        />
-                      </div>
-
-                      <div className="payment-financial-summary" style={paymentFinancialSummary}>
-                        <div style={paymentStatCard}>
-                          <span style={paymentStatLabel}>Total Bill</span>
-                          <strong style={paymentStatValue}>Rs.{formatMoney(paymentTotalBill)}</strong>
-                        </div>
-                        <div style={paymentStatCard}>
-                          <span style={paymentStatLabel}>Total Deduction</span>
-                          <strong style={paymentStatValue}>Rs.{formatMoney(paymentTotalDeduction)}</strong>
-                        </div>
-                        <div style={paymentStatCard}>
-                          <span style={paymentStatLabel}>Total Paid</span>
-                          <strong style={paymentStatValue}>Rs.{formatMoney(paymentTotalPaid)}</strong>
-                        </div>
-                        <div style={{ ...paymentStatCard, ...paymentDueCard }}>
-                          <span style={paymentStatLabel}>Total Due</span>
-                          <strong style={{ ...paymentStatValue, color: "#b91c1c" }}>Rs.{formatMoney(paymentTotalDue)}</strong>
-                        </div>
-                      </div>
-
-                      <div className="payment-entry-row" style={paymentEntryRow}>
-                        <Field label="Payment Amount">
-                          <input
-                            name="amount"
-                            type="number"
-                            step="0.0001"
-                            value={formData.amount}
-                            onChange={(event) => {
-                              handleChange(event);
-                              setPaymentAdjustments([]);
-                            }}
-                            style={paymentAmountInput}
-                            required
-                          />
-                        </Field>
-                        <div style={paymentAdjustmentAction}>
-                          <button
-                            type="button"
-                            onClick={openPaymentAdjustmentPopup}
-                            style={{ ...btnAction, background: "#2563eb", minHeight: 42 }}
-                            disabled={
-                              !formData.company_account_id ||
-                              !formData.warehouse_id ||
-                              !formData.farmer_id ||
-                              toNumber(formData.amount) <= 0
-                            }
-                          >
-                            Open Adjustment
-                          </button>
-                          <span style={paymentAdjustedText}>
-                            Adjusted: <strong>Rs.{formatMoney(paymentAdjustmentTotal)}</strong>
-                          </span>
-                        </div>
-                      </div>
-
-                      <div style={paymentSelectedBar}>
-                        <span><b>Account:</b> {getAccountName(formData) || "Choose account"}</span>
-                        <span><b>Warehouse:</b> {getWarehouseName(formData) || "Choose warehouse"}</span>
-                        <span><b>Farmer:</b> {farmers.find((f) => String(f.id || f._id) === String(formData.farmer_id))?.name || "Pick the pending farmer"}</span>
-                      </div>
-                    </div>
-                  )}
-                  <div style={formGrid}>
-                <Field label="Voucher No">
-                  <input name="voucher_no" value={formData.voucher_no} onChange={handleChange} placeholder="Voucher No *" style={inp} required />
-                </Field>
-                <Field label="Date">
-                  <input name="date" type="date" value={formData.date} onChange={handleChange} style={inp} required />
-                </Field>
-                {activeVoucherType === "sale" && (
-                  <Field label="Sale Type">
-                    <select name="sale_type" value={formData.sale_type || "direct"} onChange={handleChange} style={inp}>
-                      <option value="direct">Direct Farmer Loading Sale</option>
-                      <option value="warehouse">Warehouse Sale</option>
-                    </select>
-                  </Field>
-                )}
-                {(activeVoucherType !== "payment" && (activeVoucherType !== "sale" || formData.sale_type !== "direct")) && (
-                  <Field label="Warehouse">
-                    <select name="warehouse_id" value={formData.warehouse_id} onChange={handleChange} style={inp}>
-                      <option value="">Select Warehouse</option>
-                      {warehouses.map((w) => (
-                        <option key={w.id || w._id} value={w.id || w._id}>{w.name}</option>
-                      ))}
-                    </select>
-                  </Field>
-                )}
-                {activeVoucherType !== "payment" && (
-                  <>
-                    <Field label="Location">
-                      <select name="location_id" value={formData.location_id} onChange={handleChange} style={inp}>
-                        <option value="">Select Location</option>
-                        {locations.map((l) => (
-                          <option key={l.id || l._id} value={l.id || l._id}>{l.name}</option>
-                        ))}
-                      </select>
-                    </Field>
-                    <Field label="Employee">
-                      <select name="employee_id" value={formData.employee_id} onChange={handleChange} style={inp}>
-                        <option value="">Select Employee</option>
-                        {employees.map((e) => (
-                          <option key={e.id || e._id} value={e.id || e._id}>{e.name}</option>
-                        ))}
-                      </select>
-                    </Field>
-                  </>
-                )}
-                {activeVoucherType !== "payment" && <Field label="Account">
-                  {renderAccountSelect(inp)}
-                </Field>}
-                {activeVoucherType === "sale" && formData.sale_type === "direct" && (
-                  <>
-                    <Field label="Farmer">
-                      <select name="farmer_id" value={formData.farmer_id} onChange={handleChange} style={inp}>
-                        <option value="">Select Farmer</option>
-                        {farmers.map((farmer) => (
-                          <option key={farmer.id || farmer._id} value={farmer.id || farmer._id}>{farmer.name}</option>
-                        ))}
-                      </select>
-                    </Field>
-                    <Field label="Purchase Rate">
-                      <input name="direct_purchase_rate" type="number" step="0.0001" value={formData.direct_purchase_rate} onChange={handleChange} style={inp} />
-                    </Field>
-                    <Field label="Purchase Amount">
-                      <input value={formatMoney(saleDispatchQtyFromData(formData) * toNumber(formData.direct_purchase_rate))} readOnly style={readOnlyInp} />
-                    </Field>
-                  </>
-                )}
-
-                {(activeVoucherType === "purchase" || activeVoucherType === "payment") && (
-                  <>
-                    {activeVoucherType === "payment" && false && (
-                      <Field label="Amount">
-                        <input
-                          name="amount"
-                          type="number"
-                          step="0.0001"
-                          value={formData.amount}
-                          onChange={(event) => {
-                            handleChange(event);
-                            setPaymentAdjustments([]);
-                          }}
-                          style={inp}
-                          required
-                        />
-                      </Field>
-                    )}
-                    {activeVoucherType !== "payment" && <Field label="Farmer (Creditor)">
-                      <select name="farmer_id" value={formData.farmer_id} onChange={handleChange} style={inp}>
-                        <option value="">Select Farmer</option>
-                        {(activeVoucherType === "payment" && formData.company_account_id
-                          ? accountFarmers
-                          : farmers
-                        ).map((f) => (
-                          <option key={f.id || f._id} value={f.id || f._id}>
-                            {f.name}
-                            {activeVoucherType === "payment" && formData.company_account_id && f.outstanding !== undefined
-                              ? ` (Balance: ${formatMoney(f.outstanding)})`
-                              : ""}
-                          </option>
-                        ))}
-                        {activeVoucherType === "payment" && formData.company_account_id && accountFarmers.length === 0 && (
-                          <option value="" disabled>
-                            No farmers with outstanding balance for this account
-                          </option>
-                        )}
-                      </select>
-                    </Field>}
-                    {false && partyOutstanding && activeVoucherType === "payment" && (
-                      <div style={{ marginTop: 8, fontSize: 13, color: "#444", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                        <span>Party: <strong>{formData.company_account_id ? companyAccounts.find(ca => String(ca.id || ca._id) === String(formData.company_account_id))?.account_name || "-" : "-"}</strong></span>
-                        <span>Farmer Bill: <strong>Rs.{formatMoney(partyOutstanding.stats?.total_purchase ?? partyOutstanding.total_purchase ?? 0)}</strong></span>
-                        <span>Paid: <strong>Rs.{formatMoney(partyOutstanding.stats?.total_payment ?? partyOutstanding.total_payment ?? 0)}</strong></span>
-                        <span>Balance: <strong>Rs.{formatMoney(partyOutstanding.stats?.outstanding ?? partyOutstanding.outstanding ?? 0)}</strong></span>
-                        <button type="button" onClick={openPaymentAdjustmentPopup} style={{ ...btnAction, background: "#2563eb" }}>
-                          Adjust Bills
-                        </button>
-                        <span>Adjusted: <strong>Rs.{formatMoney(paymentAdjustmentTotal)}</strong></span>
-                      </div>
-                    )}
-                  </>
-                )}
-
-                {(activeVoucherType === "sale" || activeVoucherType === "receipt") && (
-                  <>
-                    {activeVoucherType === "sale" ? (
-                      <Field label="Buyer Name">
-                        <select name="buyer_id" value={formData.buyer_id || formData.company_id} onChange={handleChange} style={inp}>
-                          <option value="">Select Buyer</option>
-                          {buyerNames.map((buyer) => (
-                            <option key={buyer.id || buyer._id} value={buyer.id || buyer._id}>{buyer.name}</option>
-                          ))}
-                        </select>
-                      </Field>
-                    ) : (
-                      <Field label="Buyer (Debtor)">
-                        <select name="company_id" value={formData.company_id} onChange={handleChange} style={inp}>
-                          <option value="">Select Buyer</option>
-                          {buyerNames.map((c) => (
-                            <option key={c.id || c._id} value={c.id || c._id}>{c.name}</option>
-                          ))}
-                        </select>
-                      </Field>
-                    )}
-                    {partyOutstanding && activeVoucherType === "receipt" && (
-                      <div style={{ marginTop: 8, fontSize: 13, color: "#444" }}>
-                        Current outstanding: Rs.{formatMoney(partyOutstanding.stats?.outstanding ?? partyOutstanding.outstanding ?? 0)}
-                      </div>
-                    )}
-                    <Field label="Consignee">
-                      <div style={{ fontSize: 12, color: "#0f766e", fontWeight: 700, marginBottom: 4 }}>
-                        {activeVoucherType === "sale" && (formData.buyer_id || formData.company_id)
-                          ? `Buyer: ${getCompanyName({ company_id: formData.company_id || formData.buyer_id })}`
-                          : "Select a buyer first"}
-                      </div>
-                      <select name="consignee_id" value={formData.consignee_id} onChange={handleChange} style={inp}>
-                        <option value="">{activeVoucherType === "sale" && !(formData.buyer_id || formData.company_id) ? "Select Buyer First" : "Select Consignee"}</option>
-                        {(activeVoucherType === "sale" ? filteredConsignees : consignees).map((c) => (
-                          <option key={c.id || c._id} value={c.id || c._id}>{c.name}</option>
-                        ))}
-                      </select>
-                    </Field>
-                  </>
-                )}
-
-                {(activeVoucherType === "purchase" || activeVoucherType === "sale") && (
-                  <>
-                    <Field label="Product">
-                      <select name="product_id" value={formData.product_id} onChange={handleChange} style={inp}>
-                        <option value="">Select Product</option>
-                        {products.map((p) => (
-                          <option key={p.id || p._id} value={p.id || p._id}>{p.name}</option>
-                        ))}
-                      </select>
-                    </Field>
-                    {activeVoucherType === "sale" && formData.sale_type !== "direct" && (
-                      <div style={{ gridColumn: "1 / -1", border: "1px solid #dbe3ef", borderRadius: 8, padding: 12, background: "#f8fafc" }}>
-                        <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, color: "#334155" }}>
-                          <input
-                            name="against_purchase_enabled"
-                            type="checkbox"
-                            checked={Boolean(formData.against_purchase_enabled)}
-                            onChange={handleChange}
-                          />
-                          Against Purchase Bill / Farmer Bill
-                        </label>
-                        {formData.against_purchase_enabled && (
-                          <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
-                            <Field label="Farmer">
-                              <select name="against_purchase_farmer_id" value={formData.against_purchase_farmer_id} onChange={handleChange} style={inp}>
-                                <option value="">Select Farmer</option>
-                                {farmers.map((farmer) => (
-                                  <option key={farmer.id || farmer._id} value={farmer.id || farmer._id}>{farmer.name}</option>
-                                ))}
-                              </select>
-                            </Field>
-                            <div style={{ overflowX: "auto" }}>
-                              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, background: "#fff" }}>
-                                <thead>
-                                  <tr style={reportHeaderRowStyle}>
-                                    <th style={th}>Purchase Bill</th>
-                                    <th style={th}>Date</th>
-                                    <th style={th}>Farmer</th>
-                                    <th style={th}>Qty</th>
-                                    <th style={th}>Rate</th>
-                                    <th style={th}>Against Qty</th>
-                                    <th style={th}>Amount</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {againstPurchaseRows.map((purchase) => {
-                                    const purchaseId = String(purchase.id || purchase._id || "");
-                                    const link = againstPurchaseLinkMap.get(purchaseId) || {};
-                                    const qty = toNumber(link.quantity);
-                                    return (
-                                      <tr key={purchaseId}>
-                                        <td style={td}>{purchase.voucher_no || "-"}</td>
-                                        <td style={td}>{formatLedgerDate(purchase.date)}</td>
-                                        <td style={td}>{getFarmerName(purchase)}</td>
-                                        <td style={td}>{formatDecimal4(purchase.total_qty || purchase.net_weight || purchase.quantity || 0)}</td>
-                                        <td style={td}>{formatMoney(purchase.rate || 0)}</td>
-                                        <td style={td}>
-                                          <input
-                                            type="number"
-                                            step="0.0001"
-                                            min="0"
-                                            value={qty || ""}
-                                            onChange={(event) => updateSalePurchaseLink(purchase, event.target.value)}
-                                            style={{ ...inp, minWidth: 110 }}
-                                          />
-                                        </td>
-                                        <td style={td}>{formatMoney(qty * toNumber(purchase.rate))}</td>
-                                      </tr>
-                                    );
-                                  })}
-                                  {againstPurchaseRows.length === 0 && (
-                                    <tr><td colSpan={7} style={{ ...td, textAlign: "center", padding: 14 }}>No matching purchase bill found.</td></tr>
-                                  )}
-                                </tbody>
-                              </table>
-                            </div>
-                            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 13, color: "#334155" }}>
-                              <strong>Against Qty: {formatDecimal4(againstPurchaseTotalQty)}</strong>
-                              <strong>Purchase Amount: Rs.{formatMoney(againstPurchaseTotalAmount)}</strong>
-                              <strong>Sale Qty: {formatDecimal4(saleDispatchQtyFromData(formData))}</strong>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                    <Field label={activeVoucherType === "sale" ? "Loading Date" : "Date"}>
-                      <input name="date" type="date" value={formData.date} onChange={handleChange} style={inp} />
-                    </Field>
-                    {activeVoucherType === "sale" && (
-                      <Field label="Unloading Date">
-                        <input name="unloading_date" type="date" value={formData.unloading_date} onChange={handleChange} style={inp} />
-                      </Field>
-                    )}
-                    {activeVoucherType === "sale" && (
-                      <>
-                        <Field label="P.O No">
-                          <input name="po_no" value={formData.po_no} onChange={handleChange} style={inp} />
-                        </Field>
-                        <Field label="Due Days">
-                          <input name="due_days" type="number" min="0" value={formData.due_days} onChange={handleChange} style={inp} />
-                        </Field>
-                        <Field label="Due Date">
-                          <input name="due_date" type="date" value={formData.due_date} onChange={handleChange} style={inp} />
-                        </Field>
-                      </>
-                    )}
-                    <Field label="Quantity">
-                      <input name="quantity" type="number" step="0.0001" value={formData.quantity} onChange={handleChange} style={inp} />
-                    </Field>
-                    {activeVoucherType === "sale" && (
-                      <Field label="Shortage Quantity">
-                        <input name="shortage_quantity" type="number" step="0.0001" value={formData.shortage_quantity} onChange={handleChange} style={inp} />
-                      </Field>
-                    )}
-                    <Field label="Rate">
-                      <input name="rate" type="number" step="0.0001" value={formData.rate} onChange={handleChange} style={inp} />
-                    </Field>
-                    <Field label="Amount">
-                      <input name="amount" type="number" step="0.0001" value={activeVoucherType === "sale" ? formatMoney(saleGrossAmountFromData(formData)) : formData.amount} onChange={handleChange} style={activeVoucherType === "sale" ? readOnlyInp : inp} readOnly={activeVoucherType === "sale"} />
-                    </Field>
-                    {activeVoucherType === "sale" && (
-                      <>
-                        <Field label="Claim Amount">
-                          <input name="claim_amount" type="number" step="0.0001" value={formData.claim_amount} onChange={handleChange} style={inp} />
-                        </Field>
-                        <Field label="Other Deduction">
-                          <input name="other_deduction" type="number" step="0.0001" value={formData.other_deduction} onChange={handleChange} style={inp} />
-                        </Field>
-                        <Field label="CD %">
-                          <input name="cd_percent" type="number" step="0.0001" value={formData.cd_percent} onChange={handleChange} style={inp} />
-                        </Field>
-                        <Field label="CD Amount">
-                          <input value={formatMoney(saleCashDiscountAmount)} readOnly style={readOnlyInp} />
-                        </Field>
-                        <Field label="Adjustment Amount">
-                          <input name="adjustment_amount" type="number" step="0.0001" value={formData.adjustment_amount} onChange={handleChange} style={inp} />
-                        </Field>
-                        <Field label="TDS Amount">
-                          <input name="tds_amount" type="number" step="0.0001" value={formData.tds_amount} onChange={handleChange} style={inp} />
-                        </Field>
-                        <Field label="Unloading Qty">
-                          <input name="unloading_qty" type="number" step="0.0001" value={formData.unloading_qty} onChange={handleChange} style={inp} />
-                        </Field>
-                        <Field label="Net Receivable">
-                          <input value={formatMoney(saleNetReceivablePreview)} readOnly style={readOnlyInp} />
-                        </Field>
-                        <Field label="FIFO Amount">
-                          <input value={formatMoney(saleGrossAmountFromData(formData))} readOnly style={readOnlyInp} />
-                        </Field>
-                        <div style={{ marginTop: 8, fontSize: 13, color: "#444" }}>
-                          Outstanding: Rs.{formatMoney(saleNetReceivablePreview)}
-                        </div>
-                        <div style={smartInfoGridStyle}>
-                          <div style={smartInfoBoxStyle}><span>Buyer Sale Qty</span><strong>{formatDecimal4(selectedBuyerSaleQty)}</strong></div>
-                          <div style={smartInfoBoxStyle}><span>Balance Amount</span><strong>{formatMoney(selectedBuyerBalanceAmount)}</strong></div>
-                          <div style={smartInfoBoxStyle}><span>Pending Amount</span><strong>{formatMoney(selectedBuyerPendingAmount)}</strong></div>
-                          {formData.sale_type !== "direct" && (
-                            <div style={smartInfoBoxStyle}><span>Warehouse Balance Qty</span><strong>{selectedWarehouseBalanceQty === null ? "-" : formatDecimal4(selectedWarehouseBalanceQty)}</strong></div>
-                          )}
-                        </div>
-                      </>
-                    )}
-                  </>
-                )}
-
-                {activeVoucherType === "payment" && (
-                  <>
-                    <Field label={activePaymentMode === "against" ? "Reference Bills" : activePaymentMode === "new_reference" ? "Reference / Note" : "Reference Note"}>
-                      <input
-                        name="reference_id"
-                        value={activePaymentMode === "against"
-                          ? paymentAdjustments.map((item) => item.voucher_no || item.purchase_voucher_no || item.purchase_id).filter(Boolean).join(", ")
-                          : formData.reference_id}
-                        onChange={handleChange}
-                        style={activePaymentMode === "against" ? readOnlyInp : inp}
-                        placeholder={activePaymentMode === "against" ? "Auto from adjusted purchase bill" : activePaymentMode === "new_reference" ? "Optional reference note" : "Optional note"}
-                        readOnly={activePaymentMode === "against"}
-                      />
-                    </Field>
-                  </>
-                )}
-                {activeVoucherType === "receipt" && (
-                  <>
-                    <Field label="Reference Type">
-                      <select
-                        name="reference_type"
-                        value={formData.reference_type}
-                        onChange={handleChange}
-                        style={inp}
-                      >
-                        <option value="">Select Reference</option>
-                        <option value="purchase">Purchase Bill</option>
-                        <option value="sale">Sale Bill</option>
-                        <option value="other">Other</option>
-                      </select>
-                    </Field>
-                    <Field label="Reference ID">
-                      <input
-                        name="reference_id"
-                        value={formData.reference_id}
-                        onChange={handleChange}
-                        style={inp}
-                        placeholder="Optional bill ID"
-                      />
-                    </Field>
-                    <Field label="Amount">
-                      <input name="amount" type="number" step="0.0001" value={formData.amount} onChange={handleChange} style={inp} required />
-                    </Field>
-                  </>
-                )}
-
-                {activeVoucherType === "journal" && (
-                  <>
-                    <Field label="Debit Account">
-                      <input name="debit_account" value={formData.debit_account} onChange={handleChange} placeholder="Debit Account" style={inp} />
-                    </Field>
-                    <Field label="Credit Account">
-                      <input name="credit_account" value={formData.credit_account} onChange={handleChange} placeholder="Credit Account" style={inp} />
-                    </Field>
-                    <Field label="Amount">
-                      <input name="amount" type="number" step="0.0001" value={formData.amount} onChange={handleChange} style={inp} required />
-                    </Field>
-                  </>
-                )}
-
-                <div style={{ gridColumn: "1 / -1" }}>
-                  <Field label="Description">
-                    <textarea name="description" value={formData.description} onChange={handleChange} rows={2} style={{ ...inp, minHeight: 60, resize: "vertical" }} />
-                  </Field>
-                </div>
-
-                {activeVoucherType === "purchase" && (
-                  <div style={{ marginTop: 12, marginBottom: 12 }}>
-                    <div style={{ marginBottom: "12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <h3 style={{ fontSize: 16, margin: 0 }}>Purchase Details</h3>
-                      <button type="button" onClick={() => setShowPurchasePreview(true)} style={{ ...btnAction, background: "#0f766e" }}>Preview (F3)</button>
-                    </div>
-                    <div style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: 12, background: "#fff" }}>
-                      <div style={{ overflowX: "auto" }}>
-                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                          <thead>
-                            <tr style={reportHeaderRowStyle}>
-                              <th style={th}>Particulars</th>
-                              <th style={th}>Value</th>
-                              <th style={th}>Particulars</th>
-                              <th style={th}>Value</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <tr>
-                              <td style={td}>Packet</td>
-                              <td style={td}>{formData.packet || "-"}</td>
-                              <td style={td}>Gross Weight</td>
-                              <td style={td}>{formatDecimal4(toNumber(formData.gross_weight))}</td>
-                            </tr>
-                            <tr>
-                              <td style={td}>Tare Weight</td>
-                              <td style={td}>{formatDecimal4(toNumber(formData.tare_weight))}</td>
-                              <td style={td}>New Weight</td>
-                              <td style={td}>{formatDecimal4(Math.max(toNumber(formData.gross_weight) - toNumber(formData.tare_weight), 0))}</td>
-                            </tr>
-                            <tr>
-                              <td style={td}>Net Qty</td>
-                              <td style={td}>{formatDecimal4(safePurchaseNetWeight)}</td>
-                              <td style={td}>Rate</td>
-                              <td style={td}>{formatMoney(toNumber(formData.rate))}</td>
-                            </tr>
-                            <tr>
-                              <td style={td}>Gross Amount</td>
-                              <td style={td}>{formatMoney(purchaseGrossAmount)}</td>
-                              <td style={td}>Net Payable</td>
-                              <td style={td}>{formatMoney(purchaseNetPayable)}</td>
-                            </tr>
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-
-                    <div style={{ marginTop: 10, border: "1px solid #e2e8f0", borderRadius: 8, padding: 12, background: "#fff" }}>
-                      <div style={{ fontWeight: 800, marginBottom: 8 }}>Deduction Breakdown</div>
-                      <div style={{ overflowX: "auto" }}>
-                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                          <thead>
-                            <tr style={reportHeaderRowStyle}>
-                              <th style={th}>Particulars</th>
-                              <th style={th}>Value</th>
-                              <th style={th}>Particulars</th>
-                              <th style={th}>Value</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <tr>
-                              <td style={td}>Less Bags Weight</td>
-                              <td style={td}>{formatMoney(toNumber(formData.less_bags_weight))}</td>
-                              <td style={td}>Moisture</td>
-                              <td style={td}>{formatMoney(toNumber(formData.moisture))}</td>
-                            </tr>
-                            <tr>
-                              <td style={td}>Dunki</td>
-                              <td style={td}>{formatMoney(toNumber(formData.dunki))}</td>
-                              <td style={td}>Fungus</td>
-                              <td style={td}>{formatMoney(toNumber(formData.fungus))}</td>
-                            </tr>
-                            <tr>
-                              <td style={td}>Discolour</td>
-                              <td style={td}>{formatMoney(toNumber(formData.discolour))}</td>
-                              <td style={td}>Others</td>
-                              <td style={td}>{formatMoney(toNumber(formData.others))}</td>
-                            </tr>
-                            <tr>
-                              <td style={td}>Bags Claim</td>
-                              <td style={td}>{formatMoney(toNumber(formData.bags_claim))}</td>
-                              <td style={td}>Labour</td>
-                              <td style={td}>{formatMoney(toNumber(formData.labour))}</td>
-                            </tr>
-                            <tr>
-                              <td style={td}>Freight</td>
-                              <td style={td}>{formatMoney(toNumber(formData.transport_charge))}</td>
-                              <td style={td}><strong>Total Deduction</strong></td>
-                              <td style={td}><strong>{formatMoney(purchaseTotalDeduction)}</strong></td>
-                            </tr>
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                </div>
-                </div>
-              )}
-            <div style={{ marginTop: 16, display: "flex", gap: 10 }}>
-                <button type="submit" disabled={loading} style={btnPrimary}>
-                  {loading ? "Saving..." : editId ? (activeVoucherType === "sale" ? "Save Deductions" : "Update Voucher") : "Save Voucher"}
-                </button>
-                {editId && (
-                  <button type="button" onClick={() => { setEditId(null); setFormData(defaultForm()); setPaymentAdjustments([]); setReceiptAdjustments([]); setSalePurchaseLinks([]); setPartyOutstanding(null); }} style={{ ...btnPrimary, background: "#64748b" }}>Cancel</button>
-                )}
-              </div>
-            </form>
-          </WarehouseVoucherPanel>
-
-          <div style={card}>
-            <div className={`mobile-collapsible-header ${showMobileVoucherHeader ? "" : "is-mobile-hidden"}`} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <h3 style={{ marginTop: 0 }}>{activeVoucherType.charAt(0).toUpperCase() + activeVoucherType.slice(1)} Vouchers</h3>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                <button type="button" onClick={() => setVoucherSortAsc((prev) => !prev)} style={{ ...btnAction, background: voucherSortAsc ? "#0f766e" : "#64748b", padding: "6px 12px", fontSize: 12 }}>
-                  📅 {voucherSortAsc ? "Oldest First" : "Newest First"}
-                </button>
-                {activeVoucherType === "sale" && (
-                  <button type="button" onClick={() => setShowSaleAdjustedModal(true)} style={{ ...btnAction, background: "#0f766e" }}>
-                    F5 Adjusted Sales
-                  </button>
-                )}
-              </div>
-            </div>
-            <button
-              type="button"
-              className="mobile-section-toggle"
-              onClick={() => setShowMobileVoucherHeader((prev) => !prev)}
-            >
-              {showMobileVoucherHeader ? "Hide Voucher Header" : "Show Voucher Header"}
-            </button>
-            <WarehouseVoucherTable
-              activeVoucherType={activeVoucherType}
-              filteredVoucherList={filteredVoucherList}
-              th={th}
-              td={td}
-              reportHeaderRowStyle={reportHeaderRowStyle}
-              getWarehouseName={getWarehouseName}
-              getAccountName={getAccountName}
-              getFarmerName={getFarmerName}
-              getBuyerName={getBuyerName}
-              getProductName={getProductName}
-              formatLedgerDate={formatLedgerDate}
-              formatDecimal4={formatDecimal4}
-              formatMoney={formatMoney}
-              consignees={consignees}
-              companies={companies}
-              selectedPaymentId={selectedPaymentId}
-              onEditVoucher={handleEditVoucher}
-              onDeleteVoucher={handleDeleteVoucher}
-              onSelectPayment={setSelectedPaymentId}
-              onGeneratePDF={handleGeneratePDF}
-            />
-            {activeVoucherType === "purchase" && (
-              <div className="purchase-mobile-entry-list">
-                {filteredVoucherList.map((item, i) => (
-                  <div key={item.id || item._id || i} className="purchase-mobile-entry-card">
-                    <div className="purchase-mobile-entry-head">
-                      <div>
-                        <span>#{i + 1}</span>
-                        <strong>{item.voucher_no || "-"}</strong>
-                      </div>
-                      <em>{formatLedgerDate(item.date)}</em>
-                    </div>
-                    <div className="purchase-mobile-entry-grid">
-                      <div><span>Farmer</span><strong>{getFarmerName(item)}</strong></div>
-                      <div><span>Warehouse</span><strong>{getWarehouseName(item)}</strong></div>
-                      <div><span>Account</span><strong>{getAccountName(item)}</strong></div>
-                      <div><span>Product</span><strong>{getProductName(item)}</strong></div>
-                      <div><span>Qty</span><strong>{formatDecimal4(item.total_qty || item.net_weight || item.quantity || 0)}</strong></div>
-                      <div><span>Rate</span><strong>{formatMoney(item.rate || 0)}</strong></div>
-                      <div className="wide"><span>Amount</span><strong>Rs.{formatMoney(item.net_amount_payable || item.amount || 0)}</strong></div>
-                    </div>
-                    <div className="purchase-mobile-entry-actions">
-                      <button type="button" onClick={() => handleEditVoucher(item.id || item._id)}>Edit</button>
-                      <button type="button" className="danger" onClick={() => handleDeleteVoucher(item.id || item._id)}>Delete</button>
-                    </div>
-                  </div>
-                ))}
-                {filteredVoucherList.length === 0 && (
-                  <div className="purchase-mobile-empty">No vouchers found.</div>
-                )}
-              </div>
-            )}
-            {activeVoucherType === "sale" && (
-              <div className="purchase-mobile-entry-list">
-                {filteredVoucherList.map((item, i) => (
-                  <div key={item.id || item._id || i} className="purchase-mobile-entry-card sale-mobile-entry-card">
-                    <div className="purchase-mobile-entry-head">
-                      <div>
-                        <span>#{i + 1}</span>
-                        <strong>{item.voucher_no || item.bill_no || "-"}</strong>
-                      </div>
-                      <em>{formatLedgerDate(item.date)}</em>
-                    </div>
-                    <div className="purchase-mobile-entry-grid">
-                      <div><span>Buyer</span><strong>{getBuyerName(item)}</strong></div>
-                      <div><span>Consignee</span><strong>{item.consignee_name || consignees.find((c) => String(c.id || c._id) === String(item.consignee_id))?.name || "-"}</strong></div>
-                      <div><span>Account</span><strong>{getAccountName(item)}</strong></div>
-                      <div><span>Warehouse</span><strong>{getWarehouseName(item)}</strong></div>
-                      <div><span>Product</span><strong>{getProductName(item)}</strong></div>
-                      <div><span>Qty</span><strong>{formatDecimal4(item.quantity || item.total_quantity || 0)}</strong></div>
-                      <div><span>Rate</span><strong>{formatMoney(item.rate || 0)}</strong></div>
-                      <div className="wide"><span>Net Receivable</span><strong>Rs.{formatMoney(item.net_receivable_amount || item.net_amount || item.amount || 0)}</strong></div>
-                    </div>
-                    <div className="purchase-mobile-entry-actions">
-                      <button type="button" onClick={() => handleEditVoucher(item.id || item._id)}>Edit</button>
-                      <button type="button" className="danger" onClick={() => handleDeleteVoucher(item.id || item._id)}>Delete</button>
-                      <button type="button" className="pdf" onClick={() => handleGeneratePDF(item.id || item._id)}>PDF</button>
-                    </div>
-                  </div>
-                ))}
-                {filteredVoucherList.length === 0 && (
-                  <div className="purchase-mobile-empty">No vouchers found.</div>
-                )}
-              </div>
-            )}
-            {activeVoucherType === "payment" && selectedVoucher && (
-              <div style={{ marginTop: 14, padding: 14, border: "1px solid #cbd5e1", borderRadius: 8, background: "#f8fafc" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                  <strong>Selected Payment Voucher</strong>
-                  <span style={{ color: "#0f766e", fontSize: 13 }}>{selectedVoucher.voucher_no || "-"}</span>
-                </div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10, marginTop: 10, fontSize: 13 }}>
-                  <div><strong>Date:</strong> {selectedVoucher.date || "-"}</div>
-                  <div><strong>Account:</strong> {getAccountName(selectedVoucher)}</div>
-                  <div><strong>Farmer:</strong> {getFarmerName(selectedVoucher)}</div>
-                  <div><strong>Amount:</strong> Rs.{formatMoney(selectedVoucher.amount || selectedVoucher.net_amount || selectedVoucher.amount || 0)}</div>
-                  <div><strong>Reference:</strong> {selectedVoucher.reference_id || selectedVoucher.reference_type || "-"}</div>
-                </div>
-                <div style={{ marginTop: 12 }}>
-                  <strong>Adjustments</strong>
-                  {(selectedVoucher.adjustments || []).length > 0 ? (
-                    (selectedVoucher.adjustments || []).map((item, index) => (
-                      <div key={`${item.purchase_id || item.voucher_no}-${index}`} style={{ display: "flex", justifyContent: "space-between", gap: 8, padding: "8px 0", borderBottom: index < (selectedVoucher.adjustments || []).length - 1 ? "1px solid #e2e8f0" : "none" }}>
-                        <span>{item.voucher_no || item.purchase_voucher_no || item.purchase_id}</span>
-                        <strong>Rs.{formatMoney(item.adjusted_amount || 0)}</strong>
-                      </div>
-                    ))
-                  ) : (
-                    <div style={{ color: "#475569", marginTop: 8 }}>No purchase bill adjustments available.</div>
-                  )}
-                </div>
-              </div>
-            )}
-            {renderPaginationBar(voucherPage, totalVoucherPages, () => setVoucherPage((prev) => Math.max(1, prev - 1)), () => setVoucherPage((prev) => Math.min(totalVoucherPages, prev + 1)), voucherPageInfo.total, "vouchers")}
-          </div>
-        </div>
-      ) : (
-        <div ref={reportPanelRef}>
-          <WarehouseReportPanel
-            activeReport={activeReport}
-            activeVoucherButtonStyle={activeVoucherButtonStyle}
-            voucherButtonStyle={voucherButtonStyle}
-            voucherTypeRow={voucherTypeRow}
-            card={card}
-            btnAction={btnAction}
-            reportLabels={reportLabels}
-            showMobileReportHeader={showMobileReportHeader}
-            onToggleReportHeader={() => setShowMobileReportHeader((prev) => !prev)}
-            onSetActiveReport={setActiveReport}
-            allowedReports={allowedReports}
-            onDownloadPurchaseLedgerPdf={downloadPurchaseLedgerPdf}
-            onDownloadSaleLedgerPdf={downloadSaleLedgerPdf}
-            onSharePurchaseLedgerWhatsapp={sharePurchaseLedgerWhatsapp}
-            onShareSaleLedgerWhatsapp={shareSaleLedgerWhatsapp}
-          >
-            {activeReport === "purchase" && (
-              <div style={{ display: "flex", gap: 12, alignItems: "end", flexWrap: "wrap", marginBottom: 14 }}>
-                <SearchableSelect
-                  label="Account Filter"
-                  value={reportFilters.company_account_id}
-                  options={purchasePartyLedgerCompanyAccounts.map((account) => ({
-                    value: account.id || account._id,
-                    label: account.account_name || account.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("company_account_id", value)}
-                  placeholder="Select Account"
-                />
-                <SearchableSelect
-                  label="Warehouse Filter"
-                  value={reportFilters.warehouse_id}
-                  options={purchasePartyLedgerWarehouses.map((warehouse) => ({
-                    value: warehouse.id || warehouse._id,
-                    label: warehouse.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("warehouse_id", value)}
-                  placeholder={reportFilters.company_account_id ? "Select Warehouse" : "Select Account First"}
-                  disabled={!reportFilters.company_account_id}
-                />
-                <SearchableSelect
-                  label="Farmer Filter"
-                  value={reportFilters.farmer_id}
-                  options={purchasePartyLedgerFarmers.map((farmer) => ({
-                    value: farmer.id || farmer._id,
-                    label: farmer.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("farmer_id", value)}
-                  placeholder={reportFilters.warehouse_id ? "Select Farmer" : "Select Warehouse First"}
-                  disabled={!reportFilters.company_account_id || !reportFilters.warehouse_id}
-                />
-                {(reportFilters.farmer_id || reportFilters.warehouse_id || reportFilters.company_account_id || reportFilters.details_of_deduction) && (
-                  <button
-                    type="button"
-                    onClick={() => setReportFilters({ farmer_id: "", warehouse_id: "", company_account_id: "", sale_buyer_id: "", sale_company_account_id: "", sale_journey_token: "", sale_lorry_no: "", sale_bill_no: "", details_of_deduction: false })}
-                    style={{ ...btnAction, background: "#64748b", marginBottom: 1 }}
-                  >
-                    Clear Filters
-                  </button>
-                )}
-              </div>
-            )}
-            {activeReport === "purchase-party-ledger" && (
-              <div style={{ display: "flex", gap: 12, alignItems: "end", flexWrap: "wrap", marginBottom: 14 }}>
-                <SearchableSelect
-                  label="Account Filter"
-                  value={reportFilters.company_account_id}
-                  options={purchasePartyLedgerCompanyAccounts.map((account) => ({
-                    value: account.id || account._id,
-                    label: account.account_name || account.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("company_account_id", value)}
-                  placeholder="Select Account"
-                />
-                <SearchableSelect
-                  label="Warehouse Filter"
-                  value={reportFilters.warehouse_id}
-                  options={purchasePartyLedgerWarehouses.map((warehouse) => ({
-                    value: warehouse.id || warehouse._id,
-                    label: warehouse.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("warehouse_id", value)}
-                  placeholder={reportFilters.company_account_id ? "Select Warehouse" : "Select Account First"}
-                  disabled={!reportFilters.company_account_id}
-                />
-                <SearchableSelect
-                  label="Farmer Filter"
-                  value={reportFilters.farmer_id}
-                  options={purchasePartyLedgerFarmers.map((farmer) => ({
-                    value: farmer.id || farmer._id,
-                    label: farmer.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("farmer_id", value)}
-                  placeholder={reportFilters.warehouse_id ? "Select Farmer" : "Select Warehouse First"}
-                  disabled={!reportFilters.company_account_id || !reportFilters.warehouse_id}
-                />
-                <label style={{ display: "grid", gap: 6, minWidth: 190 }}>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: "#334155" }}>Journal / Deduction Details</span>
-                  <select
-                  value={reportFilters.details_of_deduction ? "details" : "all"}
-                  onChange={(e) => updateReportFilter("details_of_deduction", e.target.value === "details")}
-                  style={{ ...inp, minWidth: 190, height: 42 }}
-                  title="Show purchase deduction entries in ledger"
-                  >
-                    <option value="all">Normal Ledger</option>
-                    <option value="details">Details of Deduction</option>
-                  </select>
-                </label>
-                {(reportFilters.farmer_id || reportFilters.warehouse_id || reportFilters.company_account_id || reportFilters.details_of_deduction) && (
-                  <button
-                    type="button"
-                    onClick={() => setReportFilters({ farmer_id: "", warehouse_id: "", company_account_id: "", sale_buyer_id: "", sale_company_account_id: "", sale_journey_token: "", sale_lorry_no: "", sale_bill_no: "", details_of_deduction: false })}
-                    style={{ ...btnAction, background: "#64748b", marginBottom: 1 }}
-                  >
-                    Clear Filters
-                  </button>
-                )}
-              </div>
-            )}
-            {(activeReport === "sale" || activeReport === "sale-party-ledger") && (
-              <div style={{ display: "flex", gap: 12, alignItems: "end", flexWrap: "wrap", marginBottom: 14 }}>
-                <SearchableSelect
-                  label="Account Filter"
-                  value={reportFilters.company_account_id}
-                  options={saleReportAccounts.map((account) => ({
-                    value: account.id || account._id,
-                    label: account.account_name || account.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("company_account_id", value)}
-                  placeholder="All Accounts"
-                />
-                <SearchableSelect
-                  label="Warehouse Filter"
-                  value={reportFilters.warehouse_id}
-                  options={saleReportWarehouses.map((warehouse) => ({
-                    value: warehouse.id || warehouse._id,
-                    label: warehouse.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("warehouse_id", value)}
-                  placeholder="All Warehouses"
-                  disabled={!reportFilters.company_account_id && saleReportWarehouses.length === 0}
-                />
-                <SearchableSelect
-                  label="Farmer Filter"
-                  value={reportFilters.farmer_id}
-                  options={saleReportFarmers.map((farmer) => ({
-                    value: farmer.id || farmer._id,
-                    label: farmer.name,
-                  }))}
-                  onChange={(value) => updateReportFilter("farmer_id", value)}
-                  placeholder="All Farmers"
-                  disabled={!reportFilters.company_account_id && !reportFilters.warehouse_id && saleReportFarmers.length === 0}
-                />
-                <SearchableSelect
-                  label="Buyer Filter"
-                  value={reportFilters.sale_buyer_id}
-                  options={saleReportBuyers.map((buyer) => ({
-                    value: buyer.id || buyer._id,
-                    label: buyer.name,
-                  }))}
-                  onChange={(value) => setReportFilters((prev) => ({ ...prev, sale_buyer_id: value }))}
-                  placeholder="All Buyers"
-                />
-                {(reportFilters.farmer_id || reportFilters.warehouse_id || reportFilters.company_account_id || reportFilters.sale_buyer_id) && (
-                  <button
-                    type="button"
-                    onClick={() => setReportFilters((prev) => ({ ...prev, farmer_id: "", warehouse_id: "", company_account_id: "", sale_buyer_id: "" }))}
-                    style={{ ...btnAction, background: "#64748b", marginBottom: 1 }}
-                  >
-                    Clear Filters
-                  </button>
-                )}
-              </div>
-            )}
-            {activeReport === "sale-followup" && (
-              <>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10, marginBottom: 14 }}>
-                  {[
-                    ["all", saleFollowupCounts.all],
-                    ["payment_done", saleFollowupCounts.payment_done],
-                    ["unloading_pending", saleFollowupCounts.unloading_pending],
-                    ["pending", saleFollowupCounts.pending],
-                    ["overdue", saleFollowupCounts.overdue],
-                  ].map(([key, count]) => {
-                    const meta = saleFollowupStatusMeta[key];
-                    const active = saleFollowupFilter === key;
-                    return (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => setSaleFollowupFilter(key)}
-                        style={{
-                          border: active ? `1px solid ${meta.color}` : "1px solid #e2e8f0",
-                          background: active ? meta.bg : "#fff",
-                          borderRadius: 14,
-                          padding: "14px 16px",
-                          cursor: "pointer",
-                          textAlign: "left",
-                          boxShadow: active ? "0 10px 24px rgba(15, 23, 42, 0.08)" : "none",
-                        }}
-                      >
-                        <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", marginBottom: 6 }}>{meta.label}</div>
-                        <div style={{ fontSize: 24, fontWeight: 800, color: meta.color }}>{count}</div>
-                      </button>
-                    );
-                  })}
-                </div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
-                  {["all", "payment_done", "unloading_pending", "pending", "overdue"].map((key) => {
-                    const meta = saleFollowupStatusMeta[key];
-                    const active = saleFollowupFilter === key;
-                    return (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => setSaleFollowupFilter(key)}
-                        style={{
-                          ...btnAction,
-                          background: active ? meta.color : "#e2e8f0",
-                          color: active ? "#fff" : "#0f172a",
-                        }}
-                      >
-                        {meta.label}
-                      </button>
-                    );
-                  })}
-                  {saleFollowupFilter !== "all" && (
-                    <button type="button" onClick={() => setSaleFollowupFilter("all")} style={{ ...btnAction, background: "#64748b" }}>
-                      Clear Filter
-                    </button>
-                  )}
-                </div>
-              </>
-            )}
-            {activeReport === "purchase-party-ledger" ? (
-              <div style={ledgerSplitStyle}>
-                <WarehouseReportTable
-                  activeReport={activeReport}
-                  activeReportColumns={activeReportColumns}
-                  filteredReportData={filteredReportData}
-                  tableCard={tableCard}
-                  reportHeaderRowStyle={reportHeaderRowStyle}
-                  th={th}
-                  td={td}
-                />
-                <div className="purchase-mobile-report-list">
-                  {filteredReportData.map((item, i) => (
-                    <div
-                      key={item.id || `${item.voucher_type || item.row_type}-${item.voucher_no || i}-${i}`}
-                      className={`purchase-mobile-report-card ${item.row_type === "closing" ? "is-closing" : ""}`}
-                    >
-                      <div className="purchase-mobile-entry-head">
-                        <div>
-                          <span>{item.row_type === "closing" ? "Closing" : item.voucher_type || "Entry"}</span>
-                          <strong>{item.voucher_no || item.farmer_name || "-"}</strong>
-                        </div>
-                        <em>{item.row_type === "closing" ? "" : formatLedgerDate(item.date)}</em>
-                      </div>
-                      <div className="purchase-mobile-entry-grid">
-                        <div><span>Warehouse</span><strong>{item.row_type === "closing" ? "-" : getWarehouseName(item)}</strong></div>
-                        <div><span>Debit</span><strong>{formatMoney(item.debit || 0)}</strong></div>
-                        <div><span>Credit</span><strong>{formatMoney(item.credit || 0)}</strong></div>
-                        <div className="wide"><span>Balance</span><strong>Rs.{formatMoney(Math.abs(item.balance || 0))}</strong></div>
-                      </div>
-                      {item.row_type !== "closing" && item.voucher_type === "Purchase" && (
-                        <div className="purchase-mobile-entry-actions">
-                          <button type="button" onClick={() => showPurchaseReportPreview(item)}>View</button>
-                          <button type="button" onClick={() => handleEditPurchaseReport(item)}>Edit</button>
-                          <button type="button" className="pdf" onClick={() => handlePurchaseReportPDF(item.purchase_id || item.id || item._id)}>PDF</button>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                  {filteredReportData.length === 0 && (
-                    <div className="purchase-mobile-empty">No data available.</div>
-                  )}
-                </div>
-                {showPurchaseBillWise && (
-                  <WarehouseBillWisePanel
-                    title="Bill Wise Report"
-                    onRefresh={loadReport}
-                    btnAction={btnAction}
-                    tableCard={tableCard}
-                    billWisePanelStyle={billWisePanelStyle}
-                    reportHeaderRowStyle={reportHeaderRowStyle}
-                    th={th}
-                    td={td}
-                    rows={purchaseBillRows.map((row) => ({
-                      key: row.purchase_id || row.voucher_no,
-                      voucher_no: row.voucher_no,
-                      farmer_name: row.farmer_name || getFarmerName(row) || "-",
-                      account_name: getAccountName(row),
-                      purchase_amount: formatMoney(row.purchase_amount || row.credit || 0),
-                      payment_amount: formatMoney(row.payment_amount || 0),
-                      journal_amount: formatMoney(row.journal_amount || 0),
-                      receipt_amount: formatMoney(row.receipt_amount || 0),
-                      bill_balance: formatMoney(row.bill_balance || 0),
-                    }))}
-                    selectedRow={selectedBill ? { key: selectedBill.purchase_id || selectedBill.voucher_no } : null}
-                    onSelectRow={(rowKey) => setSelectedLedgerBillId(rowKey)}
-                    rowColumns={[
-                      { key: "bill", label: "Bill", render: (row) => row.voucher_no || "-" },
-                      { key: "farmer", label: "Farmer", render: (row) => row.farmer_name },
-                      { key: "account", label: "Account", render: (row) => row.account_name },
-                      { key: "purchase", label: "Purchase", render: (row) => row.purchase_amount },
-                      { key: "payment", label: "Payment", render: (row, rowKey, onSelect) => (
-                        <button type="button" onClick={() => onSelect(rowKey)} style={linkButtonStyle}>{row.payment_amount}</button>
-                      ) },
-                      { key: "journal", label: "Journal", render: (row) => row.journal_amount },
-                      { key: "receipt", label: "Receipt", render: (row) => row.receipt_amount },
-                      { key: "balance", label: "Balance", render: (row) => row.bill_balance },
-                    ]}
-                    detailTitle={selectedBill?.voucher_no || "Select a bill"}
-                    detailSubtitle="Payment details"
-                    detailEmptyText="No payment adjusted against this bill."
-                    detailRows={selectedBill?.payment_details || []}
-                    detailRenderer={{
-                      paymentDetailBoxStyle,
-                      renderDetail: (detail, index) => (
-                        <div key={`${detail.payment_voucher_no}-${index}`} style={paymentDetailRowStyle}>
-                          <span>{detail.payment_date || "-"}</span>
-                          <span>{detail.payment_voucher_no || "-"}</span>
-                          <strong>Rs.{formatMoney(detail.adjusted_amount || 0)}</strong>
-                        </div>
-                      ),
-                    }}
-                  />
-                )}
-              </div>
-            ) : activeReport === "sale-party-ledger" || activeReport === "sale-followup" || activeReport === "sale-journey" ? (
-              <div style={ledgerSplitStyle}>
-                <WarehouseReportTable
-                  activeReport={activeReport}
-                  activeReportColumns={activeReportColumns}
-                  filteredReportData={filteredReportData}
-                  tableCard={tableCard}
-                  reportHeaderRowStyle={reportHeaderRowStyle}
-                  th={th}
-                  td={td}
-                />
-                {activeReport === "sale-party-ledger" && (
-                  <div className="purchase-mobile-report-list">
-                    {filteredReportData.map((item, i) => (
-                      <div
-                        key={item.id || `${item.voucher_type || item.row_type}-${item.voucher_no || i}-${i}`}
-                        className={`purchase-mobile-report-card sale-mobile-entry-card ${item.row_type === "closing" ? "is-closing" : ""}`}
-                      >
-                        <div className="purchase-mobile-entry-head">
-                          <div>
-                            <span>{item.row_type === "closing" ? "Closing" : item.voucher_type || "Entry"}</span>
-                            <strong>{item.voucher_no || item.party_name || item.buyer_name || item.company_name || item.consignee_name || "-"}</strong>
-                          </div>
-                          <em>{item.row_type === "closing" ? "" : formatLedgerDate(item.date)}</em>
-                        </div>
-                        <div className="purchase-mobile-entry-grid">
-                          <div><span>Party</span><strong>{item.row_type === "closing" ? `Closing (${item.closing_side || ""})` : item.party_name || item.buyer_name || item.company_name || item.consignee_name || "-"}</strong></div>
-                          <div><span>Account</span><strong>{item.row_type === "closing" ? "-" : getAccountName(item)}</strong></div>
-                          <div><span>Warehouse</span><strong>{item.row_type === "closing" ? "-" : getWarehouseName(item)}</strong></div>
-                          <div><span>Debit</span><strong>{formatMoney(item.debit || 0)}</strong></div>
-                          <div><span>Credit</span><strong>{formatMoney(item.credit || 0)}</strong></div>
-                          <div className="wide"><span>Balance</span><strong>Rs.{formatMoney(Math.abs(item.balance || 0))}</strong></div>
-                        </div>
-                      </div>
-                    ))}
-                    {filteredReportData.length === 0 && (
-                      <div className="purchase-mobile-empty">No data available.</div>
-                    )}
-                  </div>
-                )}
-
-                {showSaleBillWise && activeReport === "sale-party-ledger" && (
-                  <WarehouseBillWisePanel
-                    title="Bill Wise Report"
-                    onRefresh={loadReport}
-                    btnAction={btnAction}
-                    tableCard={tableCard}
-                    billWisePanelStyle={billWisePanelStyle}
-                    reportHeaderRowStyle={reportHeaderRowStyle}
-                    th={th}
-                    td={td}
-                    rows={saleBillRows.map((row) => ({
-                      key: row.sale_id || row.voucher_no,
-                      voucher_no: row.voucher_no,
-                      party_name: row.party_name || row.company_name || "-",
-                      sale_amount: formatMoney(row.sale_amount || row.debit || 0),
-                      receipt_amount: formatMoney(row.receipt_amount || 0),
-                      journal_amount: formatMoney(row.journal_amount || 0),
-                      bill_balance: formatMoney(row.bill_balance || 0),
-                    }))}
-                    selectedRow={selectedSaleBill ? { key: selectedSaleBill.sale_id || selectedSaleBill.voucher_no } : null}
-                    onSelectRow={(rowKey) => setSelectedSaleLedgerBillId(rowKey)}
-                    rowColumns={[
-                      { key: "bill", label: "Bill", render: (row) => row.voucher_no || "-" },
-                      { key: "party", label: "Party", render: (row) => row.party_name },
-                      { key: "sale", label: "Sale", render: (row) => row.sale_amount },
-                      { key: "receipt", label: "Receipt", render: (row, rowKey, onSelect) => (
-                        <button type="button" onClick={() => onSelect(rowKey)} style={linkButtonStyle}>{row.receipt_amount}</button>
-                      ) },
-                      { key: "deduction", label: "Deduction", render: (row) => row.journal_amount },
-                      { key: "balance", label: "Balance", render: (row) => row.bill_balance },
-                    ]}
-                    detailTitle={selectedSaleBill?.voucher_no || "Select a bill"}
-                    detailSubtitle="Receipt details"
-                    detailEmptyText="No receipt adjusted against this bill."
-                    detailRows={selectedSaleBill?.payment_details || []}
-                    detailRenderer={{
-                      paymentDetailBoxStyle,
-                      renderDetail: (detail, index) => (
-                        <div key={`${detail.receipt_voucher_no}-${index}`} style={paymentDetailRowStyle}>
-                          <span>{detail.receipt_date || "-"}</span>
-                          <span>{detail.receipt_voucher_no || "-"}{detail.inferred_adjustment ? " (auto)" : ""}</span>
-                          <strong>Rs.{formatMoney(detail.adjusted_amount || 0)}</strong>
-                        </div>
-                      ),
-                    }}
-                    footerNode={
-                      <>
-                        <div style={{ color: "#64748b", fontSize: 12, margin: "10px 0 8px" }}>Deduction details</div>
-                        {(selectedSaleBill?.journal_details || []).length > 0 ? (
-                          (selectedSaleBill.journal_details || []).map((detail, index) => (
-                            <div key={`${detail.voucher_no}-${index}`} style={paymentDetailRowStyle}>
-                              <span>{detail.date || "-"}</span>
-                              <span>{detail.type || "-"}</span>
-                              <strong>Rs.{formatMoney(detail.amount || 0)}</strong>
-                            </div>
-                          ))
-                        ) : (
-                          <div style={{ color: "#64748b", fontSize: 13 }}>No deduction posted against this bill.</div>
-                        )}
-                      </>
-                    }
-                    showJourney
-                    journeySummary={
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 8, marginBottom: 10 }}>
-                        <div style={smartInfoBoxStyle}>
-                          <span>Leg Count</span>
-                          <strong>{selectedSaleJourneyRows.length}</strong>
-                        </div>
-                        <div style={smartInfoBoxStyle}>
-                          <span>Total Qty</span>
-                          <strong>{formatDecimal4(selectedSaleJourneyTotalQty)}</strong>
-                        </div>
-                        <div style={smartInfoBoxStyle}>
-                          <span>Total Amount</span>
-                          <strong>{formatMoney(selectedSaleJourneyTotalAmount)}</strong>
-                        </div>
-                        <div style={smartInfoBoxStyle}>
-                          <span>Balance Qty</span>
-                          <strong>{formatDecimal4(selectedSaleJourneyBalanceQty)}</strong>
-                        </div>
-                      </div>
-                    }
-                    journeyRows={selectedSaleJourneyRows}
-                    smartInfoBoxStyle={smartInfoBoxStyle}
-                    formatMoney={formatMoney}
-                    formatDecimal4={formatDecimal4}
-                    formatLedgerDate={formatLedgerDate}
-                  />
-                )}
-              </div>
-            ) : (
-              <>
-                <WarehouseReportTable
-                  activeReport={activeReport}
-                  activeReportColumns={activeReportColumns}
-                  filteredReportData={filteredReportData}
-                  tableCard={tableCard}
-                  reportHeaderRowStyle={reportHeaderRowStyle}
-                  th={th}
-                  td={td}
-                  onSaleRowClick={showSaleReportPreview}
-                />
-                {activeReport === "purchase" && (
-                  <div className="purchase-mobile-report-list">
-                    {filteredReportData.map((item, i) => (
-                      <div key={item.id || item._id || i} className="purchase-mobile-report-card">
-                        <div className="purchase-mobile-entry-head">
-                          <div>
-                            <span>#{i + 1}</span>
-                            <strong>{item.voucher_no || "-"}</strong>
-                          </div>
-                          <em>{formatLedgerDate(item.date)}</em>
-                        </div>
-                        <div className="purchase-mobile-entry-grid">
-                          <div><span>Farmer</span><strong>{item.farmer_name || getFarmerName(item)}</strong></div>
-                          <div><span>Warehouse</span><strong>{getWarehouseName(item)}</strong></div>
-                          <div><span>Product</span><strong>{getProductName(item)}</strong></div>
-                          <div><span>Net Qty</span><strong>{formatDecimal4(item.total_quantity || item.total_qty || item.net_weight || 0)}</strong></div>
-                          <div><span>Rate</span><strong>{formatMoney(item.rate || 0)}</strong></div>
-                          <div className="wide"><span>Net Payable</span><strong>Rs.{formatMoney(item.total_amount || item.net_amount_payable || 0)}</strong></div>
-                        </div>
-                        <div className="purchase-mobile-entry-actions">
-                          <button type="button" onClick={() => showPurchaseReportPreview(item)}>View</button>
-                          <button type="button" onClick={() => handleEditPurchaseReport(item)}>Edit</button>
-                          <button type="button" className="pdf" onClick={() => handlePurchaseReportPDF(item.id || item._id)}>PDF</button>
-                        </div>
-                      </div>
-                    ))}
-                    {filteredReportData.length === 0 && (
-                      <div className="purchase-mobile-empty">No data available.</div>
-                    )}
-                  </div>
-                )}
-                {activeReport === "sale" && (
-                  <div className="purchase-mobile-report-list">
-                    {filteredReportData.map((item, i) => (
-                      <div
-                        key={item.id || item._id || i}
-                        className="purchase-mobile-report-card sale-mobile-entry-card"
-                        style={{ cursor: "pointer" }}
-                        onClick={() => showSaleReportPreview(item)}
-                      >
-                        <div className="purchase-mobile-entry-head">
-                          <div>
-                            <span>#{i + 1}</span>
-                            <strong>{item.voucher_no || item.bill_no || "-"}</strong>
-                          </div>
-                          <em>{formatLedgerDate(item.date)}</em>
-                        </div>
-                        <div className="purchase-mobile-entry-grid">
-                          <div><span>Buyer</span><strong>{getBuyerName(item)}</strong></div>
-                          <div><span>Consignee</span><strong>{item.consignee_name || consignees.find((c) => String(c.id || c._id) === String(item.consignee_id))?.name || "-"}</strong></div>
-                          <div><span>Account</span><strong>{getAccountName(item)}</strong></div>
-                          <div><span>Warehouse</span><strong>{getWarehouseName(item)}</strong></div>
-                          <div><span>Product</span><strong>{getProductName(item)}</strong></div>
-                          <div><span>Total Qty</span><strong>{formatDecimal4(item.total_quantity || item.quantity || 0)}</strong></div>
-                          <div className="wide"><span>Total Amount</span><strong>Rs.{formatMoney(item.total_amount || item.amount || 0)}</strong></div>
-                        </div>
-                        <div className="purchase-mobile-entry-actions">
-                          <button type="button" onClick={() => showSaleReportPreview(item)}>View</button>
-                          <button type="button" onClick={() => handleGeneratePDF(item.id || item._id)} className="pdf">PDF</button>
-                        </div>
-                      </div>
-                    ))}
-                    {filteredReportData.length === 0 && (
-                      <div className="purchase-mobile-empty">No data available.</div>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
-            {renderPaginationBar(
-              reportPage,
-              totalReportPages,
-              () => setReportPage((prev) => Math.max(1, prev - 1)),
-              () => setReportPage((prev) => Math.min(totalReportPages, prev + 1)),
-              (activeReport === "sale" || activeReport === "purchase" || activeReport === "warehouse-stock")
-                ? Number(reportPageInfo.total || 0)
-                : filteredReportDataAll.length,
-              "rows"
-            )}
-          </WarehouseReportPanel>
-        </div>
-      )}
-      {showPaymentAdjustPopup && (
-        <div style={modalOverlayStyle}>
-          <WarehouseAdjustModal
-            title="Payment Adjustment"
-            subtitle="Account → Warehouse → Pending Farmer → Purchase Bills"
-            actionButton={btnAction}
-            controls={
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10, marginTop: 12 }}>
-                <SearchableSelect
-                  label="Account"
-                  value={formData.company_account_id}
-                  options={companyAccounts.map((a) => ({ value: a.id || a._id, label: a.account_name || a.name }))}
-                  onChange={(value) => handleChange({ target: { name: "company_account_id", value } })}
-                  placeholder="Choose account"
-                />
-                <SearchableSelect
-                  label="Warehouse"
-                  value={formData.warehouse_id}
-                  options={paymentWarehouses.map((w) => ({ value: w.id || w._id, label: w.name }))}
-                  onChange={(value) => handleChange({ target: { name: "warehouse_id", value } })}
-                  placeholder={formData.company_account_id ? "Choose warehouse" : "Choose account first"}
-                  disabled={!formData.company_account_id}
-                />
-                <SearchableSelect
-                  label="Pending Farmer"
-                  value={formData.farmer_id}
-                  options={accountFarmers.map((f) => ({ value: f.id || f._id, label: `${f.name}${f.outstanding !== undefined ? ` — Pending Rs.${formatMoney(f.outstanding)}` : ""}` }))}
-                  onChange={(value) => handleChange({ target: { name: "farmer_id", value } })}
-                  placeholder={formData.warehouse_id ? "Choose pending farmer" : "Choose warehouse first"}
-                  disabled={!formData.warehouse_id}
-                />
-              </div>
-            }
-            tableCard={{ ...paymentAdjustModalStyle, ...tableCard }}
-            reportHeaderRowStyle={reportHeaderRowStyle}
-            th={th}
-            td={td}
-            rows={(partyOutstanding?.purchases || []).filter((row) => toNumber(row.pending_amount) > 0).map((row) => ({
-              key: row.id || row._id,
-              date: row.date || "-",
-              voucher_no: row.voucher_no || "-",
-              warehouse: getWarehouseName(row),
-              amount: formatMoney(row.amount || 0),
-              adjusted: formatMoney(row.adjusted_amount || 0),
-              pending: formatMoney(row.pending_amount || 0),
-              row,
-            }))}
-            columns={[
-              { key: "date", label: "Date", render: (row) => row.date },
-              { key: "voucher", label: "Voucher No", render: (row) => row.voucher_no },
-              { key: "warehouse", label: "Warehouse", render: (row) => row.warehouse },
-              { key: "amount", label: "Bill Amount", render: (row) => row.amount },
-              { key: "adjusted", label: "Adjusted", render: (row) => row.adjusted },
-              { key: "pending", label: "Pending", render: (row) => row.pending },
-              {
-                key: "adjAmount",
-                label: "Adjustment Amount",
-                render: (row) => (
-                  <input
-                    type="number"
-                    step="0.0001"
-                    min="0"
-                    max={row.row.pending_amount || row.row.amount || 0}
-                    value={selectedAdjustmentFor(row.key)}
-                    onChange={(event) => setPaymentAdjustmentAmount(row.row, event.target.value)}
-                    style={{ ...inp, padding: "7px 8px" }}
-                  />
-                ),
-              },
-            ]}
-            emptyText="No pending purchase bills found."
-            onAutoAdjust={autoFillPaymentAdjustments}
-            autoAdjustLabel={`Auto Adjust Rs.${formatMoney(formData.amount)}`}
-            onClose={() => setShowPaymentAdjustPopup(false)}
-            onClear={() => setPaymentAdjustments([])}
-            onConfirm={() => setShowPaymentAdjustPopup(false)}
-            confirmDisabled={Math.abs(paymentAdjustmentTotal - toNumber(formData.amount)) > 0.0001}
-          />
-        </div>
-      )}
-      {showReceiptAdjustPopup && (
-        <div style={modalOverlayStyle}>
-          <WarehouseAdjustModal
-            title="Receipt Adjustment"
-            subtitle="Company and warehouse wise pending sale bills"
-            actionButton={btnAction}
-            tableCard={{ ...paymentAdjustModalStyle, ...tableCard }}
-            reportHeaderRowStyle={reportHeaderRowStyle}
-            th={th}
-            td={td}
-            rows={(partyOutstanding?.sales || []).filter((row) => toNumber(row.pending_amount) > 0).map((row) => ({
-              key: row.id || row._id,
-              date: row.date || "-",
-              voucher_no: row.voucher_no || "-",
-              warehouse: getWarehouseName(row),
-              amount: formatMoney(row.amount || 0),
-              adjusted: formatMoney(row.adjusted_amount || 0),
-              pending: formatMoney(row.pending_amount || 0),
-              row,
-            }))}
-            columns={[
-              { key: "date", label: "Date", render: (row) => row.date },
-              { key: "voucher", label: "Voucher No", render: (row) => row.voucher_no },
-              { key: "warehouse", label: "Warehouse", render: (row) => row.warehouse },
-              { key: "amount", label: "Bill Amount", render: (row) => row.amount },
-              { key: "adjusted", label: "Adjusted", render: (row) => row.adjusted },
-              { key: "pending", label: "Pending", render: (row) => row.pending },
-              {
-                key: "adjAmount",
-                label: "Adjustment Amount",
-                render: (row) => (
-                  <input
-                    type="number"
-                    step="0.0001"
-                    min="0"
-                    max={row.row.pending_amount || row.row.amount || 0}
-                    value={selectedAdjustmentFor(row.key)}
-                    onChange={(event) => setReceiptAdjustmentAmount(row.row, event.target.value)}
-                    style={{ ...inp, padding: "7px 8px" }}
-                  />
-                ),
-              },
-            ]}
-            emptyText="No pending sale bills found."
-            onClose={() => setShowReceiptAdjustPopup(false)}
-            onClear={() => setReceiptAdjustments([])}
-            onConfirm={() => setShowReceiptAdjustPopup(false)}
-            confirmDisabled={false}
-          />
-        </div>
-      )}
-      {showSaleDeductionModal && (
-        <WarehouseSaleDeductionModal
-          modalOverlayStyle={modalOverlayStyle}
-          paymentAdjustModalStyle={paymentAdjustModalStyle}
-          btnAction={btnAction}
-          inp={inp}
-          lbl={lbl}
-          readOnlyInp={readOnlyInp}
-          th={th}
-          td={td}
-          formData={formData}
-          warehouses={warehouses}
-          employees={employees}
-          buyerNames={buyerNames}
-          filteredConsignees={filteredConsignees}
-          selectedLocationName={selectedLocationName}
-          selectedSalePassBill={selectedSalePassBill}
-          saleDispatchQty={saleDispatchQty}
-          saleUnloadingQty={saleUnloadingQty}
-          saleTotalQtyPreview={saleTotalQtyPreview}
-          selectedSalePassJourneyRows={selectedSalePassJourneyRows}
-          selectedSalePassJourneyRemainingQty={selectedSalePassJourneyRemainingQty}
-          saleVoucherPassBills={saleVoucherPassBills}
-          saleBillSearch={saleBillSearch}
-          setSaleBillSearch={setSaleBillSearch}
-          journeyTemplateId={journeyTemplateId}
-          setJourneyTemplateId={setJourneyTemplateId}
-          editId={editId}
-          setShowSaleDeductionModal={setShowSaleDeductionModal}
-          handleChange={handleChange}
-          renderAccountSelect={renderAccountSelect}
-          openSaleJourneyReport={openSaleJourneyReport}
-          applyAddQty={applyAddQty}
-          applyJourneyTemplate={applyJourneyTemplate}
-          getBuyerName={getBuyerName}
-          getJourneySourceLabel={getJourneySourceLabel}
-          formatLedgerDate={formatLedgerDate}
-          formatDecimal4={formatDecimal4}
-          formatMoney={formatMoney}
-          toNumber={toNumber}
-          selectSaleVoucherForPass={selectSaleVoucherForPass}
-          saveSaleVoucherPass={saveSaleVoucherPass}
-          saveSaleVoucherPassAndNew={saveSaleVoucherPassAndNew}
-          saleQualityDeduction={saleQualityDeduction}
-          saleCashDiscountAmount={saleCashDiscountAmount}
-          saleBillAmountFromData={saleBillAmountFromData}
-          tdsEligible={tdsEligible}
-          autoTdsAmount={autoTdsAmount}
-          saleRemainingQty={saleRemainingQty}
-          saleShortageQty={saleShortageQty}
-          saleShortageAmount={saleShortageAmount}
-          saleNetReceivablePreview={saleNetReceivablePreview}
-        />
-      )}
-      {showSaleAdjustedModal && (
-        <div style={modalOverlayStyle}>
-          <div style={paymentAdjustModalStyle}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-              <div>
-                <h3 style={{ margin: 0 }}>Adjusted Sale Vouchers</h3>
-                <div style={{ fontSize: 13, color: "#64748b", marginTop: 4 }}>
-                  Press F5 to open adjusted sale items or select a row to edit its voucher.
-                </div>
-              </div>
-              <button type="button" onClick={() => setShowSaleAdjustedModal(false)} style={{ ...btnAction, background: "#64748b" }}>
-                Close
-              </button>
-            </div>
-
-            <div style={{ ...tableCard, maxHeight: 420, overflow: "auto", marginTop: 12 }}>
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                <thead>
-                  <tr style={reportHeaderRowStyle}>
-                    <th style={th}>Bill</th>
-                    <th style={th}>Date</th>
-                    <th style={th}>Lorry</th>
-                    <th style={th}>Buyer</th>
-                    <th style={th}>Consignee</th>
-                    <th style={th}>Qty</th>
-                    <th style={th}>Rate</th>
-                    <th style={th}>Claim</th>
-                    <th style={th}>Deduction</th>
-                    <th style={th}>TDS</th>
-                    <th style={th}>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {saleAdjustedBills.map((row, index) => {
-                    const rowId = row.id || row._id;
-                    return (
-                      <tr key={rowId} style={{ background: index % 2 ? "#f8fafc" : "#fff" }}>
-                        <td style={td}>{row.voucher_no || "-"}</td>
-                        <td style={td}>{row.date || "-"}</td>
-                        <td style={td}>{row.lorry_no || row.reference_id || "-"}</td>
-                        <td style={td}>{getBuyerName(row)}</td>
-                        <td style={td}>{row.consignee_name || "-"}</td>
-                        <td style={td}>{formatDecimal4(row.quantity || row.unloading_qty || 0)}</td>
-                        <td style={td}>{formatMoney(row.rate || 0)}</td>
-                        <td style={td}>{formatMoney(row.claim_amount || 0)}</td>
-                        <td style={td}>{formatMoney(row.other_deduction || row.adjustment_amount || 0)}</td>
-                        <td style={td}>{formatMoney(row.tds_amount || 0)}</td>
-                        <td style={td}>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setShowSaleAdjustedModal(false);
-                              handleEditVoucher(rowId);
-                            }}
-                            style={{ ...btnAction, background: "#2563eb" }}
-                          >
-                            Edit
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {saleAdjustedBills.length === 0 && (
-                    <tr>
-                      <td colSpan={11} style={{ ...td, textAlign: "center", padding: 18 }}>
-                        No adjusted sale vouchers found.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
-      {stockDrilldown && (
-        <div style={modalOverlayStyle}>
-          <div style={stockDrilldownModalStyle}>
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", marginBottom: 14 }}>
-              <div>
-                <h3 style={{ margin: 0 }}>{stockDrilldownTitle}</h3>
-                <div style={{ color: "#475569", fontSize: 13, marginTop: 5 }}>
-                  {getWarehouseName(stockDrilldown.item)} | {getAccountName(stockDrilldown.item)} | {getProductName(stockDrilldown.item)}
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                <button type="button" onClick={downloadStockDrilldownPdf} style={{ ...btnAction, background: "#0f766e" }}>
-                  PDF
-                </button>
-                <button type="button" onClick={() => setStockDrilldown(null)} style={{ ...btnAction, background: "#64748b" }}>
-                  Close
-                </button>
-              </div>
-            </div>
-
-            <div style={stockSummaryGridStyle}>
-              {isStockDrilldownSale ? null : (
-                <div style={stockMetricStyle}><span>Purchase / Inward Qty</span><strong>{formatDecimal4(stockDrilldownTotals.inward_qty || 0)}</strong></div>
-              )}
-              {isStockDrilldownPurchase ? null : (
-                <div style={stockMetricStyle}><span>Sale / Outward Qty</span><strong>{formatDecimal4(stockDrilldownTotals.outward_qty || 0)}</strong></div>
-              )}
-              <div style={stockMetricStyle}><span>{isStockDrilldownCombined ? "Stock Qty" : "Balance Qty"}</span><strong>{formatDecimal4(stockDrilldownTotals.balance_qty || 0)}</strong></div>
-              <div style={stockMetricStyle}><span>Purchase Avg Rate</span><strong>{formatMoney(stockDrilldownTotals.avg_rate || 0)}</strong></div>
-              <div style={stockMetricStyle}><span>Stock Amount</span><strong>{formatMoney(stockDrilldownTotals.stock_value || 0)}</strong></div>
-            </div>
-
-            <div style={stockFilterBarStyle}>
-              <Field label="From Date">
-                <input
-                  type="date"
-                  value={stockDrilldownFromDate}
-                  onChange={(event) => setStockDrilldownFromDate(event.target.value)}
-                  style={inp}
-                />
-              </Field>
-              <Field label="To Date">
-                <input
-                  type="date"
-                  value={stockDrilldownToDate}
-                  onChange={(event) => setStockDrilldownToDate(event.target.value)}
-                  style={inp}
-                />
-              </Field>
-              <button
-                type="button"
-                onClick={() => {
-                  setStockDrilldownFromDate("");
-                  setStockDrilldownToDate("");
-                }}
-                style={{ ...btnAction, background: "#475569", alignSelf: "end", minHeight: 38 }}
-              >
-                Reset Filter
-              </button>
-            </div>
-
-            <div style={{ ...tableCard, maxHeight: "66vh", marginTop: 14 }}>
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                <thead>
-                  <tr style={reportHeaderRowStyle}>
-                    <th style={th}>Date</th>
-                    <th style={th}>Type</th>
-                    <th style={th}>Voucher No</th>
-                    <th style={th}>Party</th>
-                    {isStockDrilldownSale ? null : (
-                      <>
-                        <th style={th}>Inward Qty</th>
-                        <th style={th}>In Rate</th>
-                        <th style={th}>In Value</th>
-                      </>
-                    )}
-                    {isStockDrilldownPurchase ? null : (
-                      <>
-                        <th style={th}>Outward Qty</th>
-                        <th style={th}>Out Rate</th>
-                        <th style={th}>Out Value</th>
-                      </>
-                    )}
-                    <th style={th}>{isStockDrilldownCombined ? "Stock Qty" : "Balance Qty"}</th>
-                    <th style={th}>Purchase Avg Rate</th>
-                    <th style={th}>Stock Value</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {stockDrilldownRows.map((row, index) => (
-                    <tr key={`${row.type}-${row.voucher_no || index}-${index}`} style={{ background: index % 2 ? "#f8fafc" : "#fff" }}>
-                      <td style={td}>{formatLedgerDate(row.date)}</td>
-                      <td style={{ ...td, fontWeight: 700, color: row.type === "Purchase" ? "#0f766e" : "#b45309" }}>{row.type}</td>
-                      <td style={td}>{row.voucher_no || "-"}</td>
-                      <td style={td}>{row.party_name || "-"}</td>
-                      {isStockDrilldownSale ? null : (
-                        <>
-                          <td style={td}>{row.inward_qty ? formatDecimal4(row.inward_qty) : ""}</td>
-                          <td style={td}>{row.inward_rate ? formatMoney(row.inward_rate) : ""}</td>
-                          <td style={td}>{row.inward_amount ? formatMoney(row.inward_amount) : ""}</td>
-                        </>
-                      )}
-                      {isStockDrilldownPurchase ? null : (
-                        <>
-                          <td style={td}>{row.outward_qty ? formatDecimal4(row.outward_qty) : ""}</td>
-                          <td style={td}>{row.outward_rate ? formatMoney(row.outward_rate) : ""}</td>
-                          <td style={td}>{row.outward_amount ? formatMoney(row.outward_amount) : ""}</td>
-                        </>
-                      )}
-                      <td style={{ ...td, fontWeight: 800 }}>{formatDecimal4(row.balance_qty || 0)}</td>
-                      <td style={td}>{formatMoney(row.day_avg_rate || 0)}</td>
-                      <td style={{ ...td, fontWeight: 800 }}>{formatMoney(row.stock_value || 0)}</td>
-                    </tr>
-                  ))}
-                  {stockDrilldownRows.length === 0 && (
-                    <tr><td colSpan={isStockDrilldownCombined ? 13 : 10} style={{ ...td, textAlign: "center", padding: 20 }}>No stock detail available.</td></tr>
-                  )}
-                </tbody>
-                {stockDrilldownRows.length > 0 && (
-                  <tfoot>
-                    <tr style={{ background: "#f1f5f9", fontWeight: 800 }}>
-                      <td style={td} colSpan={4}>Total</td>
-                      {isStockDrilldownSale ? null : (
-                        <>
-                          <td style={td}>{formatDecimal4(stockDrilldownTotals.inward_qty)}</td>
-                          <td style={td}></td>
-                          <td style={td}>{formatMoney(stockDrilldownTotals.inward_amount)}</td>
-                        </>
-                      )}
-                      {isStockDrilldownPurchase ? null : (
-                        <>
-                          <td style={td}>{formatDecimal4(stockDrilldownTotals.outward_qty)}</td>
-                          <td style={td}></td>
-                          <td style={td}>{formatMoney(stockDrilldownTotals.outward_amount)}</td>
-                        </>
-                      )}
-                      <td style={td}>{formatDecimal4(stockDrilldownTotals.balance_qty)}</td>
-                      <td style={td}>{formatMoney(stockDrilldownTotals.avg_rate)}</td>
-                      <td style={td}>{formatMoney(stockDrilldownTotals.stock_value)}</td>
-                    </tr>
-                  </tfoot>
-                )}
-              </table>
-            </div>
-          </div>
-        </div>
-      )}      {showPurchasePreview && (isPurchaseVoucher || purchasePreviewRow) && (
-        <WarehousePurchasePreviewModal
-          modalOverlayStyle={modalOverlayStyle}
-          paymentAdjustModalStyle={paymentAdjustModalStyle}
-          btnAction={btnAction}
-          btnPrimary={btnPrimary}
-          reportHeaderRowStyle={reportHeaderRowStyle}
-          th={th}
-          td={td}
-          purchasePreviewRow={purchasePreviewRow}
-          purchasePreviewLoading={purchasePreviewLoading}
-          purchaseReportRows={purchaseReportRows}
-          currentPurchasePreviewIndex={currentPurchasePreviewIndex}
-          navigatePurchasePreview={navigatePurchasePreview}
-          handleEditPurchaseReport={handleEditPurchaseReport}
-          handleDownloadPurchasePdf={handleDownloadPurchasePdfFromPreview}
-          setShowPurchasePreview={setShowPurchasePreview}
-          setPurchasePreviewRow={setPurchasePreviewRow}
-          setPurchasePreviewOpenedFromLedger={setPurchasePreviewOpenedFromLedger}
-          loading={loading}
-          saveVoucher={saveVoucher}
-          getPurchasePreviewData={getPurchasePreviewData}
-          getPurchasePreviewDataForRow={getPurchasePreviewDataForRow}
-          formData={formData}
-          formatMoney={formatMoney}
-        />
-      )}
-      {showSalePreview && salePreviewRow && (
-        <WarehouseSalePreviewModal
-          modalOverlayStyle={modalOverlayStyle}
-          paymentAdjustModalStyle={paymentAdjustModalStyle}
-          btnAction={btnAction}
-          btnPrimary={btnPrimary}
-          reportHeaderRowStyle={reportHeaderRowStyle}
-          th={th}
-          td={td}
-          salePreviewRow={salePreviewRow}
-          salePreviewSummary={salePreviewSummary}
-          saleTransportMode={saleTransportMode}
-          saleTransportManualAmount={saleTransportManualAmount}
-          setSaleTransportMode={setSaleTransportMode}
-          setSaleTransportManualAmount={setSaleTransportManualAmount}
-          setShowSalePreview={setShowSalePreview}
-          setSalePreviewRow={setSalePreviewRow}
-          setSalePreviewSummary={setSalePreviewSummary}
-          setLoading={setLoading}
-          loading={loading}
-          activeTab={activeTab}
-          loadReport={loadReport}
-          loadVouchers={loadVouchers}
-          formatMoney={formatMoney}
-          formatDecimal4={formatDecimal4}
-          toNumber={toNumber}
-          getSalePreviewDataForRow={getSalePreviewDataForRow}
-          axios={axios}
-        />
-      )}
-      </div>
-    </>
-  );
-}
-
-function SearchableSelect({ label, value, options, onChange, placeholder = "Select", disabled = false }) {
-  const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState("");
-  const rootRef = useRef(null);
-
-  const normalizedOptions = useMemo(
-    () =>
-      (options || []).map((option) => ({
-        ...option,
-        value: String(option?.value ?? "").trim(),
-        label: String(option?.label ?? "").trim(),
-      })),
-    [options]
-  );
-
-  const selectedOption = useMemo(
-    () => normalizedOptions.find((option) => String(option.value) === String(value)),
-    [normalizedOptions, value]
-  );
-
-  const filteredOptions = useMemo(() => {
-    const query = String(search || "").trim().toLowerCase();
-    if (!query) return normalizedOptions;
-    return normalizedOptions.filter((option) => option.label.toLowerCase().includes(query));
-  }, [normalizedOptions, search]);
-
-  useEffect(() => {
-    const handleClickOutside = (event) => {
-      if (!rootRef.current?.contains(event.target)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
-
-  const handleSelect = (nextValue) => {
-    onChange(nextValue);
-    setOpen(false);
-    setSearch("");
-  };
-
-  return (
-    <div ref={rootRef} style={{ position: "relative", minWidth: 260, flex: "1 1 260px" }}>
-      <label style={{ marginBottom: 6, display: "block", fontSize: 12, fontWeight: 700, color: "#475569" }}>{label}</label>
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => !disabled && setOpen((prev) => !prev)}
-        style={{
-          width: "100%",
-          padding: "10px 12px",
-          borderRadius: 8,
-          border: "1px solid #cbd5e1",
-          background: disabled ? "#f8fafc" : "#fff",
-          textAlign: "left",
-          cursor: disabled ? "not-allowed" : "pointer",
-          color: selectedOption ? "#0f172a" : "#64748b",
-          fontSize: 14,
-          boxSizing: "border-box",
-        }}
-      >
-        {selectedOption ? selectedOption.label : placeholder}
-      </button>
-      {open && !disabled ? (
-        <div
-          style={{
-            position: "absolute",
-            top: "calc(100% + 6px)",
-            left: 0,
-            right: 0,
-            zIndex: 30,
-            background: "#fff",
-            border: "1px solid #dbe4ea",
-            borderRadius: 12,
-            boxShadow: "0 18px 40px rgba(15, 23, 42, 0.14)",
-            overflow: "hidden",
-          }}
-        >
-          <div style={{ padding: 10, borderBottom: "1px solid #e2e8f0", background: "#f8fafc" }}>
-            <input
-              type="text"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Type to filter"
-              style={{
-                width: "100%",
-                padding: "9px 10px",
-                border: "1px solid #cbd5e1",
-                borderRadius: 8,
-                fontSize: 13,
-                boxSizing: "border-box",
-              }}
-            />
-          </div>
-          <div style={{ maxHeight: 240, overflowY: "auto" }}>
-            {filteredOptions.length ? (
-              filteredOptions.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  onClick={() => handleSelect(option.value)}
-                  style={{
-                    width: "100%",
-                    display: "block",
-                    textAlign: "left",
-                    padding: "10px 12px",
-                    border: "none",
-                    background: "transparent",
-                    cursor: "pointer",
-                    color: "#0f172a",
-                  }}
-                >
-                  {option.label}
-                </button>
-              ))
-            ) : (
-              <div style={{ padding: "10px 12px", color: "#64748b", fontSize: 13 }}>No items found</div>
-            )}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function Field({ label, children }) {
-  return <div><label style={lbl}>{label}</label>{children}</div>;
-}
-
-function SummaryInput({ label, name, value, onChange, readOnly = false }) {
-  return (
-    <div style={summaryBox}>
-      <label style={summaryLabel}>{label}</label>
-      <input
-        name={name}
-        type={readOnly ? "text" : "number"}
-        step="0.0001"
-        value={value}
-        onChange={onChange}
-        readOnly={readOnly}
-        style={readOnly ? summaryReadOnlyInput : summaryInput}
-      />
-    </div>
-  );
-}
-
-
-const paymentResponsiveCss = `
-  .payment-entry-row { grid-template-columns: minmax(0, 230px) auto !important; }
-  .payment-entry-row input { width: 230px !important; max-width: 100% !important; }
-  @media (max-width: 700px) {
-    .payment-entry-row { grid-template-columns: 1fr !important; }
-    .payment-entry-row input { width: 100% !important; }
+  if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+    const payload = buildPurchasePayload(req.body, voucher_no);
+    return PurchaseVoucher.findByIdAndUpdate(id, payload, { new: true })
+      .then(async (doc) => {
+        if (!doc) return res.status(404).json({ error: "Voucher not found" });
+        const deductionDetails = buildPurchaseDeductionDetails(req.body);
+        await PurchaseVoucher.collection.updateOne(
+          { _id: doc._id },
+          { $set: { claim_amount: Number(req.body.claim_amount || req.body.bags_claim || 0), other_deduction: Number(req.body.other_deduction || 0), cd_percent: Number(req.body.cd_percent || 0), cd_amount: Number(req.body.cd_amount || 0), adjustment_amount: Number(req.body.adjustment_amount || 0), tds_amount: Number(req.body.tds_amount || 0), deduction_details: deductionDetails, total_deduction: Number(req.body.total_deduction || 0) } }
+        );
+        res.json({ id: String(doc._id), _id: String(doc._id), message: "Voucher updated successfully", saved_to: "mongodb" });
+      })
+      .catch((err) => {
+        if (err?.code === 11000) return res.status(400).json({ error: "Voucher number already exists" });
+        res.status(500).json({ error: err.message });
+      });
   }
-`;
 
-const headerRow = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginBottom: 18, flexWrap: "wrap", position: "sticky", top: 0, zIndex: 30, background: "#fff", padding: "16px 0" };
-const subtitleStyle = { margin: 0, color: "#475569" };
-const titleStyle = { margin: 0, fontSize: 22, color: "#0f172a" };
-const tabRow = { display: "flex", gap: 10 };
-const tabStyle = { border: "1px solid #cbd5e1", background: "#fff", color: "#0f172a", padding: "10px 16px", borderRadius: 8, cursor: "pointer" };
-const activeTabStyle = { ...tabStyle, background: "#087a73", color: "#fff", borderColor: "#087a73" };
-const voucherTypeRow = { display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" };
-const voucherButtonStyle = { background: "#e2e8f0", color: "#0f172a", border: "none", padding: "8px 14px", borderRadius: 6, cursor: "pointer", fontSize: 13, fontWeight: 500 };
-const activeVoucherButtonStyle = { ...voucherButtonStyle, background: "#087a73", color: "#fff" };
-const card = { background: "#fff", border: "1px solid #e2e8f0", borderRadius: 12, padding: 20, marginBottom: 18, boxShadow: "0 4px 14px rgba(15,23,42,0.06)" };
-const formGrid = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 };
-const paymentHeroCard = { border: "1px solid #dbeafe", borderRadius: 16, padding: 16, background: "linear-gradient(135deg, #eef7ff 0%, #ffffff 100%)", boxShadow: "0 10px 24px rgba(37,99,235,0.08)", marginBottom: 16 };
-const paymentHeroHeader = { display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" };
-const paymentBadge = { display: "inline-flex", alignItems: "center", gap: 8, padding: "7px 11px", borderRadius: 999, background: "#2563eb", color: "#fff", fontWeight: 700, fontSize: 12 };
-const paymentQuickGrid = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10, marginTop: 12 };
-const paymentQuickBox = { background: "#fff", border: "1px solid #dbeafe", borderRadius: 10, padding: 10 };
+  const query = `
+    UPDATE wh_purchase_vouchers SET
+      voucher_no=?, date=?, warehouse_id=?, farmer_id=?, company_account_id=?, product_id=?, quantity=?, rate=?, amount=?,
+      packet=?, gross_weight=?, tare_weight=?, dhalta=?, less_bags_weight=?, moisture=?, dunki=?, fungus=?,
+      discolour=?, others=?, net_weight=?, bags_claim=?, labour=?, total_deduct_amount=?, total_qty=?,
+      total_deduction=?, round_off=?, net_amount_payable=?, employee_id=?, location_id=?, description=?
+    WHERE id = ?
+  `;
 
-const paymentEyebrow = { fontSize: 10, textTransform: "uppercase", letterSpacing: "0.18em", color: "#0f766e", fontWeight: 800, marginBottom: 3 };
-const paymentHeroTitle = { margin: "0 0 4px", fontSize: 17, color: "#0f172a" };
-const paymentHeroSubtitle = { margin: 0, fontSize: 12, color: "#64748b" };
-const paymentModeRow = { display: "flex", gap: 6, flexWrap: "wrap", marginTop: 12 };
-const paymentModeButton = { border: "1px solid #dbe4f0", background: "#fff", color: "#334155", borderRadius: 8, padding: "7px 10px", fontWeight: 700, fontSize: 11, cursor: "pointer" };
-const paymentModeButtonActive = { background: "#0f766e", color: "#fff", borderColor: "#0f766e" };
-const paymentSelectorGrid = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 8, marginTop: 12 };
-const paymentFinancialSummary = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(135px, 1fr))", gap: 7, marginTop: 10 };
-const paymentStatCard = { background: "#fff", border: "1px solid #dbe4f0", borderRadius: 9, padding: "8px 9px", minWidth: 0 };
-const paymentStatLabel = { display: "block", fontSize: 10, color: "#64748b", marginBottom: 3, fontWeight: 700 };
-const paymentStatValue = { display: "block", fontSize: 13, color: "#0f172a", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" };
-const paymentDueCard = { borderColor: "#fecaca", background: "#fff7f7" };
-const inp = { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14, boxSizing: "border-box" };
-const paymentEntryRow = { display: "grid", gridTemplateColumns: "minmax(0, 230px) auto", justifyContent: "start", gap: 12, alignItems: "end", marginTop: 10 };
-const paymentAmountInput = { width: "230px", maxWidth: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 15, fontWeight: 700, boxSizing: "border-box", minHeight: 42 };
-const paymentAdjustmentAction = { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", paddingBottom: 1 };
-const paymentAdjustedText = { fontSize: 11, color: "#475569", whiteSpace: "nowrap" };
-const paymentSelectedBar = { display: "flex", gap: 8, flexWrap: "wrap", marginTop: 9, padding: "7px 9px", borderRadius: 8, background: "#f8fafc", border: "1px solid #e2e8f0", fontSize: 10.5, color: "#475569" };
-const readOnlyInp = { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14, boxSizing: "border-box", background: "#f8fafc", color: "#475569" };
-const btnPrimary = { background: "#2563eb", color: "#fff", border: "none", padding: "10px 18px", borderRadius: 8, cursor: "pointer", fontWeight: 600, fontSize: 14 };
-const th = { padding: "10px 8px", textAlign: "left", borderBottom: "1px solid #0d5c56" };
-const td = { padding: "8px", borderBottom: "1px solid #e2e8f0" };
-const tableCard = { overflowX: "auto", border: "1px solid #e2e8f0", borderRadius: 10, background: "#fff" };
-const ledgerSplitStyle = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(360px, 100%), 1fr))", gap: 14, alignItems: "start" };
-const billWisePanelStyle = { border: "1px solid #dbe4ef", borderRadius: 10, padding: 12, background: "#f8fafc" };
-const linkButtonStyle = { border: "none", background: "transparent", color: "#2563eb", cursor: "pointer", padding: 0, fontWeight: 700, textDecoration: "underline" };
-const paymentDetailBoxStyle = { marginTop: 10, border: "1px solid #dbe4ef", borderRadius: 8, background: "#fff", padding: 10, maxWidth: 460 };
-const paymentDetailRowStyle = { display: "grid", gridTemplateColumns: "90px 1fr auto", gap: 8, padding: "6px 0", borderBottom: "1px solid #edf2f7", fontSize: 12 };
-const modalOverlayStyle = {
-  position: "fixed",
-  inset: 0,
-  background: "rgba(15, 23, 42, 0.48)",
-  zIndex: 50,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  padding: 16,
-};
-const paymentAdjustModalStyle = {
-  width: "min(980px, 96vw)",
-  maxHeight: "90vh",
-  overflow: "auto",
-  background: "#fff",
-  borderRadius: 8,
-  border: "1px solid #cbd5e1",
-  boxShadow: "0 20px 45px rgba(15, 23, 42, 0.25)",
-  padding: 18,
-};
-const stockDrilldownModalStyle = {
-  width: "min(1380px, 98vw)",
-  maxHeight: "96vh",
-  overflow: "auto",
-  background: "#fff",
-  borderRadius: 8,
-  border: "1px solid #cbd5e1",
-  boxShadow: "0 20px 45px rgba(15, 23, 42, 0.25)",
-  padding: 20,
-};
-const stockSummaryGridStyle = {
-  display: "grid",
-  gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-  gap: 10,
-};
-const stockFilterBarStyle = {
-  display: "grid",
-  gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-  gap: 12,
-  alignItems: "end",
-  marginTop: 14,
-  padding: 12,
-  border: "1px solid #dbe4ef",
-  borderRadius: 8,
-  background: "#f8fafc",
-};
-const stockMetricStyle = {
-  border: "1px solid #dbe4ef",
-  borderRadius: 6,
-  background: "#f8fafc",
-  padding: "10px 12px",
-  display: "grid",
-  gap: 5,
-};
-const smartInfoGridStyle = {
-  display: "grid",
-  gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-  gap: 8,
-  marginTop: 10,
-};
-const smartInfoBoxStyle = {
-  border: "1px solid #bbf7d0",
-  borderRadius: 8,
-  background: "#f0fdf4",
-  padding: "8px 10px",
-  display: "grid",
-  gap: 4,
-  color: "#14532d",
-  fontSize: 12,
-};
-const reportHeaderRowStyle = { background: "#087a73", color: "#fff", position: "sticky", top: 0, zIndex: 1 };
-const lbl = { display: "block", marginBottom: 6, fontWeight: 600, fontSize: 13, color: "#334155" };
-const memoShell = { border: "1px solid #d7dee8", borderRadius: 10, padding: 18, background: "#fbfdff" };
-const memoHeader = { display: "flex", justifyContent: "space-between", gap: 18, alignItems: "flex-start", borderBottom: "2px solid #ea580c", paddingBottom: 14, marginBottom: 16, flexWrap: "wrap" };
-const memoTitle = { margin: 0, color: "#0b2a5b", fontSize: 28, letterSpacing: 0, fontWeight: 800 };
-const memoSubTitle = { marginTop: 8, color: "#334155", fontSize: 14, fontWeight: 600 };
-const memoHeaderFields = { display: "grid", gridTemplateColumns: "repeat(2, minmax(150px, 1fr))", gap: 12, minWidth: 320 };
-const memoInfoGrid = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16, marginBottom: 16 };
-const memoMainGrid = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16, marginBottom: 18 };
-const memoPanel = { border: "1px solid #d7dee8", borderRadius: 8, padding: 16, background: "#fff" };
-const memoPanelTitle = { background: "#0b2a5b", color: "#fff", fontWeight: 800, textTransform: "uppercase", fontSize: 13, padding: "8px 12px", borderRadius: 6, margin: "-16px -16px 14px -16px" };
-const memoTable = { width: "100%", borderCollapse: "collapse", fontSize: 14 };
-const memoTh = { background: "#0b2a5b", color: "#fff", padding: "10px 8px", textAlign: "left", border: "1px solid #173a70" };
-const memoTd = { padding: "7px 8px", border: "1px solid #e2e8f0", verticalAlign: "middle" };
-const tableInput = { width: "100%", border: "1px solid #cbd5e1", borderRadius: 6, padding: "7px 8px", boxSizing: "border-box", fontSize: 13 };
-const memoBottomGrid = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 16 };
-const summaryBox = { border: "1px solid #d7dee8", borderRadius: 8, background: "#fff", overflow: "hidden" };
-const summaryLabel = { display: "block", padding: "9px 10px", color: "#0b2a5b", fontSize: 12, fontWeight: 800, textTransform: "uppercase", borderBottom: "1px solid #e2e8f0" };
-const summaryInput = { width: "100%", border: "none", padding: "12px 10px", color: "#ea580c", fontWeight: 800, fontSize: 15, textAlign: "center", boxSizing: "border-box" };
-const summaryReadOnlyInput = { ...summaryInput, background: "#f8fafc" };
-const memoTotals = { width: "min(100%, 420px)", marginLeft: "auto", border: "1px solid #d7dee8", borderRadius: 8, overflow: "hidden", background: "#fff" };
-const totalLine = { display: "flex", justifyContent: "space-between", gap: 12, padding: "12px 16px", borderBottom: "1px solid #e2e8f0", color: "#0f172a", fontWeight: 700 };
-const payableLine = { ...totalLine, borderBottom: "none", background: "#0b2a5b", color: "#fff" };
-const btnAction = { background: "#2563eb", color: "#fff", border: "none", padding: "6px 10px", borderRadius: 4, cursor: "pointer", fontWeight: 500, fontSize: 12 };
+  db.run(query, [
+    voucher_no, date, warehouse_id, farmer_id, company_account_id, product_id, quantity, rate, amount,
+    packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
+    discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
+    total_deduction, round_off, net_amount_payable, employee_id, location_id, description, id
+  ], function(err) {
+    if (err) {
+      if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+      return res.status(500).json({ error: err.message });
+    }
+    res.json({ id, message: "Voucher updated successfully" });
+  });
+});
 
-const erpShell = {
-  background: "#f5f8f7",
-  border: "1px solid #b9d0cc",
-  borderRadius: 4,
-  padding: 8,
-  color: "#111827",
-  fontFamily: "Arial, Segoe UI, sans-serif",
-  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.7)",
-};
-const erpTitleBar = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "center",
-  gap: 12,
-  marginBottom: 6,
-  flexWrap: "wrap",
-};
-const erpTitleLeft = { display: "flex", alignItems: "center", gap: 6 };
-const erpDocIcon = {
-  width: 18,
-  height: 18,
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  background: "#087a73",
-  color: "#fff",
-  fontSize: 14,
-  fontWeight: 800,
-};
-const erpTitleText = { color: "#2f542c", fontSize: 22, fontWeight: 800, lineHeight: 1 };
-const erpMetaLine = { display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "#111827", flexWrap: "wrap" };
-const erpTopGrid = {
-  display: "grid",
-  gridTemplateColumns: "minmax(390px, 1.35fr) minmax(320px, 1.05fr) minmax(260px, 0.85fr)",
-  gap: 4,
-  alignItems: "stretch",
-  marginBottom: 6,
-};
-const erpPanelWide = { border: "1px solid #c8d6d3", background: "#f7f7fb", borderRadius: 4, padding: 8 };
-const erpPanelSmall = {
-  border: "1px solid #c9c9d5",
-  background: "#f2f2f7",
-  borderRadius: 4,
-  padding: 8,
-  display: "grid",
-  alignContent: "center",
-  gap: 8,
-};
-const erpDocPanel = { border: "1px solid #c8d6d3", background: "#f7f7fb", borderRadius: 4, padding: 8 };
-const erpRow = { display: "flex", alignItems: "center", gap: 6, minHeight: 26, marginBottom: 4 };
-const erpLabel = { width: 88, fontSize: 12, color: "#111827", flex: "0 0 auto" };
-const erpCheckLabel = { display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#111827" };
-const erpCheck = { width: 16, height: 16, margin: 0 };
-const erpInput = {
-  height: 23,
-  minWidth: 0,
-  flex: 1,
-  border: "1px solid #c9c9c9",
-  background: "#fff",
-  padding: "2px 6px",
-  fontSize: 12,
-  borderRadius: 0,
-  boxSizing: "border-box",
-};
-const erpFocusInput = { borderColor: "#4d90fe", boxShadow: "inset 0 0 0 1px rgba(77,144,254,0.15)" };
-const erpSectionLabel = { fontSize: 12, color: "#111827", margin: "3px 0 2px" };
-const erpGridWrap = {
-  overflowX: "auto",
-  border: "1px solid #c3d8d5",
-  background: "#fff",
-};
-const erpItemsTable = { width: "100%", minWidth: 1320, borderCollapse: "collapse", tableLayout: "fixed", fontSize: 12 };
-const erpTh = {
-  border: "1px solid #c3d8d5",
-  background: "#e8f3f1",
-  color: "#111827",
-  padding: "2px 4px",
-  fontWeight: 500,
-  textAlign: "left",
-  height: 20,
-  whiteSpace: "nowrap",
-};
-const erpTd = {
-  border: "1px solid #c3d8d5",
-  background: "#fff",
-  color: "#111827",
-  padding: 0,
-  height: 22,
-  lineHeight: "20px",
-  verticalAlign: "middle",
-};
-const erpCellInput = {
-  width: "100%",
-  height: 21,
-  border: "none",
-  background: "transparent",
-  padding: "1px 4px",
-  fontSize: 12,
-  boxSizing: "border-box",
-  outline: "none",
-};
-const erpReadOnlyCell = { background: "#f5f7fb", color: "#111827", fontWeight: 700 };
-const erpMiddleBar = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "center",
-  gap: 12,
-  fontSize: 12,
-  padding: "5px 2px 3px",
-};
-const erpBottomGrid = {
-  display: "grid",
-  gridTemplateColumns: "minmax(420px, 1fr) minmax(420px, 1fr)",
-  gap: 10,
-  alignItems: "start",
-};
-const erpMiniTable = { width: "100%", borderCollapse: "collapse", tableLayout: "fixed", fontSize: 12, background: "#fff" };
-const erpRemarksRow = { display: "flex", alignItems: "stretch", gap: 6, marginTop: 8 };
-const erpTextarea = {
-  flex: 1,
-  minHeight: 48,
-  border: "1px solid #c9c9c9",
-  resize: "vertical",
-  padding: 6,
-  fontSize: 12,
-  fontFamily: "Arial, Segoe UI, sans-serif",
-};
-const erpTotalPanel = {
-  marginTop: 8,
-  minHeight: 46,
-  border: "1px solid #c9c9d5",
-  background: "#e8f3f1",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "space-between",
-  padding: "0 14px",
-  fontWeight: 900,
-  fontSize: 18,
-};
-const erpTotalLabel = { letterSpacing: 8, color: "#2f542c" };
-const erpTotalAmount = { letterSpacing: 0, color: "#2f542c", fontSize: 30 };
+// Delete purchase voucher
+router.delete("/purchase/:id", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.delete")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const id = req.params.id;
+  if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
+    return PurchaseVoucher.findById(id)
+      .then((doc) => {
+        if (!doc) return res.status(404).json({ error: "Voucher not found" });
+        if (!ensureWarehouseAccess(req, res, doc.warehouse_id)) return null;
+        return PurchaseVoucher.deleteOne({ _id: id }).then(() => res.json({ message: "Voucher deleted successfully" }));
+      })
+      .catch((err) => res.status(500).json({ error: err.message }));
+  }
+
+  const query = "DELETE FROM wh_purchase_vouchers WHERE id = ?";
+
+  db.run(query, [id], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    if (this.changes === 0) return res.status(404).json({ error: "Voucher not found" });
+    res.json({ message: "Voucher deleted successfully" });
+  });
+});
+
+module.exports = router;
