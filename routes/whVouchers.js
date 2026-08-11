@@ -333,7 +333,21 @@ async function getSaleVoucherPage(req) {
       .limit(options.limit)
       .lean(),
   ]);
-  const rows = await decorateSaleRows(docs);
+  let rows;
+  try {
+    rows = await decorateSaleRows(docs);
+  } catch (decorateErr) {
+    console.error("Sale list decoration skipped:", decorateErr);
+    rows = (docs || []).map((row) => ({
+      ...(row || {}),
+      id: String(row?._id || row?.id || ""),
+      _id: String(row?._id || row?.id || ""),
+      buyer_id: String(row?.buyer_id || row?.company_id || ""),
+      total_quantity: Number(row?.quantity || row?.total_quantity || 0),
+      total_amount: Number(row?.amount || row?.total_amount || 0),
+      ...calculateSaleFollowupMeta(row || {}),
+    }));
+  }
   // Do not make the fast MongoDB Sale list wait for the legacy SQLite Bilti
   // table. Bilti is an auxiliary field and is loaded lazily by the relevant
   // action. This removes an unnecessary cross-database query from every page.
@@ -903,71 +917,74 @@ async function sqliteRowsByIds(tableName, ids) {
 }
 
 async function decorateSaleRows(rows) {
-  const plainRows = rows.map((row) => (row.toObject ? row.toObject() : row));
-  const warehouseIds = [...new Set(plainRows.map((r) => r.warehouse_id).filter(Boolean))];
-  const productIds = [...new Set(plainRows.map((r) => r.product_id).filter(Boolean))];
-  const accountIds = [...new Set(plainRows.map((r) => r.company_account_id).filter(Boolean))];
-  const buyerIds = [...new Set(plainRows.map((r) => r.buyer_id || r.company_id).filter(Boolean))];
-  const consigneeIds = [...new Set(plainRows.map((r) => r.consignee_id).filter(Boolean))];
+  const plainRows = (Array.isArray(rows) ? rows : []).map((row) => (row?.toObject ? row.toObject() : row));
+  if (!plainRows.length) return [];
 
-  const mongoWarehouseIds = warehouseIds.filter(mongoose.Types.ObjectId.isValid);
-  const mongoProductIds = productIds.filter(mongoose.Types.ObjectId.isValid);
-  const mongoAccountIds = accountIds.filter(mongoose.Types.ObjectId.isValid);
+  const warehouseIds = [...new Set(plainRows.map((r) => String(r?.warehouse_id || "")).filter(Boolean))];
+  const productIds = [...new Set(plainRows.map((r) => String(r?.product_id || "")).filter(Boolean))];
+  const accountIds = [...new Set(plainRows.map((r) => String(r?.company_account_id || "")).filter(Boolean))];
+  const buyerIds = [...new Set(plainRows.map((r) => String(r?.buyer_id || r?.company_id || "")).filter(Boolean))];
+  const consigneeIds = [...new Set(plainRows.map((r) => String(r?.consignee_id || "")).filter(Boolean))];
 
-  // All list decoration stays in MongoDB. Buyer/consignee records are read from
-  // the existing Mongo mirror collection so the Trading list never queries SQLite.
+  const safeObjectIds = (ids) => ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const mongoWarehouseIds = safeObjectIds(warehouseIds);
+  const mongoProductIds = safeObjectIds(productIds);
+  const mongoAccountIds = safeObjectIds(accountIds);
+
   const mirrorFilters = (table, ids) => ({
     table,
     row_id: { $in: ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0) },
   });
-  const [
-    mongoWarehouses,
-    mongoProducts,
-    mongoAccounts,
-    mirrorBuyers,
-    mirrorConsignees,
-  ] = await Promise.all([
-    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : [],
-    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : [],
-    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : [],
-    buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : [],
-    consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : [],
+
+  // Reporting must never fail because one optional master/mirror collection is
+  // unavailable. Every lookup is independent and has an empty fallback.
+  const results = await Promise.allSettled([
+    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
+    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
+    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
+    buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : Promise.resolve([]),
+    consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : Promise.resolve([]),
   ]);
 
-  const byMongoId = (items) => new Map(items.map((item) => [String(item._id), item]));
-  const byMirrorId = (items) => new Map(items.map((item) => [String(item.row_id), item.data || {}]));
-  const mongoWarehouseMap = byMongoId(mongoWarehouses);
-  const mongoProductMap = byMongoId(mongoProducts);
-  const mongoAccountMap = byMongoId(mongoAccounts);
-  const buyerMap = byMirrorId(mirrorBuyers);
-  const consigneeMap = byMirrorId(mirrorConsignees);
+  const valueAt = (index) => results[index].status === "fulfilled" && Array.isArray(results[index].value) ? results[index].value : [];
+  results.forEach((result, index) => {
+    if (result.status === "rejected") console.warn(`Sale row lookup ${index} skipped:`, result.reason?.message || result.reason);
+  });
+
+  const byMongoId = (items) => new Map(items.map((item) => [String(item?._id), item]));
+  const byMirrorId = (items) => new Map(items.map((item) => [String(item?.row_id), item?.data || {}]));
+  const mongoWarehouseMap = byMongoId(valueAt(0));
+  const mongoProductMap = byMongoId(valueAt(1));
+  const mongoAccountMap = byMongoId(valueAt(2));
+  const buyerMap = byMirrorId(valueAt(3));
+  const consigneeMap = byMirrorId(valueAt(4));
 
   return plainRows.map((plain) => {
-    const buyerId = plain.buyer_id || plain.company_id || "";
-    const warehouse = mongoWarehouseMap.get(String(plain.warehouse_id));
-    const product = mongoProductMap.get(String(plain.product_id));
-    const account = mongoAccountMap.get(String(plain.company_account_id));
-    const buyer = buyerMap.get(String(buyerId));
-    const consignee = consigneeMap.get(String(plain.consignee_id));
-    const totalQuantity = plain.quantity || Math.max(Number(plain.gross_weight || 0) - Number(plain.tare_weight || 0), 0);
-    const totalAmount = plain.amount || 0;
+    const buyerId = String(plain?.buyer_id || plain?.company_id || "");
+    const warehouse = mongoWarehouseMap.get(String(plain?.warehouse_id || ""));
+    const product = mongoProductMap.get(String(plain?.product_id || ""));
+    const account = mongoAccountMap.get(String(plain?.company_account_id || ""));
+    const buyer = buyerMap.get(buyerId);
+    const consignee = consigneeMap.get(String(plain?.consignee_id || ""));
+    const totalQuantity = Number(plain?.quantity ?? plain?.total_quantity ?? Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0));
+    const totalAmount = Number(plain?.amount ?? plain?.total_amount ?? plain?.net_receivable_amount ?? 0);
     return {
       ...plain,
-      id: String(plain._id || plain.id),
-      _id: String(plain._id || plain.id),
+      id: String(plain?._id || plain?.id || ""),
+      _id: String(plain?._id || plain?.id || ""),
       buyer_id: buyerId,
-      warehouse_name: warehouse?.name || plain.warehouse_name,
-      product_name: product?.name || plain.product_name,
-      company_account_name: account?.account_name || account?.name || plain.company_account_name,
-      buyer_name: buyer?.name || plain.buyer_name || plain.company_name,
-      buyer_email: buyer?.email || plain.buyer_email || "",
-      buyer_mobile: buyer?.mobile || plain.buyer_mobile || "",
-      consignee_name: consignee?.name || plain.consignee_name,
-      consignee_email: consignee?.email || plain.consignee_email || "",
-      consignee_mobile: consignee?.mobile || plain.consignee_mobile || "",
-      total_quantity: totalQuantity,
-      total_amount: totalAmount,
-      ...calculateSaleFollowupMeta(plain),
+      warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
+      product_name: product?.name || plain?.product_name || "-",
+      company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
+      buyer_name: buyer?.name || plain?.buyer_name || plain?.company_name || "-",
+      buyer_email: buyer?.email || plain?.buyer_email || "",
+      buyer_mobile: buyer?.mobile || plain?.buyer_mobile || "",
+      consignee_name: consignee?.name || plain?.consignee_name || "-",
+      consignee_email: consignee?.email || plain?.consignee_email || "",
+      consignee_mobile: consignee?.mobile || plain?.consignee_mobile || "",
+      total_quantity: Number.isFinite(totalQuantity) ? totalQuantity : 0,
+      total_amount: Number.isFinite(totalAmount) ? totalAmount : 0,
+      ...calculateSaleFollowupMeta(plain || {}),
     };
   });
 }
@@ -4252,7 +4269,20 @@ async function getSaleReportRowsForUser(user, options = {}) {
       query.skip(Number(options.offset) || 0).limit(Number(options.limit));
     }
     const rows = await query;
-    return decorateSaleRows(rows);
+    try {
+      return await decorateSaleRows(rows);
+    } catch (decorateErr) {
+      console.error("Sale report decoration failed; returning raw Mongo rows:", decorateErr);
+      return (rows || []).map((row) => ({
+        ...(row || {}),
+        id: String(row?._id || row?.id || ""),
+        _id: String(row?._id || row?.id || ""),
+        buyer_id: String(row?.buyer_id || row?.company_id || ""),
+        total_quantity: Number(row?.quantity || row?.total_quantity || 0),
+        total_amount: Number(row?.amount || row?.total_amount || 0),
+        ...calculateSaleFollowupMeta(row || {}),
+      }));
+    }
   }
   return getSqliteSaleRowsForUser(user, options);
 }
@@ -4543,6 +4573,7 @@ router.get("/report/sale-summary", async (req, res) => {
     warehouseId: String(req.query.warehouse_id || "").trim(),
     companyAccountId: String(req.query.company_account_id || "").trim(),
     productId: String(req.query.product_id || "").trim(),
+    search: String(req.query.search || "").trim(),
   };
 
   try {
@@ -4553,6 +4584,26 @@ router.get("/report/sale-summary", async (req, res) => {
       if (options.warehouseId) filter.warehouse_id = options.warehouseId;
       if (options.companyAccountId) filter.company_account_id = options.companyAccountId;
       if (options.productId) filter.product_id = options.productId;
+      if (options.search) {
+        const safe = options.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const rx = new RegExp(safe, "i");
+        filter.$and = [
+          ...(filter.$and || []),
+          { $or: [
+            { voucher_no: rx },
+            { bill_no: rx },
+            { po_no: rx },
+            { buyer_name: rx },
+            { company_name: rx },
+            { product_name: rx },
+            { warehouse_name: rx },
+            { company_account_name: rx },
+            { consignee_name: rx },
+            { lorry_no: rx },
+            { description: rx },
+          ] },
+        ];
+      }
       const query = SaleVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
       const countPromise = usePaging ? SaleVoucher.countDocuments(filter).exec() : Promise.resolve(0);
       if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
