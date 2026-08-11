@@ -2936,9 +2936,18 @@ router.get("/outstanding", (req, res) => {
           db.all(paymentsQuery, paymentParams, (err3, payments) => {
             if (err3) return res.status(500).json({ error: err3.message });
             const totalPurchase = purchases.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+            const totalDeduction = purchases.reduce((sum, row) => {
+              const value =
+                row.total_deduction ??
+                row.total_deduct_amount ??
+                (Number(row.bags_claim || 0) + Number(row.labour || 0) + Number(row.transport_charge || 0));
+              return sum + (Number.isFinite(Number(value)) ? Number(value) : 0);
+            }, 0);
             const totalPayment = (payments || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
             const scopedStats = {
+              total_bill: Number(totalPurchase.toFixed(2)),
               total_purchase: Number(totalPurchase.toFixed(2)),
+              total_deduction: Number(totalDeduction.toFixed(2)),
               total_payment: Number(totalPayment.toFixed(2)),
               outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
             };
