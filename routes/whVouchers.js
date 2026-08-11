@@ -4929,28 +4929,39 @@ router.get("/report/sale-party-ledger", async (req, res) => {
     const companyAccountId = String(req.query.company_account_id || "").trim();
     const sales = await getSaleReportRowsForUser(req.user, { buyerId, farmerId, warehouseId, companyAccountId });
 
+    // Sale Party Ledger must still render when receipt/adjustment mirror data is
+    // temporarily unavailable. The sale rows themselves are the primary ledger
+    // source; receipts are optional detail rows.
+    let receipts = [];
+    let adjustmentRows = [];
     const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
     const receiptParams = [...filter.params];
     const clauses = [];
     if (buyerId) { clauses.push(" AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(buyerId); }
     if (warehouseId) { clauses.push(" AND CAST(r.warehouse_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(warehouseId); }
     if (companyAccountId) { clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(companyAccountId); }
-    const receipts = await dbAll(`
-      SELECT r.*, ca.account_name AS company_account_name
-      FROM wh_receipt_vouchers r
-      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
-      WHERE 1=1 ${filter.clause} ${clauses.join(" ")}
-      ORDER BY r.date DESC, r.id DESC
-    `, receiptParams);
+    try {
+      receipts = await dbAll(`
+        SELECT r.*, ca.account_name AS company_account_name
+        FROM wh_receipt_vouchers r
+        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
+        WHERE 1=1 ${filter.clause} ${clauses.join(" ")}
+        ORDER BY r.date DESC, r.id DESC
+      `, receiptParams);
 
-    const receiptIds = receipts.map((row) => row.id);
-    const adjustmentRows = receiptIds.length ? await dbAll(`
-      SELECT a.*, rv.voucher_no AS receipt_voucher_no
-      FROM wh_receipt_adjustments a
-      LEFT JOIN wh_receipt_vouchers rv ON CAST(rv.id AS TEXT) = CAST(a.receipt_id AS TEXT)
-      WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
-      ORDER BY a.id ASC
-    `, receiptIds) : [];
+      const receiptIds = receipts.map((row) => row.id);
+      adjustmentRows = receiptIds.length ? await dbAll(`
+        SELECT a.*, rv.voucher_no AS receipt_voucher_no
+        FROM wh_receipt_adjustments a
+        LEFT JOIN wh_receipt_vouchers rv ON CAST(rv.id AS TEXT) = CAST(a.receipt_id AS TEXT)
+        WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
+        ORDER BY a.id ASC
+      `, receiptIds) : [];
+    } catch (receiptErr) {
+      console.warn("Sale Party Ledger receipt details unavailable; rendering sale rows only:", receiptErr.message);
+      receipts = [];
+      adjustmentRows = [];
+    }
 
     const saleMap = new Map((sales || []).map((row) => [String(row.id || row._id), row]));
     const receiptMap = new Map((receipts || []).map((row) => [String(row.id), row]));
