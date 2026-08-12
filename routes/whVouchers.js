@@ -922,15 +922,27 @@ async function decoratePurchaseRows(rows) {
   const accountIds = [...new Set(rows.map((r) => r.company_account_id).filter(mongoose.Types.ObjectId.isValid))];
 
   const [warehouses, farmers, products, accounts] = await Promise.all([
-    warehouseIds.length ? Warehouse.find({ _id: { $in: warehouseIds } }).lean() : [],
-    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
-    productIds.length ? Product.find({ _id: { $in: productIds } }).lean() : [],
-    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
+    warehouseIds.length ? Warehouse.find({ _id: { $in: warehouseIds } }).select("_id name address location city district state pincode").lean() : [],
+    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).select("_id name mobile address village city district state pincode gst_no gst pan_no pan").lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }).select("_id name").lean() : [],
+    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).select("_id account_name name address mobile email city district state pincode").lean() : [],
   ]);
 
-  const byId = (items) => new Map(items.map((item) => [String(item._id), item]));
+  // Some older PurchaseVoucher rows store the legacy SQLite farmer id (number/string)
+  // instead of the Mongo ObjectId. Resolve those ids in one batch so Party Ledger
+  // never falls back to a blank farmer name.
+  const mongoFarmerKeys = new Set(farmers.map((item) => String(item._id)));
+  const legacyFarmerIds = [...new Set(rows.map((r) => String(r?.farmer_id ?? "").trim()).filter((id) => id && !mongoFarmerKeys.has(id)))];
+  const legacyFarmers = legacyFarmerIds.length
+    ? await dbAll(
+        `SELECT id, name, mobile, address, village, city, district, state, pincode, gst, gst_no, pan, pan_no FROM farmers WHERE CAST(id AS TEXT) IN (${legacyFarmerIds.map(() => "?").join(",")})`,
+        legacyFarmerIds
+      ).catch(() => [])
+    : [];
+
+  const byId = (items) => new Map(items.map((item) => [String(item._id ?? item.id), item]));
   const warehouseMap = byId(warehouses);
-  const farmerMap = byId(farmers);
+  const farmerMap = byId([...farmers, ...legacyFarmers]);
   const productMap = byId(products);
   const accountMap = byId(accounts);
 
@@ -4498,8 +4510,14 @@ async function enrichLedgerRowsWithPartyDetails(rows) {
   const list = Array.isArray(rows) ? rows : [];
   if (!mongoReady() || !list.length) return list;
 
-  const farmerIds = [...new Set(list.map((row) => String(row?.farmer_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-  const accountIds = [...new Set(list.map((row) => String(row?.company_account_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+  const farmerIds = [...new Set(list
+    .filter((row) => !String(row?.farmer_name || "").trim())
+    .map((row) => String(row?.farmer_id || ""))
+    .filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+  const accountIds = [...new Set(list
+    .filter((row) => !String(row?.company_account_name || "").trim())
+    .map((row) => String(row?.company_account_id || ""))
+    .filter((id) => mongoose.Types.ObjectId.isValid(id)))];
   const [farmers, accounts] = await Promise.all([
     farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
     accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
@@ -5134,7 +5152,23 @@ router.get("/report/profit-loss", async (req, res) => {
   }
 });
 
+const purchasePartyLedgerCache = new Map();
+const PURCHASE_PARTY_LEDGER_CACHE_MS = 8000;
+
 router.get("/report/purchase-party-ledger", async (req, res) => {
+  ensureTradingIndexes();
+  const cacheKey = JSON.stringify([
+    req.user?.id || req.user?._id || "",
+    String(req.query.farmer_id || "").trim(),
+    String(req.query.warehouse_id || "").trim(),
+    String(req.query.company_account_id || "").trim(),
+    String(req.query.details_of_deduction || "").trim(),
+  ]);
+  const cachedLedger = purchasePartyLedgerCache.get(cacheKey);
+  if (cachedLedger && Date.now() - cachedLedger.time < PURCHASE_PARTY_LEDGER_CACHE_MS) {
+    res.set("Cache-Control", "private, max-age=5, stale-while-revalidate=10");
+    return res.json(cachedLedger.data);
+  }
   if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
     return res.status(403).json({ error: "Permission denied" });
   }
@@ -5314,11 +5348,18 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     ];
 
     const enrichedRows = await enrichLedgerRowsWithPartyDetails(rows);
-    return res.json(buildLedgerRows(
+    const responseData = buildLedgerRows(
       enrichedRows,
       (row) => `${row.farmer_id || "unknown"}::${row.company_account_id || "no-account"}`,
       (row) => row.farmer_name || row.company_account_name || "Unknown Farmer"
-    ));
+    );
+    purchasePartyLedgerCache.set(cacheKey, { time: Date.now(), data: responseData });
+    if (purchasePartyLedgerCache.size > 100) {
+      const oldestKey = purchasePartyLedgerCache.keys().next().value;
+      purchasePartyLedgerCache.delete(oldestKey);
+    }
+    res.set("Cache-Control", "private, max-age=5, stale-while-revalidate=10");
+    return res.json(responseData);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
