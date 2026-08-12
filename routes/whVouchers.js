@@ -5377,49 +5377,125 @@ function mongoReferenceValues(value) {
 }
 
 async function getMongoSalePartyLedgerSupport(req, sales) {
-  if (!mongoReady()) return { receipts: [], adjustments: [] };
-
-  const receiptCollection = await getMongoCollectionIfExists([
-    "wh_receipt_vouchers", "receipt_vouchers", "receiptvouchers", "receipts"
-  ]);
-  const adjustmentCollection = await getMongoCollectionIfExists([
-    "wh_receipt_adjustments", "receipt_adjustments", "receiptadjustments"
-  ]);
-  if (!receiptCollection) return { receipts: [], adjustments: [] };
-
-  const buyerIds = [...new Set((sales || []).flatMap((s) => [s?.buyer_id, s?.company_id]).filter(Boolean).map(String))];
+  // Sale vouchers are MongoDB-first, but receipt vouchers created by the
+  // current Receipt screen are still stored in SQLite. The Sale Party Ledger
+  // must therefore read BOTH stores; otherwise existing receipts disappear
+  // from the ledger even though they were successfully saved.
   const warehouseId = String(req.query.warehouse_id || "").trim();
   const accountId = String(req.query.company_account_id || "").trim();
   const buyerId = String(req.query.buyer_id || "").trim();
+  const buyerIds = [...new Set((sales || []).flatMap((s) => [s?.buyer_id, s?.company_id]).filter(Boolean).map(String))];
 
-  const clauses = [];
-  const idsForBuyer = buyerId ? [buyerId] : buyerIds;
-  if (idsForBuyer.length) {
-    const idVals = idsForBuyer.flatMap(mongoReferenceValues);
-    clauses.push({ $or: [
-      { company_id: { $in: idVals } },
-      { buyer_id: { $in: idVals } },
-      { party_id: { $in: idVals } },
-    ]});
-  }
-  if (warehouseId) clauses.push({ warehouse_id: { $in: mongoReferenceValues(warehouseId) } });
-  if (accountId) clauses.push({ company_account_id: { $in: mongoReferenceValues(accountId) } });
+  const receiptsByKey = new Map();
+  const adjustmentsByKey = new Map();
+  const addReceipt = (row, source) => {
+    if (!row) return;
+    const keys = [row?._id, row?.id, row?.voucher_no].filter(Boolean).map(String);
+    const key = keys[0] || `${source}:${row?.company_id || row?.buyer_id || ""}:${row?.date || ""}:${row?.amount || 0}`;
+    const existing = receiptsByKey.get(key);
+    if (!existing || (existing.source !== "mongo" && source === "mongo")) {
+      receiptsByKey.set(key, { ...row, source });
+    }
+    for (const k of keys) receiptsByKey.set(k, { ...(receiptsByKey.get(k) || row), ...row, source: source === "mongo" ? "mongo" : (receiptsByKey.get(k)?.source || source) });
+  };
+  const addAdjustment = (row, source) => {
+    if (!row) return;
+    const keys = [row?._id, row?.id, row?.receipt_id, row?.sale_id, row?.sale_voucher_no, row?.reference_id].filter(Boolean).map(String);
+    const key = keys[0] || `${source}:${row?.receipt_id || ""}:${row?.sale_id || ""}:${row?.adjusted_amount || 0}`;
+    if (!adjustmentsByKey.has(key)) adjustmentsByKey.set(key, { ...row, source });
+  };
 
-  const receipts = typeof receiptCollection.find === "function"
-    ? await receiptCollection.find(clauses.length ? { $and: clauses } : {}).sort({ date: 1, _id: 1 }).toArray()
-    : [];
-  let adjustments = [];
-  if (adjustmentCollection && receipts.length) {
-    const receiptIds = receipts.flatMap((r) => mongoReferenceValues(r?._id || r?.id));
-    const saleIds = (sales || []).flatMap((s) => [s?._id, s?.id, s?.voucher_no, s?.bill_no, s?.legacy_id, s?.sqlite_id]).flatMap(mongoReferenceValues);
-    const or = [];
-    if (receiptIds.length) or.push({ receipt_id: { $in: receiptIds } });
-    if (saleIds.length) or.push({ sale_id: { $in: saleIds } }, { sale_voucher_no: { $in: saleIds.map(String) } }, { reference_id: { $in: saleIds.map(String) } });
-    if (or.length && typeof adjustmentCollection.find === "function") {
-      adjustments = await adjustmentCollection.find({ $or: or }).sort({ createdAt: 1, _id: 1 }).toArray();
+  if (mongoReady()) {
+    try {
+      const receiptCollection = await getMongoCollectionIfExists([
+        "wh_receipt_vouchers", "receipt_vouchers", "receiptvouchers", "receipts"
+      ]);
+      const adjustmentCollection = await getMongoCollectionIfExists([
+        "wh_receipt_adjustments", "receipt_adjustments", "receiptadjustments"
+      ]);
+
+      if (receiptCollection) {
+        const clauses = [];
+        const idsForBuyer = buyerId ? [buyerId] : buyerIds;
+        if (idsForBuyer.length) {
+          const idVals = idsForBuyer.flatMap(mongoReferenceValues);
+          clauses.push({ $or: [
+            { company_id: { $in: idVals } },
+            { buyer_id: { $in: idVals } },
+            { party_id: { $in: idVals } },
+          ]});
+        }
+        if (warehouseId) clauses.push({ warehouse_id: { $in: mongoReferenceValues(warehouseId) } });
+        if (accountId) clauses.push({ company_account_id: { $in: mongoReferenceValues(accountId) } });
+        const mongoReceipts = await receiptCollection.find(clauses.length ? { $and: clauses } : {}).sort({ date: 1, _id: 1 }).toArray();
+        mongoReceipts.forEach((r) => addReceipt(r, "mongo"));
+
+        if (adjustmentCollection && mongoReceipts.length) {
+          const receiptIds = mongoReceipts.flatMap((r) => mongoReferenceValues(r?._id || r?.id));
+          const saleIds = (sales || []).flatMap((s) => [s?._id, s?.id, s?.voucher_no, s?.bill_no, s?.legacy_id, s?.sqlite_id]).flatMap(mongoReferenceValues);
+          const or = [];
+          if (receiptIds.length) or.push({ receipt_id: { $in: receiptIds } });
+          if (saleIds.length) or.push({ sale_id: { $in: saleIds } }, { sale_voucher_no: { $in: saleIds.map(String) } }, { reference_id: { $in: saleIds.map(String) } });
+          if (or.length) {
+            const mongoAdjustments = await adjustmentCollection.find({ $or: or }).sort({ createdAt: 1, _id: 1 }).toArray();
+            mongoAdjustments.forEach((a) => addAdjustment(a, "mongo"));
+          }
+        }
+      }
+    } catch (mongoErr) {
+      console.warn("Mongo receipt ledger lookup skipped:", mongoErr?.message || mongoErr);
     }
   }
-  return { receipts, adjustments };
+
+  // Current Receipt Voucher API persists receipts/adjustments in SQLite.
+  // Always include them so old and newly-created receipts appear immediately
+  // in Sale Party Ledger.
+  try {
+    const where = [];
+    const params = [];
+    if (buyerId) {
+      where.push("(CAST(r.company_id AS TEXT)=CAST(? AS TEXT) OR CAST(r.buyer_id AS TEXT)=CAST(? AS TEXT))");
+      params.push(buyerId, buyerId);
+    } else if (buyerIds.length) {
+      where.push(`CAST(r.company_id AS TEXT) IN (${buyerIds.map(() => "?").join(",")})`);
+      params.push(...buyerIds);
+    }
+    if (warehouseId) { where.push("CAST(r.warehouse_id AS TEXT)=CAST(? AS TEXT)"); params.push(warehouseId); }
+    if (accountId) { where.push("CAST(r.company_account_id AS TEXT)=CAST(? AS TEXT)"); params.push(accountId); }
+    const sqliteReceipts = await dbAll(
+      `SELECT r.* FROM wh_receipt_vouchers r ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY r.date ASC, r.id ASC`,
+      params
+    );
+    sqliteReceipts.forEach((r) => addReceipt(r, "sqlite"));
+
+    if (sqliteReceipts.length) {
+      const receiptIds = sqliteReceipts.map((r) => String(r.id));
+      const placeholders = receiptIds.map(() => "?").join(",");
+      const sqliteAdjustments = await dbAll(
+        `SELECT a.* FROM wh_receipt_adjustments a WHERE CAST(a.receipt_id AS TEXT) IN (${placeholders}) ORDER BY a.id ASC`,
+        receiptIds
+      );
+      const saleVoucherById = new Map((sales || []).flatMap((s) => [
+        [String(s?.id || s?._id || ""), s],
+        [String(s?.voucher_no || ""), s],
+        [String(s?.bill_no || ""), s],
+      ]).filter(([k]) => k));
+      sqliteAdjustments.forEach((a) => {
+        const sale = saleVoucherById.get(String(a.sale_id));
+        addAdjustment({
+          ...a,
+          sale_voucher_no: a.sale_voucher_no || sale?.voucher_no || sale?.bill_no || "",
+        }, "sqlite");
+      });
+    }
+  } catch (sqliteErr) {
+    console.warn("SQLite receipt ledger lookup skipped:", sqliteErr?.message || sqliteErr);
+  }
+
+  return {
+    receipts: [...receiptsByKey.values()],
+    adjustments: [...adjustmentsByKey.values()],
+  };
 }
 
 async function getMongoPartyMasters(ids, candidates) {
