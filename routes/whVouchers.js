@@ -1002,52 +1002,74 @@ async function decorateSaleRows(rows) {
   const mongoProductIds = safeObjectIds(productIds);
   const mongoAccountIds = safeObjectIds(accountIds);
 
-  const mirrorFilters = (table, ids) => ({
-    table,
-    row_id: { $in: ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0) },
-  });
+  // IMPORTANT: Sale data is MongoDB-first. Do not call SqliteMirrorRow here.
+  // Older code did `SqliteMirrorRow.find(...)`, but that model is not exported
+  // in some deployments, causing: Cannot read properties of undefined (reading 'find').
+  // Buyer/consignee masters are read directly from MongoDB collections instead.
+  const mongoMasterRows = async (collectionName, ids) => {
+    if (!mongoose?.connection?.readyState || !ids.length) return [];
+    try {
+      const collection = mongoose.connection.collection(collectionName);
+      const objectIds = safeObjectIds(ids).map((id) => new mongoose.Types.ObjectId(id));
+      const clauses = [];
+      if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
+      clauses.push({ id: { $in: ids } });
+      clauses.push({ id: { $in: ids.map((id) => Number(id)).filter((id) => Number.isFinite(id)) } });
+      return await collection.find({ $or: clauses }).toArray();
+    } catch (err) {
+      console.warn(`Mongo master lookup skipped (${collectionName}):`, err?.message || err);
+      return [];
+    }
+  };
 
-  // Reporting must never fail because one optional master/mirror collection is
-  // unavailable. Every lookup is independent and has an empty fallback.
-  const results = await Promise.allSettled([
+  const [warehouses, products, accounts, buyers, consignees] = await Promise.all([
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
-    buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : Promise.resolve([]),
-    consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : Promise.resolve([]),
-    // Some Sale vouchers still contain the legacy SQLite buyer id directly.
-    // Read buyer_names by TEXT id as a reliable fallback so the Sale Party
-    // Ledger never shows a blank party merely because the mirror row is stale.
-    buyerIds.length
-      ? dbAll(`SELECT * FROM buyer_names WHERE CAST(id AS TEXT) IN (${buyerIds.map(() => "?").join(",")})`, buyerIds)
-      : Promise.resolve([]),
+    mongoMasterRows("buyer_names", buyerIds),
+    mongoMasterRows("consignee_names", consigneeIds),
   ]);
 
-  const valueAt = (index) => results[index].status === "fulfilled" && Array.isArray(results[index].value) ? results[index].value : [];
-  results.forEach((result, index) => {
-    if (result.status === "rejected") console.warn(`Sale row lookup ${index} skipped:`, result.reason?.message || result.reason);
-  });
+  const makeLookup = (items) => {
+    const map = new Map();
+    for (const item of Array.isArray(items) ? items : []) {
+      const keys = [item?._id, item?.id, item?.legacy_id, item?.row_id]
+        .filter((v) => v !== undefined && v !== null && String(v) !== "")
+        .map(String);
+      keys.forEach((key) => map.set(key, item));
+    }
+    return map;
+  };
 
-  const byMongoId = (items) => new Map(items.map((item) => [String(item?._id), item]));
-  const byMirrorId = (items) => new Map(items.map((item) => [String(item?.row_id), item?.data || {}]));
-  const mongoWarehouseMap = byMongoId(valueAt(0));
-  const mongoProductMap = byMongoId(valueAt(1));
-  const mongoAccountMap = byMongoId(valueAt(2));
-  const buyerMap = byMirrorId(valueAt(3));
-  const consigneeMap = byMirrorId(valueAt(4));
-  const sqliteBuyerMap = new Map(
-    valueAt(5).map((item) => [String(item?.id || ""), item]).filter(([id]) => id)
-  );
+  const warehouseMap = makeLookup(warehouses);
+  const productMap = makeLookup(products);
+  const accountMap = makeLookup(accounts);
+  const buyerMap = makeLookup(buyers);
+  const consigneeMap = makeLookup(consignees);
 
   return plainRows.map((plain) => {
     const buyerId = String(plain?.buyer_id || plain?.company_id || "");
-    const warehouse = mongoWarehouseMap.get(String(plain?.warehouse_id || ""));
-    const product = mongoProductMap.get(String(plain?.product_id || ""));
-    const account = mongoAccountMap.get(String(plain?.company_account_id || ""));
-    const buyer = buyerMap.get(buyerId) || sqliteBuyerMap.get(buyerId) || {};
-    const consignee = consigneeMap.get(String(plain?.consignee_id || ""));
-    const totalQuantity = Number(plain?.quantity ?? plain?.total_quantity ?? Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0));
-    const totalAmount = Number(plain?.amount ?? plain?.total_amount ?? plain?.net_receivable_amount ?? 0);
+    const warehouse = warehouseMap.get(String(plain?.warehouse_id || ""));
+    const product = productMap.get(String(plain?.product_id || ""));
+    const account = accountMap.get(String(plain?.company_account_id || ""));
+    const buyer = buyerMap.get(buyerId) || {};
+    const consignee = consigneeMap.get(String(plain?.consignee_id || "")) || {};
+    const totalQuantity = Number(
+      plain?.quantity ??
+      plain?.total_quantity ??
+      plain?.unloading_qty ??
+      Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0)
+    );
+    const totalAmount = Number(
+      plain?.amount ??
+      plain?.total_amount ??
+      plain?.net_receivable_amount ??
+      plain?.net_amount ??
+      0
+    );
+    const rate = Number(plain?.rate ?? 0);
+    const grossAmount = Number(plain?.gross_amount ?? (totalQuantity * rate));
+
     return {
       ...plain,
       id: String(plain?._id || plain?.id || ""),
@@ -1056,14 +1078,16 @@ async function decorateSaleRows(rows) {
       warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
       product_name: product?.name || plain?.product_name || "-",
       company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
-      buyer_name: buyer?.name || buyer?.company_name || plain?.buyer_name || plain?.party_name || plain?.company_name || "-",
+      buyer_name: buyer?.name || buyer?.company_name || buyer?.party_name || plain?.buyer_name || plain?.party_name || plain?.company_name || "-",
       buyer_email: buyer?.email || plain?.buyer_email || "",
-      buyer_mobile: buyer?.mobile || plain?.buyer_mobile || "",
-      consignee_name: consignee?.name || plain?.consignee_name || "-",
+      buyer_mobile: buyer?.mobile || buyer?.phone || plain?.buyer_mobile || "",
+      consignee_name: consignee?.name || consignee?.company_name || plain?.consignee_name || "-",
       consignee_email: consignee?.email || plain?.consignee_email || "",
-      consignee_mobile: consignee?.mobile || plain?.consignee_mobile || "",
+      consignee_mobile: consignee?.mobile || consignee?.phone || plain?.consignee_mobile || "",
+      rate: Number.isFinite(rate) ? rate : 0,
       total_quantity: Number.isFinite(totalQuantity) ? totalQuantity : 0,
       total_amount: Number.isFinite(totalAmount) ? totalAmount : 0,
+      gross_amount: Number.isFinite(grossAmount) ? grossAmount : 0,
       ...calculateSaleFollowupMeta(plain || {}),
     };
   });
@@ -4642,21 +4666,34 @@ router.get("/report/filter-options", async (req, res) => {
 
     // Return labels together with IDs so Reports do not need to load the
     // entire nine-table master bundle just to populate filter dropdowns.
+    const mongoBuyerMasterRows = async () => {
+      if (!cleanBuyerIds.length || !mongoose?.connection?.readyState) return [];
+      try {
+        const collection = mongoose.connection.collection("buyer_names");
+        const objectIds = cleanBuyerIds.filter((id) => mongoose.Types.ObjectId.isValid(id)).map((id) => new mongoose.Types.ObjectId(id));
+        const clauses = [];
+        if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
+        clauses.push({ id: { $in: cleanBuyerIds } });
+        clauses.push({ id: { $in: cleanBuyerIds.map(Number).filter(Number.isFinite) } });
+        return await collection.find({ $or: clauses }).toArray();
+      } catch (err) {
+        console.warn("Mongo buyer filter lookup skipped:", err?.message || err);
+        return [];
+      }
+    };
+
     const [accountDocs, warehouseDocs, farmerDocs, buyerDocs] = await Promise.all([
       cleanAccountIds.length ? CompanyAccount.find({ _id: { $in: cleanAccountIds } }).select("_id account_name name").lean() : [],
       cleanWarehouseIds.length ? Warehouse.find({ _id: { $in: cleanWarehouseIds } }).select("_id name").lean() : [],
       cleanFarmerIds.length ? Farmer.find({ _id: { $in: cleanFarmerIds } }).select("_id name").lean() : [],
-      cleanBuyerIds.length ? SqliteMirrorRow.find({
-        table: "buyer_names",
-        row_id: { $in: cleanBuyerIds.map((value) => Number(value)).filter(Number.isFinite) },
-      }).select("row_id data").lean() : [],
+      mongoBuyerMasterRows(),
     ]);
 
     const cleanNamed = (docs, type) => {
       if (type === "buyer") {
         return (docs || []).map((doc) => ({
-          id: String(doc.row_id),
-          name: String(doc?.data?.name || doc?.data?.company_name || "").trim(),
+          id: String(doc?._id || doc?.id || doc?.legacy_id || ""),
+          name: String(doc?.name || doc?.company_name || doc?.party_name || "").trim(),
         })).filter((item) => item.id && item.name);
       }
       return (docs || []).map((doc) => ({
@@ -5164,42 +5201,24 @@ router.get("/report/sale-party-ledger", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
   }
-
   try {
     const buyerId = String(req.query.buyer_id || "").trim();
     const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
+    const sales = await getSaleReportRowsForUser(req.user, { buyerId, farmerId, warehouseId, companyAccountId });
 
-    // Sale rows are read from the active reporting source (MongoDB when
-    // enabled, SQLite otherwise). Receipt/adjustment history may still be in
-    // SQLite, so never assume that a Mongo _id === SQLite sale_id.
-    const sales = await getSaleReportRowsForUser(req.user, {
-      buyerId,
-      farmerId,
-      warehouseId,
-      companyAccountId,
-    });
-
+    // Sale Party Ledger must still render when receipt/adjustment mirror data is
+    // temporarily unavailable. The sale rows themselves are the primary ledger
+    // source; receipts are optional detail rows.
     let receipts = [];
     let adjustmentRows = [];
     const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
     const receiptParams = [...filter.params];
     const clauses = [];
-
-    if (buyerId) {
-      clauses.push(" AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)");
-      receiptParams.push(buyerId);
-    }
-    if (warehouseId) {
-      clauses.push(" AND CAST(r.warehouse_id AS TEXT) = CAST(? AS TEXT)");
-      receiptParams.push(warehouseId);
-    }
-    if (companyAccountId) {
-      clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)");
-      receiptParams.push(companyAccountId);
-    }
-
+    if (buyerId) { clauses.push(" AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(buyerId); }
+    if (warehouseId) { clauses.push(" AND CAST(r.warehouse_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(warehouseId); }
+    if (companyAccountId) { clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(companyAccountId); }
     try {
       receipts = await dbAll(`
         SELECT
@@ -5207,333 +5226,145 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           ca.account_name AS company_account_name,
           b.name AS buyer_name
         FROM wh_receipt_vouchers r
-        LEFT JOIN company_accounts ca
-          ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
-        LEFT JOIN buyer_names b
-          ON CAST(b.id AS TEXT) = CAST(COALESCE(r.company_id, r.buyer_id) AS TEXT)
+        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
+        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(r.company_id AS TEXT)
         WHERE 1=1 ${filter.clause} ${clauses.join(" ")}
         ORDER BY r.date DESC, r.id DESC
       `, receiptParams);
 
-      const receiptIds = receipts.map((row) => row.id).filter((id) => id !== null && id !== undefined);
-      adjustmentRows = receiptIds.length
-        ? await dbAll(`
-            SELECT
-              a.*,
-              rv.voucher_no AS receipt_voucher_no,
-              rv.date AS adjustment_receipt_date,
-              rv.amount AS adjustment_receipt_amount
-            FROM wh_receipt_adjustments a
-            LEFT JOIN wh_receipt_vouchers rv
-              ON CAST(rv.id AS TEXT) = CAST(a.receipt_id AS TEXT)
-            WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
-            ORDER BY a.id ASC
-          `, receiptIds)
-        : [];
+      const receiptIds = receipts.map((row) => row.id);
+      adjustmentRows = receiptIds.length ? await dbAll(`
+        SELECT a.*, rv.voucher_no AS receipt_voucher_no
+        FROM wh_receipt_adjustments a
+        LEFT JOIN wh_receipt_vouchers rv ON CAST(rv.id AS TEXT) = CAST(a.receipt_id AS TEXT)
+        WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
+        ORDER BY a.id ASC
+      `, receiptIds) : [];
     } catch (receiptErr) {
-      console.warn("Sale Party Ledger receipt details unavailable:", receiptErr.message);
+      console.warn("Sale Party Ledger receipt details unavailable; rendering sale rows only:", receiptErr.message);
       receipts = [];
       adjustmentRows = [];
     }
 
-    const saleList = Array.isArray(sales) ? sales : [];
-    const receiptList = Array.isArray(receipts) ? receipts : [];
-    const adjustments = Array.isArray(adjustmentRows) ? adjustmentRows : [];
-
-    const normalizeKey = (value) => String(value ?? "").trim().toLowerCase();
-    const firstNonEmpty = (...values) => values.find((value) => {
-      return value !== undefined && value !== null && String(value).trim() !== "";
+    // Match Mongo Sale vouchers using every stable reference we have.
+    // Legacy receipt adjustments can contain an old SQLite sale_id, while the
+    // current Sale voucher has a Mongo ObjectId. Voucher/bill number is the
+    // bridge between the two generations.
+    const saleMap = new Map();
+    (sales || []).forEach((row) => {
+      const keys = [row?.id, row?._id, row?.voucher_no, row?.bill_no, row?.legacy_id, row?.sqlite_id]
+        .filter((v) => v !== undefined && v !== null && String(v).trim() !== "")
+        .map(String);
+      keys.forEach((key) => saleMap.set(key, row));
     });
-
-    // Multiple ID systems can coexist:
-    //   Mongo sale _id / id
-    //   legacy SQLite wh_sale_vouchers.id
-    //   bill_no / voucher_no / reference_id
-    // Build all keys so old receipts can still be attached to the current
-    // Mongo sale row.
-    const saleByKey = new Map();
-    const addSaleKey = (key, sale) => {
-      const normalized = normalizeKey(key);
-      if (normalized) saleByKey.set(normalized, sale);
-    };
-
-    saleList.forEach((sale) => {
-      addSaleKey(sale.id, sale);
-      addSaleKey(sale._id, sale);
-      addSaleKey(sale.voucher_no, sale);
-      addSaleKey(sale.bill_no, sale);
-      addSaleKey(sale.sale_id, sale);
-    });
-
-    // Legacy SQLite sale IDs are resolved to their voucher/bill numbers.
-    const legacySaleIds = [...new Set(
-      adjustments
-        .map((item) => String(item.sale_id ?? "").trim())
-        .filter(Boolean)
-    )];
-
-    if (legacySaleIds.length) {
-      try {
-        const legacyRows = await dbAll(`
-          SELECT id, voucher_no, bill_no
-          FROM wh_sale_vouchers
-          WHERE id IN (${legacySaleIds.map(() => "?").join(",")})
-        `, legacySaleIds);
-
-        legacyRows.forEach((legacy) => {
-          const sale = saleByKey.get(normalizeKey(legacy.voucher_no))
-            || saleByKey.get(normalizeKey(legacy.bill_no));
-          if (sale) {
-            addSaleKey(legacy.id, sale);
-          }
-        });
-      } catch (legacyErr) {
-        console.warn("Legacy sale-id mapping unavailable:", legacyErr.message);
-      }
-    }
-
-    const receiptMap = new Map(
-      receiptList.map((row) => [normalizeKey(row.id), row])
-    );
-
+    const receiptMap = new Map((receipts || []).map((row) => [String(row.id), row]));
     const bySale = new Map();
     const byReceipt = new Map();
-
-    const pushDetail = (sale, receipt, item, inferred = false) => {
-      if (!sale || !receipt) return;
-
-      const adjustedAmount = Number(
-        firstNonEmpty(
-          item?.adjusted_amount,
-          item?.amount,
-          item?.adjustment_amount,
-          0
-        )
-      ) || 0;
-
+    (adjustmentRows || []).forEach((item) => {
+      const saleKey = String(item.sale_id || item.sale_voucher_no || item.reference_id || "");
+      const receiptId = String(item.receipt_id || "");
+      const sale = saleMap.get(saleKey);
+      const receipt = receiptMap.get(receiptId);
       const detail = {
-        ...(item || {}),
-        sale_id: String(sale.id || sale._id || ""),
-        sale_voucher_no: firstNonEmpty(
-          sale.voucher_no,
-          sale.bill_no,
-          item?.sale_voucher_no,
-          item?.bill_no,
-          item?.sale_id,
-          ""
-        ),
-        receipt_id: String(receipt.id || ""),
-        receipt_date: firstNonEmpty(receipt.date, item?.adjustment_receipt_date, ""),
-        receipt_voucher_no: firstNonEmpty(
-          receipt.voucher_no,
-          item?.receipt_voucher_no,
-          ""
-        ),
-        receipt_amount: Number(firstNonEmpty(receipt.amount, item?.adjustment_receipt_amount, 0)) || 0,
-        adjusted_amount: Number(adjustedAmount.toFixed(2)),
-        inferred_adjustment: Boolean(inferred),
+        ...item,
+        sale_voucher_no: sale?.voucher_no || item.sale_voucher_no || item.sale_id,
+        receipt_date: receipt?.date || "",
+        receipt_voucher_no: receipt?.voucher_no || item.receipt_voucher_no || "",
+        receipt_amount: Number(receipt?.amount || 0),
       };
-
-      const saleKey = normalizeKey(sale.id || sale._id || sale.voucher_no || sale.bill_no);
-      const receiptKey = normalizeKey(receipt.id);
-
-      if (!bySale.has(saleKey)) bySale.set(saleKey, []);
-      bySale.get(saleKey).push(detail);
-
-      if (!byReceipt.has(receiptKey)) byReceipt.set(receiptKey, []);
-      byReceipt.get(receiptKey).push(detail);
-    };
-
-    // 1) Normal adjustment rows.
-    adjustments.forEach((item) => {
-      const receipt = receiptMap.get(normalizeKey(item.receipt_id));
-      const sale = saleByKey.get(normalizeKey(item.sale_id))
-        || saleByKey.get(normalizeKey(item.sale_voucher_no))
-        || saleByKey.get(normalizeKey(item.bill_no))
-        || saleByKey.get(normalizeKey(receipt?.reference_id));
-
-      pushDetail(sale, receipt, item, false);
+      if (!bySale.has(saleId)) bySale.set(saleId, []);
+      bySale.get(saleId).push(detail);
+      if (!byReceipt.has(receiptId)) byReceipt.set(receiptId, []);
+      byReceipt.get(receiptId).push(detail);
     });
 
-    // 2) Older receipt records sometimes contain reference_id but have no
-    // wh_receipt_adjustments row. Infer the bill link instead of dropping it.
-    receiptList.forEach((receipt) => {
-      const receiptKey = normalizeKey(receipt.id);
-      const existing = byReceipt.get(receiptKey) || [];
-      if (existing.length) return;
-
-      const referenceTokens = String(receipt.reference_id || "")
-        .split(/[,\s;|]+/)
-        .map((value) => value.trim())
-        .filter(Boolean);
-
-      const candidates = [
-        ...referenceTokens,
-        receipt.bill_no,
-        receipt.voucher_reference,
-      ].filter(Boolean);
-
-      for (const token of candidates) {
-        const sale = saleByKey.get(normalizeKey(token));
-        if (sale) {
-          pushDetail(
-            sale,
-            receipt,
-            {
-              sale_voucher_no: sale.voucher_no || sale.bill_no || token,
-              adjusted_amount: Number(receipt.amount || 0),
-            },
-            true
-          );
-          break;
-        }
-      }
+    // Some legacy receipts have no adjustment row but do carry reference_id.
+    // Treat a reference to the Mongo voucher/bill number as an inferred receipt
+    // adjustment so the Receipt Date/Voucher/Amount columns are not blank.
+    (receipts || []).forEach((receipt) => {
+      const reference = String(receipt?.reference_id || "").trim();
+      if (!reference) return;
+      const sale = saleMap.get(reference);
+      if (!sale) return;
+      const receiptId = String(receipt.id);
+      if (byReceipt.has(receiptId)) return;
+      const detail = {
+        sale_id: String(sale.id || sale._id || ""),
+        sale_voucher_no: sale.voucher_no || sale.bill_no || reference,
+        receipt_id: receiptId,
+        receipt_date: receipt.date || "",
+        receipt_voucher_no: receipt.voucher_no || "",
+        receipt_amount: Number(receipt.amount || 0),
+        adjusted_amount: Number(receipt.amount || 0),
+        inferred_adjustment: true,
+      };
+      const saleKey = String(sale.id || sale._id || "");
+      if (!bySale.has(saleKey)) bySale.set(saleKey, []);
+      bySale.get(saleKey).push(detail);
+      byReceipt.set(receiptId, [detail]);
     });
 
     const rows = [
-      ...saleList.map((row) => {
-        const saleKey = normalizeKey(row.id || row._id || row.voucher_no || row.bill_no);
-        const details = bySale.get(saleKey) || [];
-
-        const quantity = Number(firstNonEmpty(
-          row.quantity,
-          row.total_quantity,
-          row.dispatch_qty,
-          0
-        )) || 0;
-
-        const rate = Number(firstNonEmpty(row.rate, 0)) || 0;
-        const grossAmount = Number(firstNonEmpty(
-          row.gross_amount,
-          row.sale_gross_amount,
-          row.quantity && row.rate ? Number(row.quantity) * Number(row.rate) : undefined,
-          row.amount,
-          row.total_amount,
-          row.net_receivable_amount,
-          0
-        )) || 0;
-
-        const saleAmount = Number(firstNonEmpty(
-          row.total_amount,
-          row.net_receivable_amount,
-          row.amount,
-          row.gross_amount,
-          grossAmount,
-          0
-        )) || 0;
-
-        const receiptAmount = details.reduce(
-          (sum, item) => sum + (Number(item.adjusted_amount) || 0),
-          0
-        );
-
-        const normalizedParty = firstNonEmpty(
-          row.party_name,
-          row.buyer_name,
-          row.company_name,
-          row.consignee_name,
-          "-"
-        );
-
+      ...(sales || []).map((row) => {
+        const saleId = String(row.id || row._id);
+        const details = bySale.get(saleId) || [];
+        const saleAmount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
+        const receiptAmount = details.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
         return {
           ...row,
-          row_type: "entry",
-          date: row.date || row.bill_date || "",
-          voucher_no: firstNonEmpty(row.voucher_no, row.bill_no, "-"),
-          bill_no: firstNonEmpty(row.bill_no, row.voucher_no, "-"),
+          date: row.date,
+          voucher_no: row.voucher_no,
           voucher_type: "Sale",
-          particulars: `Sale Bill ${firstNonEmpty(row.voucher_no, row.bill_no, "")}`.trim(),
-          party_id: String(firstNonEmpty(row.buyer_id, row.company_id, "") || ""),
-          party_name: normalizedParty,
-          buyer_name: firstNonEmpty(row.buyer_name, normalizedParty, "-"),
-          company_account_name: firstNonEmpty(row.company_account_name, row.account_name, "-"),
-          product_name: firstNonEmpty(row.product_name, row.product, "-"),
-          quantity: Number(quantity.toFixed(4)),
-          total_quantity: Number(quantity.toFixed(4)),
-          rate: Number(rate.toFixed(2)),
-          gross_amount: Number(grossAmount.toFixed(2)),
+          particulars: `Sale Bill ${row.voucher_no || ""}`.trim(),
+          adjustment_details: details.map((item) => `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+          receipt_details: details,
+          sale_id: saleId,
           sale_amount: Number(saleAmount.toFixed(2)),
           receipt_amount: Number(receiptAmount.toFixed(2)),
-          receipt_details: details,
-          payment_details: details,
-          adjustment: Number(receiptAmount.toFixed(2)),
           journal_amount: 0,
           bill_balance: Number((saleAmount - receiptAmount).toFixed(2)),
-          debit: Number(saleAmount.toFixed(2)),
+          debit: saleAmount,
           credit: 0,
-          closing_balance: Number((saleAmount - receiptAmount).toFixed(2)),
-          adjustment_details: details.map((item) =>
-            `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`
-          ).join("; "),
+          party_id: String(row.buyer_id || row.company_id || ""),
+          party_name: row.buyer_name || row.party_name || row.company_name || row.consignee_name || "-",
+          company_account_name: row.company_account_name || "-",
+          product_name: row.product_name || "-",
+          quantity: Number(row.quantity ?? row.total_quantity ?? row.unloading_qty ?? 0),
+          total_quantity: Number(row.total_quantity ?? row.quantity ?? row.unloading_qty ?? 0),
+          rate: Number(row.rate || 0),
+          gross_amount: Number(row.gross_amount ?? (Number(row.total_quantity ?? row.quantity ?? 0) * Number(row.rate || 0))),
+          receipt_date: details[0]?.receipt_date || "",
+          receipt_voucher_no: details[0]?.receipt_voucher_no || "",
+          received_amount: Number(receiptAmount.toFixed(2)),
+          adjustment: Number(receiptAmount.toFixed(2)),
+          balance: Number((saleAmount - receiptAmount).toFixed(2)),
         };
       }),
-
-      ...receiptList.map((row) => {
-        const details = byReceipt.get(normalizeKey(row.id)) || [];
-        const partyName = firstNonEmpty(
-          row.party_name,
-          row.buyer_name,
-          row.company_name,
-          row.company_account_name,
-          "-"
-        );
-
+      ...(receipts || []).map((row) => {
+        const details = byReceipt.get(String(row.id)) || [];
+        const isOnAccount = !details.length && !String(row.reference_id || "").trim();
         return {
           ...row,
-          row_type: "entry",
-          date: row.date || "",
-          voucher_no: firstNonEmpty(row.voucher_no, row.receipt_no, "-"),
-          bill_no: firstNonEmpty(row.reference_id, ""),
+          date: row.date,
+          voucher_no: row.voucher_no,
           voucher_type: "Receipt",
-          particulars: details.length
-            ? `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ")}`
-            : "Unadjusted on account",
-          party_id: String(firstNonEmpty(row.company_id, row.buyer_id, "") || ""),
-          party_name: partyName,
-          buyer_name: firstNonEmpty(row.buyer_name, partyName, "-"),
-          company_account_name: firstNonEmpty(row.company_account_name, row.account_name, "-"),
-          product_name: "-",
-          quantity: 0,
-          total_quantity: 0,
-          rate: 0,
-          gross_amount: 0,
-          sale_amount: 0,
-          receipt_amount: Number(row.amount || 0),
+          particulars: isOnAccount ? "Unadjusted on account" : `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
+          adjustment_details: details.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+          reference_id: row.reference_id || details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
           receipt_details: details,
-          payment_details: details,
-          adjustment: Number(row.amount || 0),
-          journal_amount: 0,
-          bill_balance: 0,
           debit: 0,
           credit: Number(row.amount || 0),
-          closing_balance: 0,
-          reference_id: firstNonEmpty(
-            row.reference_id,
-            details.map((item) => item.sale_voucher_no).filter(Boolean).join(", "),
-            "On account"
-          ),
-          adjustment_details: details.map((item) =>
-            `${item.sale_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`
-          ).join("; "),
+          party_id: String(row.company_id || ""),
+          party_name: row.buyer_name || row.party_name || row.company_name || row.company_account_name || "-",
+          buyer_name: row.buyer_name || "-",
         };
       }),
     ];
 
-    const finalRows = buildLedgerRows(
-      rows,
-      (row) => `${row.party_id || "unknown"}::${row.company_account_id || "no-account"}`,
-      (row) => row.party_name || row.company_account_name || "Unknown Party"
-    ).map((row) => ({
-      ...row,
-      closing_balance: Number(row.balance || 0),
-    }));
-
-    return res.json(finalRows);
+    return res.json(buildLedgerRows(rows, (row) => `${row.party_id || "unknown"}::${row.company_account_id || "no-account"}`, (row) => row.party_name || row.company_account_name || "Unknown Party"));
   } catch (err) {
     console.error("Sale party ledger failed:", err);
-    return res.status(500).json({
-      error: err.message || "Failed to load sale party ledger",
-    });
+    res.status(500).json({ error: err.message || "Failed to load sale party ledger" });
   }
 });
 
