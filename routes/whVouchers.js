@@ -98,6 +98,10 @@ function normalizePartyNames(row = {}, buyerMaster = null, consigneeMaster = nul
     "-";
   const consigneeName =
     row.consignee_name ||
+    row.consignee ||
+    row.company_name ||
+    row.party_name ||
+    buyerName ||
     consigneeMaster?.name ||
     consigneeMaster?.consignee_name ||
     consigneeMaster?.company_name ||
@@ -5312,22 +5316,32 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       // $in array of regex expressions, because Mongo/Mongoose deployments can
       // serialize those differently.
       mongoJournals = await JournalVoucher.find({
-        description: { $regex: /^Auto sale deduction:/i },
-        amount: { $gt: 0 },
+        $and: [
+          { amount: { $gt: 0 } },
+          {
+            $or: [
+              { description: { $regex: /^Auto sale deduction:/i } },
+              { sale_id: { $in: (sales || []).map((s) => String(s.id || s._id || "")) } },
+              { sale_voucher_no: { $in: (sales || []).map((s) => String(s.voucher_no || s.bill_no || "")) } },
+              { reference_id: { $in: (sales || []).map((s) => String(s.id || s._id || "")) } },
+              { reference_no: { $in: (sales || []).map((s) => String(s.voucher_no || s.bill_no || "")) } },
+            ],
+          },
+        ],
       }).sort({ date: 1, createdAt: 1, _id: 1 }).lean();
     }
     const journalsBySale = new Map();
     for (const journal of mongoJournals) {
       const match = String(journal.description || "").match(/^Auto sale deduction:(.+?):(claim|other_deduction|cash_discount|tds)$/);
-      if (!match) continue;
-      const key = match[1];
+      const key = (match && match[1]) || String(journal.sale_id || journal.reference_id || journal.reference_no || journal.sale_voucher_no || "").trim();
+      if (!key) continue;
       if (!journalsBySale.has(key)) journalsBySale.set(key, []);
       journalsBySale.get(key).push({
         ...journal,
         id: String(journal._id),
         _id: String(journal._id),
-        type: match[2],
-        label: journal.credit_account || match[2],
+        type: match?.[2] || journal.type || journal.credit_account || "journal",
+        label: journal.credit_account || match?.[2] || journal.label || "journal",
         amount: Number(journal.amount || 0),
       });
     }
@@ -5339,7 +5353,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       const master = buyerMap.get(buyerIdValue) || {};
       const saleAmount = Number(row.total_amount ?? row.net_receivable_amount ?? row.amount ?? 0);
       const received = details.reduce((sum, d) => sum + Number(d.adjusted_amount || 0), 0);
-      const journalDetails = journalsBySale.get(String(row.voucher_no || row.bill_no || "")) || [];
+      const journalDetails = journalsBySale.get(String(row.voucher_no || row.bill_no || "")) || journalsBySale.get(saleId) || [];
       const journalAmount = journalDetails.reduce((sum, d) => sum + Number(d.amount || 0), 0);
       const partyName = row.buyer_name || row.party_name || row.company_name || master.name || master.buyer_name || master.company_name || master.party_name || "-";
       return {
