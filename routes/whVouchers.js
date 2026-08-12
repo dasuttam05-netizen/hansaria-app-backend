@@ -860,9 +860,20 @@ async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deduc
     location_id: body.location_id || sale.location_id || null,
   };
 
+  // F2 deductions must create FOUR independent journal vouchers.
+  // Do not combine Claim + Other Deduction and do not create a separate
+  // generic Shortage journal. Claim is the claim/shortage amount entered
+  // on the F2 screen; Other Deduction, CD and TDS each get their own entry.
+  const claimValue = Number(
+    body?.claim_amount !== undefined && body?.claim_amount !== null
+      ? body.claim_amount
+      : shortageAmount || 0
+  ) || 0;
+  const otherDeductionValue = Number(body?.other_deduction || 0) || 0;
+
   const rows = [
-    { key: "shortage", label: "Shortage", amount: Number(shortageAmount || 0) },
-    { key: "claim", label: "Claim", amount: Number(deductionAmount || 0) },
+    { key: "claim", label: "Claim", amount: claimValue },
+    { key: "other_deduction", label: "Other Deduction", amount: otherDeductionValue },
     { key: "cash_discount", label: "Cash Discount", amount: Number(cdAmount || 0) },
     { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
   ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
