@@ -916,77 +916,77 @@ function mongoIdFilter(id) {
 }
 
 async function decoratePurchaseRows(rows) {
-  const warehouseIds = [...new Set(rows.map((r) => r.warehouse_id).filter(mongoose.Types.ObjectId.isValid))];
-  const farmerIds = [...new Set(rows.map((r) => r.farmer_id).filter(mongoose.Types.ObjectId.isValid))];
-  const productIds = [...new Set(rows.map((r) => r.product_id).filter(mongoose.Types.ObjectId.isValid))];
-  const accountIds = [...new Set(rows.map((r) => r.company_account_id).filter(mongoose.Types.ObjectId.isValid))];
+  const plainRows = (Array.isArray(rows) ? rows : []).map((row) => (row?.toObject ? row.toObject() : row));
+  if (!plainRows.length) return [];
 
-  const [warehouses, farmers, products, accounts] = await Promise.all([
-    warehouseIds.length ? Warehouse.find({ _id: { $in: warehouseIds } }).select("_id name address location city district state pincode").lean() : [],
-    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).select("_id name mobile address village city district state pincode gst_no gst pan_no pan").lean() : [],
-    productIds.length ? Product.find({ _id: { $in: productIds } }).select("_id name").lean() : [],
-    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).select("_id account_name name address mobile email city district state pincode").lean() : [],
+  const warehouseIds = [...new Set(plainRows.map((r) => String(r?.warehouse_id || "")).filter(Boolean))];
+  const farmerIds = [...new Set(plainRows.map((r) => String(r?.farmer_id || "")).filter(Boolean))];
+  const productIds = [...new Set(plainRows.map((r) => String(r?.product_id || "")).filter(Boolean))];
+  const accountIds = [...new Set(plainRows.map((r) => String(r?.company_account_id || "")).filter(Boolean))];
+
+  const safeObjectIds = (ids) => ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const mongoWarehouseIds = safeObjectIds(warehouseIds);
+  const mongoFarmerIds = safeObjectIds(farmerIds);
+  const mongoProductIds = safeObjectIds(productIds);
+  const mongoAccountIds = safeObjectIds(accountIds);
+  const legacyFarmerIds = farmerIds.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+
+  const [warehouses, farmers, legacyFarmers, products, accounts] = await Promise.all([
+    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
+    mongoFarmerIds.length ? Farmer.find({ _id: { $in: mongoFarmerIds } }).lean() : Promise.resolve([]),
+    legacyFarmerIds.length ? sqliteRowsByIds("farmers", legacyFarmerIds) : Promise.resolve(new Map()),
+    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
+    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
   ]);
 
-  // Some older PurchaseVoucher rows store the legacy SQLite farmer id (number/string)
-  // instead of the Mongo ObjectId. Resolve those ids in one batch so Party Ledger
-  // never falls back to a blank farmer name.
-  const mongoFarmerKeys = new Set(farmers.map((item) => String(item._id)));
-  const legacyFarmerIds = [...new Set(rows.map((r) => String(r?.farmer_id ?? "").trim()).filter((id) => id && !mongoFarmerKeys.has(id)))];
-  const legacyFarmers = legacyFarmerIds.length
-    ? await dbAll(
-        `SELECT id, name, mobile, address, village, city, district, state, pincode, gst, gst_no, pan, pan_no FROM farmers WHERE CAST(id AS TEXT) IN (${legacyFarmerIds.map(() => "?").join(",")})`,
-        legacyFarmerIds
-      ).catch(() => [])
-    : [];
-
-  const byId = (items) => new Map(items.map((item) => [String(item._id ?? item.id), item]));
+  const byId = (items) => new Map((Array.isArray(items) ? items : []).map((item) => [String(item._id), item]));
   const warehouseMap = byId(warehouses);
-  const farmerMap = byId([...farmers, ...legacyFarmers]);
+  const farmerMap = byId(farmers);
   const productMap = byId(products);
   const accountMap = byId(accounts);
 
-  return rows.map((row) => {
-    const plain = row.toObject ? row.toObject() : row;
-    const warehouse = warehouseMap.get(String(plain.warehouse_id));
-    const farmer = farmerMap.get(String(plain.farmer_id));
-    const product = productMap.get(String(plain.product_id));
-    const account = accountMap.get(String(plain.company_account_id));
+  return plainRows.map((plain) => {
+    const farmerId = String(plain?.farmer_id || "");
+    const warehouse = warehouseMap.get(String(plain?.warehouse_id));
+    const farmer = farmerMap.get(farmerId);
+    const legacyFarmer = legacyFarmers.get(farmerId) || {};
+    const product = productMap.get(String(plain?.product_id));
+    const account = accountMap.get(String(plain?.company_account_id));
     return {
       ...plain,
-      id: String(plain._id),
-      _id: String(plain._id),
-      warehouse_name: warehouse?.name || plain.warehouse_name,
-      warehouse_address: warehouse?.address || plain.warehouse_address,
-      warehouse_location: warehouse?.location || plain.warehouse_location,
-      warehouse_city: warehouse?.city || plain.warehouse_city,
-      warehouse_district: warehouse?.district || plain.warehouse_district,
-      warehouse_state: warehouse?.state || plain.warehouse_state,
-      warehouse_pincode: warehouse?.pincode || plain.warehouse_pincode,
-      farmer_name: farmer?.name || plain.farmer_name,
-      farmer_mobile: farmer?.mobile || plain.farmer_mobile,
-      farmer_address: farmer?.address || plain.farmer_address,
-      farmer_village: farmer?.village || plain.farmer_village,
-      farmer_city: farmer?.city || plain.farmer_city,
-      farmer_district: farmer?.district || plain.farmer_district,
-      farmer_state: farmer?.state || plain.farmer_state,
-      farmer_pincode: farmer?.pincode || plain.farmer_pincode,
-      farmer_gst: farmer?.gst_no || farmer?.gst || plain.farmer_gst,
-      farmer_pan: farmer?.pan_no || farmer?.pan || plain.farmer_pan,
-      product_name: product?.name || plain.product_name,
-      company_account_name: account?.account_name || plain.company_account_name,
-      company_account_address: account?.address || plain.company_account_address,
-      company_account_mobile: account?.mobile || plain.company_account_mobile,
-      company_account_email: account?.email || plain.company_account_email,
-      company_account_city: account?.city || plain.company_account_city,
-      company_account_district: account?.district || plain.company_account_district,
-      company_account_state: account?.state || plain.company_account_state,
-      company_account_pincode: account?.pincode || plain.company_account_pincode,
-      company_account_gst: account?.gst_no || account?.gst || plain.company_account_gst,
-      company_account_pan: account?.pan_no || account?.pan || plain.company_account_pan,
-      total_quantity: plain.total_qty || plain.net_weight || plain.quantity || 0,
-      total_amount: plain.net_amount_payable || plain.amount || 0,
-      gross_amount: (plain.total_qty || plain.net_weight || plain.quantity || 0) * (plain.rate || 0),
+      id: String(plain?._id || plain?.id || ""),
+      _id: String(plain?._id || plain?.id || ""),
+      warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
+      warehouse_address: warehouse?.address || plain?.warehouse_address,
+      warehouse_location: warehouse?.location || plain?.warehouse_location,
+      warehouse_city: warehouse?.city || plain?.warehouse_city,
+      warehouse_district: warehouse?.district || plain?.warehouse_district,
+      warehouse_state: warehouse?.state || plain?.warehouse_state,
+      warehouse_pincode: warehouse?.pincode || plain?.warehouse_pincode,
+      farmer_name: plain?.farmer_name || farmer?.name || legacyFarmer?.name || "-",
+      farmer_mobile: plain?.farmer_mobile || farmer?.mobile || legacyFarmer?.mobile || legacyFarmer?.phone,
+      farmer_address: plain?.farmer_address || farmer?.address || legacyFarmer?.address,
+      farmer_village: plain?.farmer_village || farmer?.village || legacyFarmer?.village,
+      farmer_city: plain?.farmer_city || farmer?.city || legacyFarmer?.city,
+      farmer_district: plain?.farmer_district || farmer?.district || legacyFarmer?.district,
+      farmer_state: plain?.farmer_state || farmer?.state || legacyFarmer?.state,
+      farmer_pincode: plain?.farmer_pincode || farmer?.pincode || legacyFarmer?.pincode,
+      farmer_gst: plain?.farmer_gst || farmer?.gst_no || farmer?.gst || legacyFarmer?.gst_no || legacyFarmer?.gst,
+      farmer_pan: plain?.farmer_pan || farmer?.pan_no || farmer?.pan || legacyFarmer?.pan_no || legacyFarmer?.pan,
+      product_name: product?.name || plain?.product_name || "-",
+      company_account_name: account?.account_name || plain?.company_account_name || "-",
+      company_account_address: account?.address || plain?.company_account_address,
+      company_account_mobile: account?.mobile || plain?.company_account_mobile,
+      company_account_email: account?.email || plain?.company_account_email,
+      company_account_city: account?.city || plain?.company_account_city,
+      company_account_district: account?.district || plain?.company_account_district,
+      company_account_state: account?.state || plain?.company_account_state,
+      company_account_pincode: account?.pincode || plain?.company_account_pincode,
+      company_account_gst: account?.gst_no || account?.gst || plain?.company_account_gst,
+      company_account_pan: account?.pan_no || account?.pan || plain?.company_account_pan,
+      total_quantity: plain?.total_qty || plain?.net_weight || plain?.quantity || 0,
+      total_amount: plain?.net_amount_payable || plain?.amount || 0,
+      gross_amount: (plain?.total_qty || plain?.net_weight || plain?.quantity || 0) * (plain?.rate || 0),
     };
   });
 }
@@ -1006,13 +1006,7 @@ async function decorateSaleRows(rows) {
   const warehouseIds = [...new Set(plainRows.map((r) => String(r?.warehouse_id || "")).filter(Boolean))];
   const productIds = [...new Set(plainRows.map((r) => String(r?.product_id || "")).filter(Boolean))];
   const accountIds = [...new Set(plainRows.map((r) => String(r?.company_account_id || "")).filter(Boolean))];
-  // Keep BOTH buyer_id and company_id. Older sales may store the master
-  // reference in company_id while newer sales use buyer_id.
-  const buyerIds = [...new Set(
-    plainRows.flatMap((r) => [r?.buyer_id, r?.company_id])
-      .map((value) => String(value || "").trim())
-      .filter(Boolean)
-  )];
+  const buyerIds = [...new Set(plainRows.map((r) => String(r?.buyer_id || r?.company_id || "")).filter(Boolean))];
   const consigneeIds = [...new Set(plainRows.map((r) => String(r?.consignee_id || "")).filter(Boolean))];
 
   const safeObjectIds = (ids) => ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
@@ -1040,80 +1034,12 @@ async function decorateSaleRows(rows) {
     }
   };
 
-  // Buyer masters can exist under different collection names in older/newer deployments.
-  // Resolve both buyer_id and company_id against all supported buyer master collections
-  // so Sale Summary / Party Ledger never lose the buyer name.
-  const mongoBuyerRows = async (ids) => {
-    if (!mongoose?.connection?.readyState || !ids.length) return [];
-    try {
-      const values = ids.flatMap(mongoReferenceValues);
-      const objectIds = values.filter((value) => value instanceof mongoose.Types.ObjectId);
-      const stringIds = values.filter((value) => typeof value === "string");
-      const numericIds = values.filter((value) => typeof value === "number");
-      const names = new Set(
-        (await mongoose.connection.db.listCollections({}, { nameOnly: true }).toArray()).map((item) => item.name)
-      );
-      const candidates = ["buyer_names", "buyers", "parties", "company_names"].filter((name) => names.has(name));
-      const results = [];
-      for (const name of candidates) {
-        const collection = mongoose.connection.db.collection(name);
-        const clauses = [];
-        if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
-        if (stringIds.length) {
-          clauses.push({ id: { $in: stringIds } });
-          clauses.push({ legacy_id: { $in: stringIds } });
-          clauses.push({ row_id: { $in: stringIds } });
-        }
-        if (numericIds.length) clauses.push({ id: { $in: numericIds } });
-        if (clauses.length) results.push(...(await collection.find({ $or: clauses }).toArray()));
-      }
-      const seen = new Set();
-      return results.filter((item) => {
-        const key = String(item?._id || item?.id || item?.legacy_id || item?.row_id || "");
-        if (!key || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-    } catch (err) {
-      console.warn("Mongo buyer master lookup skipped:", err?.message || err);
-      return [];
-    }
-  };
-
-  // SQLite is a compatibility fallback for legacy numeric master IDs.
-  // Some older sales keep buyer/consignee masters in SQLite while the voucher
-  // itself is already stored in MongoDB.
-  const sqliteMasterRows = async (tableName, ids) => {
-    const clean = [...new Set((ids || []).map((value) => String(value || "").trim()).filter(Boolean))];
-    if (!clean.length) return [];
-    try {
-      const placeholders = clean.map(() => "?").join(",");
-      return await dbAll(
-        `SELECT * FROM ${tableName} WHERE CAST(id AS TEXT) IN (${placeholders})`,
-        clean
-      );
-    } catch (err) {
-      console.warn(`SQLite master lookup skipped (${tableName}):`, err?.message || err);
-      return [];
-    }
-  };
-
-  const [
-    warehouses,
-    products,
-    accounts,
-    buyers,
-    consignees,
-    sqliteBuyers,
-    sqliteConsignees,
-  ] = await Promise.all([
+  const [warehouses, products, accounts, buyers, consignees] = await Promise.all([
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
-    mongoBuyerRows(buyerIds),
+    mongoMasterRows("buyer_names", buyerIds),
     mongoMasterRows("consignee_names", consigneeIds),
-    sqliteMasterRows("buyer_names", buyerIds),
-    sqliteMasterRows("consignee_names", consigneeIds),
   ]);
 
   const makeLookup = (items) => {
@@ -1130,18 +1056,15 @@ async function decorateSaleRows(rows) {
   const warehouseMap = makeLookup(warehouses);
   const productMap = makeLookup(products);
   const accountMap = makeLookup(accounts);
-  const buyerMap = makeLookup([...(buyers || []), ...(sqliteBuyers || [])]);
-  const consigneeMap = makeLookup([...(consignees || []), ...(sqliteConsignees || [])]);
+  const buyerMap = makeLookup(buyers);
+  const consigneeMap = makeLookup(consignees);
 
   return plainRows.map((plain) => {
     const buyerId = String(plain?.buyer_id || plain?.company_id || "");
-    const buyerLookupIds = [plain?.buyer_id, plain?.company_id]
-      .map((value) => String(value || "").trim())
-      .filter(Boolean);
     const warehouse = warehouseMap.get(String(plain?.warehouse_id || ""));
     const product = productMap.get(String(plain?.product_id || ""));
     const account = accountMap.get(String(plain?.company_account_id || ""));
-    const buyer = buyerLookupIds.map((id) => buyerMap.get(id)).find(Boolean) || {};
+    const buyer = buyerMap.get(buyerId) || {};
     const consignee = consigneeMap.get(String(plain?.consignee_id || "")) || {};
     const totalQuantity = Number(
       plain?.quantity ??
@@ -1167,31 +1090,10 @@ async function decorateSaleRows(rows) {
       warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
       product_name: product?.name || plain?.product_name || "-",
       company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
-      buyer_name:
-        plain?.buyer_name && String(plain.buyer_name).trim() !== "-"
-          ? plain.buyer_name
-          : (
-              buyer?.name ||
-              buyer?.buyer_name ||
-              buyer?.company_name ||
-              buyer?.party_name ||
-              buyer?.account_name ||
-              plain?.party_name ||
-              plain?.company_name ||
-              "-"
-            ),
+      buyer_name: buyer?.name || buyer?.buyer_name || buyer?.company_name || buyer?.party_name || buyer?.account_name || plain?.buyer_name || plain?.party_name || plain?.company_name || "-",
       buyer_email: buyer?.email || plain?.buyer_email || "",
       buyer_mobile: buyer?.mobile || buyer?.phone || plain?.buyer_mobile || "",
-      consignee_name:
-        plain?.consignee_name && String(plain.consignee_name).trim() !== "-"
-          ? plain.consignee_name
-          : (
-              consignee?.name ||
-              consignee?.consignee_name ||
-              consignee?.company_name ||
-              consignee?.party_name ||
-              "-"
-            ),
+      consignee_name: consignee?.name || consignee?.consignee_name || consignee?.company_name || consignee?.party_name || plain?.consignee_name || "-",
       consignee_email: consignee?.email || plain?.consignee_email || "",
       consignee_mobile: consignee?.mobile || consignee?.phone || plain?.consignee_mobile || "",
       rate: Number.isFinite(rate) ? rate : 0,
@@ -4508,38 +4410,45 @@ async function getSaleReportRowsForUser(user, options = {}) {
 
 async function enrichLedgerRowsWithPartyDetails(rows) {
   const list = Array.isArray(rows) ? rows : [];
-  if (!mongoReady() || !list.length) return list;
+  if (!list.length) return list;
 
-  const farmerIds = [...new Set(list
-    .filter((row) => !String(row?.farmer_name || "").trim())
-    .map((row) => String(row?.farmer_id || ""))
-    .filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-  const accountIds = [...new Set(list
-    .filter((row) => !String(row?.company_account_name || "").trim())
-    .map((row) => String(row?.company_account_id || ""))
-    .filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-  const [farmers, accounts] = await Promise.all([
-    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
-    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
+  const farmerIds = [...new Set(list.map((row) => String(row?.farmer_id || "")).filter(Boolean))];
+  const accountIds = [...new Set(list.map((row) => String(row?.company_account_id || "")).filter(Boolean))];
+  const mongoFarmerIds = farmerIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const mongoAccountIds = accountIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const legacyFarmerIds = farmerIds.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+
+  // Most purchase rows are already decorated by getPurchaseReportRowsForUser.
+  // Only fetch missing master data, and do legacy farmer IDs in one SQLite query.
+  const needsFarmerLookup = list.some((row) => !String(row?.farmer_name || "").trim() || String(row?.farmer_name).trim() === "-");
+  const needsAccountLookup = list.some((row) => !String(row?.company_account_name || "").trim() || String(row?.company_account_name).trim() === "-");
+  if (!needsFarmerLookup && !needsAccountLookup) return list;
+
+  const [farmers, legacyFarmers, accounts] = await Promise.all([
+    mongoReady() && mongoFarmerIds.length ? Farmer.find({ _id: { $in: mongoFarmerIds } }).lean() : Promise.resolve([]),
+    legacyFarmerIds.length ? sqliteRowsByIds("farmers", legacyFarmerIds) : Promise.resolve(new Map()),
+    mongoReady() && mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
   ]);
   const farmerMap = new Map(farmers.map((item) => [String(item._id), item]));
   const accountMap = new Map(accounts.map((item) => [String(item._id), item]));
 
   return list.map((row) => {
-    const farmer = farmerMap.get(String(row?.farmer_id || ""));
-    const account = accountMap.get(String(row?.company_account_id || ""));
+    const farmerId = String(row?.farmer_id || "");
+    const farmer = farmerMap.get(farmerId) || {};
+    const legacyFarmer = legacyFarmers.get(farmerId) || {};
+    const account = accountMap.get(String(row?.company_account_id || "")) || {};
     return {
       ...row,
-      farmer_name: row?.farmer_name || farmer?.name,
-      farmer_mobile: row?.farmer_mobile || farmer?.mobile,
-      farmer_address: row?.farmer_address || farmer?.address,
-      farmer_village: row?.farmer_village || farmer?.village,
-      farmer_city: row?.farmer_city || farmer?.city,
-      farmer_district: row?.farmer_district || farmer?.district,
-      farmer_state: row?.farmer_state || farmer?.state,
-      farmer_pincode: row?.farmer_pincode || farmer?.pincode,
-      farmer_gst: row?.farmer_gst || farmer?.gst_no || farmer?.gst,
-      farmer_pan: row?.farmer_pan || farmer?.pan_no || farmer?.pan,
+      farmer_name: row?.farmer_name || farmer?.name || legacyFarmer?.name,
+      farmer_mobile: row?.farmer_mobile || farmer?.mobile || legacyFarmer?.mobile || legacyFarmer?.phone,
+      farmer_address: row?.farmer_address || farmer?.address || legacyFarmer?.address,
+      farmer_village: row?.farmer_village || farmer?.village || legacyFarmer?.village,
+      farmer_city: row?.farmer_city || farmer?.city || legacyFarmer?.city,
+      farmer_district: row?.farmer_district || farmer?.district || legacyFarmer?.district,
+      farmer_state: row?.farmer_state || farmer?.state || legacyFarmer?.state,
+      farmer_pincode: row?.farmer_pincode || farmer?.pincode || legacyFarmer?.pincode,
+      farmer_gst: row?.farmer_gst || farmer?.gst_no || farmer?.gst || legacyFarmer?.gst_no || legacyFarmer?.gst,
+      farmer_pan: row?.farmer_pan || farmer?.pan_no || farmer?.pan || legacyFarmer?.pan_no || legacyFarmer?.pan,
       company_account_name: row?.company_account_name || account?.account_name,
       company_account_address: row?.company_account_address || account?.address,
       company_account_mobile: row?.company_account_mobile || account?.mobile,
@@ -4764,20 +4673,11 @@ router.get("/report/filter-options", async (req, res) => {
     } else {
       const saleScope = { ...mongoSaleScope(req.user) };
       const buyerFilter = buyerId ? { $or: [{ buyer_id: buyerId }, { company_id: buyerId }] } : {};
-      const saleMasterScope = {
-        ...saleScope,
-        ...(accountId ? { company_account_id: accountId } : {}),
-        ...(warehouseId ? { warehouse_id: warehouseId } : {}),
-      };
-      const [saleAccountIds, saleWarehouseIds, saleBuyerIds, saleCompanyIds] = await Promise.all([
+      [accountIds, warehouseIds, buyerIds] = await Promise.all([
         SaleVoucher.distinct("company_account_id", { ...saleScope, ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...buyerFilter }),
         SaleVoucher.distinct("warehouse_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...buyerFilter }),
-        SaleVoucher.distinct("buyer_id", { ...saleMasterScope, ...buyerFilter }),
-        SaleVoucher.distinct("company_id", { ...saleMasterScope, ...buyerFilter }),
+        SaleVoucher.distinct("buyer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}) }),
       ]);
-      accountIds = saleAccountIds;
-      warehouseIds = saleWarehouseIds;
-      buyerIds = [...(saleBuyerIds || []), ...(saleCompanyIds || [])];
       farmerIds = [];
     }
 
@@ -4794,33 +4694,13 @@ router.get("/report/filter-options", async (req, res) => {
     const mongoBuyerMasterRows = async () => {
       if (!cleanBuyerIds.length || !mongoose?.connection?.readyState) return [];
       try {
-        const values = cleanBuyerIds.flatMap(mongoReferenceValues);
-        const objectIds = values.filter((value) => value instanceof mongoose.Types.ObjectId);
-        const stringIds = values.filter((value) => typeof value === "string");
-        const numericIds = values.filter((value) => typeof value === "number");
-        const names = new Set(
-          (await mongoose.connection.db.listCollections({}, { nameOnly: true }).toArray()).map((item) => item.name)
-        );
-        const results = [];
-        for (const name of ["buyer_names", "buyers", "parties", "company_names"].filter((item) => names.has(item))) {
-          const collection = mongoose.connection.db.collection(name);
-          const clauses = [];
-          if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
-          if (stringIds.length) {
-            clauses.push({ id: { $in: stringIds } });
-            clauses.push({ legacy_id: { $in: stringIds } });
-            clauses.push({ row_id: { $in: stringIds } });
-          }
-          if (numericIds.length) clauses.push({ id: { $in: numericIds } });
-          if (clauses.length) results.push(...(await collection.find({ $or: clauses }).toArray()));
-        }
-        const seen = new Set();
-        return results.filter((item) => {
-          const key = String(item?._id || item?.id || item?.legacy_id || item?.row_id || "");
-          if (!key || seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
+        const collection = mongoose.connection.collection("buyer_names");
+        const objectIds = cleanBuyerIds.filter((id) => mongoose.Types.ObjectId.isValid(id)).map((id) => new mongoose.Types.ObjectId(id));
+        const clauses = [];
+        if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
+        clauses.push({ id: { $in: cleanBuyerIds } });
+        clauses.push({ id: { $in: cleanBuyerIds.map(Number).filter(Number.isFinite) } });
+        return await collection.find({ $or: clauses }).toArray();
       } catch (err) {
         console.warn("Mongo buyer filter lookup skipped:", err?.message || err);
         return [];
@@ -5152,23 +5032,7 @@ router.get("/report/profit-loss", async (req, res) => {
   }
 });
 
-const purchasePartyLedgerCache = new Map();
-const PURCHASE_PARTY_LEDGER_CACHE_MS = 8000;
-
 router.get("/report/purchase-party-ledger", async (req, res) => {
-  ensureTradingIndexes();
-  const cacheKey = JSON.stringify([
-    req.user?.id || req.user?._id || "",
-    String(req.query.farmer_id || "").trim(),
-    String(req.query.warehouse_id || "").trim(),
-    String(req.query.company_account_id || "").trim(),
-    String(req.query.details_of_deduction || "").trim(),
-  ]);
-  const cachedLedger = purchasePartyLedgerCache.get(cacheKey);
-  if (cachedLedger && Date.now() - cachedLedger.time < PURCHASE_PARTY_LEDGER_CACHE_MS) {
-    res.set("Cache-Control", "private, max-age=5, stale-while-revalidate=10");
-    return res.json(cachedLedger.data);
-  }
   if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
     return res.status(403).json({ error: "Permission denied" });
   }
@@ -5200,11 +5064,13 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
 
     const paymentsPromise = dbAll(
       `
-        SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name, ca.account_name AS company_account_name
+        SELECT p.id, p.voucher_no, p.date, p.warehouse_id, p.farmer_id, p.company_account_id,
+               p.amount, p.reference_id, p.reference_type,
+               w.name AS warehouse_name, f.name AS farmer_name, ca.account_name AS company_account_name
         FROM wh_payment_vouchers p
-        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
-        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
-        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+        LEFT JOIN warehouses w ON w.id = p.warehouse_id
+        LEFT JOIN farmers f ON f.id = p.farmer_id
+        LEFT JOIN company_accounts ca ON ca.id = p.company_account_id
         WHERE 1 = 1 ${filter.clause} ${farmerClause} ${warehouseClause} ${accountClause}
       `,
       paymentParams
@@ -5215,9 +5081,8 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const sqliteAdjustments = paymentIds.length
       ? await dbAll(
           `
-            SELECT a.*, pv.voucher_no AS purchase_voucher_no
+            SELECT a.*
             FROM wh_payment_adjustments a
-            LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
             WHERE a.payment_id IN (${paymentIds.map(() => "?").join(",")})
             ORDER BY a.id ASC
           `,
@@ -5235,7 +5100,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       const purchaseId = String(item.purchase_id);
       const purchase = purchaseMap.get(purchaseId);
       const payment = paymentMap.get(paymentId);
-      const voucherNo = item.purchase_voucher_no || purchase?.voucher_no || item.purchase_id;
+      const voucherNo = purchase?.voucher_no || item.purchase_voucher_no || item.purchase_id;
       const detail = {
         ...item,
         purchase_voucher_no: voucherNo,
@@ -5348,18 +5213,11 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     ];
 
     const enrichedRows = await enrichLedgerRowsWithPartyDetails(rows);
-    const responseData = buildLedgerRows(
+    return res.json(buildLedgerRows(
       enrichedRows,
       (row) => `${row.farmer_id || "unknown"}::${row.company_account_id || "no-account"}`,
       (row) => row.farmer_name || row.company_account_name || "Unknown Farmer"
-    );
-    purchasePartyLedgerCache.set(cacheKey, { time: Date.now(), data: responseData });
-    if (purchasePartyLedgerCache.size > 100) {
-      const oldestKey = purchasePartyLedgerCache.keys().next().value;
-      purchasePartyLedgerCache.delete(oldestKey);
-    }
-    res.set("Cache-Control", "private, max-age=5, stale-while-revalidate=10");
-    return res.json(responseData);
+    ));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -5439,32 +5297,16 @@ async function getMongoSalePartyLedgerSupport(req, sales) {
 
 async function getMongoPartyMasters(ids, candidates) {
   if (!mongoReady() || !ids.length) return [];
-  try {
-    const vals = ids.flatMap(mongoReferenceValues);
-    const names = new Set(
-      (await mongoose.connection.db.listCollections({}, { nameOnly: true }).toArray()).map((item) => item.name)
-    );
-    const docs = [];
-    for (const name of (candidates || []).filter((candidate) => names.has(candidate))) {
-      const collection = mongoose.connection.db.collection(name);
-      docs.push(...(await collection.find({ $or: [
-        { _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } },
-        { id: { $in: vals } },
-        { legacy_id: { $in: vals } },
-        { row_id: { $in: vals } },
-      ] }).toArray()));
-    }
-    const seen = new Set();
-    return docs.filter((doc) => {
-      const key = String(doc?._id || doc?.id || doc?.legacy_id || doc?.row_id || "");
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  } catch (err) {
-    console.warn("Mongo party master lookup skipped:", err?.message || err);
-    return [];
-  }
+  const collection = await getMongoCollectionIfExists(candidates);
+  if (!collection) return [];
+  const vals = ids.flatMap(mongoReferenceValues);
+  const docs = await collection.find({ $or: [
+    { _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } },
+    { id: { $in: vals } },
+    { legacy_id: { $in: vals } },
+    { row_id: { $in: vals } },
+  ] }).toArray();
+  return docs;
 }
 
 router.get("/report/sale-party-ledger", async (req, res) => {
