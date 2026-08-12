@@ -5468,8 +5468,11 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         ...journal,
         id: String(journal._id),
         _id: String(journal._id),
+        voucher_no: journal.voucher_no || "",
         type: match?.[2] || journal.type || journal.credit_account || "journal",
         label: journal.credit_account || match?.[2] || journal.label || "journal",
+        credit_account: journal.credit_account || "",
+        description: journal.description || "",
         amount: Number(journal.amount || 0),
       });
     }
