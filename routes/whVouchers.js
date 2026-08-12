@@ -3141,31 +3141,66 @@ router.get("/receipt-pending-buyers", async (req, res) => {
   const startedAt = Date.now();
   const { company_account_id, warehouse_id, exclude_receipt_id } = req.query;
   if (!company_account_id) return res.status(400).json({ error: "company_account_id is required" });
-  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for pending buyers" });
+  const mongoAvailable = await waitForMongoReady();
   try {
-    const receiptCollection = await getMongoCollectionIfExists(["wh_receipt_vouchers","receipt_vouchers","receiptvouchers","receipts"]);
-    if (!receiptCollection) return res.status(503).json({ error: "MongoDB receipt collection not found" });
-    const salesFilter = { company_account_id: String(company_account_id) };
-    if (warehouse_id) salesFilter.warehouse_id = String(warehouse_id);
-    const sales = await SaleVoucher.find(salesFilter).select("buyer_id company_id net_receivable_amount net_amount amount").lean();
+    if (mongoAvailable) {
+      const receiptCollection = await getMongoCollectionIfExists(["wh_receipt_vouchers","receipt_vouchers","receiptvouchers","receipts"]);
+      if (!receiptCollection) return res.status(200).json([]);
+      const salesFilter = { company_account_id: String(company_account_id) };
+      if (warehouse_id) salesFilter.warehouse_id = String(warehouse_id);
+      const sales = await SaleVoucher.find(salesFilter).select("buyer_id company_id net_receivable_amount net_amount amount").lean();
+      const salesByBuyer = new Map();
+      for (const sale of sales || []) {
+        const buyerId = String(sale.buyer_id || sale.company_id || "").trim();
+        if (!buyerId) continue;
+        const amount = Number(sale.net_receivable_amount || sale.net_amount || sale.amount || 0);
+        salesByBuyer.set(buyerId, (salesByBuyer.get(buyerId) || 0) + amount);
+      }
+      const receiptFilter = { company_account_id: String(company_account_id) };
+      if (warehouse_id) receiptFilter.warehouse_id = String(warehouse_id);
+      if (exclude_receipt_id) {
+        const vals = mongoReferenceValues(exclude_receipt_id);
+        receiptFilter._id = { $nin: vals.filter((v) => v instanceof mongoose.Types.ObjectId) };
+        if (vals.some((v) => typeof v === "string" || typeof v === "number")) receiptFilter.id = { $nin: vals };
+      }
+      const receipts = await receiptCollection.find(receiptFilter).toArray();
+      const receiptMap = new Map();
+      for (const r of receipts || []) {
+        const buyerId = String(r.company_id || r.buyer_id || r.party_id || "").trim();
+        if (!buyerId) continue;
+        receiptMap.set(buyerId, (receiptMap.get(buyerId) || 0) + Number(r.amount || 0));
+      }
+      const result = [...salesByBuyer.entries()].map(([buyerId, totalSale]) => {
+        const totalReceipt = receiptMap.get(buyerId) || 0;
+        return { company_id: buyerId, total_sale: Number(totalSale.toFixed(2)), total_receipt: Number(totalReceipt.toFixed(2)), outstanding: Number(Math.max(0, totalSale-totalReceipt).toFixed(2)) };
+      }).filter(x => x.outstanding > 0).sort((a,b) => b.outstanding-a.outstanding);
+      res.set("Server-Timing", `receipt-pending-buyers-mongo;dur=${Date.now()-startedAt}`);
+      return res.json(result);
+    }
+
+    const sales = await dbAll(
+      `SELECT COALESCE(buyer_id, company_id) AS company_id, COALESCE(net_receivable_amount, net_amount, amount, 0) AS amount
+       FROM wh_sale_vouchers
+       WHERE CAST(company_account_id AS TEXT) = CAST(? AS TEXT)
+       ${warehouse_id ? "AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)" : ""}`,
+      warehouse_id ? [String(company_account_id), String(warehouse_id)] : [String(company_account_id)]
+    );
+    const receipts = await dbAll(
+      `SELECT COALESCE(company_id, buyer_id, party_id) AS company_id, COALESCE(amount, 0) AS amount
+       FROM wh_receipt_vouchers
+       WHERE CAST(company_account_id AS TEXT) = CAST(? AS TEXT)
+       ${warehouse_id ? "AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)" : ""}`,
+      warehouse_id ? [String(company_account_id), String(warehouse_id)] : [String(company_account_id)]
+    );
     const salesByBuyer = new Map();
     for (const sale of sales || []) {
-      const buyerId = String(sale.buyer_id || sale.company_id || "").trim();
+      const buyerId = String(sale.company_id || "").trim();
       if (!buyerId) continue;
-      const amount = Number(sale.net_receivable_amount || sale.net_amount || sale.amount || 0);
-      salesByBuyer.set(buyerId, (salesByBuyer.get(buyerId) || 0) + amount);
+      salesByBuyer.set(buyerId, (salesByBuyer.get(buyerId) || 0) + Number(sale.amount || 0));
     }
-    const receiptFilter = { company_account_id: String(company_account_id) };
-    if (warehouse_id) receiptFilter.warehouse_id = String(warehouse_id);
-    if (exclude_receipt_id) {
-      const vals = mongoReferenceValues(exclude_receipt_id);
-      receiptFilter._id = { $nin: vals.filter((v) => v instanceof mongoose.Types.ObjectId) };
-      if (vals.some((v) => typeof v === "string" || typeof v === "number")) receiptFilter.id = { $nin: vals };
-    }
-    const receipts = await receiptCollection.find(receiptFilter).toArray();
     const receiptMap = new Map();
     for (const r of receipts || []) {
-      const buyerId = String(r.company_id || r.buyer_id || r.party_id || "").trim();
+      const buyerId = String(r.company_id || "").trim();
       if (!buyerId) continue;
       receiptMap.set(buyerId, (receiptMap.get(buyerId) || 0) + Number(r.amount || 0));
     }
@@ -3173,11 +3208,78 @@ router.get("/receipt-pending-buyers", async (req, res) => {
       const totalReceipt = receiptMap.get(buyerId) || 0;
       return { company_id: buyerId, total_sale: Number(totalSale.toFixed(2)), total_receipt: Number(totalReceipt.toFixed(2)), outstanding: Number(Math.max(0, totalSale-totalReceipt).toFixed(2)) };
     }).filter(x => x.outstanding > 0).sort((a,b) => b.outstanding-a.outstanding);
-    res.set("Server-Timing", `receipt-pending-buyers-mongo;dur=${Date.now()-startedAt}`);
     return res.json(result);
   } catch (err) {
     console.error("Receipt pending buyer lookup failed:", err);
     return res.status(500).json({ error: err.message || "Failed to load pending buyers" });
+  }
+});
+
+router.get("/outstanding", async (req, res) => {
+  const partyType = String(req.query.party_type || "").trim().toLowerCase();
+  const partyId = String(req.query.id || "").trim();
+  const warehouseId = String(req.query.warehouse_id || "").trim();
+  const companyAccountId = String(req.query.company_account_id || "").trim();
+  if (!partyType || !partyId) return res.status(400).json({ error: "party_type and id are required" });
+
+  try {
+    if (partyType === "farmer") {
+      const purchaseRow = await dbGetAsync(
+        `SELECT COALESCE(SUM(COALESCE(NULLIF(net_amount_payable, 0), amount)), 0) AS total_purchase
+         FROM wh_purchase_vouchers
+         WHERE CAST(farmer_id AS TEXT) = CAST(? AS TEXT)
+         ${companyAccountId ? "AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}
+         ${warehouseId ? "AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)" : ""}`,
+        [partyId, ...(companyAccountId ? [companyAccountId] : []), ...(warehouseId ? [warehouseId] : [])]
+      );
+      const paymentRow = await dbGetAsync(
+        `SELECT COALESCE(SUM(amount), 0) AS total_payment
+         FROM wh_payment_vouchers
+         WHERE CAST(farmer_id AS TEXT) = CAST(? AS TEXT)
+         ${companyAccountId ? "AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}
+         ${warehouseId ? "AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)" : ""}`,
+        [partyId, ...(companyAccountId ? [companyAccountId] : []), ...(warehouseId ? [warehouseId] : [])]
+      );
+      const purchase = Number(purchaseRow?.total_purchase || 0);
+      const payment = Number(paymentRow?.total_payment || 0);
+      return res.json({ total_purchase: purchase, total_payment: payment, outstanding: Number((purchase - payment).toFixed(2)) });
+    }
+
+    const companyFilter = { $or: [{ buyer_id: partyId }, { company_id: partyId }] };
+    if (companyAccountId) companyFilter.company_account_id = companyAccountId;
+    if (warehouseId) companyFilter.warehouse_id = warehouseId;
+    if (mongoReady()) {
+      const [sales, receipts] = await Promise.all([
+        SaleVoucher.aggregate([{ $match: companyFilter }, { $group: { _id: null, total_sale: { $sum: { $ifNull: ["$net_receivable_amount", { $ifNull: ["$amount", 0] }] } } } }]),
+        getMongoCollectionIfExists(["wh_receipt_vouchers","receipt_vouchers","receiptvouchers","receipts"]).then((col) => col ? col.find({ company_id: partyId, ...(companyAccountId ? { company_account_id: companyAccountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}) }).toArray() : []),
+      ]);
+      const totalSale = Number(sales?.[0]?.total_sale || 0);
+      const totalReceipt = (receipts || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
+      return res.json({ total_sale: totalSale, total_receipt: totalReceipt, outstanding: Number((totalSale - totalReceipt).toFixed(2)) });
+    }
+
+    const saleRow = await dbGetAsync(
+      `SELECT COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount)), 0) AS total_sale
+       FROM wh_sale_vouchers
+       WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT)
+       ${companyAccountId ? "AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}
+       ${warehouseId ? "AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)" : ""}`,
+      [partyId, ...(companyAccountId ? [companyAccountId] : []), ...(warehouseId ? [warehouseId] : [])]
+    );
+    const receiptRow = await dbGetAsync(
+      `SELECT COALESCE(SUM(amount), 0) AS total_receipt
+       FROM wh_receipt_vouchers
+       WHERE CAST(company_id AS TEXT) = CAST(? AS TEXT)
+       ${companyAccountId ? "AND CAST(company_account_id AS TEXT) = CAST(? AS TEXT)" : ""}
+       ${warehouseId ? "AND CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)" : ""}`,
+      [partyId, ...(companyAccountId ? [companyAccountId] : []), ...(warehouseId ? [warehouseId] : [])]
+    );
+    const totalSale = Number(saleRow?.total_sale || 0);
+    const totalReceipt = Number(receiptRow?.total_receipt || 0);
+    return res.json({ total_sale: totalSale, total_receipt: totalReceipt, outstanding: Number((totalSale - totalReceipt).toFixed(2)) });
+  } catch (err) {
+    console.error("Outstanding lookup failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to load outstanding" });
   }
 });
 
@@ -4224,6 +4326,28 @@ router.post("/journal", async (req, res) => {
 function dbAll(query, params = []) {
   return new Promise((resolve, reject) => {
     db.all(query, params, (err, rows) => (err ? reject(err) : resolve(rows || [])));
+  });
+}
+
+function dbGetAsync(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => (err ? reject(err) : resolve(row || null)));
+  });
+}
+
+function waitForMongoReady(timeoutMs = 1500, intervalMs = 100) {
+  if (mongoReady()) return Promise.resolve(true);
+  const startedAt = Date.now();
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (mongoReady()) {
+        clearInterval(timer);
+        resolve(true);
+      } else if (Date.now() - startedAt >= timeoutMs) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, intervalMs);
   });
 }
 
