@@ -69,6 +69,8 @@ const corsOptions = {
     "Accept",
     "Origin",
     "X-Requested-With",
+    "Cache-Control",
+    "Pragma",
   ],
   exposedHeaders: ["Authorization"],
   credentials: true,
@@ -83,7 +85,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Pragma");
     res.setHeader("Vary", "Origin");
   }
   return next();
@@ -101,7 +103,7 @@ app.use((req, res, next) => {
       res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
     }
     if (!res.getHeader("Access-Control-Allow-Headers")) {
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Pragma");
     }
     if (!res.getHeader("Vary")) {
       res.setHeader("Vary", "Origin");
@@ -116,7 +118,7 @@ app.use((req, res, next) => {
       res.setHeader("Access-Control-Allow-Origin", req.headers.origin);
       res.setHeader("Access-Control-Allow-Credentials", "true");
       res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Pragma");
       res.setHeader("Vary", "Origin");
     }
     return res.sendStatus(204);
@@ -140,7 +142,7 @@ app.use((req, res, next) => {
       res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
     }
     if (!res.getHeader("Access-Control-Allow-Headers")) {
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Pragma");
     }
     if (!res.getHeader("Vary")) {
       res.setHeader("Vary", "Origin");
@@ -889,7 +891,7 @@ app.use(
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Access-Control-Allow-Credentials", "true");
       res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,Origin,X-Requested-With,Cache-Control,Pragma");
       res.setHeader("Vary", "Origin");
     }
 
