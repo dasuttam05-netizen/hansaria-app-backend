@@ -5793,6 +5793,19 @@ router.get("/sale/:id/summary", async (req, res) => {
     if (!row) return res.status(404).json({ error: "Not found" });
     if (!(await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id))) return;
 
+    const buyerIdValue = String(row.buyer_id || row.company_id || "").trim();
+    const consigneeIdValue = String(row.consignee_id || "").trim();
+    let buyerMaster = null;
+    let consigneeMaster = null;
+    if (mongoReady()) {
+      const [buyerDocs, consigneeDocs] = await Promise.all([
+        buyerIdValue ? getMongoPartyMasters([buyerIdValue], ["buyer_names", "buyers", "parties", "company_names"]) : Promise.resolve([]),
+        consigneeIdValue ? getMongoPartyMasters([consigneeIdValue], ["consignee_names", "consignees", "parties", "company_names"]) : Promise.resolve([]),
+      ]);
+      buyerMaster = buyerDocs[0] || null;
+      consigneeMaster = consigneeDocs[0] || null;
+    }
+
     const purchaseLinks = Array.isArray(row.against_purchase_links)
       ? row.against_purchase_links
       : (() => {
@@ -5802,7 +5815,6 @@ router.get("/sale/:id/summary", async (req, res) => {
             return [];
           }
         })();
-    const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
     let journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
     if (mongoReady() && row.voucher_no) {
       try {
@@ -5814,6 +5826,82 @@ router.get("/sale/:id/summary", async (req, res) => {
         console.warn("Mongo sale journal lookup skipped:", journalErr?.message || journalErr);
       }
     }
+
+    let paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
+    if (mongoReady() && row.voucher_no) {
+      try {
+        const receiptCollection = await getMongoCollectionIfExists([
+          "wh_receipt_vouchers",
+          "receipt_vouchers",
+          "receiptvouchers",
+          "receipts",
+        ]);
+        const adjustmentCollection = await getMongoCollectionIfExists([
+          "wh_receipt_adjustments",
+          "receipt_adjustments",
+          "receiptadjustments",
+        ]);
+        if (receiptCollection) {
+          const saleIdValues = mongoReferenceValues(row._id || row.id || id);
+          const receiptRows = await receiptCollection.find({
+            $or: [
+              { reference_id: row.voucher_no },
+              { sale_id: row.voucher_no },
+              { sale_id: { $in: saleIdValues } },
+              { reference_id: { $in: saleIdValues } },
+            ],
+          }).sort({ date: 1, createdAt: 1, _id: 1 }).toArray();
+
+          const adjustmentRows = adjustmentCollection
+            ? await adjustmentCollection.find({
+                $or: [
+                  { sale_id: row.voucher_no },
+                  { sale_voucher_no: row.voucher_no },
+                  { sale_id: { $in: saleIdValues } },
+                ],
+              }).sort({ date: 1, createdAt: 1, _id: 1 }).toArray()
+            : [];
+
+          const receiptMap = new Map();
+          for (const receipt of receiptRows) {
+            const key = String(receipt?._id || receipt?.id || receipt?.voucher_no || "");
+            if (key) receiptMap.set(key, receipt);
+          }
+
+          const details = [];
+          for (const adj of adjustmentRows) {
+            const receipt = receiptMap.get(String(adj.receipt_id || "")) || receiptRows.find((item) => String(item.voucher_no || "") === String(adj.receipt_voucher_no || ""));
+            details.push({
+              ...adj,
+              id: String(adj._id || adj.id || ""),
+              _id: String(adj._id || adj.id || ""),
+              receipt_id: String(adj.receipt_id || receipt?._id || receipt?.id || ""),
+              receipt_voucher_no: adj.receipt_voucher_no || receipt?.voucher_no || "",
+              receipt_date: adj.receipt_date || receipt?.date || "",
+              adjusted_amount: Number(adj.adjusted_amount || 0),
+              inferred_adjustment: false,
+            });
+          }
+
+          if (!details.length && receiptRows.length) {
+            for (const receipt of receiptRows) {
+              details.push({
+                receipt_id: String(receipt._id || receipt.id || ""),
+                receipt_voucher_no: receipt.voucher_no || "",
+                receipt_date: receipt.date || "",
+                adjusted_amount: Number(receipt.amount || 0),
+                inferred_adjustment: true,
+              });
+            }
+          }
+
+          paymentDetails = details;
+        }
+      } catch (receiptErr) {
+        console.warn("Mongo sale receipt lookup skipped:", receiptErr?.message || receiptErr);
+      }
+    }
+
     const resolvedTransportRow = await getTransportBiltiMatch({
       saleId: row._id || row.id,
       voucherNo: row.voucher_no || row.bill_no || "",
@@ -5824,7 +5912,12 @@ router.get("/sale/:id/summary", async (req, res) => {
     const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
 
     res.json({
-      sale: row,
+      sale: {
+        ...row,
+        buyer_id: buyerIdValue || row.buyer_id || row.company_id || "",
+        buyer_name: row.buyer_name || buyerMaster?.name || buyerMaster?.buyer_name || buyerMaster?.company_name || buyerMaster?.party_name || row.company_name || "-",
+        consignee_name: row.consignee_name || consigneeMaster?.name || consigneeMaster?.consignee_name || consigneeMaster?.company_name || consigneeMaster?.party_name || "-",
+      },
       purchase_links: purchaseLinks,
       payment_details: paymentDetails,
       journal_details: journalDetails,
