@@ -36,6 +36,23 @@ const {
   SqliteMirrorRow,
 } = require("../mongo");
 
+// Journal vouchers are persisted in MongoDB so sale-deduction journals survive
+// refresh/logout and are available to reports after the SQLite session is gone.
+const journalSchema = new mongoose.Schema({
+  voucher_no: { type: String, index: true },
+  date: { type: String, index: true },
+  warehouse_id: { type: String, index: true },
+  company_account_id: { type: String, index: true },
+  debit_account: String,
+  credit_account: String,
+  amount: { type: Number, default: 0 },
+  employee_id: String,
+  location_id: String,
+  description: String,
+}, { timestamps: true, strict: false, collection: "wh_journal_vouchers" });
+const JournalVoucher = mongoose.models.WarehouseTradingJournalVoucher
+  || mongoose.model("WarehouseTradingJournalVoucher", journalSchema);
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Trading report indexes. Build in the background so the first HTTP request is
@@ -820,54 +837,71 @@ function createVoucherNoPromise(type, voucherNo = "") {
   });
 }
 
+async function nextMongoJournalVoucherNo() {
+  const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const prefix = `JRN-${datePart}-`;
+  const latest = await JournalVoucher.findOne({ voucher_no: { $regex: `^JRN-` } })
+    .sort({ createdAt: -1, _id: -1 }).lean();
+  let next = 1;
+  if (latest?.voucher_no) {
+    const last = Number(String(latest.voucher_no).split("-").pop());
+    if (Number.isFinite(last) && last >= 1) next = last + 1;
+  }
+  return `${prefix}${String(next).padStart(4, "0")}`;
+}
+
 async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deductionAmount, cdAmount, tdsAmount }) {
   const saleVoucherNo = String(sale?.voucher_no || body?.voucher_no || "").trim();
   if (!saleVoucherNo) return [];
+  if (!mongoReady()) throw new Error("MongoDB is required for automatic sale journals");
 
-  await dbRunPromise("DELETE FROM wh_journal_vouchers WHERE description LIKE ?", [`Auto sale deduction:${saleVoucherNo}:%`]);
+  const autoPrefix = `Auto sale deduction:${saleVoucherNo}:`;
+  await JournalVoucher.deleteMany({ description: { $regex: `^${escapeRegExp(autoPrefix)}` } });
 
   const journalBase = {
     date: body.unloading_date || body.date || sale.date,
-    warehouse_id: body.warehouse_id || sale.warehouse_id,
-    company_account_id: body.company_account_id || sale.company_account_id,
+    warehouse_id: String(body.warehouse_id || sale.warehouse_id || ""),
+    company_account_id: String(body.company_account_id || sale.company_account_id || ""),
     employee_id: body.employee_id || sale.employee_id || null,
     location_id: body.location_id || sale.location_id || null,
   };
 
+  const claimValue = Number(
+    body?.claim_amount !== undefined && body?.claim_amount !== null
+      ? body.claim_amount
+      : shortageAmount || 0
+  ) || 0;
+  const otherDeductionValue = Number(body?.other_deduction || 0) || 0;
+
   const rows = [
-    { key: "shortage", label: "Shortage", amount: Number(shortageAmount || 0) },
-    { key: "claim", label: "Claim", amount: Number(deductionAmount || 0) },
+    { key: "claim", label: "Claim", amount: claimValue },
+    { key: "other_deduction", label: "Other Deduction", amount: otherDeductionValue },
     { key: "cash_discount", label: "Cash Discount", amount: Number(cdAmount || 0) },
     { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
   ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
 
   const created = [];
   for (const row of rows) {
-    const voucherNo = await createVoucherNoPromise("journal");
-    const description = `Auto sale deduction:${saleVoucherNo}:${row.key}`;
-    const result = await dbRunPromise(
-      `
-        INSERT INTO wh_journal_vouchers
-          (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        voucherNo,
-        journalBase.date,
-        journalBase.warehouse_id,
-        journalBase.company_account_id,
-        "Sale Party",
-        row.label,
-        row.amount,
-        journalBase.employee_id,
-        journalBase.location_id,
-        description,
-      ]
-    );
-    created.push({ id: result.lastID, voucher_no: voucherNo, type: row.key, amount: row.amount });
+    const voucherNo = await nextMongoJournalVoucherNo();
+    const description = `${autoPrefix}${row.key}`;
+    const doc = await JournalVoucher.create({
+      voucher_no: voucherNo,
+      ...journalBase,
+      debit_account: "Sale Party",
+      credit_account: row.label,
+      amount: row.amount,
+      description,
+    });
+    created.push({
+      id: String(doc._id), _id: String(doc._id), voucher_no: voucherNo,
+      type: row.key, label: row.label, amount: row.amount, saved_to: "mongodb"
+    });
   }
-
   return created;
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function assignedWarehouseIdsForMongo(user) {
@@ -916,65 +950,77 @@ function mongoIdFilter(id) {
 }
 
 async function decoratePurchaseRows(rows) {
-  const warehouseIds = [...new Set(rows.map((r) => r.warehouse_id).filter(mongoose.Types.ObjectId.isValid))];
-  const farmerIds = [...new Set(rows.map((r) => r.farmer_id).filter(mongoose.Types.ObjectId.isValid))];
-  const productIds = [...new Set(rows.map((r) => r.product_id).filter(mongoose.Types.ObjectId.isValid))];
-  const accountIds = [...new Set(rows.map((r) => r.company_account_id).filter(mongoose.Types.ObjectId.isValid))];
+  const plainRows = (Array.isArray(rows) ? rows : []).map((row) => (row?.toObject ? row.toObject() : row));
+  if (!plainRows.length) return [];
 
-  const [warehouses, farmers, products, accounts] = await Promise.all([
-    warehouseIds.length ? Warehouse.find({ _id: { $in: warehouseIds } }).lean() : [],
-    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
-    productIds.length ? Product.find({ _id: { $in: productIds } }).lean() : [],
-    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
+  const warehouseIds = [...new Set(plainRows.map((r) => String(r?.warehouse_id || "")).filter(Boolean))];
+  const farmerIds = [...new Set(plainRows.map((r) => String(r?.farmer_id || "")).filter(Boolean))];
+  const productIds = [...new Set(plainRows.map((r) => String(r?.product_id || "")).filter(Boolean))];
+  const accountIds = [...new Set(plainRows.map((r) => String(r?.company_account_id || "")).filter(Boolean))];
+
+  const safeObjectIds = (ids) => ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const mongoWarehouseIds = safeObjectIds(warehouseIds);
+  const mongoFarmerIds = safeObjectIds(farmerIds);
+  const mongoProductIds = safeObjectIds(productIds);
+  const mongoAccountIds = safeObjectIds(accountIds);
+  const legacyFarmerIds = farmerIds.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+
+  const [warehouses, farmers, legacyFarmers, products, accounts] = await Promise.all([
+    mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
+    mongoFarmerIds.length ? Farmer.find({ _id: { $in: mongoFarmerIds } }).lean() : Promise.resolve([]),
+    legacyFarmerIds.length ? sqliteRowsByIds("farmers", legacyFarmerIds) : Promise.resolve(new Map()),
+    mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
+    mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
   ]);
 
-  const byId = (items) => new Map(items.map((item) => [String(item._id), item]));
+  const byId = (items) => new Map((Array.isArray(items) ? items : []).map((item) => [String(item._id), item]));
   const warehouseMap = byId(warehouses);
   const farmerMap = byId(farmers);
   const productMap = byId(products);
   const accountMap = byId(accounts);
 
-  return rows.map((row) => {
-    const plain = row.toObject ? row.toObject() : row;
-    const warehouse = warehouseMap.get(String(plain.warehouse_id));
-    const farmer = farmerMap.get(String(plain.farmer_id));
-    const product = productMap.get(String(plain.product_id));
-    const account = accountMap.get(String(plain.company_account_id));
+  return plainRows.map((plain) => {
+    const farmerId = String(plain?.farmer_id || "");
+    const warehouse = warehouseMap.get(String(plain?.warehouse_id));
+    const farmer = farmerMap.get(farmerId);
+    const legacyFarmer = legacyFarmers.get(farmerId) || {};
+    const product = productMap.get(String(plain?.product_id));
+    const account = accountMap.get(String(plain?.company_account_id));
     return {
       ...plain,
-      id: String(plain._id),
-      _id: String(plain._id),
-      warehouse_name: warehouse?.name || plain.warehouse_name,
-      warehouse_address: warehouse?.address || plain.warehouse_address,
-      warehouse_location: warehouse?.location || plain.warehouse_location,
-      warehouse_city: warehouse?.city || plain.warehouse_city,
-      warehouse_district: warehouse?.district || plain.warehouse_district,
-      warehouse_state: warehouse?.state || plain.warehouse_state,
-      warehouse_pincode: warehouse?.pincode || plain.warehouse_pincode,
-      farmer_name: farmer?.name || plain.farmer_name,
-      farmer_mobile: farmer?.mobile || plain.farmer_mobile,
-      farmer_address: farmer?.address || plain.farmer_address,
-      farmer_village: farmer?.village || plain.farmer_village,
-      farmer_city: farmer?.city || plain.farmer_city,
-      farmer_district: farmer?.district || plain.farmer_district,
-      farmer_state: farmer?.state || plain.farmer_state,
-      farmer_pincode: farmer?.pincode || plain.farmer_pincode,
-      farmer_gst: farmer?.gst_no || farmer?.gst || plain.farmer_gst,
-      farmer_pan: farmer?.pan_no || farmer?.pan || plain.farmer_pan,
-      product_name: product?.name || plain.product_name,
-      company_account_name: account?.account_name || plain.company_account_name,
-      company_account_address: account?.address || plain.company_account_address,
-      company_account_mobile: account?.mobile || plain.company_account_mobile,
-      company_account_email: account?.email || plain.company_account_email,
-      company_account_city: account?.city || plain.company_account_city,
-      company_account_district: account?.district || plain.company_account_district,
-      company_account_state: account?.state || plain.company_account_state,
-      company_account_pincode: account?.pincode || plain.company_account_pincode,
-      company_account_gst: account?.gst_no || account?.gst || plain.company_account_gst,
-      company_account_pan: account?.pan_no || account?.pan || plain.company_account_pan,
-      total_quantity: plain.total_qty || plain.net_weight || plain.quantity || 0,
-      total_amount: plain.net_amount_payable || plain.amount || 0,
-      gross_amount: (plain.total_qty || plain.net_weight || plain.quantity || 0) * (plain.rate || 0),
+      id: String(plain?._id || plain?.id || ""),
+      _id: String(plain?._id || plain?.id || ""),
+      warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
+      warehouse_address: warehouse?.address || plain?.warehouse_address,
+      warehouse_location: warehouse?.location || plain?.warehouse_location,
+      warehouse_city: warehouse?.city || plain?.warehouse_city,
+      warehouse_district: warehouse?.district || plain?.warehouse_district,
+      warehouse_state: warehouse?.state || plain?.warehouse_state,
+      warehouse_pincode: warehouse?.pincode || plain?.warehouse_pincode,
+      farmer_name: plain?.farmer_name || farmer?.name || legacyFarmer?.name || "-",
+      farmer_mobile: plain?.farmer_mobile || farmer?.mobile || legacyFarmer?.mobile || legacyFarmer?.phone,
+      farmer_address: plain?.farmer_address || farmer?.address || legacyFarmer?.address,
+      farmer_village: plain?.farmer_village || farmer?.village || legacyFarmer?.village,
+      farmer_city: plain?.farmer_city || farmer?.city || legacyFarmer?.city,
+      farmer_district: plain?.farmer_district || farmer?.district || legacyFarmer?.district,
+      farmer_state: plain?.farmer_state || farmer?.state || legacyFarmer?.state,
+      farmer_pincode: plain?.farmer_pincode || farmer?.pincode || legacyFarmer?.pincode,
+      farmer_gst: plain?.farmer_gst || farmer?.gst_no || farmer?.gst || legacyFarmer?.gst_no || legacyFarmer?.gst,
+      farmer_pan: plain?.farmer_pan || farmer?.pan_no || farmer?.pan || legacyFarmer?.pan_no || legacyFarmer?.pan,
+      product_name: product?.name || plain?.product_name || "-",
+      company_account_name: account?.account_name || plain?.company_account_name || "-",
+      company_account_address: account?.address || plain?.company_account_address,
+      company_account_mobile: account?.mobile || plain?.company_account_mobile,
+      company_account_email: account?.email || plain?.company_account_email,
+      company_account_city: account?.city || plain?.company_account_city,
+      company_account_district: account?.district || plain?.company_account_district,
+      company_account_state: account?.state || plain?.company_account_state,
+      company_account_pincode: account?.pincode || plain?.company_account_pincode,
+      company_account_gst: account?.gst_no || account?.gst || plain?.company_account_gst,
+      company_account_pan: account?.pan_no || account?.pan || plain?.company_account_pan,
+      total_quantity: plain?.total_qty || plain?.net_weight || plain?.quantity || 0,
+      total_amount: plain?.net_amount_payable || plain?.amount || 0,
+      gross_amount: (plain?.total_qty || plain?.net_weight || plain?.quantity || 0) * (plain?.rate || 0),
     };
   });
 }
@@ -3048,182 +3094,51 @@ router.get("/next-voucher-no", (req, res) => {
   });
 });
 
-router.get("/outstanding", (req, res) => {
+// Fast buyer list for Receipt Voucher: only buyers with outstanding sales.
+// This mirrors the Payment Voucher's "Pending Farmer" selector, but uses
+// sales minus receipts and returns only positive balances.
+router.get("/receipt-pending-buyers", async (req, res) => {
   const startedAt = Date.now();
-  const { party_type, id, warehouse_id, location_id, exclude_payment_id, company_account_id } = req.query;
-  if (!party_type || !id) return res.status(400).json({ error: "party_type and id are required" });
-
-  const filters = ["1=1"];
-  const params = [id];
-  let detailsQuery;
-  let paymentsQuery;
-
-  if (party_type === "farmer") {
-    if (warehouse_id) {
-      filters.push("warehouse_id = ?");
-      params.push(warehouse_id);
+  const { company_account_id, warehouse_id, exclude_receipt_id } = req.query;
+  if (!company_account_id) return res.status(400).json({ error: "company_account_id is required" });
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for pending buyers" });
+  try {
+    const receiptCollection = await getMongoCollectionIfExists(["wh_receipt_vouchers","receipt_vouchers","receiptvouchers","receipts"]);
+    if (!receiptCollection) return res.status(503).json({ error: "MongoDB receipt collection not found" });
+    const salesFilter = { company_account_id: String(company_account_id) };
+    if (warehouse_id) salesFilter.warehouse_id = String(warehouse_id);
+    const sales = await SaleVoucher.find(salesFilter).select("buyer_id company_id net_receivable_amount net_amount amount").lean();
+    const salesByBuyer = new Map();
+    for (const sale of sales || []) {
+      const buyerId = String(sale.buyer_id || sale.company_id || "").trim();
+      if (!buyerId) continue;
+      const amount = Number(sale.net_receivable_amount || sale.net_amount || sale.amount || 0);
+      salesByBuyer.set(buyerId, (salesByBuyer.get(buyerId) || 0) + amount);
     }
-    if (location_id) {
-      filters.push("location_id = ?");
-      params.push(location_id);
+    const receiptFilter = { company_account_id: String(company_account_id) };
+    if (warehouse_id) receiptFilter.warehouse_id = String(warehouse_id);
+    if (exclude_receipt_id) {
+      const vals = mongoReferenceValues(exclude_receipt_id);
+      receiptFilter._id = { $nin: vals.filter((v) => v instanceof mongoose.Types.ObjectId) };
+      if (vals.some((v) => typeof v === "string" || typeof v === "number")) receiptFilter.id = { $nin: vals };
     }
-    if (company_account_id) {
-      filters.push("company_account_id = ?");
-      params.push(company_account_id);
+    const receipts = await receiptCollection.find(receiptFilter).toArray();
+    const receiptMap = new Map();
+    for (const r of receipts || []) {
+      const buyerId = String(r.company_id || r.buyer_id || r.party_id || "").trim();
+      if (!buyerId) continue;
+      receiptMap.set(buyerId, (receiptMap.get(buyerId) || 0) + Number(r.amount || 0));
     }
-    const paymentFilters = filters.slice(1);
-    const paymentParams = [...params];
-    if (exclude_payment_id) {
-      paymentFilters.push("CAST(id AS TEXT) <> CAST(? AS TEXT)");
-      paymentParams.push(exclude_payment_id);
-    }
-    paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_payment_vouchers WHERE farmer_id = ? ${paymentFilters.length ? `AND ${paymentFilters.join(" AND ")}` : ""} ORDER BY date ASC`;
-    // The scoped stats below are authoritative for this account/warehouse.
-    // Avoid the older global farmer aggregation here; it was both slower and
-    // could produce a different balance during payment edit.
-    getPaymentAdjustmentsByPurchase((adjustErr, adjustedMap) => {
-        if (adjustErr) return res.status(500).json({ error: adjustErr.message });
-
-        const send = (purchaseRows) => {
-          const purchases = (purchaseRows || []).map((row) => {
-            const purchaseId = String(row.id || row._id);
-            const amount = Number(row.amount || row.net_amount_payable || row.total_amount || 0);
-            const adjusted_amount = adjustedMap.get(purchaseId) || 0;
-            return {
-              ...row,
-              id: purchaseId,
-              amount,
-              adjusted_amount,
-              pending_amount: Number(Math.max(0, amount - adjusted_amount).toFixed(2)),
-            };
-          });
-
-          db.all(paymentsQuery, paymentParams, (err3, payments) => {
-            if (err3) return res.status(500).json({ error: err3.message });
-            const totalPurchase = purchases.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-            const totalDeduction = purchases.reduce((sum, row) => {
-              const value =
-                row.total_deduction ??
-                row.total_deduct_amount ??
-                (Number(row.bags_claim || 0) + Number(row.labour || 0) + Number(row.transport_charge || 0));
-              return sum + (Number.isFinite(Number(value)) ? Number(value) : 0);
-            }, 0);
-            const totalPayment = (payments || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
-            const scopedStats = {
-              total_bill: Number(totalPurchase.toFixed(2)),
-              total_purchase: Number(totalPurchase.toFixed(2)),
-              total_deduction: Number(totalDeduction.toFixed(2)),
-              total_payment: Number(totalPayment.toFixed(2)),
-              outstanding: Number((totalPurchase - totalPayment).toFixed(2)),
-            };
-            res.set("Server-Timing", `outstanding;dur=${Date.now() - startedAt}`);
-            res.json({ party_type: "farmer", id, party_id: String(id), farmer_id: String(id), warehouse_id: warehouse_id ? String(warehouse_id) : "", company_account_id: company_account_id ? String(company_account_id) : "", exclude_payment_id: exclude_payment_id ? String(exclude_payment_id) : "", stats: scopedStats, purchases, payments });
-          });
-        };
-
-        if (mongoReady()) {
-          const filter = { farmer_id: String(id || "") };
-          if (warehouse_id) filter.warehouse_id = String(warehouse_id);
-          if (company_account_id) filter.company_account_id = String(company_account_id);
-          PurchaseVoucher.find(filter)
-            .sort({ date: 1, createdAt: 1, _id: 1 })
-            .lean()
-            .then((rows) => decoratePurchaseRows(rows || []))
-            .then((rows) => send(rows.map((row) => ({
-              ...row,
-              amount: Number(row.total_amount || row.net_amount_payable || row.amount || 0),
-            }))))
-            .catch((mongoErr) => res.status(500).json({ error: mongoErr.message }));
-          return;
-        }
-
-        detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_amount_payable, 0), amount) AS amount FROM wh_purchase_vouchers WHERE farmer_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
-        db.all(detailsQuery, params, (err2, purchases) => {
-          if (err2) return res.status(500).json({ error: err2.message });
-          send(purchases || []);
-        });
-      }, exclude_payment_id);
-    return;
+    const result = [...salesByBuyer.entries()].map(([buyerId, totalSale]) => {
+      const totalReceipt = receiptMap.get(buyerId) || 0;
+      return { company_id: buyerId, total_sale: Number(totalSale.toFixed(2)), total_receipt: Number(totalReceipt.toFixed(2)), outstanding: Number(Math.max(0, totalSale-totalReceipt).toFixed(2)) };
+    }).filter(x => x.outstanding > 0).sort((a,b) => b.outstanding-a.outstanding);
+    res.set("Server-Timing", `receipt-pending-buyers-mongo;dur=${Date.now()-startedAt}`);
+    return res.json(result);
+  } catch (err) {
+    console.error("Receipt pending buyer lookup failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to load pending buyers" });
   }
-
-  if (party_type === "company") {
-    if (warehouse_id) {
-      filters.push("warehouse_id = ?");
-      params.push(warehouse_id);
-    }
-    if (location_id) {
-      filters.push("location_id = ?");
-      params.push(location_id);
-    }
-    if (company_account_id) {
-      filters.push("CAST(company_account_id AS TEXT) = CAST(? AS TEXT)");
-      params.push(company_account_id);
-    }
-
-    const getSaleRows = (callback) => {
-      if (mongoReady()) {
-        const filter = {
-          $or: [
-            { buyer_id: String(id || "") },
-            { company_id: String(id || "") },
-          ],
-        };
-        if (warehouse_id) filter.warehouse_id = String(warehouse_id);
-        if (company_account_id) filter.company_account_id = String(company_account_id);
-        return SaleVoucher.find(filter)
-          .sort({ date: 1, createdAt: 1, _id: 1 })
-          .lean()
-          .then((rows) => callback(null, (rows || []).map((row) => ({
-            ...row,
-            id: String(row._id),
-            amount: Number(row.net_receivable_amount || row.amount || 0),
-          })))).catch(callback);
-      }
-
-      detailsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, COALESCE(NULLIF(net_receivable_amount, 0), amount) AS amount FROM wh_sale_vouchers WHERE CAST(COALESCE(buyer_id, company_id) AS TEXT) = CAST(? AS TEXT) ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
-      db.all(detailsQuery, params, (err2, sales) => (err2 ? callback(err2) : callback(null, sales || [])));
-    };
-
-    paymentsQuery = `SELECT id, voucher_no, date, warehouse_id, location_id, amount FROM wh_receipt_vouchers WHERE company_id = ? ${filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : ""} ORDER BY date ASC`;
-    computeOutstandingForCompany(id, (err, stats) => {
-      if (err) return res.status(500).json({ error: err.message });
-      getReceiptAdjustmentsBySale((adjustErr, adjustedMap) => {
-        if (adjustErr) return res.status(500).json({ error: adjustErr.message });
-
-        getSaleRows((err2, sales) => {
-          if (err2) return res.status(500).json({ error: err2.message });
-
-          const receiptsFilter = filters.slice(1).length ? `AND ${filters.slice(1).join(" AND ")}` : "";
-          const receiptExcludeClause = exclude_payment_id ? `AND CAST(id AS TEXT) <> CAST(? AS TEXT)` : "";
-          const receiptParams = [...params];
-          if (exclude_payment_id) receiptParams.push(exclude_payment_id);
-          const receiptsQuery = `${paymentsQuery} ${receiptExcludeClause}`.trim();
-
-          db.all(receiptsQuery, receiptParams, (err3, receipts) => {
-            if (err3) return res.status(500).json({ error: err3.message });
-
-            const decoratedSales = (sales || []).map((row) => {
-              const saleId = String(row.id || row._id);
-              const amount = Number(row.amount || 0);
-              const adjusted_amount = adjustedMap.get(saleId) || 0;
-              return {
-                ...row,
-                id: saleId,
-                amount,
-                adjusted_amount,
-                pending_amount: Number(Math.max(0, amount - adjusted_amount).toFixed(2)),
-              };
-            });
-
-            res.json({ party_type: "company", id, stats, sales: decoratedSales, receipts });
-          });
-        });
-      }, exclude_payment_id);
-    });
-    return;
-  }
-
-  res.status(400).json({ error: "Unsupported party_type" });
 });
 
 // ===========================
@@ -3991,206 +3906,272 @@ router.delete("/payment/:id", (req, res) => {
   });
 });
 
-// MongoDB-only Receipt Voucher helpers.
-async function getMongoReceiptCollectionsStrict() {
-  if (!mongoReady()) throw new Error("MongoDB is not connected. Receipt data must be saved in MongoDB.");
-  const receiptCollection = await getMongoCollectionIfExists(["wh_receipt_vouchers","receipt_vouchers","receiptvouchers","receipts"]) || mongoose.connection.db.collection("wh_receipt_vouchers");
-  const adjustmentCollection = await getMongoCollectionIfExists(["wh_receipt_adjustments","receipt_adjustments","receiptadjustments"]) || mongoose.connection.db.collection("wh_receipt_adjustments");
-  return { receiptCollection, adjustmentCollection };
-}
-
-async function validateMongoReceiptAdjustmentsStrict({ companyId, amount, adjustments, excludeReceiptId = null }) {
-  const clean = normalizeReceiptAdjustments(adjustments);
-  const receiptAmount = Number(amount || 0);
-  const total = clean.reduce((sum,x)=>sum+Number(x.adjusted_amount||0),0);
-  if (receiptAmount <= 0) throw new Error("Receipt amount is required");
-  if (!clean.length) throw new Error("Please adjust this receipt against sale bills");
-  if (Math.abs(total-receiptAmount)>0.0001) throw new Error("Receipt amount and adjustment amount must be equal");
-  const { adjustmentCollection } = await getMongoReceiptCollectionsStrict();
-  const sales = await SaleVoucher.find({$or:[{buyer_id:String(companyId)},{company_id:String(companyId)}]}).select("_id voucher_no amount net_receivable_amount").lean();
-  const byId=new Map(), byVoucher=new Map();
-  for(const sale of sales||[]){byId.set(String(sale._id),sale);if(sale.voucher_no)byVoucher.set(String(sale.voucher_no),sale);}
-  const existing=await adjustmentCollection.find(excludeReceiptId?{receipt_id:{$ne:String(excludeReceiptId)}}:{}).toArray();
-  const adjusted=new Map();
-  for(const a of existing||[]){const k=String(a.sale_id||a.sale_voucher_no||a.reference_id||"");if(k)adjusted.set(k,(adjusted.get(k)||0)+Number(a.adjusted_amount||a.amount||0));}
-  return clean.map(item=>{
-    const sale=byId.get(String(item.sale_id))||byVoucher.get(String(item.voucher_no||""));
-    if(!sale) throw new Error(`Invalid sale adjustment target: ${item.sale_id||item.voucher_no||""}`);
-    const saleKey=String(sale._id), bill=Number(sale.net_receivable_amount||sale.amount||0);
-    const already=Number(adjusted.get(saleKey)||adjusted.get(String(sale.voucher_no))||0);
-    if(Number(item.adjusted_amount)>Math.max(0,bill-already)+0.0001) throw new Error(`Adjustment cannot exceed pending amount for ${sale.voucher_no||saleKey}`);
-    return {sale_id:saleKey,sale_voucher_no:sale.voucher_no||item.voucher_no||"",voucher_no:sale.voucher_no||item.voucher_no||"",adjusted_amount:Number(item.adjusted_amount)};
-  });
-}
-
-async function insertMongoReceiptStrict(data, adjustments) {
-  const { receiptCollection, adjustmentCollection } = await getMongoReceiptCollectionsStrict();
-  const now=new Date();
-  const doc={voucher_no:String(data.voucher_no||"").trim(),date:data.date||now.toISOString().slice(0,10),
-    warehouse_id:data.warehouse_id!=null?String(data.warehouse_id):"",company_id:data.company_id!=null?String(data.company_id):"",
-    buyer_id:data.company_id!=null?String(data.company_id):"",company_account_id:data.company_account_id!=null?String(data.company_account_id):"",
-    consignee_id:data.consignee_id!=null?String(data.consignee_id):"",amount:Number(data.amount||0),
-    reference_type:data.reference_type||"sale",reference_id:data.reference_id||adjustments.map(a=>a.sale_voucher_no||a.sale_id).filter(Boolean).join(", "),
-    employee_id:data.employee_id!=null?String(data.employee_id):"",location_id:data.location_id!=null?String(data.location_id):"",
-    description:data.description||"",createdAt:now,updatedAt:now};
-  const inserted=await receiptCollection.insertOne(doc);
-  if(adjustments.length) await adjustmentCollection.insertMany(adjustments.map(a=>({receipt_id:inserted.insertedId,receipt_voucher_no:doc.voucher_no,sale_id:a.sale_id,sale_voucher_no:a.sale_voucher_no||a.voucher_no||"",voucher_no:a.voucher_no||a.sale_voucher_no||"",adjusted_amount:Number(a.adjusted_amount||0),amount:Number(a.adjusted_amount||0),reference_id:a.sale_voucher_no||a.sale_id||"",createdAt:now,updatedAt:now})));
-  return {...doc,_id:inserted.insertedId};
-}
-
 // ===========================
 // RECEIPT VOUCHERS
 // ===========================
 router.get("/receipt", async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) return res.status(403).json({ error: "Permission denied" });
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Receipt vouchers" });
   try {
-    const { receiptCollection, adjustmentCollection } = await getMongoReceiptCollectionsStrict();
+    const receiptCollection = await getMongoCollectionIfExists([
+      "wh_receipt_vouchers", "receipt_vouchers", "receiptvouchers", "receipts"
+    ]);
+    if (!receiptCollection) return res.status(503).json({ error: "MongoDB receipt collection not found" });
+
+    const warehouseId = String(req.query.warehouse_id || "").trim();
+    const accountId = String(req.query.company_account_id || "").trim();
+    const buyerId = String(req.query.company_id || req.query.buyer_id || "").trim();
     const filter = {};
-    const warehouseId=String(req.query.warehouse_id||"").trim();
-    const accountId=String(req.query.company_account_id||"").trim();
-    const buyerId=String(req.query.buyer_id||"").trim();
-    if(warehouseId) filter.warehouse_id={$in:mongoReferenceValues(warehouseId)};
-    if(accountId) filter.company_account_id={$in:mongoReferenceValues(accountId)};
-    if(buyerId) filter.$or=[{company_id:{$in:mongoReferenceValues(buyerId)}},{buyer_id:{$in:mongoReferenceValues(buyerId)}},{party_id:{$in:mongoReferenceValues(buyerId)}}];
-    const rows=await receiptCollection.find(filter).sort({date:-1,_id:-1}).toArray();
-    const ids=rows.map(r=>r._id).filter(Boolean);
-    const adj=ids.length?await adjustmentCollection.find({receipt_id:{$in:ids}}).toArray():[];
-    const grouped=new Map();
-    for(const x of adj){const k=String(x.receipt_id||x.receipt_voucher_no||"");if(!grouped.has(k))grouped.set(k,[]);grouped.get(k).push(x);}
-    res.json(rows.map(r=>({...r,id:String(r._id),_id:String(r._id),buyer_id:r.buyer_id||r.company_id||"",company_id:r.company_id||r.buyer_id||"",adjustments:grouped.get(String(r._id))||grouped.get(String(r.voucher_no))||[]})));
-  } catch(err){res.status(503).json({error:err.message||"Failed to load MongoDB receipts"});}
+    const and = [];
+    if (warehouseId) and.push({ warehouse_id: { $in: mongoReferenceValues(warehouseId) } });
+    if (accountId) and.push({ company_account_id: { $in: mongoReferenceValues(accountId) } });
+    if (buyerId) and.push({ $or: [
+      { company_id: { $in: mongoReferenceValues(buyerId) } },
+      { buyer_id: { $in: mongoReferenceValues(buyerId) } },
+      { party_id: { $in: mongoReferenceValues(buyerId) } },
+    ]});
+    if (and.length) filter.$and = and;
+
+    const rows = await receiptCollection.find(filter).sort({ date: -1, _id: -1 }).toArray();
+    return res.json(rows.map((r) => ({ ...r, id: String(r._id || r.id), _id: String(r._id || r.id), saved_to: "mongodb" })));
+  } catch (err) {
+    console.error("Mongo receipt list failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to load receipts" });
+  }
 });
 
 router.get("/receipt/:id", async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) return res.status(403).json({ error: "Permission denied" });
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Receipt vouchers" });
   try {
-    const { receiptCollection, adjustmentCollection } = await getMongoReceiptCollectionsStrict();
-    const vals=mongoReferenceValues(req.params.id);
-    const row=await receiptCollection.findOne({$or:[{_id:{$in:vals.filter(v=>v instanceof mongoose.Types.ObjectId)}},{id:{$in:vals}},{voucher_no:{$in:vals.map(String)}}]});
-    if(!row)return res.status(404).json({error:"Receipt voucher not found"});
-    const adjustments=await adjustmentCollection.find({$or:[{receipt_id:row._id},{receipt_id:String(row._id)},{receipt_voucher_no:row.voucher_no}]}).toArray();
-    res.json({...row,id:String(row._id),_id:String(row._id),adjustments});
-  }catch(err){res.status(503).json({error:err.message||"Failed to load MongoDB receipt"});}
+    const receiptCollection = await getMongoCollectionIfExists([
+      "wh_receipt_vouchers", "receipt_vouchers", "receiptvouchers", "receipts"
+    ]);
+    const adjustmentCollection = await getMongoCollectionIfExists([
+      "wh_receipt_adjustments", "receipt_adjustments", "receiptadjustments"
+    ]);
+    if (!receiptCollection) return res.status(404).json({ error: "MongoDB receipt collection not found" });
+
+    const vals = mongoReferenceValues(req.params.id);
+    const or = [{ _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } }, { id: { $in: vals } }, { voucher_no: String(req.params.id) }];
+    const row = await receiptCollection.findOne({ $or: or });
+    if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
+
+    const ok = await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id);
+    if (!ok) return;
+
+    let adjustments = Array.isArray(row.adjustments) ? row.adjustments : [];
+    if (adjustmentCollection) {
+      const ridVals = mongoReferenceValues(row._id || row.id);
+      adjustments = await adjustmentCollection.find({
+        $or: [
+          { receipt_id: { $in: ridVals } },
+          { receipt_voucher_no: row.voucher_no },
+        ]
+      }).sort({ createdAt: 1, _id: 1 }).toArray();
+    }
+    return res.json({ ...row, id: String(row._id || row.id), _id: String(row._id || row.id), adjustments, saved_to: "mongodb" });
+  } catch (err) {
+    console.error("Mongo receipt get failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to load receipt" });
+  }
 });
 
 router.post("/receipt", async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.receipt.create")) return res.status(403).json({ error: "Permission denied" });
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Receipt vouchers" });
+
+  const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
+  const ok = await ensureWarehouseAccess(req, res, warehouse_id, location_id);
+  if (!ok) return;
+  if (!company_id) return res.status(400).json({ error: "Buyer is required for receipt vouchers" });
+
   try {
-    if (!mongoReady()) return res.status(503).json({ error: "MongoDB is not connected. Receipt data must be saved in MongoDB." });
-    const {voucher_no,date,warehouse_id,company_id,company_account_id,consignee_id,amount,reference_type,reference_id,employee_id,location_id,description,adjustments}=req.body;
-    if(!company_id)return res.status(400).json({error:"Buyer is required for receipt vouchers"});
-    const access=await ensureWarehouseAccess(req,res,warehouse_id,location_id);if(!access)return;
-    const clean=await validateMongoReceiptAdjustmentsStrict({companyId:company_id,amount,adjustments});
-    const generatedVoucherNo=String(voucher_no||"").trim()||await nextMongoVoucherNo("receipt");
-    const {receiptCollection}=await getMongoReceiptCollectionsStrict();
-    if(await receiptCollection.findOne({voucher_no:generatedVoucherNo}))return res.status(400).json({error:"Voucher number already exists"});
-    const saved=await insertMongoReceiptStrict({voucher_no:generatedVoucherNo,date,warehouse_id,company_id,company_account_id,consignee_id,amount,reference_type,reference_id,employee_id,location_id,description},clean);
-    res.json({id:String(saved._id),_id:String(saved._id),voucher_no:saved.voucher_no,saved_to:"mongodb",adjustments:clean});
-  }catch(err){console.error("Mongo receipt create failed:",err);res.status(500).json({error:err.message||"Failed to save receipt in MongoDB"});}
+    const cleanAdjustments = normalizeReceiptAdjustments(adjustments);
+    const receiptAmount = Number(amount || 0);
+    const adjustedTotal = cleanAdjustments.reduce((sum, x) => sum + Number(x.adjusted_amount || 0), 0);
+    if (!(receiptAmount > 0)) return res.status(400).json({ error: "Receipt amount is required" });
+    if (!cleanAdjustments.length) return res.status(400).json({ error: "Please adjust this receipt against sale bills" });
+    if (Math.abs(receiptAmount - adjustedTotal) > 0.0001) return res.status(400).json({ error: "Receipt amount and adjustment amount must be equal" });
+
+    const receiptCollection = await getMongoCollectionIfExists(["wh_receipt_vouchers","receipt_vouchers","receiptvouchers","receipts"]);
+    if (!receiptCollection) return res.status(503).json({ error: "MongoDB receipt collection not found" });
+    const adjustmentCollection = await getMongoCollectionIfExists(["wh_receipt_adjustments","receipt_adjustments","receiptadjustments"]);
+
+    const generatedVoucherNo = String(voucher_no || "").trim() || await nextMongoVoucherNo("receipt");
+    const existing = await receiptCollection.findOne({ voucher_no: generatedVoucherNo });
+    if (existing) return res.status(400).json({ error: "Voucher number already exists" });
+
+    const doc = {
+      voucher_no: generatedVoucherNo, date, warehouse_id: String(warehouse_id || ""),
+      company_id: String(company_id || ""), buyer_id: String(company_id || ""),
+      company_account_id: String(company_account_id || ""), consignee_id: consignee_id || null,
+      amount: receiptAmount, reference_type: reference_type || "sale",
+      reference_id: reference_id || buildReceiptReferenceId(cleanAdjustments),
+      employee_id: employee_id || null, location_id: location_id || null,
+      description: description || "", adjustments: cleanAdjustments,
+      createdAt: new Date(), updatedAt: new Date(), saved_to: "mongodb"
+    };
+    const result = await receiptCollection.insertOne(doc);
+    const receiptId = result.insertedId;
+
+    if (adjustmentCollection && cleanAdjustments.length) {
+      await adjustmentCollection.insertMany(cleanAdjustments.map((a) => ({
+        receipt_id: receiptId, receipt_voucher_no: generatedVoucherNo,
+        sale_id: a.sale_id, sale_voucher_no: a.voucher_no || "", adjusted_amount: Number(a.adjusted_amount),
+        company_id: String(company_id || ""), company_account_id: String(company_account_id || ""),
+        warehouse_id: String(warehouse_id || ""), date, createdAt: new Date(), updatedAt: new Date()
+      })));
+    }
+
+    return res.json({ id: String(receiptId), _id: String(receiptId), voucher_no: generatedVoucherNo, adjustments: cleanAdjustments, saved_to: "mongodb" });
+  } catch (err) {
+    console.error("Mongo receipt save failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to save receipt" });
+  }
 });
 
 router.put("/receipt/:id", async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.receipt.edit")) return res.status(403).json({ error: "Permission denied" });
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.edit")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Receipt vouchers" });
+
+  const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
   try {
-    const {receiptCollection,adjustmentCollection}=await getMongoReceiptCollectionsStrict();
-    const vals=mongoReferenceValues(req.params.id);
-    const old=await receiptCollection.findOne({$or:[{_id:{$in:vals.filter(v=>v instanceof mongoose.Types.ObjectId)}},{id:{$in:vals}},{voucher_no:{$in:vals.map(String)}}]});
-    if(!old)return res.status(404).json({error:"Receipt voucher not found"});
-    const {voucher_no,date,warehouse_id,company_id,company_account_id,consignee_id,amount,reference_type,reference_id,employee_id,location_id,description,adjustments}=req.body;
-    if(!company_id)return res.status(400).json({error:"Buyer is required for receipt vouchers"});
-    const access=await ensureWarehouseAccess(req,res,warehouse_id,location_id);if(!access)return;
-    const clean=await validateMongoReceiptAdjustmentsStrict({companyId:company_id,amount,adjustments,excludeReceiptId:String(old._id)});
-    const newNo=String(voucher_no||old.voucher_no||"").trim();
-    const duplicate=await receiptCollection.findOne({voucher_no:newNo,_id:{$ne:old._id}});
-    if(duplicate)return res.status(400).json({error:"Voucher number already exists"});
-    await receiptCollection.updateOne({_id:old._id},{$set:{voucher_no:newNo,date,warehouse_id:String(warehouse_id||""),company_id:String(company_id),buyer_id:String(company_id),company_account_id:String(company_account_id||""),consignee_id:String(consignee_id||""),amount:Number(amount||0),reference_type:reference_type||"sale",reference_id:reference_id||clean.map(a=>a.sale_voucher_no||a.sale_id).join(", "),employee_id:String(employee_id||""),location_id:String(location_id||""),description:description||"",updatedAt:new Date()}});
-    await adjustmentCollection.deleteMany({$or:[{receipt_id:old._id},{receipt_id:String(old._id)},{receipt_voucher_no:old.voucher_no}]});
-    if(clean.length)await adjustmentCollection.insertMany(clean.map(a=>({receipt_id:old._id,receipt_voucher_no:newNo,sale_id:a.sale_id,sale_voucher_no:a.sale_voucher_no||a.voucher_no||"",voucher_no:a.voucher_no||a.sale_voucher_no||"",adjusted_amount:Number(a.adjusted_amount),amount:Number(a.adjusted_amount),reference_id:a.sale_voucher_no||a.sale_id,createdAt:new Date(),updatedAt:new Date()})));
-    res.json({id:String(old._id),updated:1,voucher_no:newNo,saved_to:"mongodb",adjustments:clean});
-  }catch(err){res.status(500).json({error:err.message||"Failed to update MongoDB receipt"});}
+    const receiptCollection = await getMongoCollectionIfExists(["wh_receipt_vouchers","receipt_vouchers","receiptvouchers","receipts"]);
+    const adjustmentCollection = await getMongoCollectionIfExists(["wh_receipt_adjustments","receipt_adjustments","receiptadjustments"]);
+    if (!receiptCollection) return res.status(503).json({ error: "MongoDB receipt collection not found" });
+
+    const vals = mongoReferenceValues(req.params.id);
+    const row = await receiptCollection.findOne({ $or: [
+      { _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } },
+      { id: { $in: vals } }, { voucher_no: String(req.params.id) }
+    ]});
+    if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
+    const ok = await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id);
+    if (!ok) return;
+
+    const cleanAdjustments = normalizeReceiptAdjustments(adjustments);
+    const receiptAmount = Number(amount || 0);
+    const adjustedTotal = cleanAdjustments.reduce((sum, x) => sum + Number(x.adjusted_amount || 0), 0);
+    if (!(receiptAmount > 0)) return res.status(400).json({ error: "Receipt amount is required" });
+    if (!cleanAdjustments.length || Math.abs(receiptAmount - adjustedTotal) > 0.0001) {
+      return res.status(400).json({ error: "Receipt amount and adjustment amount must be equal" });
+    }
+
+    const newVoucherNo = String(voucher_no || row.voucher_no || "").trim();
+    const duplicate = await receiptCollection.findOne({ voucher_no: newVoucherNo, _id: { $ne: row._id } });
+    if (duplicate) return res.status(400).json({ error: "Voucher number already exists" });
+
+    const update = {
+      voucher_no: newVoucherNo, date, warehouse_id: String(warehouse_id || row.warehouse_id || ""),
+      company_id: String(company_id || ""), buyer_id: String(company_id || ""),
+      company_account_id: String(company_account_id || ""), consignee_id: consignee_id || null,
+      amount: receiptAmount, reference_type: reference_type || "sale",
+      reference_id: reference_id || buildReceiptReferenceId(cleanAdjustments),
+      employee_id: employee_id || null, location_id: location_id || null,
+      description: description || "", adjustments: cleanAdjustments, updatedAt: new Date(), saved_to: "mongodb"
+    };
+    await receiptCollection.updateOne({ _id: row._id }, { $set: update });
+    if (adjustmentCollection) {
+      await adjustmentCollection.deleteMany({ $or: [{ receipt_id: row._id }, { receipt_voucher_no: row.voucher_no }] });
+      if (cleanAdjustments.length) await adjustmentCollection.insertMany(cleanAdjustments.map((a) => ({
+        receipt_id: row._id, receipt_voucher_no: newVoucherNo, sale_id: a.sale_id,
+        sale_voucher_no: a.voucher_no || "", adjusted_amount: Number(a.adjusted_amount),
+        company_id: String(company_id || ""), company_account_id: String(company_account_id || ""),
+        warehouse_id: String(warehouse_id || row.warehouse_id || ""), date, createdAt: new Date(), updatedAt: new Date()
+      })));
+    }
+    return res.json({ id: String(row._id), _id: String(row._id), updated: 1, voucher_no: newVoucherNo, adjustments: cleanAdjustments, saved_to: "mongodb" });
+  } catch (err) {
+    console.error("Mongo receipt update failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to update receipt" });
+  }
 });
 
 router.delete("/receipt/:id", async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.receipt.delete")) return res.status(403).json({ error: "Permission denied" });
+  if (!userHasPermission(req.user, "warehouse.trading.receipt.delete")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Receipt vouchers" });
   try {
-    const {receiptCollection,adjustmentCollection}=await getMongoReceiptCollectionsStrict();
-    const vals=mongoReferenceValues(req.params.id);
-    const row=await receiptCollection.findOne({$or:[{_id:{$in:vals.filter(v=>v instanceof mongoose.Types.ObjectId)}},{id:{$in:vals}},{voucher_no:{$in:vals.map(String)}}]});
-    if(!row)return res.status(404).json({error:"Receipt voucher not found"});
-    await adjustmentCollection.deleteMany({$or:[{receipt_id:row._id},{receipt_id:String(row._id)},{receipt_voucher_no:row.voucher_no}]});
-    await receiptCollection.deleteOne({_id:row._id});
-    res.json({deleted:1,saved_to:"mongodb"});
-  }catch(err){res.status(500).json({error:err.message||"Failed to delete MongoDB receipt"});}
+    const receiptCollection = await getMongoCollectionIfExists(["wh_receipt_vouchers","receipt_vouchers","receiptvouchers","receipts"]);
+    const adjustmentCollection = await getMongoCollectionIfExists(["wh_receipt_adjustments","receipt_adjustments","receiptadjustments"]);
+    if (!receiptCollection) return res.status(503).json({ error: "MongoDB receipt collection not found" });
+
+    const vals = mongoReferenceValues(req.params.id);
+    const row = await receiptCollection.findOne({ $or: [
+      { _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } },
+      { id: { $in: vals } }, { voucher_no: String(req.params.id) }
+    ]});
+    if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
+    const ok = await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id);
+    if (!ok) return;
+
+    if (adjustmentCollection) {
+      await adjustmentCollection.deleteMany({ $or: [{ receipt_id: row._id }, { receipt_voucher_no: row.voucher_no }] });
+    }
+    await receiptCollection.deleteOne({ _id: row._id });
+    return res.json({ deleted: 1, id: String(row._id), saved_to: "mongodb" });
+  } catch (err) {
+    console.error("Mongo receipt delete failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to delete receipt" });
+  }
 });
 
+// ===========================
 // ===========================
 // JOURNAL VOUCHERS
 // ===========================
-router.get("/journal", (req, res) => {
+router.get("/journal", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.journal.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
-
-  getWarehouseScopedRows(req, res, "wh_journal_vouchers");
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Journal" });
+  try {
+    const filter = { ...mongoPurchaseScope(req.user) };
+    const rows = await JournalVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+    return res.json((rows || []).map((row) => ({ ...row, id: String(row._id), _id: String(row._id), saved_to: "mongodb" })));
+  } catch (err) {
+    console.error("Mongo journal list failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to load journals" });
+  }
 });
 
-router.post("/journal", (req, res) => {
+router.post("/journal", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.journal.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
-
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Journal" });
   const { voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description } = req.body;
-  ensureWarehouseAccess(req, res, warehouse_id, location_id).then((ok) => {
-  if (!ok) return;
-
-  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
-  if (idemKey) {
-    return getIdempotency(idemKey, "journal", (err, existingId) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (existingId) {
-        return db.get(`SELECT * FROM wh_journal_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
-          if (e2) return res.status(500).json({ error: e2.message });
-          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
-        });
-      }
-
-      createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
-        if (err) return res.status(500).json({ error: err.message });
-
-        const query = `
-          INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `;
-
-        db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
-          if (err) {
-            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-            return res.status(500).json({ error: err.message });
-          }
-          saveIdempotency(idemKey, "journal", this.lastID, () => {});
-          res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
-        });
-      });
+  const access = await ensureWarehouseAccess(req, res, warehouse_id, location_id);
+  if (!access) return;
+  try {
+    const generatedVoucherNo = voucher_no && String(voucher_no).trim() ? String(voucher_no).trim() : await nextMongoJournalVoucherNo();
+    const doc = await JournalVoucher.create({
+      voucher_no: generatedVoucherNo,
+      date,
+      warehouse_id: String(warehouse_id || ""),
+      company_account_id: String(company_account_id || ""),
+      debit_account,
+      credit_account,
+      amount: Number(amount || 0),
+      employee_id: employee_id || null,
+      location_id: location_id || null,
+      description,
     });
+    return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: generatedVoucherNo, saved_to: "mongodb" });
+  } catch (err) {
+    console.error("Mongo journal save failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to save journal" });
   }
-
-  createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
-    if (err) return res.status(500).json({ error: err.message });
-
-    const query = `
-      INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
-
-    db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
-      if (err) {
-        if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
-    });
-  });
-  });
 });
 
 function dbAll(query, params = []) {
@@ -4291,32 +4272,45 @@ async function getSaleReportRowsForUser(user, options = {}) {
 
 async function enrichLedgerRowsWithPartyDetails(rows) {
   const list = Array.isArray(rows) ? rows : [];
-  if (!mongoReady() || !list.length) return list;
+  if (!list.length) return list;
 
-  const farmerIds = [...new Set(list.map((row) => String(row?.farmer_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-  const accountIds = [...new Set(list.map((row) => String(row?.company_account_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-  const [farmers, accounts] = await Promise.all([
-    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
-    accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
+  const farmerIds = [...new Set(list.map((row) => String(row?.farmer_id || "")).filter(Boolean))];
+  const accountIds = [...new Set(list.map((row) => String(row?.company_account_id || "")).filter(Boolean))];
+  const mongoFarmerIds = farmerIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const mongoAccountIds = accountIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const legacyFarmerIds = farmerIds.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+
+  // Most purchase rows are already decorated by getPurchaseReportRowsForUser.
+  // Only fetch missing master data, and do legacy farmer IDs in one SQLite query.
+  const needsFarmerLookup = list.some((row) => !String(row?.farmer_name || "").trim() || String(row?.farmer_name).trim() === "-");
+  const needsAccountLookup = list.some((row) => !String(row?.company_account_name || "").trim() || String(row?.company_account_name).trim() === "-");
+  if (!needsFarmerLookup && !needsAccountLookup) return list;
+
+  const [farmers, legacyFarmers, accounts] = await Promise.all([
+    mongoReady() && mongoFarmerIds.length ? Farmer.find({ _id: { $in: mongoFarmerIds } }).lean() : Promise.resolve([]),
+    legacyFarmerIds.length ? sqliteRowsByIds("farmers", legacyFarmerIds) : Promise.resolve(new Map()),
+    mongoReady() && mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
   ]);
   const farmerMap = new Map(farmers.map((item) => [String(item._id), item]));
   const accountMap = new Map(accounts.map((item) => [String(item._id), item]));
 
   return list.map((row) => {
-    const farmer = farmerMap.get(String(row?.farmer_id || ""));
-    const account = accountMap.get(String(row?.company_account_id || ""));
+    const farmerId = String(row?.farmer_id || "");
+    const farmer = farmerMap.get(farmerId) || {};
+    const legacyFarmer = legacyFarmers.get(farmerId) || {};
+    const account = accountMap.get(String(row?.company_account_id || "")) || {};
     return {
       ...row,
-      farmer_name: row?.farmer_name || farmer?.name,
-      farmer_mobile: row?.farmer_mobile || farmer?.mobile,
-      farmer_address: row?.farmer_address || farmer?.address,
-      farmer_village: row?.farmer_village || farmer?.village,
-      farmer_city: row?.farmer_city || farmer?.city,
-      farmer_district: row?.farmer_district || farmer?.district,
-      farmer_state: row?.farmer_state || farmer?.state,
-      farmer_pincode: row?.farmer_pincode || farmer?.pincode,
-      farmer_gst: row?.farmer_gst || farmer?.gst_no || farmer?.gst,
-      farmer_pan: row?.farmer_pan || farmer?.pan_no || farmer?.pan,
+      farmer_name: row?.farmer_name || farmer?.name || legacyFarmer?.name,
+      farmer_mobile: row?.farmer_mobile || farmer?.mobile || legacyFarmer?.mobile || legacyFarmer?.phone,
+      farmer_address: row?.farmer_address || farmer?.address || legacyFarmer?.address,
+      farmer_village: row?.farmer_village || farmer?.village || legacyFarmer?.village,
+      farmer_city: row?.farmer_city || farmer?.city || legacyFarmer?.city,
+      farmer_district: row?.farmer_district || farmer?.district || legacyFarmer?.district,
+      farmer_state: row?.farmer_state || farmer?.state || legacyFarmer?.state,
+      farmer_pincode: row?.farmer_pincode || farmer?.pincode || legacyFarmer?.pincode,
+      farmer_gst: row?.farmer_gst || farmer?.gst_no || farmer?.gst || legacyFarmer?.gst_no || legacyFarmer?.gst,
+      farmer_pan: row?.farmer_pan || farmer?.pan_no || farmer?.pan || legacyFarmer?.pan_no || legacyFarmer?.pan,
       company_account_name: row?.company_account_name || account?.account_name,
       company_account_address: row?.company_account_address || account?.address,
       company_account_mobile: row?.company_account_mobile || account?.mobile,
@@ -4906,6 +4900,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
   }
 
   try {
+    const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
     const detailsOfDeduction = ["1", "true", "yes", "details"].includes(String(req.query.details_of_deduction || "").trim().toLowerCase());
@@ -4931,11 +4926,13 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
 
     const paymentsPromise = dbAll(
       `
-        SELECT p.*, w.name AS warehouse_name, f.name AS farmer_name, ca.account_name AS company_account_name
+        SELECT p.id, p.voucher_no, p.date, p.warehouse_id, p.farmer_id, p.company_account_id,
+               p.amount, p.reference_id, p.reference_type,
+               w.name AS warehouse_name, f.name AS farmer_name, ca.account_name AS company_account_name
         FROM wh_payment_vouchers p
-        LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
-        LEFT JOIN farmers f ON CAST(f.id AS TEXT) = CAST(p.farmer_id AS TEXT)
-        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(p.company_account_id AS TEXT)
+        LEFT JOIN warehouses w ON w.id = p.warehouse_id
+        LEFT JOIN farmers f ON f.id = p.farmer_id
+        LEFT JOIN company_accounts ca ON ca.id = p.company_account_id
         WHERE 1 = 1 ${filter.clause} ${farmerClause} ${warehouseClause} ${accountClause}
       `,
       paymentParams
@@ -4946,9 +4943,8 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const sqliteAdjustments = paymentIds.length
       ? await dbAll(
           `
-            SELECT a.*, pv.voucher_no AS purchase_voucher_no
+            SELECT a.*
             FROM wh_payment_adjustments a
-            LEFT JOIN wh_purchase_vouchers pv ON CAST(pv.id AS TEXT) = CAST(a.purchase_id AS TEXT)
             WHERE a.payment_id IN (${paymentIds.map(() => "?").join(",")})
             ORDER BY a.id ASC
           `,
@@ -4966,7 +4962,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       const purchaseId = String(item.purchase_id);
       const purchase = purchaseMap.get(purchaseId);
       const payment = paymentMap.get(paymentId);
-      const voucherNo = item.purchase_voucher_no || purchase?.voucher_no || item.purchase_id;
+      const voucherNo = purchase?.voucher_no || item.purchase_voucher_no || item.purchase_id;
       const detail = {
         ...item,
         purchase_voucher_no: voucherNo,
@@ -5263,6 +5259,36 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       }
     }
 
+    // Journal deductions are MongoDB-only. Load all automatic F2 journals for
+    // the current sales in one query so the ledger shows deduction totals and
+    // drill-down details without touching SQLite.
+    let mongoJournals = [];
+    if (mongoReady() && sales.length) {
+      // Read the Mongo journal collection directly and match the sale voucher
+      // number in the automatic F2 journal description. Do not depend on an
+      // $in array of regex expressions, because Mongo/Mongoose deployments can
+      // serialize those differently.
+      mongoJournals = await JournalVoucher.find({
+        description: { $regex: /^Auto sale deduction:/i },
+        amount: { $gt: 0 },
+      }).sort({ date: 1, createdAt: 1, _id: 1 }).lean();
+    }
+    const journalsBySale = new Map();
+    for (const journal of mongoJournals) {
+      const match = String(journal.description || "").match(/^Auto sale deduction:(.+?):(claim|other_deduction|cash_discount|tds)$/);
+      if (!match) continue;
+      const key = match[1];
+      if (!journalsBySale.has(key)) journalsBySale.set(key, []);
+      journalsBySale.get(key).push({
+        ...journal,
+        id: String(journal._id),
+        _id: String(journal._id),
+        type: match[2],
+        label: journal.credit_account || match[2],
+        amount: Number(journal.amount || 0),
+      });
+    }
+
     const saleRows = (sales || []).map((row) => {
       const saleId = String(row.id || row._id || row.voucher_no || row.bill_no);
       const details = bySale.get(saleId) || [];
@@ -5270,6 +5296,8 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       const master = buyerMap.get(buyerIdValue) || {};
       const saleAmount = Number(row.total_amount ?? row.net_receivable_amount ?? row.amount ?? 0);
       const received = details.reduce((sum, d) => sum + Number(d.adjusted_amount || 0), 0);
+      const journalDetails = journalsBySale.get(String(row.voucher_no || row.bill_no || "")) || [];
+      const journalAmount = journalDetails.reduce((sum, d) => sum + Number(d.amount || 0), 0);
       const partyName = row.buyer_name || row.party_name || row.company_name || master.name || master.buyer_name || master.company_name || master.party_name || "-";
       return {
         ...row,
@@ -5292,6 +5320,9 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         receipt_details: details,
         receipt_date: details[0]?.receipt_date || "",
         receipt_voucher_no: details[0]?.receipt_voucher_no || "",
+        journal_details: journalDetails,
+        journal_amount: Number(journalAmount.toFixed(2)),
+        deduction_amount: Number(journalAmount.toFixed(2)),
         debit: Number(saleAmount.toFixed(2)),
         credit: 0,
         bill_balance: Number((saleAmount - received).toFixed(2)),
@@ -5316,6 +5347,8 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         credit: Number(row.amount || 0),
         balance: -Number(row.amount || 0),
         receipt_amount: Number(row.amount || 0),
+        journal_amount: 0,
+        journal_details: [],
       };
     });
 
@@ -5770,7 +5803,17 @@ router.get("/sale/:id/summary", async (req, res) => {
           }
         })();
     const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
-    const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
+    let journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
+    if (mongoReady() && row.voucher_no) {
+      try {
+        journalDetails = await JournalVoucher.find({
+          description: { $regex: `^${escapeRegExp(`Auto sale deduction:${row.voucher_no}:`)}` },
+        }).sort({ createdAt: 1, _id: 1 }).lean();
+        journalDetails = journalDetails.map((item) => ({ ...item, id: String(item._id), _id: String(item._id) }));
+      } catch (journalErr) {
+        console.warn("Mongo sale journal lookup skipped:", journalErr?.message || journalErr);
+      }
+    }
     const resolvedTransportRow = await getTransportBiltiMatch({
       saleId: row._id || row.id,
       voucherNo: row.voucher_no || row.bill_no || "",
