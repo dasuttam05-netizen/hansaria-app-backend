@@ -1022,11 +1022,51 @@ async function decorateSaleRows(rows) {
     }
   };
 
+  // Buyer masters can exist under different collection names in older/newer deployments.
+  // Resolve both buyer_id and company_id against all supported buyer master collections
+  // so Sale Summary / Party Ledger never lose the buyer name.
+  const mongoBuyerRows = async (ids) => {
+    if (!mongoose?.connection?.readyState || !ids.length) return [];
+    try {
+      const values = ids.flatMap(mongoReferenceValues);
+      const objectIds = values.filter((value) => value instanceof mongoose.Types.ObjectId);
+      const stringIds = values.filter((value) => typeof value === "string");
+      const numericIds = values.filter((value) => typeof value === "number");
+      const names = new Set(
+        (await mongoose.connection.db.listCollections({}, { nameOnly: true }).toArray()).map((item) => item.name)
+      );
+      const candidates = ["buyer_names", "buyers", "parties", "company_names"].filter((name) => names.has(name));
+      const results = [];
+      for (const name of candidates) {
+        const collection = mongoose.connection.db.collection(name);
+        const clauses = [];
+        if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
+        if (stringIds.length) {
+          clauses.push({ id: { $in: stringIds } });
+          clauses.push({ legacy_id: { $in: stringIds } });
+          clauses.push({ row_id: { $in: stringIds } });
+        }
+        if (numericIds.length) clauses.push({ id: { $in: numericIds } });
+        if (clauses.length) results.push(...(await collection.find({ $or: clauses }).toArray()));
+      }
+      const seen = new Set();
+      return results.filter((item) => {
+        const key = String(item?._id || item?.id || item?.legacy_id || item?.row_id || "");
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    } catch (err) {
+      console.warn("Mongo buyer master lookup skipped:", err?.message || err);
+      return [];
+    }
+  };
+
   const [warehouses, products, accounts, buyers, consignees] = await Promise.all([
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
-    mongoMasterRows("buyer_names", buyerIds),
+    mongoBuyerRows(buyerIds),
     mongoMasterRows("consignee_names", consigneeIds),
   ]);
 
@@ -4648,11 +4688,20 @@ router.get("/report/filter-options", async (req, res) => {
     } else {
       const saleScope = { ...mongoSaleScope(req.user) };
       const buyerFilter = buyerId ? { $or: [{ buyer_id: buyerId }, { company_id: buyerId }] } : {};
-      [accountIds, warehouseIds, buyerIds] = await Promise.all([
+      const saleMasterScope = {
+        ...saleScope,
+        ...(accountId ? { company_account_id: accountId } : {}),
+        ...(warehouseId ? { warehouse_id: warehouseId } : {}),
+      };
+      const [saleAccountIds, saleWarehouseIds, saleBuyerIds, saleCompanyIds] = await Promise.all([
         SaleVoucher.distinct("company_account_id", { ...saleScope, ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...buyerFilter }),
         SaleVoucher.distinct("warehouse_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...buyerFilter }),
-        SaleVoucher.distinct("buyer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}) }),
+        SaleVoucher.distinct("buyer_id", { ...saleMasterScope, ...buyerFilter }),
+        SaleVoucher.distinct("company_id", { ...saleMasterScope, ...buyerFilter }),
       ]);
+      accountIds = saleAccountIds;
+      warehouseIds = saleWarehouseIds;
+      buyerIds = [...(saleBuyerIds || []), ...(saleCompanyIds || [])];
       farmerIds = [];
     }
 
@@ -4669,13 +4718,33 @@ router.get("/report/filter-options", async (req, res) => {
     const mongoBuyerMasterRows = async () => {
       if (!cleanBuyerIds.length || !mongoose?.connection?.readyState) return [];
       try {
-        const collection = mongoose.connection.collection("buyer_names");
-        const objectIds = cleanBuyerIds.filter((id) => mongoose.Types.ObjectId.isValid(id)).map((id) => new mongoose.Types.ObjectId(id));
-        const clauses = [];
-        if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
-        clauses.push({ id: { $in: cleanBuyerIds } });
-        clauses.push({ id: { $in: cleanBuyerIds.map(Number).filter(Number.isFinite) } });
-        return await collection.find({ $or: clauses }).toArray();
+        const values = cleanBuyerIds.flatMap(mongoReferenceValues);
+        const objectIds = values.filter((value) => value instanceof mongoose.Types.ObjectId);
+        const stringIds = values.filter((value) => typeof value === "string");
+        const numericIds = values.filter((value) => typeof value === "number");
+        const names = new Set(
+          (await mongoose.connection.db.listCollections({}, { nameOnly: true }).toArray()).map((item) => item.name)
+        );
+        const results = [];
+        for (const name of ["buyer_names", "buyers", "parties", "company_names"].filter((item) => names.has(item))) {
+          const collection = mongoose.connection.db.collection(name);
+          const clauses = [];
+          if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
+          if (stringIds.length) {
+            clauses.push({ id: { $in: stringIds } });
+            clauses.push({ legacy_id: { $in: stringIds } });
+            clauses.push({ row_id: { $in: stringIds } });
+          }
+          if (numericIds.length) clauses.push({ id: { $in: numericIds } });
+          if (clauses.length) results.push(...(await collection.find({ $or: clauses }).toArray()));
+        }
+        const seen = new Set();
+        return results.filter((item) => {
+          const key = String(item?._id || item?.id || item?.legacy_id || item?.row_id || "");
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
       } catch (err) {
         console.warn("Mongo buyer filter lookup skipped:", err?.message || err);
         return [];
@@ -5270,16 +5339,32 @@ async function getMongoSalePartyLedgerSupport(req, sales) {
 
 async function getMongoPartyMasters(ids, candidates) {
   if (!mongoReady() || !ids.length) return [];
-  const collection = await getMongoCollectionIfExists(candidates);
-  if (!collection) return [];
-  const vals = ids.flatMap(mongoReferenceValues);
-  const docs = await collection.find({ $or: [
-    { _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } },
-    { id: { $in: vals } },
-    { legacy_id: { $in: vals } },
-    { row_id: { $in: vals } },
-  ] }).toArray();
-  return docs;
+  try {
+    const vals = ids.flatMap(mongoReferenceValues);
+    const names = new Set(
+      (await mongoose.connection.db.listCollections({}, { nameOnly: true }).toArray()).map((item) => item.name)
+    );
+    const docs = [];
+    for (const name of (candidates || []).filter((candidate) => names.has(candidate))) {
+      const collection = mongoose.connection.db.collection(name);
+      docs.push(...(await collection.find({ $or: [
+        { _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } },
+        { id: { $in: vals } },
+        { legacy_id: { $in: vals } },
+        { row_id: { $in: vals } },
+      ] }).toArray()));
+    }
+    const seen = new Set();
+    return docs.filter((doc) => {
+      const key = String(doc?._id || doc?.id || doc?.legacy_id || doc?.row_id || "");
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  } catch (err) {
+    console.warn("Mongo party master lookup skipped:", err?.message || err);
+    return [];
+  }
 }
 
 router.get("/report/sale-party-ledger", async (req, res) => {
