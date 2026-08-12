@@ -1078,10 +1078,10 @@ async function decorateSaleRows(rows) {
       warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
       product_name: product?.name || plain?.product_name || "-",
       company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
-      buyer_name: buyer?.name || buyer?.company_name || buyer?.party_name || plain?.buyer_name || plain?.party_name || plain?.company_name || "-",
+      buyer_name: buyer?.name || buyer?.buyer_name || buyer?.company_name || buyer?.party_name || buyer?.account_name || plain?.buyer_name || plain?.party_name || plain?.company_name || "-",
       buyer_email: buyer?.email || plain?.buyer_email || "",
       buyer_mobile: buyer?.mobile || buyer?.phone || plain?.buyer_mobile || "",
-      consignee_name: consignee?.name || consignee?.company_name || plain?.consignee_name || "-",
+      consignee_name: consignee?.name || consignee?.consignee_name || consignee?.company_name || consignee?.party_name || plain?.consignee_name || "-",
       consignee_email: consignee?.email || plain?.consignee_email || "",
       consignee_mobile: consignee?.mobile || consignee?.phone || plain?.consignee_mobile || "",
       rate: Number.isFinite(rate) ? rate : 0,
@@ -5197,6 +5197,85 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
   }
 });
 
+async function getMongoCollectionIfExists(candidates) {
+  if (!mongoReady()) return null;
+  try {
+    const names = new Set((await mongoose.connection.db.listCollections({}, { nameOnly: true }).toArray()).map((x) => x.name));
+    for (const name of candidates) {
+      if (names.has(name)) return mongoose.connection.collection(name);
+    }
+  } catch (err) {
+    console.warn("Mongo collection discovery skipped:", err?.message || err);
+  }
+  return null;
+}
+
+function mongoReferenceValues(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return [];
+  const values = [raw];
+  const n = Number(raw);
+  if (Number.isFinite(n)) values.push(n);
+  if (mongoose.Types.ObjectId.isValid(raw)) values.push(new mongoose.Types.ObjectId(raw));
+  return values;
+}
+
+async function getMongoSalePartyLedgerSupport(req, sales) {
+  if (!mongoReady()) return { receipts: [], adjustments: [] };
+
+  const receiptCollection = await getMongoCollectionIfExists([
+    "wh_receipt_vouchers", "receipt_vouchers", "receiptvouchers", "receipts"
+  ]);
+  const adjustmentCollection = await getMongoCollectionIfExists([
+    "wh_receipt_adjustments", "receipt_adjustments", "receiptadjustments"
+  ]);
+  if (!receiptCollection) return { receipts: [], adjustments: [] };
+
+  const buyerIds = [...new Set((sales || []).flatMap((s) => [s?.buyer_id, s?.company_id]).filter(Boolean).map(String))];
+  const warehouseId = String(req.query.warehouse_id || "").trim();
+  const accountId = String(req.query.company_account_id || "").trim();
+  const buyerId = String(req.query.buyer_id || "").trim();
+
+  const clauses = [];
+  const idsForBuyer = buyerId ? [buyerId] : buyerIds;
+  if (idsForBuyer.length) {
+    const idVals = idsForBuyer.flatMap(mongoReferenceValues);
+    clauses.push({ $or: [
+      { company_id: { $in: idVals } },
+      { buyer_id: { $in: idVals } },
+      { party_id: { $in: idVals } },
+    ]});
+  }
+  if (warehouseId) clauses.push({ warehouse_id: { $in: mongoReferenceValues(warehouseId) } });
+  if (accountId) clauses.push({ company_account_id: { $in: mongoReferenceValues(accountId) } });
+
+  const receipts = await receiptCollection.find(clauses.length ? { $and: clauses } : {}).sort({ date: 1, _id: 1 }).toArray();
+  let adjustments = [];
+  if (adjustmentCollection && receipts.length) {
+    const receiptIds = receipts.flatMap((r) => mongoReferenceValues(r?._id || r?.id));
+    const saleIds = (sales || []).flatMap((s) => [s?._id, s?.id, s?.voucher_no, s?.bill_no, s?.legacy_id, s?.sqlite_id]).flatMap(mongoReferenceValues);
+    const or = [];
+    if (receiptIds.length) or.push({ receipt_id: { $in: receiptIds } });
+    if (saleIds.length) or.push({ sale_id: { $in: saleIds } }, { sale_voucher_no: { $in: saleIds.map(String) } }, { reference_id: { $in: saleIds.map(String) } });
+    if (or.length) adjustments = await adjustmentCollection.find({ $or: or }).sort({ createdAt: 1, _id: 1 }).toArray();
+  }
+  return { receipts, adjustments };
+}
+
+async function getMongoPartyMasters(ids, candidates) {
+  if (!mongoReady() || !ids.length) return [];
+  const collection = await getMongoCollectionIfExists(candidates);
+  if (!collection) return [];
+  const vals = ids.flatMap(mongoReferenceValues);
+  const docs = await collection.find({ $or: [
+    { _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } },
+    { id: { $in: vals } },
+    { legacy_id: { $in: vals } },
+    { row_id: { $in: vals } },
+  ] }).toArray();
+  return docs;
+}
+
 router.get("/report/sale-party-ledger", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
@@ -5206,162 +5285,143 @@ router.get("/report/sale-party-ledger", async (req, res) => {
     const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
+
     const sales = await getSaleReportRowsForUser(req.user, { buyerId, farmerId, warehouseId, companyAccountId });
 
-    // Sale Party Ledger must still render when receipt/adjustment mirror data is
-    // temporarily unavailable. The sale rows themselves are the primary ledger
-    // source; receipts are optional detail rows.
-    let receipts = [];
-    let adjustmentRows = [];
-    const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
-    const receiptParams = [...filter.params];
-    const clauses = [];
-    if (buyerId) { clauses.push(" AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(buyerId); }
-    if (warehouseId) { clauses.push(" AND CAST(r.warehouse_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(warehouseId); }
-    if (companyAccountId) { clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(companyAccountId); }
-    try {
-      receipts = await dbAll(`
-        SELECT
-          r.*,
-          ca.account_name AS company_account_name,
-          b.name AS buyer_name
-        FROM wh_receipt_vouchers r
-        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
-        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(r.company_id AS TEXT)
-        WHERE 1=1 ${filter.clause} ${clauses.join(" ")}
-        ORDER BY r.date DESC, r.id DESC
-      `, receiptParams);
+    // IMPORTANT: Sale Party Ledger is MongoDB-first. Do not read SQLite receipt
+    // rows here. Existing Mongo receipt/adjustment collections are discovered
+    // dynamically because deployments may use different collection names.
+    const support = await getMongoSalePartyLedgerSupport(req, sales);
+    const receipts = support.receipts || [];
+    const adjustmentRows = support.adjustments || [];
 
-      const receiptIds = receipts.map((row) => row.id);
-      adjustmentRows = receiptIds.length ? await dbAll(`
-        SELECT a.*, rv.voucher_no AS receipt_voucher_no
-        FROM wh_receipt_adjustments a
-        LEFT JOIN wh_receipt_vouchers rv ON CAST(rv.id AS TEXT) = CAST(a.receipt_id AS TEXT)
-        WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
-        ORDER BY a.id ASC
-      `, receiptIds) : [];
-    } catch (receiptErr) {
-      console.warn("Sale Party Ledger receipt details unavailable; rendering sale rows only:", receiptErr.message);
-      receipts = [];
-      adjustmentRows = [];
+    // Extra master lookup: some old SaleVoucher records keep numeric/legacy
+    // buyer IDs while newer records keep Mongo ObjectIds.
+    const buyerIds = [...new Set((sales || []).flatMap((r) => [r?.buyer_id, r?.company_id]).filter(Boolean).map(String))];
+    const buyerMasters = await getMongoPartyMasters(buyerIds, ["buyer_names", "buyers", "parties", "company_names"]);
+    const buyerMap = new Map();
+    for (const b of buyerMasters) {
+      for (const k of [b?._id, b?.id, b?.legacy_id, b?.row_id].filter((v) => v !== undefined && v !== null).map(String)) buyerMap.set(k, b);
     }
 
-    // Match Mongo Sale vouchers using every stable reference we have.
-    // Legacy receipt adjustments can contain an old SQLite sale_id, while the
-    // current Sale voucher has a Mongo ObjectId. Voucher/bill number is the
-    // bridge between the two generations.
     const saleMap = new Map();
     (sales || []).forEach((row) => {
-      const keys = [row?.id, row?._id, row?.voucher_no, row?.bill_no, row?.legacy_id, row?.sqlite_id]
-        .filter((v) => v !== undefined && v !== null && String(v).trim() !== "")
-        .map(String);
-      keys.forEach((key) => saleMap.set(key, row));
+      for (const key of [row?.id, row?._id, row?.voucher_no, row?.bill_no, row?.legacy_id, row?.sqlite_id].filter(Boolean).map(String)) {
+        saleMap.set(key, row);
+      }
     });
-    const receiptMap = new Map((receipts || []).map((row) => [String(row.id), row]));
+    const receiptMap = new Map();
+    receipts.forEach((r) => {
+      for (const key of [r?._id, r?.id, r?.voucher_no].filter(Boolean).map(String)) receiptMap.set(key, r);
+    });
+
     const bySale = new Map();
     const byReceipt = new Map();
-    (adjustmentRows || []).forEach((item) => {
-      const saleKey = String(item.sale_id || item.sale_voucher_no || item.reference_id || "");
-      const receiptId = String(item.receipt_id || "");
-      const sale = saleMap.get(saleKey);
-      const receipt = receiptMap.get(receiptId);
+    const addDetail = (sale, receipt, item, inferred = false) => {
+      if (!sale) return;
+      const saleKey = String(sale.id || sale._id || sale.voucher_no || sale.bill_no);
+      const receiptKey = String(receipt?._id || receipt?.id || item?.receipt_id || "");
+      const adjusted = Number(item?.adjusted_amount ?? item?.amount ?? receipt?.amount ?? 0);
       const detail = {
         ...item,
-        sale_voucher_no: sale?.voucher_no || item.sale_voucher_no || item.sale_id,
-        receipt_date: receipt?.date || "",
-        receipt_voucher_no: receipt?.voucher_no || item.receipt_voucher_no || "",
-        receipt_amount: Number(receipt?.amount || 0),
+        sale_id: saleKey,
+        sale_voucher_no: sale?.voucher_no || sale?.bill_no || item?.sale_voucher_no || "",
+        receipt_id: receiptKey,
+        receipt_date: receipt?.date || item?.receipt_date || "",
+        receipt_voucher_no: receipt?.voucher_no || item?.receipt_voucher_no || "",
+        receipt_amount: Number(receipt?.amount || item?.receipt_amount || 0),
+        adjusted_amount: adjusted,
+        inferred_adjustment: inferred,
       };
-      if (!bySale.has(saleId)) bySale.set(saleId, []);
-      bySale.get(saleId).push(detail);
-      if (!byReceipt.has(receiptId)) byReceipt.set(receiptId, []);
-      byReceipt.get(receiptId).push(detail);
-    });
-
-    // Some legacy receipts have no adjustment row but do carry reference_id.
-    // Treat a reference to the Mongo voucher/bill number as an inferred receipt
-    // adjustment so the Receipt Date/Voucher/Amount columns are not blank.
-    (receipts || []).forEach((receipt) => {
-      const reference = String(receipt?.reference_id || "").trim();
-      if (!reference) return;
-      const sale = saleMap.get(reference);
-      if (!sale) return;
-      const receiptId = String(receipt.id);
-      if (byReceipt.has(receiptId)) return;
-      const detail = {
-        sale_id: String(sale.id || sale._id || ""),
-        sale_voucher_no: sale.voucher_no || sale.bill_no || reference,
-        receipt_id: receiptId,
-        receipt_date: receipt.date || "",
-        receipt_voucher_no: receipt.voucher_no || "",
-        receipt_amount: Number(receipt.amount || 0),
-        adjusted_amount: Number(receipt.amount || 0),
-        inferred_adjustment: true,
-      };
-      const saleKey = String(sale.id || sale._id || "");
       if (!bySale.has(saleKey)) bySale.set(saleKey, []);
       bySale.get(saleKey).push(detail);
-      byReceipt.set(receiptId, [detail]);
+      if (receiptKey) {
+        if (!byReceipt.has(receiptKey)) byReceipt.set(receiptKey, []);
+        byReceipt.get(receiptKey).push(detail);
+      }
+    };
+
+    for (const item of adjustmentRows) {
+      const saleKeyCandidates = [item?.sale_id, item?.sale_voucher_no, item?.reference_id].filter(Boolean).map(String);
+      const receipt = receiptMap.get(String(item?.receipt_id || "")) || receiptMap.get(String(item?.receipt_voucher_no || ""));
+      const sale = saleKeyCandidates.map((k) => saleMap.get(k)).find(Boolean) || (receipt ? saleMap.get(String(receipt.reference_id || "")) : null);
+      addDetail(sale, receipt, item, false);
+    }
+
+    // Legacy receipt documents sometimes store only reference_id and no
+    // adjustment document. Map that reference directly to the sale bill.
+    for (const receipt of receipts) {
+      const ref = String(receipt?.reference_id || receipt?.sale_id || "").trim();
+      if (!ref) continue;
+      const sale = saleMap.get(ref);
+      if (!sale) continue;
+      const receiptKey = String(receipt?._id || receipt?.id || receipt?.voucher_no || "");
+      if (!byReceipt.has(receiptKey)) {
+        addDetail(sale, receipt, {
+          receipt_id: receiptKey,
+          adjusted_amount: Number(receipt?.amount || 0),
+          reference_id: ref,
+        }, true);
+      }
+    }
+
+    const saleRows = (sales || []).map((row) => {
+      const saleId = String(row.id || row._id || row.voucher_no || row.bill_no);
+      const details = bySale.get(saleId) || [];
+      const buyerIdValue = String(row.buyer_id || row.company_id || "");
+      const master = buyerMap.get(buyerIdValue) || {};
+      const saleAmount = Number(row.total_amount ?? row.net_receivable_amount ?? row.amount ?? 0);
+      const received = details.reduce((sum, d) => sum + Number(d.adjusted_amount || 0), 0);
+      const partyName = row.buyer_name || row.party_name || row.company_name || master.name || master.buyer_name || master.company_name || master.party_name || "-";
+      return {
+        ...row,
+        sale_id: saleId,
+        voucher_type: "Sale",
+        particulars: `Sale Bill ${row.voucher_no || row.bill_no || ""}`.trim(),
+        party_id: buyerIdValue,
+        party_name: partyName,
+        buyer_name: partyName,
+        company_account_name: row.company_account_name || "-",
+        product_name: row.product_name || "-",
+        quantity: Number(row.quantity ?? row.total_quantity ?? row.unloading_qty ?? 0),
+        total_quantity: Number(row.total_quantity ?? row.quantity ?? row.unloading_qty ?? 0),
+        rate: Number(row.rate || 0),
+        gross_amount: Number(row.gross_amount ?? (Number(row.total_quantity ?? row.quantity ?? 0) * Number(row.rate || 0))),
+        sale_amount: Number(saleAmount.toFixed(2)),
+        receipt_amount: Number(received.toFixed(2)),
+        received_amount: Number(received.toFixed(2)),
+        adjustment: Number(received.toFixed(2)),
+        receipt_details: details,
+        receipt_date: details[0]?.receipt_date || "",
+        receipt_voucher_no: details[0]?.receipt_voucher_no || "",
+        debit: Number(saleAmount.toFixed(2)),
+        credit: 0,
+        bill_balance: Number((saleAmount - received).toFixed(2)),
+        balance: Number((saleAmount - received).toFixed(2)),
+      };
     });
 
-    const rows = [
-      ...(sales || []).map((row) => {
-        const saleId = String(row.id || row._id);
-        const details = bySale.get(saleId) || [];
-        const saleAmount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
-        const receiptAmount = details.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
-        return {
-          ...row,
-          date: row.date,
-          voucher_no: row.voucher_no,
-          voucher_type: "Sale",
-          particulars: `Sale Bill ${row.voucher_no || ""}`.trim(),
-          adjustment_details: details.map((item) => `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
-          receipt_details: details,
-          sale_id: saleId,
-          sale_amount: Number(saleAmount.toFixed(2)),
-          receipt_amount: Number(receiptAmount.toFixed(2)),
-          journal_amount: 0,
-          bill_balance: Number((saleAmount - receiptAmount).toFixed(2)),
-          debit: saleAmount,
-          credit: 0,
-          party_id: String(row.buyer_id || row.company_id || ""),
-          party_name: row.buyer_name || row.party_name || row.company_name || row.consignee_name || "-",
-          company_account_name: row.company_account_name || "-",
-          product_name: row.product_name || "-",
-          quantity: Number(row.quantity ?? row.total_quantity ?? row.unloading_qty ?? 0),
-          total_quantity: Number(row.total_quantity ?? row.quantity ?? row.unloading_qty ?? 0),
-          rate: Number(row.rate || 0),
-          gross_amount: Number(row.gross_amount ?? (Number(row.total_quantity ?? row.quantity ?? 0) * Number(row.rate || 0))),
-          receipt_date: details[0]?.receipt_date || "",
-          receipt_voucher_no: details[0]?.receipt_voucher_no || "",
-          received_amount: Number(receiptAmount.toFixed(2)),
-          adjustment: Number(receiptAmount.toFixed(2)),
-          balance: Number((saleAmount - receiptAmount).toFixed(2)),
-        };
-      }),
-      ...(receipts || []).map((row) => {
-        const details = byReceipt.get(String(row.id)) || [];
-        const isOnAccount = !details.length && !String(row.reference_id || "").trim();
-        return {
-          ...row,
-          date: row.date,
-          voucher_no: row.voucher_no,
-          voucher_type: "Receipt",
-          particulars: isOnAccount ? "Unadjusted on account" : `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
-          adjustment_details: details.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
-          reference_id: row.reference_id || details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
-          receipt_details: details,
-          debit: 0,
-          credit: Number(row.amount || 0),
-          party_id: String(row.company_id || ""),
-          party_name: row.buyer_name || row.party_name || row.company_name || row.company_account_name || "-",
-          buyer_name: row.buyer_name || "-",
-        };
-      }),
-    ];
+    // Keep genuinely unadjusted Mongo receipts as separate credit rows. Receipts
+    // already attached to a sale are NOT repeated as standalone rows.
+    const standaloneReceipts = receipts.filter((r) => !byReceipt.has(String(r?._id || r?.id || r?.voucher_no || ""))).map((row) => {
+      const buyerIdValue = String(row.company_id || row.buyer_id || row.party_id || "");
+      const master = buyerMap.get(buyerIdValue) || {};
+      const partyName = row.buyer_name || row.party_name || row.company_name || master.name || master.buyer_name || master.company_name || master.party_name || "-";
+      return {
+        ...row,
+        voucher_type: "Receipt",
+        party_id: buyerIdValue,
+        party_name: partyName,
+        buyer_name: partyName,
+        particulars: "Unadjusted on account",
+        debit: 0,
+        credit: Number(row.amount || 0),
+        balance: -Number(row.amount || 0),
+        receipt_amount: Number(row.amount || 0),
+      };
+    });
 
-    return res.json(buildLedgerRows(rows, (row) => `${row.party_id || "unknown"}::${row.company_account_id || "no-account"}`, (row) => row.party_name || row.company_account_name || "Unknown Party"));
+    return res.json(buildLedgerRows([...saleRows, ...standaloneReceipts], (row) => `${row.party_id || "unknown"}::${row.company_account_id || row.company_account_name || "no-account"}`, (row) => row.party_name || row.buyer_name || row.company_name || row.company_account_name || "Unknown Party"));
   } catch (err) {
     console.error("Sale party ledger failed:", err);
     res.status(500).json({ error: err.message || "Failed to load sale party ledger" });
