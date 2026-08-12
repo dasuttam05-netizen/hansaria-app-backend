@@ -904,6 +904,10 @@ async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deduc
     company_account_id: String(body.company_account_id || sale.company_account_id || ""),
     employee_id: body.employee_id || sale.employee_id || null,
     location_id: body.location_id || sale.location_id || null,
+    sale_id: String(sale?._id || sale?.id || ""),
+    sale_voucher_no: saleVoucherNo,
+    reference_id: String(sale?._id || sale?.id || saleVoucherNo || ""),
+    reference_no: saleVoucherNo,
   };
 
   const claimValue = Number(
