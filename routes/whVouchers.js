@@ -86,6 +86,40 @@ function fmtNum(value) {
   return n.toFixed(2);
 }
 
+function normalizePartyNames(row = {}, buyerMaster = null, consigneeMaster = null) {
+  const buyerName =
+    row.buyer_name ||
+    row.company_name ||
+    row.party_name ||
+    buyerMaster?.name ||
+    buyerMaster?.buyer_name ||
+    buyerMaster?.company_name ||
+    buyerMaster?.party_name ||
+    "-";
+  const consigneeName =
+    row.consignee_name ||
+    consigneeMaster?.name ||
+    consigneeMaster?.consignee_name ||
+    consigneeMaster?.company_name ||
+    consigneeMaster?.party_name ||
+    "-";
+  const companyName =
+    row.company_name ||
+    row.party_name ||
+    row.buyer_name ||
+    buyerMaster?.company_name ||
+    buyerMaster?.party_name ||
+    buyerMaster?.name ||
+    "-";
+
+  return {
+    buyer_name: buyerName,
+    consignee_name: consigneeName,
+    company_name: companyName,
+    party_name: row.party_name || buyerName || companyName,
+  };
+}
+
 function toDateOnly(value) {
   const text = String(value || "").trim();
   if (!text) return "";
@@ -362,6 +396,7 @@ async function getSaleVoucherPage(req) {
       buyer_id: String(row?.buyer_id || row?.company_id || ""),
       total_quantity: Number(row?.quantity || row?.total_quantity || 0),
       total_amount: Number(row?.amount || row?.total_amount || 0),
+      ...normalizePartyNames(row),
       ...calculateSaleFollowupMeta(row || {}),
     }));
   }
@@ -369,7 +404,7 @@ async function getSaleVoucherPage(req) {
   // table. Bilti is an auxiliary field and is loaded lazily by the relevant
   // action. This removes an unnecessary cross-database query from every page.
   return voucherListResponse(
-    rows.map((row) => ({ ...row, bilti_id: row.bilti_id || null, ...calculateSaleFollowupMeta(row) })),
+    rows.map((row) => ({ ...row, ...normalizePartyNames(row), bilti_id: row.bilti_id || null, ...calculateSaleFollowupMeta(row) })),
     total,
     options
   );
@@ -424,6 +459,7 @@ function getSaleVoucherRowsSqlite(req, res) {
     if (err) return res.status(500).json({ error: err.message });
     res.json((rows || []).map((row) => ({
       ...row,
+      ...normalizePartyNames(row),
       ...calculateSaleFollowupMeta(row),
       id: String(row.id),
       _id: String(row.id),
@@ -3974,7 +4010,14 @@ router.get("/receipt/:id", async (req, res) => {
         ]
       }).sort({ createdAt: 1, _id: 1 }).toArray();
     }
-    return res.json({ ...row, id: String(row._id || row.id), _id: String(row._id || row.id), adjustments, saved_to: "mongodb" });
+    return res.json({
+      ...row,
+      ...normalizePartyNames(row),
+      id: String(row._id || row.id),
+      _id: String(row._id || row.id),
+      adjustments,
+      saved_to: "mongodb",
+    });
   } catch (err) {
     console.error("Mongo receipt get failed:", err);
     return res.status(500).json({ error: err.message || "Failed to load receipt" });
