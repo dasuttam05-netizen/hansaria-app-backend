@@ -36,6 +36,23 @@ const {
   SqliteMirrorRow,
 } = require("../mongo");
 
+// Journal vouchers are persisted in MongoDB so sale-deduction journals survive
+// refresh/logout and are available to reports after the SQLite session is gone.
+const journalSchema = new mongoose.Schema({
+  voucher_no: { type: String, index: true },
+  date: { type: String, index: true },
+  warehouse_id: { type: String, index: true },
+  company_account_id: { type: String, index: true },
+  debit_account: String,
+  credit_account: String,
+  amount: { type: Number, default: 0 },
+  employee_id: String,
+  location_id: String,
+  description: String,
+}, { timestamps: true, strict: false, collection: "wh_journal_vouchers" });
+const JournalVoucher = mongoose.models.WarehouseTradingJournalVoucher
+  || mongoose.model("WarehouseTradingJournalVoucher", journalSchema);
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Trading report indexes. Build in the background so the first HTTP request is
@@ -824,12 +841,21 @@ async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deduc
   const saleVoucherNo = String(sale?.voucher_no || body?.voucher_no || "").trim();
   if (!saleVoucherNo) return [];
 
-  await dbRunPromise("DELETE FROM wh_journal_vouchers WHERE description LIKE ?", [`Auto sale deduction:${saleVoucherNo}:%`]);
+  const autoPrefix = `Auto sale deduction:${saleVoucherNo}:`;
+  const created = [];
+
+  // MongoDB is the source of truth. Remove old auto journals first so editing
+  // an F2 sale voucher does not create duplicate journals.
+  if (mongoReady()) {
+    await JournalVoucher.deleteMany({ description: { $regex: `^${escapeRegExp(autoPrefix)}` } });
+  }
+  // Keep the legacy SQLite mirror for old reports/backward compatibility.
+  await dbRunPromise("DELETE FROM wh_journal_vouchers WHERE description LIKE ?", [`${autoPrefix}%`]);
 
   const journalBase = {
     date: body.unloading_date || body.date || sale.date,
-    warehouse_id: body.warehouse_id || sale.warehouse_id,
-    company_account_id: body.company_account_id || sale.company_account_id,
+    warehouse_id: String(body.warehouse_id || sale.warehouse_id || ""),
+    company_account_id: String(body.company_account_id || sale.company_account_id || ""),
     employee_id: body.employee_id || sale.employee_id || null,
     location_id: body.location_id || sale.location_id || null,
   };
@@ -841,33 +867,41 @@ async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deduc
     { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
   ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
 
-  const created = [];
   for (const row of rows) {
     const voucherNo = await createVoucherNoPromise("journal");
-    const description = `Auto sale deduction:${saleVoucherNo}:${row.key}`;
-    const result = await dbRunPromise(
-      `
-        INSERT INTO wh_journal_vouchers
-          (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        voucherNo,
-        journalBase.date,
-        journalBase.warehouse_id,
-        journalBase.company_account_id,
-        "Sale Party",
-        row.label,
-        row.amount,
-        journalBase.employee_id,
-        journalBase.location_id,
+    const description = `${autoPrefix}${row.key}`;
+
+    if (mongoReady()) {
+      const doc = await JournalVoucher.create({
+        voucher_no: voucherNo,
+        ...journalBase,
+        debit_account: "Sale Party",
+        credit_account: row.label,
+        amount: row.amount,
         description,
-      ]
-    );
-    created.push({ id: result.lastID, voucher_no: voucherNo, type: row.key, amount: row.amount });
+      });
+      created.push({ id: String(doc._id), _id: String(doc._id), voucher_no: voucherNo, type: row.key, amount: row.amount, saved_to: "mongodb" });
+    }
+
+    // SQLite mirror. Failure here should not make the Mongo journal disappear.
+    try {
+      const result = await dbRunPromise(
+        `INSERT INTO wh_journal_vouchers
+          (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [voucherNo, journalBase.date, journalBase.warehouse_id, journalBase.company_account_id, "Sale Party", row.label, row.amount, journalBase.employee_id, journalBase.location_id, description]
+      );
+      if (!mongoReady()) created.push({ id: result.lastID, voucher_no: voucherNo, type: row.key, amount: row.amount, saved_to: "sqlite" });
+    } catch (mirrorErr) {
+      console.warn("Journal SQLite mirror skipped:", mirrorErr?.message || mirrorErr);
+    }
   }
 
   return created;
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function assignedWarehouseIdsForMongo(user) {
@@ -3060,6 +3094,98 @@ router.get("/next-voucher-no", (req, res) => {
   });
 });
 
+// Fast buyer list for Receipt Voucher: only buyers with outstanding sales.
+// This mirrors the Payment Voucher's "Pending Farmer" selector, but uses
+// sales minus receipts and returns only positive balances.
+router.get("/receipt-pending-buyers", async (req, res) => {
+  const startedAt = Date.now();
+  const { company_account_id, warehouse_id, exclude_receipt_id } = req.query;
+  if (!company_account_id) return res.status(400).json({ error: "company_account_id is required" });
+
+  try {
+    if (mongoReady()) {
+      const salesFilter = { company_account_id: String(company_account_id) };
+      if (warehouse_id) salesFilter.warehouse_id = String(warehouse_id);
+      const sales = await SaleVoucher.find(salesFilter)
+        .select("buyer_id company_id net_receivable_amount net_amount amount")
+        .lean();
+
+      const salesByBuyer = new Map();
+      for (const sale of sales || []) {
+        const buyerId = String(sale.buyer_id || sale.company_id || "").trim();
+        if (!buyerId) continue;
+        const amount = Number(sale.net_receivable_amount || sale.net_amount || sale.amount || 0);
+        salesByBuyer.set(buyerId, (salesByBuyer.get(buyerId) || 0) + amount);
+      }
+
+      const receiptWhere = ["CAST(company_account_id AS TEXT) = CAST(? AS TEXT)"];
+      const receiptParams = [company_account_id];
+      if (warehouse_id) {
+        receiptWhere.push("CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)");
+        receiptParams.push(warehouse_id);
+      }
+      if (exclude_receipt_id) {
+        receiptWhere.push("CAST(id AS TEXT) <> CAST(? AS TEXT)");
+        receiptParams.push(exclude_receipt_id);
+      }
+      const receipts = await dbAll(
+        `SELECT company_id, COALESCE(SUM(amount), 0) AS total_receipt
+         FROM wh_receipt_vouchers
+         WHERE ${receiptWhere.join(" AND ")}
+         GROUP BY company_id`,
+        receiptParams
+      );
+      const receiptMap = new Map((receipts || []).map((row) => [String(row.company_id || ""), Number(row.total_receipt || 0)]));
+
+      const result = [...salesByBuyer.entries()]
+        .map(([buyerId, totalSale]) => {
+          const totalReceipt = receiptMap.get(buyerId) || 0;
+          return {
+            company_id: buyerId,
+            total_sale: Number(totalSale.toFixed(2)),
+            total_receipt: Number(totalReceipt.toFixed(2)),
+            outstanding: Number(Math.max(0, totalSale - totalReceipt).toFixed(2)),
+          };
+        })
+        .filter((row) => row.outstanding > 0)
+        .sort((a, b) => b.outstanding - a.outstanding);
+
+      res.set("Server-Timing", `receipt-pending-buyers-mongo;dur=${Date.now() - startedAt}`);
+      return res.json(result);
+    }
+
+    // Legacy SQLite fallback.
+    const salesWhere = ["1=1", "CAST(s.company_account_id AS TEXT) = CAST(? AS TEXT)"];
+    const salesParams = [company_account_id];
+    if (warehouse_id) { salesWhere.push("CAST(s.warehouse_id AS TEXT) = CAST(? AS TEXT)"); salesParams.push(warehouse_id); }
+    const receiptWhere = ["CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)"];
+    const receiptParams = [company_account_id];
+    if (warehouse_id) { receiptWhere.push("CAST(r.warehouse_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(warehouse_id); }
+    if (exclude_receipt_id) { receiptWhere.push("CAST(r.id AS TEXT) <> CAST(? AS TEXT)"); receiptParams.push(exclude_receipt_id); }
+    const sql = `
+      SELECT CAST(COALESCE(NULLIF(s.buyer_id, ''), s.company_id) AS TEXT) AS company_id,
+             SUM(COALESCE(NULLIF(s.net_receivable_amount, 0), s.amount, 0)) AS total_sale,
+             COALESCE((SELECT SUM(COALESCE(r.amount, 0)) FROM wh_receipt_vouchers r
+                       WHERE CAST(r.company_id AS TEXT) = CAST(COALESCE(NULLIF(s.buyer_id, ''), s.company_id) AS TEXT)
+                         AND ${receiptWhere.join(" AND ")}), 0) AS total_receipt
+      FROM wh_sale_vouchers s
+      WHERE ${salesWhere.join(" AND ")}
+      GROUP BY CAST(COALESCE(NULLIF(s.buyer_id, ''), s.company_id) AS TEXT)
+      ORDER BY company_id`;
+    const rows = await dbAll(sql, [...salesParams, ...receiptParams]);
+    const result = (rows || []).map((row) => {
+      const totalSale = Number(row.total_sale || 0);
+      const totalReceipt = Number(row.total_receipt || 0);
+      return { company_id: String(row.company_id || ""), total_sale: Number(totalSale.toFixed(2)), total_receipt: Number(totalReceipt.toFixed(2)), outstanding: Number(Math.max(0, totalSale - totalReceipt).toFixed(2)) };
+    }).filter((row) => row.outstanding > 0);
+    res.set("Server-Timing", `receipt-pending-buyers-sqlite;dur=${Date.now() - startedAt}`);
+    return res.json(result);
+  } catch (err) {
+    console.error("Receipt pending buyer lookup failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to load pending buyers" });
+  }
+});
+
 router.get("/outstanding", (req, res) => {
   const startedAt = Date.now();
   const { party_type, id, warehouse_id, location_id, exclude_payment_id, company_account_id } = req.query;
@@ -4245,71 +4371,61 @@ router.delete("/receipt/:id", (req, res) => {
 // ===========================
 // JOURNAL VOUCHERS
 // ===========================
-router.get("/journal", (req, res) => {
+router.get("/journal", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.journal.view")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
-  getWarehouseScopedRows(req, res, "wh_journal_vouchers");
+  try {
+    if (mongoReady()) {
+      const filter = { ...mongoPurchaseScope(req.user) };
+      const rows = await JournalVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+      return res.json((rows || []).map((row) => ({ ...row, id: String(row._id), _id: String(row._id) })));
+    }
+    return getWarehouseScopedRows(req, res, "wh_journal_vouchers");
+  } catch (err) {
+    console.error("Mongo journal list failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to load journals" });
+  }
 });
 
-router.post("/journal", (req, res) => {
+router.post("/journal", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.journal.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
 
   const { voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description } = req.body;
-  ensureWarehouseAccess(req, res, warehouse_id, location_id).then((ok) => {
-  if (!ok) return;
+  const access = await ensureWarehouseAccess(req, res, warehouse_id, location_id);
+  if (!access) return;
 
-  const idemKey = req.get("Idempotency-Key") || req.headers["idempotency-key"];
-  if (idemKey) {
-    return getIdempotency(idemKey, "journal", (err, existingId) => {
+  try {
+    if (mongoReady()) {
+      const generatedVoucherNo = await new Promise((resolve, reject) => {
+        createVoucherNoIfMissing("journal", voucher_no, (err, value) => err ? reject(err) : resolve(value));
+      });
+      const doc = await JournalVoucher.create({
+        voucher_no: generatedVoucherNo, date, warehouse_id: String(warehouse_id || ""),
+        company_account_id: String(company_account_id || ""), debit_account, credit_account,
+        amount: Number(amount || 0), employee_id: employee_id || null, location_id: location_id || null, description,
+      });
+      return res.json({ id: String(doc._id), _id: String(doc._id), voucher_no: generatedVoucherNo, saved_to: "mongodb" });
+    }
+
+    createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
       if (err) return res.status(500).json({ error: err.message });
-      if (existingId) {
-        return db.get(`SELECT * FROM wh_journal_vouchers WHERE id = ?`, [existingId], (e2, existingRow) => {
-          if (e2) return res.status(500).json({ error: e2.message });
-          return res.json({ id: existingRow.id, voucher_no: existingRow.voucher_no, existing: existingRow });
-        });
-      }
-
-      createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
-        if (err) return res.status(500).json({ error: err.message });
-
-        const query = `
-          INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `;
-
-        db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
-          if (err) {
-            if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-            return res.status(500).json({ error: err.message });
-          }
-          saveIdempotency(idemKey, "journal", this.lastID, () => {});
-          res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
-        });
+      const query = `INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (dbErr) {
+        if (dbErr) {
+          if (dbErr.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
+          return res.status(500).json({ error: dbErr.message });
+        }
+        return res.json({ id: this.lastID, voucher_no: generatedVoucherNo, saved_to: "sqlite" });
       });
     });
+  } catch (err) {
+    console.error("Journal save failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to save journal" });
   }
-
-  createVoucherNoIfMissing("journal", voucher_no, (err, generatedVoucherNo) => {
-    if (err) return res.status(500).json({ error: err.message });
-
-    const query = `
-      INSERT INTO wh_journal_vouchers (voucher_no, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
-
-    db.run(query, [generatedVoucherNo, date, warehouse_id, company_account_id, debit_account, credit_account, amount, employee_id, location_id, description], function (err) {
-      if (err) {
-        if (err.message.includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ id: this.lastID, voucher_no: generatedVoucherNo });
-    });
-  });
-  });
 });
 
 function dbAll(query, params = []) {
@@ -5904,7 +6020,17 @@ router.get("/sale/:id/summary", async (req, res) => {
           }
         })();
     const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
-    const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
+    let journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
+    if (mongoReady() && row.voucher_no) {
+      try {
+        journalDetails = await JournalVoucher.find({
+          description: { $regex: `^${escapeRegExp(`Auto sale deduction:${row.voucher_no}:`)}` },
+        }).sort({ createdAt: 1, _id: 1 }).lean();
+        journalDetails = journalDetails.map((item) => ({ ...item, id: String(item._id), _id: String(item._id) }));
+      } catch (journalErr) {
+        console.warn("Mongo sale journal lookup skipped:", journalErr?.message || journalErr);
+      }
+    }
     const resolvedTransportRow = await getTransportBiltiMatch({
       saleId: row._id || row.id,
       voucherNo: row.voucher_no || row.bill_no || "",
