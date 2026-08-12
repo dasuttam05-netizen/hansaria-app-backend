@@ -5164,24 +5164,42 @@ router.get("/report/sale-party-ledger", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
   }
+
   try {
     const buyerId = String(req.query.buyer_id || "").trim();
     const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
-    const sales = await getSaleReportRowsForUser(req.user, { buyerId, farmerId, warehouseId, companyAccountId });
 
-    // Sale Party Ledger must still render when receipt/adjustment mirror data is
-    // temporarily unavailable. The sale rows themselves are the primary ledger
-    // source; receipts are optional detail rows.
+    // Sale rows are read from the active reporting source (MongoDB when
+    // enabled, SQLite otherwise). Receipt/adjustment history may still be in
+    // SQLite, so never assume that a Mongo _id === SQLite sale_id.
+    const sales = await getSaleReportRowsForUser(req.user, {
+      buyerId,
+      farmerId,
+      warehouseId,
+      companyAccountId,
+    });
+
     let receipts = [];
     let adjustmentRows = [];
     const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
     const receiptParams = [...filter.params];
     const clauses = [];
-    if (buyerId) { clauses.push(" AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(buyerId); }
-    if (warehouseId) { clauses.push(" AND CAST(r.warehouse_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(warehouseId); }
-    if (companyAccountId) { clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(companyAccountId); }
+
+    if (buyerId) {
+      clauses.push(" AND CAST(r.company_id AS TEXT) = CAST(? AS TEXT)");
+      receiptParams.push(buyerId);
+    }
+    if (warehouseId) {
+      clauses.push(" AND CAST(r.warehouse_id AS TEXT) = CAST(? AS TEXT)");
+      receiptParams.push(warehouseId);
+    }
+    if (companyAccountId) {
+      clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)");
+      receiptParams.push(companyAccountId);
+    }
+
     try {
       receipts = await dbAll(`
         SELECT
@@ -5189,98 +5207,333 @@ router.get("/report/sale-party-ledger", async (req, res) => {
           ca.account_name AS company_account_name,
           b.name AS buyer_name
         FROM wh_receipt_vouchers r
-        LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
-        LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(r.company_id AS TEXT)
+        LEFT JOIN company_accounts ca
+          ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
+        LEFT JOIN buyer_names b
+          ON CAST(b.id AS TEXT) = CAST(COALESCE(r.company_id, r.buyer_id) AS TEXT)
         WHERE 1=1 ${filter.clause} ${clauses.join(" ")}
         ORDER BY r.date DESC, r.id DESC
       `, receiptParams);
 
-      const receiptIds = receipts.map((row) => row.id);
-      adjustmentRows = receiptIds.length ? await dbAll(`
-        SELECT a.*, rv.voucher_no AS receipt_voucher_no
-        FROM wh_receipt_adjustments a
-        LEFT JOIN wh_receipt_vouchers rv ON CAST(rv.id AS TEXT) = CAST(a.receipt_id AS TEXT)
-        WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
-        ORDER BY a.id ASC
-      `, receiptIds) : [];
+      const receiptIds = receipts.map((row) => row.id).filter((id) => id !== null && id !== undefined);
+      adjustmentRows = receiptIds.length
+        ? await dbAll(`
+            SELECT
+              a.*,
+              rv.voucher_no AS receipt_voucher_no,
+              rv.date AS adjustment_receipt_date,
+              rv.amount AS adjustment_receipt_amount
+            FROM wh_receipt_adjustments a
+            LEFT JOIN wh_receipt_vouchers rv
+              ON CAST(rv.id AS TEXT) = CAST(a.receipt_id AS TEXT)
+            WHERE a.receipt_id IN (${receiptIds.map(() => "?").join(",")})
+            ORDER BY a.id ASC
+          `, receiptIds)
+        : [];
     } catch (receiptErr) {
-      console.warn("Sale Party Ledger receipt details unavailable; rendering sale rows only:", receiptErr.message);
+      console.warn("Sale Party Ledger receipt details unavailable:", receiptErr.message);
       receipts = [];
       adjustmentRows = [];
     }
 
-    const saleMap = new Map((sales || []).map((row) => [String(row.id || row._id), row]));
-    const receiptMap = new Map((receipts || []).map((row) => [String(row.id), row]));
+    const saleList = Array.isArray(sales) ? sales : [];
+    const receiptList = Array.isArray(receipts) ? receipts : [];
+    const adjustments = Array.isArray(adjustmentRows) ? adjustmentRows : [];
+
+    const normalizeKey = (value) => String(value ?? "").trim().toLowerCase();
+    const firstNonEmpty = (...values) => values.find((value) => {
+      return value !== undefined && value !== null && String(value).trim() !== "";
+    });
+
+    // Multiple ID systems can coexist:
+    //   Mongo sale _id / id
+    //   legacy SQLite wh_sale_vouchers.id
+    //   bill_no / voucher_no / reference_id
+    // Build all keys so old receipts can still be attached to the current
+    // Mongo sale row.
+    const saleByKey = new Map();
+    const addSaleKey = (key, sale) => {
+      const normalized = normalizeKey(key);
+      if (normalized) saleByKey.set(normalized, sale);
+    };
+
+    saleList.forEach((sale) => {
+      addSaleKey(sale.id, sale);
+      addSaleKey(sale._id, sale);
+      addSaleKey(sale.voucher_no, sale);
+      addSaleKey(sale.bill_no, sale);
+      addSaleKey(sale.sale_id, sale);
+    });
+
+    // Legacy SQLite sale IDs are resolved to their voucher/bill numbers.
+    const legacySaleIds = [...new Set(
+      adjustments
+        .map((item) => String(item.sale_id ?? "").trim())
+        .filter(Boolean)
+    )];
+
+    if (legacySaleIds.length) {
+      try {
+        const legacyRows = await dbAll(`
+          SELECT id, voucher_no, bill_no
+          FROM wh_sale_vouchers
+          WHERE id IN (${legacySaleIds.map(() => "?").join(",")})
+        `, legacySaleIds);
+
+        legacyRows.forEach((legacy) => {
+          const sale = saleByKey.get(normalizeKey(legacy.voucher_no))
+            || saleByKey.get(normalizeKey(legacy.bill_no));
+          if (sale) {
+            addSaleKey(legacy.id, sale);
+          }
+        });
+      } catch (legacyErr) {
+        console.warn("Legacy sale-id mapping unavailable:", legacyErr.message);
+      }
+    }
+
+    const receiptMap = new Map(
+      receiptList.map((row) => [normalizeKey(row.id), row])
+    );
+
     const bySale = new Map();
     const byReceipt = new Map();
-    (adjustmentRows || []).forEach((item) => {
-      const saleId = String(item.sale_id || "");
-      const receiptId = String(item.receipt_id || "");
-      const sale = saleMap.get(saleId);
-      const receipt = receiptMap.get(receiptId);
+
+    const pushDetail = (sale, receipt, item, inferred = false) => {
+      if (!sale || !receipt) return;
+
+      const adjustedAmount = Number(
+        firstNonEmpty(
+          item?.adjusted_amount,
+          item?.amount,
+          item?.adjustment_amount,
+          0
+        )
+      ) || 0;
+
       const detail = {
-        ...item,
-        sale_voucher_no: sale?.voucher_no || item.sale_voucher_no || item.sale_id,
-        receipt_date: receipt?.date || "",
-        receipt_voucher_no: receipt?.voucher_no || item.receipt_voucher_no || "",
-        receipt_amount: Number(receipt?.amount || 0),
+        ...(item || {}),
+        sale_id: String(sale.id || sale._id || ""),
+        sale_voucher_no: firstNonEmpty(
+          sale.voucher_no,
+          sale.bill_no,
+          item?.sale_voucher_no,
+          item?.bill_no,
+          item?.sale_id,
+          ""
+        ),
+        receipt_id: String(receipt.id || ""),
+        receipt_date: firstNonEmpty(receipt.date, item?.adjustment_receipt_date, ""),
+        receipt_voucher_no: firstNonEmpty(
+          receipt.voucher_no,
+          item?.receipt_voucher_no,
+          ""
+        ),
+        receipt_amount: Number(firstNonEmpty(receipt.amount, item?.adjustment_receipt_amount, 0)) || 0,
+        adjusted_amount: Number(adjustedAmount.toFixed(2)),
+        inferred_adjustment: Boolean(inferred),
       };
-      if (!bySale.has(saleId)) bySale.set(saleId, []);
-      bySale.get(saleId).push(detail);
-      if (!byReceipt.has(receiptId)) byReceipt.set(receiptId, []);
-      byReceipt.get(receiptId).push(detail);
+
+      const saleKey = normalizeKey(sale.id || sale._id || sale.voucher_no || sale.bill_no);
+      const receiptKey = normalizeKey(receipt.id);
+
+      if (!bySale.has(saleKey)) bySale.set(saleKey, []);
+      bySale.get(saleKey).push(detail);
+
+      if (!byReceipt.has(receiptKey)) byReceipt.set(receiptKey, []);
+      byReceipt.get(receiptKey).push(detail);
+    };
+
+    // 1) Normal adjustment rows.
+    adjustments.forEach((item) => {
+      const receipt = receiptMap.get(normalizeKey(item.receipt_id));
+      const sale = saleByKey.get(normalizeKey(item.sale_id))
+        || saleByKey.get(normalizeKey(item.sale_voucher_no))
+        || saleByKey.get(normalizeKey(item.bill_no))
+        || saleByKey.get(normalizeKey(receipt?.reference_id));
+
+      pushDetail(sale, receipt, item, false);
+    });
+
+    // 2) Older receipt records sometimes contain reference_id but have no
+    // wh_receipt_adjustments row. Infer the bill link instead of dropping it.
+    receiptList.forEach((receipt) => {
+      const receiptKey = normalizeKey(receipt.id);
+      const existing = byReceipt.get(receiptKey) || [];
+      if (existing.length) return;
+
+      const referenceTokens = String(receipt.reference_id || "")
+        .split(/[,\s;|]+/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+      const candidates = [
+        ...referenceTokens,
+        receipt.bill_no,
+        receipt.voucher_reference,
+      ].filter(Boolean);
+
+      for (const token of candidates) {
+        const sale = saleByKey.get(normalizeKey(token));
+        if (sale) {
+          pushDetail(
+            sale,
+            receipt,
+            {
+              sale_voucher_no: sale.voucher_no || sale.bill_no || token,
+              adjusted_amount: Number(receipt.amount || 0),
+            },
+            true
+          );
+          break;
+        }
+      }
     });
 
     const rows = [
-      ...(sales || []).map((row) => {
-        const saleId = String(row.id || row._id);
-        const details = bySale.get(saleId) || [];
-        const saleAmount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
-        const receiptAmount = details.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
+      ...saleList.map((row) => {
+        const saleKey = normalizeKey(row.id || row._id || row.voucher_no || row.bill_no);
+        const details = bySale.get(saleKey) || [];
+
+        const quantity = Number(firstNonEmpty(
+          row.quantity,
+          row.total_quantity,
+          row.dispatch_qty,
+          0
+        )) || 0;
+
+        const rate = Number(firstNonEmpty(row.rate, 0)) || 0;
+        const grossAmount = Number(firstNonEmpty(
+          row.gross_amount,
+          row.sale_gross_amount,
+          row.quantity && row.rate ? Number(row.quantity) * Number(row.rate) : undefined,
+          row.amount,
+          row.total_amount,
+          row.net_receivable_amount,
+          0
+        )) || 0;
+
+        const saleAmount = Number(firstNonEmpty(
+          row.total_amount,
+          row.net_receivable_amount,
+          row.amount,
+          row.gross_amount,
+          grossAmount,
+          0
+        )) || 0;
+
+        const receiptAmount = details.reduce(
+          (sum, item) => sum + (Number(item.adjusted_amount) || 0),
+          0
+        );
+
+        const normalizedParty = firstNonEmpty(
+          row.party_name,
+          row.buyer_name,
+          row.company_name,
+          row.consignee_name,
+          "-"
+        );
+
         return {
           ...row,
-          date: row.date,
-          voucher_no: row.voucher_no,
+          row_type: "entry",
+          date: row.date || row.bill_date || "",
+          voucher_no: firstNonEmpty(row.voucher_no, row.bill_no, "-"),
+          bill_no: firstNonEmpty(row.bill_no, row.voucher_no, "-"),
           voucher_type: "Sale",
-          particulars: `Sale Bill ${row.voucher_no || ""}`.trim(),
-          adjustment_details: details.map((item) => `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
-          receipt_details: details,
-          sale_id: saleId,
+          particulars: `Sale Bill ${firstNonEmpty(row.voucher_no, row.bill_no, "")}`.trim(),
+          party_id: String(firstNonEmpty(row.buyer_id, row.company_id, "") || ""),
+          party_name: normalizedParty,
+          buyer_name: firstNonEmpty(row.buyer_name, normalizedParty, "-"),
+          company_account_name: firstNonEmpty(row.company_account_name, row.account_name, "-"),
+          product_name: firstNonEmpty(row.product_name, row.product, "-"),
+          quantity: Number(quantity.toFixed(4)),
+          total_quantity: Number(quantity.toFixed(4)),
+          rate: Number(rate.toFixed(2)),
+          gross_amount: Number(grossAmount.toFixed(2)),
           sale_amount: Number(saleAmount.toFixed(2)),
           receipt_amount: Number(receiptAmount.toFixed(2)),
+          receipt_details: details,
+          payment_details: details,
+          adjustment: Number(receiptAmount.toFixed(2)),
           journal_amount: 0,
           bill_balance: Number((saleAmount - receiptAmount).toFixed(2)),
-          debit: saleAmount,
+          debit: Number(saleAmount.toFixed(2)),
           credit: 0,
-          party_id: String(row.buyer_id || row.company_id || ""),
-          party_name: row.buyer_name || row.company_name || "-",
+          closing_balance: Number((saleAmount - receiptAmount).toFixed(2)),
+          adjustment_details: details.map((item) =>
+            `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`
+          ).join("; "),
         };
       }),
-      ...(receipts || []).map((row) => {
-        const details = byReceipt.get(String(row.id)) || [];
-        const isOnAccount = !details.length && !String(row.reference_id || "").trim();
+
+      ...receiptList.map((row) => {
+        const details = byReceipt.get(normalizeKey(row.id)) || [];
+        const partyName = firstNonEmpty(
+          row.party_name,
+          row.buyer_name,
+          row.company_name,
+          row.company_account_name,
+          "-"
+        );
+
         return {
           ...row,
-          date: row.date,
-          voucher_no: row.voucher_no,
+          row_type: "entry",
+          date: row.date || "",
+          voucher_no: firstNonEmpty(row.voucher_no, row.receipt_no, "-"),
+          bill_no: firstNonEmpty(row.reference_id, ""),
           voucher_type: "Receipt",
-          particulars: isOnAccount ? "Unadjusted on account" : `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
-          adjustment_details: details.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
-          reference_id: row.reference_id || details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
+          particulars: details.length
+            ? `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ")}`
+            : "Unadjusted on account",
+          party_id: String(firstNonEmpty(row.company_id, row.buyer_id, "") || ""),
+          party_name: partyName,
+          buyer_name: firstNonEmpty(row.buyer_name, partyName, "-"),
+          company_account_name: firstNonEmpty(row.company_account_name, row.account_name, "-"),
+          product_name: "-",
+          quantity: 0,
+          total_quantity: 0,
+          rate: 0,
+          gross_amount: 0,
+          sale_amount: 0,
+          receipt_amount: Number(row.amount || 0),
           receipt_details: details,
+          payment_details: details,
+          adjustment: Number(row.amount || 0),
+          journal_amount: 0,
+          bill_balance: 0,
           debit: 0,
           credit: Number(row.amount || 0),
-          party_id: String(row.company_id || ""),
-          party_name: row.buyer_name || row.party_name || row.company_name || row.company_account_name || "-",
-          buyer_name: row.buyer_name || "-",
+          closing_balance: 0,
+          reference_id: firstNonEmpty(
+            row.reference_id,
+            details.map((item) => item.sale_voucher_no).filter(Boolean).join(", "),
+            "On account"
+          ),
+          adjustment_details: details.map((item) =>
+            `${item.sale_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`
+          ).join("; "),
         };
       }),
     ];
 
-    return res.json(buildLedgerRows(rows, (row) => `${row.party_id || "unknown"}::${row.company_account_id || "no-account"}`, (row) => row.party_name || row.company_account_name || "Unknown Party"));
+    const finalRows = buildLedgerRows(
+      rows,
+      (row) => `${row.party_id || "unknown"}::${row.company_account_id || "no-account"}`,
+      (row) => row.party_name || row.company_account_name || "Unknown Party"
+    ).map((row) => ({
+      ...row,
+      closing_balance: Number(row.balance || 0),
+    }));
+
+    return res.json(finalRows);
   } catch (err) {
     console.error("Sale party ledger failed:", err);
-    res.status(500).json({ error: err.message || "Failed to load sale party ledger" });
+    return res.status(500).json({
+      error: err.message || "Failed to load sale party ledger",
+    });
   }
 });
 
