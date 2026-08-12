@@ -1022,13 +1022,49 @@ async function decorateSaleRows(rows) {
     }
   };
 
-  const [warehouses, products, accounts, buyers, consignees] = await Promise.all([
+  // Buyer/consignee masters are legacy SQLite tables mirrored into MongoDB
+  // through SqliteMirrorRow. They are NOT stored in the native BuyerName /
+  // ConsigneeName collections in all deployments. Read the mirror first and
+  // fall back to the native collections when available.
+  const getMirrorMasterRows = async (table, ids) => {
+    if (!ids.length) return [];
+    const numericIds = ids
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id));
+    if (!numericIds.length) return [];
+    try {
+      return await SqliteMirrorRow.find({
+        table,
+        row_id: { $in: numericIds },
+      }).lean();
+    } catch (err) {
+      console.warn(`Mongo mirror master lookup skipped (${table}):`, err?.message || err);
+      return [];
+    }
+  };
+
+  const unwrapMirrorRows = (rows) =>
+    (Array.isArray(rows) ? rows : []).map((item) => ({
+      ...(item?.data && typeof item.data === "object" ? item.data : {}),
+      id: item?.row_id ?? item?.data?.id,
+      _mirror_row_id: item?.row_id,
+    }));
+
+  const [warehouses, products, accounts, buyerMirrorRows, consigneeMirrorRows] = await Promise.all([
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
+    getMirrorMasterRows("buyer_names", buyerIds),
+    getMirrorMasterRows("consignee_names", consigneeIds),
+  ]);
+
+  const [nativeBuyers, nativeConsignees] = await Promise.all([
     mongoMasterRows("buyer_names", buyerIds),
     mongoMasterRows("consignee_names", consigneeIds),
   ]);
+
+  const buyers = [...unwrapMirrorRows(buyerMirrorRows), ...(nativeBuyers || [])];
+  const consignees = [...unwrapMirrorRows(consigneeMirrorRows), ...(nativeConsignees || [])];
 
   const makeLookup = (items) => {
     const map = new Map();
@@ -4662,24 +4698,58 @@ router.get("/report/filter-options", async (req, res) => {
     const cleanAccountIds = validIds(accountIds);
     const cleanWarehouseIds = validIds(warehouseIds);
     const cleanFarmerIds = validIds(farmerIds);
-    const cleanBuyerIds = validIds(buyerIds);
+    // Buyer IDs can be legacy numeric SQLite IDs or native Mongo ObjectIds.
+    // Keep both forms; buyer master rows are primarily available through the
+    // MongoDB SqliteMirrorRow collection.
+    const cleanBuyerIds = clean(buyerIds);
 
     // Return labels together with IDs so Reports do not need to load the
-    // entire nine-table master bundle just to populate filter dropdowns.
+    // entire master bundle just to populate filter dropdowns.
     const mongoBuyerMasterRows = async () => {
       if (!cleanBuyerIds.length || !mongoose?.connection?.readyState) return [];
+      const result = [];
+      try {
+        const numericIds = cleanBuyerIds.map(Number).filter((value) => Number.isFinite(value));
+        if (numericIds.length) {
+          const mirrorRows = await SqliteMirrorRow.find({
+            table: "buyer_names",
+            row_id: { $in: numericIds },
+          }).lean();
+          result.push(...mirrorRows.map((mirror) => ({
+            ...(mirror?.data && typeof mirror.data === "object" ? mirror.data : {}),
+            id: mirror?.row_id ?? mirror?.data?.id,
+            _mirror_row_id: mirror?.row_id,
+          })));
+        }
+      } catch (err) {
+        console.warn("Mongo buyer mirror filter lookup skipped:", err?.message || err);
+      }
+
+      // Also support native BuyerName documents if a deployment has them.
       try {
         const collection = mongoose.connection.collection("buyer_names");
-        const objectIds = cleanBuyerIds.filter((id) => mongoose.Types.ObjectId.isValid(id)).map((id) => new mongoose.Types.ObjectId(id));
+        const vals = cleanBuyerIds.flatMap(mongoReferenceValues);
         const clauses = [];
+        const objectIds = vals.filter((value) => value instanceof mongoose.Types.ObjectId);
         if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
-        clauses.push({ id: { $in: cleanBuyerIds } });
-        clauses.push({ id: { $in: cleanBuyerIds.map(Number).filter(Number.isFinite) } });
-        return await collection.find({ $or: clauses }).toArray();
+        clauses.push(
+          { id: { $in: vals } },
+          { legacy_id: { $in: vals } },
+          { row_id: { $in: vals } }
+        );
+        if (clauses.length) result.push(...await collection.find({ $or: clauses }).toArray());
       } catch (err) {
-        console.warn("Mongo buyer filter lookup skipped:", err?.message || err);
-        return [];
+        console.warn("Mongo buyer native filter lookup skipped:", err?.message || err);
       }
+
+      const seen = new Set();
+      return result.filter((doc) => {
+        const id = String(doc?._id || doc?.id || doc?.legacy_id || doc?.row_id || "");
+        const name = String(doc?.name || doc?.buyer_name || doc?.company_name || doc?.party_name || "").trim();
+        if (!id || !name || seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
     };
 
     const [accountDocs, warehouseDocs, farmerDocs, buyerDocs] = await Promise.all([
@@ -5223,59 +5293,146 @@ function mongoReferenceValues(value) {
 async function getMongoSalePartyLedgerSupport(req, sales) {
   if (!mongoReady()) return { receipts: [], adjustments: [] };
 
-  const receiptCollection = await getMongoCollectionIfExists([
-    "wh_receipt_vouchers", "receipt_vouchers", "receiptvouchers", "receipts"
-  ]);
-  const adjustmentCollection = await getMongoCollectionIfExists([
-    "wh_receipt_adjustments", "receipt_adjustments", "receiptadjustments"
-  ]);
-  if (!receiptCollection) return { receipts: [], adjustments: [] };
+  // Receipts and receipt adjustments are legacy SQLite tables that are
+  // continuously mirrored into MongoDB as SqliteMirrorRow documents.
+  // Do NOT query SQLite and do NOT assume a native Mongo collection exists.
+  const saleRows = Array.isArray(sales) ? sales : [];
+  const saleBuyerIds = [...new Set(
+    saleRows
+      .flatMap((s) => [s?.buyer_id, s?.company_id])
+      .filter((v) => v !== undefined && v !== null && String(v).trim() !== "")
+      .map(String)
+  )];
 
-  const buyerIds = [...new Set((sales || []).flatMap((s) => [s?.buyer_id, s?.company_id]).filter(Boolean).map(String))];
   const warehouseId = String(req.query.warehouse_id || "").trim();
   const accountId = String(req.query.company_account_id || "").trim();
   const buyerId = String(req.query.buyer_id || "").trim();
 
-  const clauses = [];
-  const idsForBuyer = buyerId ? [buyerId] : buyerIds;
-  if (idsForBuyer.length) {
-    const idVals = idsForBuyer.flatMap(mongoReferenceValues);
-    clauses.push({ $or: [
-      { company_id: { $in: idVals } },
-      { buyer_id: { $in: idVals } },
-      { party_id: { $in: idVals } },
-    ]});
-  }
-  if (warehouseId) clauses.push({ warehouse_id: { $in: mongoReferenceValues(warehouseId) } });
-  if (accountId) clauses.push({ company_account_id: { $in: mongoReferenceValues(accountId) } });
+  const receiptClauses = [];
+  const buyerIds = buyerId ? [buyerId] : saleBuyerIds;
 
-  const receipts = await receiptCollection.find(clauses.length ? { $and: clauses } : {}).sort({ date: 1, _id: 1 }).toArray();
-  let adjustments = [];
-  if (adjustmentCollection && receipts.length) {
-    const receiptIds = receipts.flatMap((r) => mongoReferenceValues(r?._id || r?.id));
-    const saleIds = (sales || []).flatMap((s) => [s?._id, s?.id, s?.voucher_no, s?.bill_no, s?.legacy_id, s?.sqlite_id]).flatMap(mongoReferenceValues);
-    const or = [];
-    if (receiptIds.length) or.push({ receipt_id: { $in: receiptIds } });
-    if (saleIds.length) or.push({ sale_id: { $in: saleIds } }, { sale_voucher_no: { $in: saleIds.map(String) } }, { reference_id: { $in: saleIds.map(String) } });
-    if (or.length) adjustments = await adjustmentCollection.find({ $or: or }).sort({ createdAt: 1, _id: 1 }).toArray();
+  const addDataIdClause = (field, value) => {
+    const vals = mongoReferenceValues(value);
+    if (vals.length) receiptClauses.push({ [`data.${field}`]: { $in: vals } });
+  };
+
+  if (buyerIds.length) {
+    const vals = buyerIds.flatMap(mongoReferenceValues);
+    receiptClauses.push(
+      { "data.company_id": { $in: vals } },
+      { "data.buyer_id": { $in: vals } },
+      { "data.party_id": { $in: vals } }
+    );
   }
+  if (warehouseId) addDataIdClause("warehouse_id", warehouseId);
+  if (accountId) addDataIdClause("company_account_id", accountId);
+
+  let receiptQuery = { table: "wh_receipt_vouchers" };
+  if (receiptClauses.length) receiptQuery = { table: "wh_receipt_vouchers", $or: receiptClauses };
+
+  let mirrorReceipts = await SqliteMirrorRow.find(receiptQuery)
+    .sort({ "data.date": 1, row_id: 1 })
+    .lean();
+
+  const receipts = mirrorReceipts.map((mirror) => ({
+    ...(mirror?.data && typeof mirror.data === "object" ? mirror.data : {}),
+    id: mirror?.row_id ?? mirror?.data?.id,
+    _mirror_row_id: mirror?.row_id,
+  }));
+
+  let adjustments = [];
+  if (receipts.length) {
+    const receiptIds = receipts
+      .flatMap((r) => [r?.id, r?._id, r?._mirror_row_id])
+      .flatMap(mongoReferenceValues);
+
+    const saleIds = saleRows
+      .flatMap((s) => [s?._id, s?.id, s?.voucher_no, s?.bill_no, s?.legacy_id, s?.sqlite_id])
+      .flatMap(mongoReferenceValues);
+
+    const adjustmentOr = [];
+    if (receiptIds.length) {
+      adjustmentOr.push({ "data.receipt_id": { $in: receiptIds } });
+    }
+    if (saleIds.length) {
+      adjustmentOr.push(
+        { "data.sale_id": { $in: saleIds } },
+        { "data.sale_voucher_no": { $in: saleIds.map(String) } },
+        { "data.reference_id": { $in: saleIds.map(String) } }
+      );
+    }
+
+    const adjustmentQuery = {
+      table: "wh_receipt_adjustments",
+      ...(adjustmentOr.length ? { $or: adjustmentOr } : {}),
+    };
+
+    const mirrorAdjustments = await SqliteMirrorRow.find(adjustmentQuery)
+      .sort({ "data.created_at": 1, row_id: 1 })
+      .lean();
+
+    adjustments = mirrorAdjustments.map((mirror) => ({
+      ...(mirror?.data && typeof mirror.data === "object" ? mirror.data : {}),
+      id: mirror?.row_id ?? mirror?.data?.id,
+      _mirror_row_id: mirror?.row_id,
+    }));
+  }
+
   return { receipts, adjustments };
 }
-
 async function getMongoPartyMasters(ids, candidates) {
   if (!mongoReady() || !ids.length) return [];
-  const collection = await getMongoCollectionIfExists(candidates);
-  if (!collection) return [];
-  const vals = ids.flatMap(mongoReferenceValues);
-  const docs = await collection.find({ $or: [
-    { _id: { $in: vals.filter((v) => v instanceof mongoose.Types.ObjectId) } },
-    { id: { $in: vals } },
-    { legacy_id: { $in: vals } },
-    { row_id: { $in: vals } },
-  ] }).toArray();
-  return docs;
-}
 
+  const result = [];
+  const seen = new Set();
+  const addRows = (rows) => {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const key = String(row?._id || row?.id || row?.row_id || row?.legacy_id || "");
+      const name = String(row?.name || row?.buyer_name || row?.company_name || row?.party_name || row?.account_name || "").trim();
+      if (!key || !name || seen.has(key)) continue;
+      seen.add(key);
+      result.push(row);
+    }
+  };
+
+  const numericIds = ids.map((id) => Number(id)).filter((id) => Number.isFinite(id));
+  if (numericIds.length) {
+    for (const table of candidates) {
+      try {
+        const mirrorRows = await SqliteMirrorRow.find({
+          table,
+          row_id: { $in: numericIds },
+        }).lean();
+        addRows(mirrorRows.map((mirror) => ({
+          ...(mirror?.data && typeof mirror.data === "object" ? mirror.data : {}),
+          id: mirror?.row_id ?? mirror?.data?.id,
+          _mirror_row_id: mirror?.row_id,
+        })));
+      } catch (err) {
+        console.warn(`Mongo mirror party lookup skipped (${table}):`, err?.message || err);
+      }
+    }
+  }
+
+  // Also support deployments where a native Mongo master collection exists.
+  for (const collectionName of candidates) {
+    const collection = await getMongoCollectionIfExists([collectionName]);
+    if (!collection) continue;
+    try {
+      const vals = ids.flatMap(mongoReferenceValues);
+      const clauses = [];
+      const objectIds = vals.filter((v) => v instanceof mongoose.Types.ObjectId);
+      if (objectIds.length) clauses.push({ _id: { $in: objectIds } });
+      clauses.push({ id: { $in: vals } }, { legacy_id: { $in: vals } }, { row_id: { $in: vals } });
+      if (!clauses.length) continue;
+      addRows(await collection.find({ $or: clauses }).toArray());
+    } catch (err) {
+      console.warn(`Mongo native party lookup skipped (${collectionName}):`, err?.message || err);
+    }
+  }
+
+  return result;
+}
 router.get("/report/sale-party-ledger", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.sale")) {
     return res.status(403).json({ error: "Permission denied" });
