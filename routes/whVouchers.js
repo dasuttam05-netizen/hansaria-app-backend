@@ -994,7 +994,13 @@ async function decorateSaleRows(rows) {
   const warehouseIds = [...new Set(plainRows.map((r) => String(r?.warehouse_id || "")).filter(Boolean))];
   const productIds = [...new Set(plainRows.map((r) => String(r?.product_id || "")).filter(Boolean))];
   const accountIds = [...new Set(plainRows.map((r) => String(r?.company_account_id || "")).filter(Boolean))];
-  const buyerIds = [...new Set(plainRows.map((r) => String(r?.buyer_id || r?.company_id || "")).filter(Boolean))];
+  // Keep BOTH buyer_id and company_id. Older sales may store the master
+  // reference in company_id while newer sales use buyer_id.
+  const buyerIds = [...new Set(
+    plainRows.flatMap((r) => [r?.buyer_id, r?.company_id])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  )];
   const consigneeIds = [...new Set(plainRows.map((r) => String(r?.consignee_id || "")).filter(Boolean))];
 
   const safeObjectIds = (ids) => ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
@@ -1062,12 +1068,40 @@ async function decorateSaleRows(rows) {
     }
   };
 
-  const [warehouses, products, accounts, buyers, consignees] = await Promise.all([
+  // SQLite is a compatibility fallback for legacy numeric master IDs.
+  // Some older sales keep buyer/consignee masters in SQLite while the voucher
+  // itself is already stored in MongoDB.
+  const sqliteMasterRows = async (tableName, ids) => {
+    const clean = [...new Set((ids || []).map((value) => String(value || "").trim()).filter(Boolean))];
+    if (!clean.length) return [];
+    try {
+      const placeholders = clean.map(() => "?").join(",");
+      return await dbAll(
+        `SELECT * FROM ${tableName} WHERE CAST(id AS TEXT) IN (${placeholders})`,
+        clean
+      );
+    } catch (err) {
+      console.warn(`SQLite master lookup skipped (${tableName}):`, err?.message || err);
+      return [];
+    }
+  };
+
+  const [
+    warehouses,
+    products,
+    accounts,
+    buyers,
+    consignees,
+    sqliteBuyers,
+    sqliteConsignees,
+  ] = await Promise.all([
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
     mongoBuyerRows(buyerIds),
     mongoMasterRows("consignee_names", consigneeIds),
+    sqliteMasterRows("buyer_names", buyerIds),
+    sqliteMasterRows("consignee_names", consigneeIds),
   ]);
 
   const makeLookup = (items) => {
@@ -1084,15 +1118,18 @@ async function decorateSaleRows(rows) {
   const warehouseMap = makeLookup(warehouses);
   const productMap = makeLookup(products);
   const accountMap = makeLookup(accounts);
-  const buyerMap = makeLookup(buyers);
-  const consigneeMap = makeLookup(consignees);
+  const buyerMap = makeLookup([...(buyers || []), ...(sqliteBuyers || [])]);
+  const consigneeMap = makeLookup([...(consignees || []), ...(sqliteConsignees || [])]);
 
   return plainRows.map((plain) => {
     const buyerId = String(plain?.buyer_id || plain?.company_id || "");
+    const buyerLookupIds = [plain?.buyer_id, plain?.company_id]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
     const warehouse = warehouseMap.get(String(plain?.warehouse_id || ""));
     const product = productMap.get(String(plain?.product_id || ""));
     const account = accountMap.get(String(plain?.company_account_id || ""));
-    const buyer = buyerMap.get(buyerId) || {};
+    const buyer = buyerLookupIds.map((id) => buyerMap.get(id)).find(Boolean) || {};
     const consignee = consigneeMap.get(String(plain?.consignee_id || "")) || {};
     const totalQuantity = Number(
       plain?.quantity ??
@@ -1118,10 +1155,31 @@ async function decorateSaleRows(rows) {
       warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
       product_name: product?.name || plain?.product_name || "-",
       company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
-      buyer_name: buyer?.name || buyer?.buyer_name || buyer?.company_name || buyer?.party_name || buyer?.account_name || plain?.buyer_name || plain?.party_name || plain?.company_name || "-",
+      buyer_name:
+        plain?.buyer_name && String(plain.buyer_name).trim() !== "-"
+          ? plain.buyer_name
+          : (
+              buyer?.name ||
+              buyer?.buyer_name ||
+              buyer?.company_name ||
+              buyer?.party_name ||
+              buyer?.account_name ||
+              plain?.party_name ||
+              plain?.company_name ||
+              "-"
+            ),
       buyer_email: buyer?.email || plain?.buyer_email || "",
       buyer_mobile: buyer?.mobile || buyer?.phone || plain?.buyer_mobile || "",
-      consignee_name: consignee?.name || consignee?.consignee_name || consignee?.company_name || consignee?.party_name || plain?.consignee_name || "-",
+      consignee_name:
+        plain?.consignee_name && String(plain.consignee_name).trim() !== "-"
+          ? plain.consignee_name
+          : (
+              consignee?.name ||
+              consignee?.consignee_name ||
+              consignee?.company_name ||
+              consignee?.party_name ||
+              "-"
+            ),
       consignee_email: consignee?.email || plain?.consignee_email || "",
       consignee_mobile: consignee?.mobile || consignee?.phone || plain?.consignee_mobile || "",
       rate: Number.isFinite(rate) ? rate : 0,
@@ -5082,6 +5140,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
   }
 
   try {
+    const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
     const detailsOfDeduction = ["1", "true", "yes", "details"].includes(String(req.query.details_of_deduction || "").trim().toLowerCase());
