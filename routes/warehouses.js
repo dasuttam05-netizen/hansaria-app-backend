@@ -7,7 +7,6 @@ const {
   Warehouse,
   Employee,
   Company,
-  Location,
 } = require("../mongo");
 
 const {
@@ -130,27 +129,17 @@ router.get("/", async (req, res) => {
           }
         : {};
 
-    // Read raw warehouse documents without mongoose populate.
-    // Some legacy records may contain non-ObjectId reference values; populate
-    // would throw a CastError and make the whole /api/warehouses endpoint 500.
-    const rows = await Warehouse.find(filter).sort({ created_at: -1 });
+    const rows =
+      await Warehouse.find(filter)
+        .populate("location_id", "name")
+        .populate("employee_id", "name")
+        .sort({ created_at: -1 });
 
-    const safeObjectIds = (values) =>
-      Array.from(new Set((values || [])
-        .map((value) => normalizeId(value))
-        .filter((value) => value && mongoose.Types.ObjectId.isValid(value))))
-        .map((value) => new mongoose.Types.ObjectId(value));
-
-    const locationIds = safeObjectIds(rows.map((row) => row.location_id));
-    const companyIds = safeObjectIds(rows.map((row) => row.company_id));
-
-    const [locationRows, companyRows] = await Promise.all([
-      locationIds.length ? Location.find({ _id: { $in: locationIds } }, { name: 1 }) : [],
-      companyIds.length ? Company.find({ _id: { $in: companyIds } }, { name: 1 }) : [],
-    ]);
-
-    const locationNameMap = new Map((locationRows || []).map((item) => [String(item._id), item.name || ""]));
-    const companyNameMap = new Map((companyRows || []).map((item) => [String(item._id), item.name || ""]));
+    const companyIds = Array.from(new Set(rows.map((row) => normalizeId(row.company_id)).filter(Boolean)));
+    const companyDocs = companyIds.length
+      ? await Company.find({ _id: { $in: companyIds } }, { name: 1 }).lean()
+      : [];
+    const companyNameMap = new Map(companyDocs.map((company) => [String(company._id), company.name || ""]));
 
     const warehouseIds = rows.map((row) => String(row._id));
     const employeeRowsByAssignment =
@@ -233,17 +222,17 @@ router.get("/", async (req, res) => {
           normalizeId(row.location_id),
 
         location_name:
-          locationNameMap.get(normalizeId(row.location_id)) || "",
+          row.location_id?.name || "",
 
         company_id: normalizeId(row.company_id),
         company_name: companyNameMap.get(normalizeId(row.company_id)) || "",
-        monthly_rent: Number(row.monthly_rent || 0),
+        monthly_rent: Number(row.monthly_rent ?? 0),
 
         employee_id:
           normalizeId(row.employee_id),
 
         employee_name:
-          employeeNameMap.get(normalizeId(row.employee_id)) || "",
+          row.employee_id?.name || "",
 
         employee_ids: Array.from(
           warehouseToEmployeeSet.get(String(row._id)) || []
@@ -484,6 +473,7 @@ router.put("/:id", async (req, res) => {
 
     return res.json({
       updated: 1,
+      warehouse: updated,
     });
 
   } catch (err) {
