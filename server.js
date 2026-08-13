@@ -175,6 +175,7 @@ const companiesRoute = require("./routes/companies");
 const companyAccountsRoute = require("./routes/companyAccounts");
 
 const warehouseRoutes = require("./routes/warehouses");
+const warehouseRentBookingRoutes = require("./routes/warehouseRentBooking");
 
 const productsRoute = require("./routes/products");
 
@@ -369,6 +370,13 @@ app.use(
   authenticate,
   authorize(["dropdown.view", "warehouses.view", "warehouses.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
   warehouseRoutes
+);
+
+app.use(
+  "/api/warehouse-rent-bookings",
+  authenticate,
+  authorize(["dropdown.view", "warehouses.view", "warehouses.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
+  warehouseRentBookingRoutes
 );
 
 app.use(
@@ -748,9 +756,6 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     });
 
     const totalStockValue = rentDetailedRows.reduce((sum, row) => sum + Number(row.balance_qty || 0), 0);
-    const totalRentValue = Number(
-      rentDetailedRows.reduce((sum, row) => sum + Number(row.total_rent || 0), 0).toFixed(2)
-    );
 
     const monthEndRentSummary = normalizeDashboardSummary({
       summary: rentDetailedRows.map((row) => ({
@@ -772,7 +777,6 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       partyStock: partyStockSummary,
       warehouseStock: warehouseStockSummary,
       totalStock: totalStockValue,
-      totalRent: totalRentValue,
       monthEndRentSummary,
       meta: {
         currentMonth,
