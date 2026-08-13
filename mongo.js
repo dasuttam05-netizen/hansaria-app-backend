@@ -253,6 +253,17 @@ const warehouseSchema =
     room_floor_building: String,
     street_locality_landmark: String,
 
+    company_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Company",
+      default: null,
+    },
+
+    monthly_rent: {
+      type: Number,
+      default: 0,
+    },
+
     location_id: {
       type:
         mongoose.Schema.Types.ObjectId,
@@ -279,17 +290,6 @@ const warehouseSchema =
     opening_balance_type: {
       type: String,
       default: "dr",
-    },
-
-    company_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      default: null,
-    },
-
-    monthly_rent: {
-      type: Number,
-      default: 0,
     },
   });
 
@@ -442,6 +442,26 @@ saleVoucherSchema.index({ journey_token: 1, date: -1, _id: -1 });
 
 
 // =========================
+// WAREHOUSE RENT BOOKING
+// =========================
+const warehouseRentBookingSchema = new mongoose.Schema({
+  booking_no: { type: String, unique: true, index: true },
+  booking_date: { type: String, required: true },
+  rent_month: { type: String, required: true },
+  warehouse_id: { type: mongoose.Schema.Types.ObjectId, ref: "Warehouse", required: true, index: true },
+  company_id: { type: mongoose.Schema.Types.ObjectId, ref: "Company", default: null, index: true },
+  monthly_rent: { type: Number, default: 0 },
+  status: { type: String, enum: ["unpaid", "partial", "paid"], default: "unpaid", index: true },
+  paid_amount: { type: Number, default: 0 },
+  balance_amount: { type: Number, default: 0 },
+  payment_mode: { type: String, default: "" },
+  reference_no: { type: String, default: "" },
+  remarks: { type: String, default: "" },
+}, { timestamps: true });
+
+warehouseRentBookingSchema.index({ warehouse_id: 1, rent_month: 1 }, { unique: true });
+
+// =========================
 // EXPORTS
 // =========================
 module.exports = {
@@ -488,6 +508,13 @@ module.exports = {
     mongoose.model(
       "Warehouse",
       warehouseSchema
+    ),
+
+  WarehouseRentBooking:
+    mongoose.models.WarehouseRentBooking ||
+    mongoose.model(
+      "WarehouseRentBooking",
+      warehouseRentBookingSchema
     ),
 
   Product:
