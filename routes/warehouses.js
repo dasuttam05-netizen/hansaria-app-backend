@@ -137,6 +137,11 @@ router.get("/", async (req, res) => {
         )
 
         .populate(
+          "company_id",
+          "name"
+        )
+
+        .populate(
           "employee_id",
           "name"
         )
@@ -228,6 +233,15 @@ router.get("/", async (req, res) => {
         location_name:
           row.location_id?.name || "",
 
+        company_id:
+          normalizeId(row.company_id),
+
+        company_name:
+          row.company_id?.name || "",
+
+        monthly_rent:
+          Number(row.monthly_rent || 0),
+
         employee_id:
           normalizeId(row.employee_id),
 
@@ -282,6 +296,8 @@ router.post("/", async (req, res) => {
 
     const {
       name,
+      company_id,
+      monthly_rent,
       address,
       pincode,
       state,
@@ -326,6 +342,9 @@ router.post("/", async (req, res) => {
       await Warehouse.create({
 
         name,
+
+        company_id: company_id || null,
+        monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
 
         address,
 
@@ -386,6 +405,8 @@ router.put("/:id", async (req, res) => {
 
     const {
       name,
+      company_id,
+      monthly_rent,
       address,
       pincode,
       state,
@@ -420,6 +441,9 @@ router.put("/:id", async (req, res) => {
 
         {
           name,
+
+          company_id: company_id || null,
+          monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
 
           address,
 
