@@ -1022,9 +1022,6 @@ async function decorateSaleRows(rows) {
     buyerIds.length
       ? dbAll(`SELECT * FROM buyer_names WHERE CAST(id AS TEXT) IN (${buyerIds.map(() => "?").join(",")})`, buyerIds)
       : Promise.resolve([]),
-    consigneeIds.length
-      ? dbAll(`SELECT * FROM consignee_names WHERE CAST(id AS TEXT) IN (${consigneeIds.map(() => "?").join(",")})`, consigneeIds)
-      : Promise.resolve([]),
   ]);
 
   const valueAt = (index) => results[index].status === "fulfilled" && Array.isArray(results[index].value) ? results[index].value : [];
@@ -1042,9 +1039,6 @@ async function decorateSaleRows(rows) {
   const sqliteBuyerMap = new Map(
     valueAt(5).map((item) => [String(item?.id || ""), item]).filter(([id]) => id)
   );
-  const sqliteConsigneeMap = new Map(
-    valueAt(6).map((item) => [String(item?.id || ""), item]).filter(([id]) => id)
-  );
 
   return plainRows.map((plain) => {
     const buyerId = String(plain?.buyer_id || plain?.company_id || "");
@@ -1052,7 +1046,7 @@ async function decorateSaleRows(rows) {
     const product = mongoProductMap.get(String(plain?.product_id || ""));
     const account = mongoAccountMap.get(String(plain?.company_account_id || ""));
     const buyer = buyerMap.get(buyerId) || sqliteBuyerMap.get(buyerId) || {};
-    const consignee = consigneeMap.get(String(plain?.consignee_id || "")) || sqliteConsigneeMap.get(String(plain?.consignee_id || ""));
+    const consignee = consigneeMap.get(String(plain?.consignee_id || ""));
     const totalQuantity = Number(plain?.quantity ?? plain?.total_quantity ?? Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0));
     const totalAmount = Number(plain?.amount ?? plain?.total_amount ?? plain?.net_receivable_amount ?? 0);
     return {
@@ -4751,10 +4745,7 @@ router.get("/report/filter-options", async (req, res) => {
         SaleVoucher.distinct("company_account_id", { ...saleScope, ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}), ...buyerFilter }),
         SaleVoucher.distinct("warehouse_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}), ...buyerFilter }),
         SaleVoucher.distinct("farmer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...buyerFilter }),
-        Promise.all([
-          SaleVoucher.distinct("buyer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
-          SaleVoucher.distinct("company_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
-        ]).then(([buyerValues, companyValues]) => [...(buyerValues || []), ...(companyValues || [])]),
+        SaleVoucher.distinct("buyer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
       ]);
     }
 
@@ -5364,6 +5355,8 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       // sale net calculation. shortage_amount is kept as supporting detail,
       // so it is never subtracted twice.
       const claim = Number(row.claim_amount || 0);
+      const shortageQty = Number(row.shortage_quantity || 0);
+      const shortageAmount = Number(row.shortage_amount || 0);
       const otherDeduction = Number(row.other_deduction || 0);
       const cdAmount = Number(row.cd_amount || 0);
       const freight = Number(row.transport_charge || 0);
@@ -5371,9 +5364,16 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       const tds = Number(row.tds_amount || 0);
       const roundOff = Number(row.round_off || 0);
 
+      // Keep the existing accounting amount unchanged. Claim/shortage are
+      // displayed as one effective deduction so the same amount is never
+      // credited twice when shortage_amount is the supporting claim value.
+      const claimLabel = claim > 0
+        ? (shortageAmount > 0 && Math.abs(claim - shortageAmount) < 0.000001 ? "Shortage" : "Claim")
+        : (shortageAmount > 0 ? "Shortage" : "Claim");
+
       const deductionParts = [
-        { key: "claim", label: "Claim / Shortage", amount: claim },
-        { key: "other", label: "Others", amount: otherDeduction },
+        ...(claim > 0 || shortageAmount > 0 ? [{ key: claimLabel.toLowerCase(), label: claimLabel, amount: claim > 0 ? claim : shortageAmount }] : []),
+        { key: "other", label: "Other", amount: otherDeduction },
         { key: "cd", label: "CD", amount: cdAmount },
         { key: "freight", label: "Freight", amount: freight },
         { key: "adjustment", label: "Adjustment", amount: adjustment },
@@ -5405,9 +5405,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
 
       // Every F2 deduction is a separate Credit in the same Sale Party Ledger.
       deductionParts.forEach((part) => {
-        const shortageQty = Number(row.shortage_quantity || 0);
-        const shortageAmount = Number(row.shortage_amount || 0);
-        const shortageInfo = part.key === "claim" && (shortageQty || shortageAmount)
+        const shortageInfo = part.label === "Shortage" && (shortageQty || shortageAmount)
           ? ` Shortage Qty ${fmtNum(shortageQty)}, Shortage Amount Rs.${fmtNum(shortageAmount)}`
           : "";
 
