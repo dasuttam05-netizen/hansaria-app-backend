@@ -6,7 +6,6 @@ const router = express.Router();
 const {
   Warehouse,
   Employee,
-  Company,
 } = require("../mongo");
 
 const {
@@ -138,6 +137,11 @@ router.get("/", async (req, res) => {
         )
 
         .populate(
+          "company_id",
+          "name"
+        )
+
+        .populate(
           "employee_id",
           "name"
         )
@@ -145,15 +149,6 @@ router.get("/", async (req, res) => {
         .sort({
           created_at: -1,
         });
-
-    const companyIds = Array.from(new Set(rows.map((row) => normalizeId(row.company_id)).filter(Boolean)));
-    const companyNameMap = new Map();
-    if (companyIds.length) {
-      const companyRows = await Company.find({ _id: { $in: companyIds } }, { name: 1, company_name: 1 });
-      companyRows.forEach((company) => {
-        companyNameMap.set(String(company._id), company.name || company.company_name || "");
-      });
-    }
 
     const warehouseIds = rows.map((row) => String(row._id));
     const employeeRowsByAssignment =
@@ -238,6 +233,10 @@ router.get("/", async (req, res) => {
         location_name:
           row.location_id?.name || "",
 
+        company_id: normalizeId(row.company_id),
+        company_name: row.company_id?.name || "",
+        monthly_rent: Number(row.monthly_rent || 0),
+
         employee_id:
           normalizeId(row.employee_id),
 
@@ -258,10 +257,6 @@ router.get("/", async (req, res) => {
             ])
           )
             .filter(Boolean),
-
-        company_id: normalizeId(row.company_id),
-        company_name: companyNameMap.get(normalizeId(row.company_id)) || "",
-        monthly_rent: Number(row.monthly_rent || 0),
 
       }));
 
@@ -306,10 +301,10 @@ router.post("/", async (req, res) => {
       location_id,
       employee_id,
       employee_ids,
-      opening_balance,
-      opening_balance_type,
       company_id,
       monthly_rent,
+      opening_balance,
+      opening_balance_type,
     } = req.body;
 
     if (
@@ -363,6 +358,7 @@ router.post("/", async (req, res) => {
 
         opening_balance: safeOpeningBalance,
         opening_balance_type: safeOpeningBalanceType,
+
         company_id: company_id || null,
         monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
 
@@ -414,10 +410,10 @@ router.put("/:id", async (req, res) => {
       location_id,
       employee_id,
       employee_ids,
-      opening_balance,
-      opening_balance_type,
       company_id,
       monthly_rent,
+      opening_balance,
+      opening_balance_type,
     } = req.body;
 
     const safeEmployeeIds =
