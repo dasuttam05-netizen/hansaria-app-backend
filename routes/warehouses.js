@@ -6,6 +6,8 @@ const router = express.Router();
 const {
   Warehouse,
   Employee,
+  Company,
+  Location,
 } = require("../mongo");
 
 const {
@@ -128,27 +130,27 @@ router.get("/", async (req, res) => {
           }
         : {};
 
-    const rows =
-      await Warehouse.find(filter)
+    // Read raw warehouse documents without mongoose populate.
+    // Some legacy records may contain non-ObjectId reference values; populate
+    // would throw a CastError and make the whole /api/warehouses endpoint 500.
+    const rows = await Warehouse.find(filter).sort({ created_at: -1 });
 
-        .populate(
-          "location_id",
-          "name"
-        )
+    const safeObjectIds = (values) =>
+      Array.from(new Set((values || [])
+        .map((value) => normalizeId(value))
+        .filter((value) => value && mongoose.Types.ObjectId.isValid(value))))
+        .map((value) => new mongoose.Types.ObjectId(value));
 
-        .populate(
-          "company_id",
-          "name"
-        )
+    const locationIds = safeObjectIds(rows.map((row) => row.location_id));
+    const companyIds = safeObjectIds(rows.map((row) => row.company_id));
 
-        .populate(
-          "employee_id",
-          "name"
-        )
+    const [locationRows, companyRows] = await Promise.all([
+      locationIds.length ? Location.find({ _id: { $in: locationIds } }, { name: 1 }) : [],
+      companyIds.length ? Company.find({ _id: { $in: companyIds } }, { name: 1 }) : [],
+    ]);
 
-        .sort({
-          created_at: -1,
-        });
+    const locationNameMap = new Map((locationRows || []).map((item) => [String(item._id), item.name || ""]));
+    const companyNameMap = new Map((companyRows || []).map((item) => [String(item._id), item.name || ""]));
 
     const warehouseIds = rows.map((row) => String(row._id));
     const employeeRowsByAssignment =
@@ -231,17 +233,17 @@ router.get("/", async (req, res) => {
           normalizeId(row.location_id),
 
         location_name:
-          row.location_id?.name || "",
+          locationNameMap.get(normalizeId(row.location_id)) || "",
 
         company_id: normalizeId(row.company_id),
-        company_name: row.company_id?.name || "",
+        company_name: companyNameMap.get(normalizeId(row.company_id)) || "",
         monthly_rent: Number(row.monthly_rent || 0),
 
         employee_id:
           normalizeId(row.employee_id),
 
         employee_name:
-          row.employee_id?.name || "",
+          employeeNameMap.get(normalizeId(row.employee_id)) || "",
 
         employee_ids: Array.from(
           warehouseToEmployeeSet.get(String(row._id)) || []
