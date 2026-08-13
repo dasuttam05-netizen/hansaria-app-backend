@@ -6,6 +6,7 @@ const router = express.Router();
 const {
   Warehouse,
   Employee,
+  Company,
 } = require("../mongo");
 
 const {
@@ -137,11 +138,6 @@ router.get("/", async (req, res) => {
         )
 
         .populate(
-          "company_id",
-          "name"
-        )
-
-        .populate(
           "employee_id",
           "name"
         )
@@ -149,6 +145,26 @@ router.get("/", async (req, res) => {
         .sort({
           created_at: -1,
         });
+
+    // Company is read separately instead of populate() so older warehouse
+    // records with legacy/string company_id values cannot make GET /api/warehouses fail.
+    const companyIds = Array.from(
+      new Set(
+        rows
+          .map((row) => normalizeId(row.company_id))
+          .filter((id) => id && mongoose.Types.ObjectId.isValid(id))
+      )
+    );
+    const companyNameMap = new Map();
+    if (companyIds.length) {
+      const companyRows = await Company.find(
+        { _id: { $in: companyIds } },
+        { name: 1 }
+      ).lean();
+      companyRows.forEach((company) => {
+        companyNameMap.set(String(company._id), company.name || "");
+      });
+    }
 
     const warehouseIds = rows.map((row) => String(row._id));
     const employeeRowsByAssignment =
@@ -237,7 +253,7 @@ router.get("/", async (req, res) => {
           normalizeId(row.company_id),
 
         company_name:
-          row.company_id?.name || "",
+          companyNameMap.get(normalizeId(row.company_id)) || "",
 
         monthly_rent:
           Number(row.monthly_rent || 0),
