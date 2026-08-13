@@ -1304,6 +1304,15 @@ function ensureWarehouseAccess(req, res, warehouseId, locationId = null) {
   return false;
 }
 
+function ensureWarehouseAccessAsync(req, res, warehouseId, locationId = null) {
+  try {
+    return Promise.resolve(ensureWarehouseAccess(req, res, warehouseId, locationId));
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to check warehouse access" });
+    return Promise.resolve(false);
+  }
+}
+
 async function getMongoPurchaseVoucherForPdf(id) {
   const filter = mongoIdFilter(id);
   if (!filter || !mongoReady()) return null;
@@ -4088,7 +4097,7 @@ router.get("/receipt/:id", (req, res) => {
   db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
-    ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id).then((ok) => {
+    ensureWarehouseAccessAsync(req, res, row.warehouse_id, row.location_id).then((ok) => {
       if (!ok) return;
 
     // Join with wh_sale_vouchers to fetch voucher_no for each adjusted sale
@@ -4113,7 +4122,7 @@ router.post("/receipt", (req, res) => {
   }
 
   const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
-  ensureWarehouseAccess(req, res, warehouse_id, location_id).then((ok) => {
+  ensureWarehouseAccessAsync(req, res, warehouse_id, location_id).then((ok) => {
   if (!ok) return;
   if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
 
@@ -4202,13 +4211,15 @@ router.put("/receipt/:id", (req, res) => {
 
   const id = req.params.id;
   const { voucher_no, date, warehouse_id, company_id, company_account_id, consignee_id, amount, reference_type, reference_id, employee_id, location_id, description, adjustments } = req.body;
-  if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
-  if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
+  ensureWarehouseAccessAsync(req, res, warehouse_id, location_id).then((ok) => {
+    if (!ok) return;
+    if (!company_id) return res.status(400).json({ error: "Company is required for receipt vouchers" });
 
-  db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (findErr, oldRow) => {
+    db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (findErr, oldRow) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!oldRow) return res.status(404).json({ error: "Receipt voucher not found" });
-    if (!ensureWarehouseAccess(req, res, oldRow.warehouse_id)) return;
+    ensureWarehouseAccessAsync(req, res, oldRow.warehouse_id, oldRow.location_id).then((oldOk) => {
+      if (!oldOk) return;
 
     validateReceiptAdjustments({ companyId: company_id, amount, adjustments }, (validationErr, cleanAdjustments) => {
       if (validationErr) return res.status(400).json({ error: validationErr.message });
@@ -4264,6 +4275,8 @@ router.put("/receipt/:id", (req, res) => {
       });
     });
   });
+  });
+  });
 });
 
 router.delete("/receipt/:id", (req, res) => {
@@ -4275,7 +4288,7 @@ router.delete("/receipt/:id", (req, res) => {
   db.get("SELECT * FROM wh_receipt_vouchers WHERE id = ?", [id], (findErr, row) => {
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!row) return res.status(404).json({ error: "Receipt voucher not found" });
-    ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id).then((ok) => {
+    ensureWarehouseAccessAsync(req, res, row.warehouse_id, row.location_id).then((ok) => {
       if (!ok) return;
 
     db.serialize(() => {
