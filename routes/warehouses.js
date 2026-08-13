@@ -146,23 +146,12 @@ router.get("/", async (req, res) => {
           created_at: -1,
         });
 
-    // Company is read separately instead of populate() so older warehouse
-    // records with legacy/string company_id values cannot make GET /api/warehouses fail.
-    const companyIds = Array.from(
-      new Set(
-        rows
-          .map((row) => normalizeId(row.company_id))
-          .filter((id) => id && mongoose.Types.ObjectId.isValid(id))
-      )
-    );
+    const companyIds = Array.from(new Set(rows.map((row) => normalizeId(row.company_id)).filter(Boolean)));
     const companyNameMap = new Map();
     if (companyIds.length) {
-      const companyRows = await Company.find(
-        { _id: { $in: companyIds } },
-        { name: 1 }
-      ).lean();
+      const companyRows = await Company.find({ _id: { $in: companyIds } }, { name: 1, company_name: 1 });
       companyRows.forEach((company) => {
-        companyNameMap.set(String(company._id), company.name || "");
+        companyNameMap.set(String(company._id), company.name || company.company_name || "");
       });
     }
 
@@ -249,15 +238,6 @@ router.get("/", async (req, res) => {
         location_name:
           row.location_id?.name || "",
 
-        company_id:
-          normalizeId(row.company_id),
-
-        company_name:
-          companyNameMap.get(normalizeId(row.company_id)) || "",
-
-        monthly_rent:
-          Number(row.monthly_rent || 0),
-
         employee_id:
           normalizeId(row.employee_id),
 
@@ -278,6 +258,10 @@ router.get("/", async (req, res) => {
             ])
           )
             .filter(Boolean),
+
+        company_id: normalizeId(row.company_id),
+        company_name: companyNameMap.get(normalizeId(row.company_id)) || "",
+        monthly_rent: Number(row.monthly_rent || 0),
 
       }));
 
@@ -312,8 +296,6 @@ router.post("/", async (req, res) => {
 
     const {
       name,
-      company_id,
-      monthly_rent,
       address,
       pincode,
       state,
@@ -326,6 +308,8 @@ router.post("/", async (req, res) => {
       employee_ids,
       opening_balance,
       opening_balance_type,
+      company_id,
+      monthly_rent,
     } = req.body;
 
     if (
@@ -359,9 +343,6 @@ router.post("/", async (req, res) => {
 
         name,
 
-        company_id: company_id || null,
-        monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
-
         address,
 
         pincode: pincode || null,
@@ -382,6 +363,8 @@ router.post("/", async (req, res) => {
 
         opening_balance: safeOpeningBalance,
         opening_balance_type: safeOpeningBalanceType,
+        company_id: company_id || null,
+        monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
 
       });
 
@@ -421,8 +404,6 @@ router.put("/:id", async (req, res) => {
 
     const {
       name,
-      company_id,
-      monthly_rent,
       address,
       pincode,
       state,
@@ -435,6 +416,8 @@ router.put("/:id", async (req, res) => {
       employee_ids,
       opening_balance,
       opening_balance_type,
+      company_id,
+      monthly_rent,
     } = req.body;
 
     const safeEmployeeIds =
@@ -458,9 +441,6 @@ router.put("/:id", async (req, res) => {
         {
           name,
 
-          company_id: company_id || null,
-          monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
-
           address,
 
           pincode: pincode || null,
@@ -481,6 +461,8 @@ router.put("/:id", async (req, res) => {
 
           opening_balance: safeOpeningBalance,
           opening_balance_type: safeOpeningBalanceType,
+          company_id: company_id || null,
+          monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
         },
 
         {
