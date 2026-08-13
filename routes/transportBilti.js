@@ -152,7 +152,80 @@ router.get("/outward-list", (req, res) => {
   });
 });
 
-router.get("/sale-list", (req, res) => {
+router.get("/sale-list", async (req, res) => {
+  // Warehouse Trading Sale vouchers are stored in MongoDB.  The old
+  // implementation read this list from SQLite, which meant the returned
+  // `id` was the SQLite row id.  Transport Bilti then used that id to load
+  // the Sale from MongoDB, so the Sale details could not be found.
+  // Keep the existing response shape, but use the Mongo SaleVoucher _id
+  // whenever MongoDB is available.  No save/calculation logic is changed.
+  try {
+    if (mongoose.connection.readyState === 1) {
+      const alreadyBiltied = await new Promise((resolve, reject) => {
+        db.all(
+          `SELECT sale_id FROM transport_bilti WHERE sale_id IS NOT NULL`,
+          [],
+          (err, rows) => {
+            if (err) return reject(err);
+            resolve(new Set((rows || []).map((r) => String(r.sale_id))));
+          }
+        );
+      });
+
+      const docs = await SaleVoucher.find({}).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
+      const pending = [];
+
+      for (const doc of docs || []) {
+        const mongoId = String(doc._id || "");
+        if (!mongoId || alreadyBiltied.has(mongoId)) continue;
+
+        const decorated = await decorateMongoSale(doc);
+        pending.push({
+          id: mongoId,
+          sale_id: mongoId,
+          bilti_id: null,
+          voucher_no: decorated.voucher_no || decorated.bill_no || "",
+          date: decorated.date || decorated.bill_date || "",
+          lorry_no: decorated.lorry_no || "",
+          quantity: num(decorated.quantity),
+          unloading_qty: num(decorated.unloading_qty),
+          rate: num(decorated.rate),
+          amount: num(decorated.amount),
+          buyer_name:
+            decorated.sale_buyer_name ||
+            decorated.buyer_name ||
+            decorated.company_name ||
+            "",
+          consignee_name:
+            decorated.sale_consignee_name ||
+            decorated.consignee_name ||
+            "",
+          account_name:
+            decorated.sale_account_name ||
+            decorated.company_account_name ||
+            decorated.account_name ||
+            "",
+          warehouse_name:
+            decorated.sale_warehouse_name ||
+            decorated.warehouse_name ||
+            "",
+          product_name:
+            decorated.sale_product_name ||
+            decorated.product_name ||
+            "",
+          source: "mongo",
+        });
+      }
+
+      return res.json(pending);
+    }
+  } catch (mongoErr) {
+    console.error("Mongo sale-list lookup failed; falling back to SQLite:", mongoErr.message || mongoErr);
+  }
+
+  // Keep the existing SQLite fallback for installations where MongoDB is
+  // temporarily unavailable.  This preserves the old behaviour and does not
+  // change any transport calculation/save logic.
   const sql = `
     SELECT
       s.id,
