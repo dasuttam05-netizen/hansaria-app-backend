@@ -245,6 +245,16 @@ const warehouseSchema =
 
     name: String,
 
+    company_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Company",
+    },
+
+    monthly_rent: {
+      type: Number,
+      default: 0,
+    },
+
     address: String,
     pincode: String,
     state: String,
@@ -282,6 +292,21 @@ const warehouseSchema =
     },
   });
 
+
+// =========================
+// WAREHOUSE RENT BOOKING
+// =========================
+const warehouseRentBookingSchema =
+  new mongoose.Schema({
+    booking_no: { type: String, unique: true },
+    booking_date: { type: String, required: true },
+    month: { type: String, required: true },
+    warehouse_id: { type: mongoose.Schema.Types.ObjectId, ref: "Warehouse", required: true },
+    company_id: { type: mongoose.Schema.Types.ObjectId, ref: "Company", required: true },
+    monthly_rent: { type: Number, required: true, default: 0 },
+    status: { type: String, default: "BOOKED" },
+    created_by: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  }, { timestamps: true });
 
 // =========================
 // PRODUCT
@@ -478,6 +503,10 @@ module.exports = {
       "Warehouse",
       warehouseSchema
     ),
+
+  WarehouseRentBooking:
+    mongoose.models.WarehouseRentBooking ||
+    mongoose.model("WarehouseRentBooking", warehouseRentBookingSchema),
 
   Product:
     mongoose.models.Product ||
