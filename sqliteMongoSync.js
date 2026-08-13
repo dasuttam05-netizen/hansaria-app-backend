@@ -48,6 +48,7 @@ const TRACKED_TABLES = new Set([
   "wh_payment_adjustments",
   "wh_purchase_vouchers",
   "wh_receipt_vouchers",
+  "wh_receipt_adjustments",
   "wh_journal_vouchers",
   "wh_sale_vouchers",
 ]);
