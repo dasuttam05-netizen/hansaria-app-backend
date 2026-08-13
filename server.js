@@ -479,14 +479,13 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     });
 
     const calculateMonthSlab = (inwardDateStr, refDateStr) => {
-      const inwardDate = new Date(`${String(inwardDateStr || "").slice(0, 10)}T00:00:00`);
-      const refDate = new Date(`${String(refDateStr || "").slice(0, 10)}T00:00:00`);
+      const inwardDate = new Date(inwardDateStr);
+      const refDate = new Date(refDateStr);
       const msPerDay = 1000 * 60 * 60 * 24;
-      const rawDaysDiff = Math.floor((refDate - inwardDate) / msPerDay);
-      const daysDiff = rawDaysDiff < 0 ? 0 : rawDaysDiff;
-      // Rent slab: days 1-30 = 1x, 31-60 = 2x, 61-90 = 3x, etc.
-      const monthsDiff = Math.max(1, Math.ceil(daysDiff / 30));
-      return { daysDiff, monthsDiff };
+      const daysDiff = Math.floor((refDate - inwardDate) / msPerDay);
+      let monthsDiff = Math.floor((daysDiff <= 0 ? 0 : daysDiff - 1) / 30) + 1;
+      if (monthsDiff < 1) monthsDiff = 1;
+      return { daysDiff: daysDiff < 0 ? 0 : daysDiff, monthsDiff };
     };
 
     const firstNonEmptyDate = (...values) => {
@@ -749,6 +748,9 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
     });
 
     const totalStockValue = rentDetailedRows.reduce((sum, row) => sum + Number(row.balance_qty || 0), 0);
+    const totalRentValue = Number(
+      rentDetailedRows.reduce((sum, row) => sum + Number(row.total_rent || 0), 0).toFixed(2)
+    );
 
     const monthEndRentSummary = normalizeDashboardSummary({
       summary: rentDetailedRows.map((row) => ({
@@ -770,8 +772,8 @@ app.get("/api/dashboard", authenticate, authorize("dashboard.view"), async (req,
       partyStock: partyStockSummary,
       warehouseStock: warehouseStockSummary,
       totalStock: totalStockValue,
+      totalRent: totalRentValue,
       monthEndRentSummary,
-      totalRent: Number(rentDetailedRows.reduce((sum, row) => sum + Number(row.total_rent || 0), 0).toFixed(2)),
       meta: {
         currentMonth,
         currentDate,
