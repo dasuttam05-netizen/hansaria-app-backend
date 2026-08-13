@@ -373,13 +373,6 @@ app.use(
 );
 
 app.use(
-  "/api/warehouse-rent-bookings",
-  authenticate,
-  authorize(["dropdown.view", "warehouses.view", "warehouses.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
-  warehouseRentBookingRoutes
-);
-
-app.use(
   "/api/products",
   authenticate,
   authorize(["dropdown.view", "products.view", "products.manage", "expense.entry", "expense.view", "expense.create", "expense.edit"]),
