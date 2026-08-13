@@ -3381,6 +3381,107 @@ router.get("/farmers-by-account/:accountId", async (req, res) => {
   });
 });
 
+router.get("/receipt-pending-buyers", async (req, res) => {
+  const accountId = String(req.query.company_account_id || "").trim();
+  const warehouseId = String(req.query.warehouse_id || "").trim();
+  const excludeReceiptId = String(req.query.exclude_receipt_id || "").trim();
+
+  if (!accountId) return res.status(400).json({ error: "company_account_id is required" });
+
+  try {
+    let saleRows = [];
+
+    if (mongoReady()) {
+      const saleFilter = { ...mongoSaleScope(req.user), company_account_id: accountId };
+      if (warehouseId) saleFilter.warehouse_id = warehouseId;
+      saleRows = await SaleVoucher.aggregate([
+        { $match: saleFilter },
+        {
+          $group: {
+            _id: { $ifNull: ["$buyer_id", "$company_id"] },
+            total_sale: { $sum: { $ifNull: ["$net_receivable_amount", { $ifNull: ["$amount", 0] }] } },
+            warehouse_ids: { $addToSet: "$warehouse_id" },
+          },
+        },
+      ]).allowDiskUse(true);
+    } else {
+      const scope = assignedWarehouseFilter(req.user, "warehouse_id");
+      const filters = ["CAST(company_account_id AS TEXT) = CAST(? AS TEXT)", "CAST(COALESCE(buyer_id, company_id) AS TEXT) <> ''"];
+      const params = [accountId];
+      if (warehouseId) {
+        filters.push("CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)");
+        params.push(warehouseId);
+      }
+      const rows = await dbAll(
+        `SELECT CAST(COALESCE(buyer_id, company_id) AS TEXT) AS buyer_id,
+                COALESCE(SUM(COALESCE(NULLIF(net_receivable_amount, 0), amount, 0)), 0) AS total_sale
+         FROM wh_sale_vouchers
+         WHERE ${filters.join(" AND ")} ${scope.clause}
+         GROUP BY CAST(COALESCE(buyer_id, company_id) AS TEXT)`,
+        [...params, ...scope.params]
+      );
+      saleRows = rows.map((row) => ({ _id: row.buyer_id, total_sale: Number(row.total_sale || 0), warehouse_ids: [] }));
+    }
+
+    const buyerIds = saleRows.map((row) => String(row._id || "")).filter(Boolean);
+    if (!buyerIds.length) return res.json([]);
+
+    const receiptFilters = [
+      `CAST(company_account_id AS TEXT) = CAST(? AS TEXT)`,
+      `CAST(company_id AS TEXT) IN (${buyerIds.map(() => "?").join(",")})`,
+    ];
+    const receiptParams = [accountId, ...buyerIds];
+    if (warehouseId) {
+      receiptFilters.push("CAST(warehouse_id AS TEXT) = CAST(? AS TEXT)");
+      receiptParams.push(warehouseId);
+    }
+    if (excludeReceiptId) {
+      receiptFilters.push("CAST(id AS TEXT) <> CAST(? AS TEXT)");
+      receiptParams.push(excludeReceiptId);
+    }
+
+    const receiptRows = await dbAll(
+      `SELECT CAST(company_id AS TEXT) AS buyer_id, COALESCE(SUM(amount), 0) AS total_receipt
+       FROM wh_receipt_vouchers
+       WHERE ${receiptFilters.join(" AND ")}
+       GROUP BY CAST(company_id AS TEXT)`,
+      receiptParams
+    );
+    const receiptMap = new Map(receiptRows.map((row) => [String(row.buyer_id), Number(row.total_receipt || 0)]));
+
+    const buyerRows = await dbAll(
+      `SELECT CAST(id AS TEXT) AS id, name FROM buyer_names WHERE CAST(id AS TEXT) IN (${buyerIds.map(() => "?").join(",")})`,
+      buyerIds
+    );
+    const buyerNameMap = new Map(buyerRows.map((row) => [String(row.id), row.name]));
+
+    const result = saleRows
+      .map((row) => {
+        const buyerId = String(row._id || "");
+        const totalSale = Number(row.total_sale || 0);
+        const totalReceipt = receiptMap.get(buyerId) || 0;
+        const outstanding = Number((totalSale - totalReceipt).toFixed(2));
+        return {
+          id: buyerId,
+          buyer_id: buyerId,
+          company_id: buyerId,
+          buyer_name: buyerNameMap.get(buyerId) || "",
+          company_name: buyerNameMap.get(buyerId) || "",
+          total_sale: Number(totalSale.toFixed(2)),
+          total_receipt: Number(totalReceipt.toFixed(2)),
+          outstanding,
+          warehouse_ids: (row.warehouse_ids || []).map(String),
+        };
+      })
+      .filter((row) => row.outstanding > 0)
+      .sort((a, b) => String(a.buyer_name || a.buyer_id).localeCompare(String(b.buyer_name || b.buyer_id)));
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===========================
 // SALE VOUCHERS
 // ===========================
