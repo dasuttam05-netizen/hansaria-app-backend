@@ -1022,6 +1022,9 @@ async function decorateSaleRows(rows) {
     buyerIds.length
       ? dbAll(`SELECT * FROM buyer_names WHERE CAST(id AS TEXT) IN (${buyerIds.map(() => "?").join(",")})`, buyerIds)
       : Promise.resolve([]),
+    consigneeIds.length
+      ? dbAll(`SELECT * FROM consignee_names WHERE CAST(id AS TEXT) IN (${consigneeIds.map(() => "?").join(",")})`, consigneeIds)
+      : Promise.resolve([]),
   ]);
 
   const valueAt = (index) => results[index].status === "fulfilled" && Array.isArray(results[index].value) ? results[index].value : [];
@@ -1039,6 +1042,9 @@ async function decorateSaleRows(rows) {
   const sqliteBuyerMap = new Map(
     valueAt(5).map((item) => [String(item?.id || ""), item]).filter(([id]) => id)
   );
+  const sqliteConsigneeMap = new Map(
+    valueAt(6).map((item) => [String(item?.id || ""), item]).filter(([id]) => id)
+  );
 
   return plainRows.map((plain) => {
     const buyerId = String(plain?.buyer_id || plain?.company_id || "");
@@ -1046,7 +1052,7 @@ async function decorateSaleRows(rows) {
     const product = mongoProductMap.get(String(plain?.product_id || ""));
     const account = mongoAccountMap.get(String(plain?.company_account_id || ""));
     const buyer = buyerMap.get(buyerId) || sqliteBuyerMap.get(buyerId) || {};
-    const consignee = consigneeMap.get(String(plain?.consignee_id || ""));
+    const consignee = consigneeMap.get(String(plain?.consignee_id || "")) || sqliteConsigneeMap.get(String(plain?.consignee_id || ""));
     const totalQuantity = Number(plain?.quantity ?? plain?.total_quantity ?? Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0));
     const totalAmount = Number(plain?.amount ?? plain?.total_amount ?? plain?.net_receivable_amount ?? 0);
     return {
@@ -4745,7 +4751,10 @@ router.get("/report/filter-options", async (req, res) => {
         SaleVoucher.distinct("company_account_id", { ...saleScope, ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}), ...buyerFilter }),
         SaleVoucher.distinct("warehouse_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}), ...buyerFilter }),
         SaleVoucher.distinct("farmer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...buyerFilter }),
-        SaleVoucher.distinct("buyer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
+        Promise.all([
+          SaleVoucher.distinct("buyer_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
+          SaleVoucher.distinct("company_id", { ...saleScope, ...(accountId ? { company_account_id: accountId } : {}), ...(warehouseId ? { warehouse_id: warehouseId } : {}), ...(farmerId ? { farmer_id: farmerId } : {}) }),
+        ]).then(([buyerValues, companyValues]) => [...(buyerValues || []), ...(companyValues || [])]),
       ]);
     }
 
