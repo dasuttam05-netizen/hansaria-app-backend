@@ -3598,12 +3598,14 @@ router.put("/sale/:id", (req, res) => {
           existing.due_days = dueFields.due_days;
           existing.unloading_qty = unloadingQtyValue;
           existing.shortage_quantity = shortageQty;
+          existing.shortage_amount = shortageAmount;
           existing.moisture = Number(req.body.moisture !== undefined ? req.body.moisture : existing.moisture) || 0;
           existing.dunki = Number(req.body.dunki !== undefined ? req.body.dunki : existing.dunki) || 0;
           existing.fungus = Number(req.body.fungus !== undefined ? req.body.fungus : existing.fungus) || 0;
           existing.discolour = Number(req.body.discolour !== undefined ? req.body.discolour : existing.discolour) || 0;
           existing.others = Number(req.body.others !== undefined ? req.body.others : existing.others) || 0;
-          existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : existing.total_deduction) || 0;
+          const calculatedTotalDeduction = claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue;
+          existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : calculatedTotalDeduction) || calculatedTotalDeduction;
           existing.transport_charge = transportChargeValue;
           existing.claim_amount = claimValue;
           existing.other_deduction = otherDeductionValue;
@@ -5285,9 +5287,6 @@ router.get("/report/sale-party-ledger", async (req, res) => {
     const companyAccountId = String(req.query.company_account_id || "").trim();
     const sales = await getSaleReportRowsForUser(req.user, { buyerId, farmerId, warehouseId, companyAccountId });
 
-    // Sale Party Ledger must still render when receipt/adjustment mirror data is
-    // temporarily unavailable. The sale rows themselves are the primary ledger
-    // source; receipts are optional detail rows.
     let receipts = [];
     let adjustmentRows = [];
     const filter = assignedWarehouseFilter(req.user, "r.warehouse_id");
@@ -5298,10 +5297,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
     if (companyAccountId) { clauses.push(" AND CAST(r.company_account_id AS TEXT) = CAST(? AS TEXT)"); receiptParams.push(companyAccountId); }
     try {
       receipts = await dbAll(`
-        SELECT
-          r.*,
-          ca.account_name AS company_account_name,
-          b.name AS buyer_name
+        SELECT r.*, ca.account_name AS company_account_name, b.name AS buyer_name
         FROM wh_receipt_vouchers r
         LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(r.company_account_id AS TEXT)
         LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(r.company_id AS TEXT)
@@ -5345,53 +5341,137 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       byReceipt.get(receiptId).push(detail);
     });
 
-    const rows = [
-      ...(sales || []).map((row) => {
-        const saleId = String(row.id || row._id);
-        const details = bySale.get(saleId) || [];
-        const saleAmount = Number(row.total_amount || row.net_receivable_amount || row.amount || 0);
-        const receiptAmount = details.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
-        return {
+    const ledgerRows = [];
+
+    (sales || []).forEach((row) => {
+      const saleId = String(row.id || row._id);
+      const details = bySale.get(saleId) || [];
+      const grossSale = Number(row.amount || row.total_amount || 0);
+
+      // claim_amount is the effective shortage/claim deduction used by the
+      // sale net calculation. shortage_amount is kept as supporting detail,
+      // so it is never subtracted twice.
+      const claim = Number(row.claim_amount || 0);
+      const otherDeduction = Number(row.other_deduction || 0);
+      const cdAmount = Number(row.cd_amount || 0);
+      const freight = Number(row.transport_charge || 0);
+      const adjustment = Number(row.adjustment_amount || 0);
+      const tds = Number(row.tds_amount || 0);
+      const roundOff = Number(row.round_off || 0);
+
+      const deductionParts = [
+        { key: "claim", label: "Claim / Shortage", amount: claim },
+        { key: "other", label: "Others", amount: otherDeduction },
+        { key: "cd", label: "CD", amount: cdAmount },
+        { key: "freight", label: "Freight", amount: freight },
+        { key: "adjustment", label: "Adjustment", amount: adjustment },
+        { key: "tds", label: "TDS", amount: tds },
+      ].filter((item) => Number.isFinite(item.amount) && Math.abs(item.amount) > 0.000001);
+
+      const deductionTotal = deductionParts.reduce((sum, item) => sum + item.amount, 0);
+      const receiptAmount = details.reduce((sum, item) => sum + Number(item.adjusted_amount || 0), 0);
+      const netReceivable = grossSale - deductionTotal + roundOff;
+
+      ledgerRows.push({
+        ...row,
+        date: row.date,
+        voucher_no: row.voucher_no,
+        voucher_type: "Sale",
+        particulars: `Sale Bill ${row.voucher_no || ""}`.trim(),
+        adjustment_details: details.map((item) => `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+        receipt_details: details,
+        sale_id: saleId,
+        sale_amount: Number(grossSale.toFixed(2)),
+        receipt_amount: Number(receiptAmount.toFixed(2)),
+        journal_amount: Number(deductionTotal.toFixed(2)),
+        bill_balance: Number((netReceivable - receiptAmount).toFixed(2)),
+        debit: Number(grossSale.toFixed(2)),
+        credit: 0,
+        party_id: String(row.buyer_id || row.company_id || ""),
+        party_name: row.buyer_name || row.company_name || "-",
+      });
+
+      // Every F2 deduction is a separate Credit in the same Sale Party Ledger.
+      deductionParts.forEach((part) => {
+        const shortageQty = Number(row.shortage_quantity || 0);
+        const shortageAmount = Number(row.shortage_amount || 0);
+        const shortageInfo = part.key === "claim" && (shortageQty || shortageAmount)
+          ? ` Shortage Qty ${fmtNum(shortageQty)}, Shortage Amount Rs.${fmtNum(shortageAmount)}`
+          : "";
+
+        ledgerRows.push({
           ...row,
-          date: row.date,
+          id: `${saleId}-deduction-${part.key}`,
+          _id: `${saleId}-deduction-${part.key}`,
+          date: row.unloading_date || row.date,
           voucher_no: row.voucher_no,
-          voucher_type: "Sale",
-          particulars: `Sale Bill ${row.voucher_no || ""}`.trim(),
-          adjustment_details: details.map((item) => `${item.receipt_date || "-"} ${item.receipt_voucher_no || "-"}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
-          receipt_details: details,
+          voucher_type: `Sale - ${part.label}`,
+          particulars: `${part.label} against ${row.voucher_no || "Sale"}${shortageInfo}`,
+          adjustment_details: "",
+          receipt_details: [],
           sale_id: saleId,
-          sale_amount: Number(saleAmount.toFixed(2)),
-          receipt_amount: Number(receiptAmount.toFixed(2)),
-          journal_amount: 0,
-          bill_balance: Number((saleAmount - receiptAmount).toFixed(2)),
-          debit: saleAmount,
-          credit: 0,
+          sale_amount: 0,
+          receipt_amount: 0,
+          journal_amount: Number(part.amount.toFixed(2)),
+          bill_balance: Number((netReceivable - receiptAmount).toFixed(2)),
+          debit: 0,
+          credit: Number(part.amount.toFixed(2)),
           party_id: String(row.buyer_id || row.company_id || ""),
           party_name: row.buyer_name || row.company_name || "-",
-        };
-      }),
-      ...(receipts || []).map((row) => {
-        const details = byReceipt.get(String(row.id)) || [];
-        const isOnAccount = !details.length && !String(row.reference_id || "").trim();
-        return {
-          ...row,
-          date: row.date,
-          voucher_no: row.voucher_no,
-          voucher_type: "Receipt",
-          particulars: isOnAccount ? "Unadjusted on account" : `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
-          adjustment_details: details.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
-          reference_id: row.reference_id || details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
-          receipt_details: details,
-          debit: 0,
-          credit: Number(row.amount || 0),
-          party_id: String(row.company_id || ""),
-          party_name: row.buyer_name || row.party_name || row.company_name || row.company_account_name || "-",
-          buyer_name: row.buyer_name || "-",
-        };
-      }),
-    ];
+          ledger_component: part.key,
+        });
+      });
 
-    return res.json(buildLedgerRows(rows, (row) => `${row.party_id || "unknown"}::${row.company_account_id || "no-account"}`, (row) => row.party_name || row.company_account_name || "Unknown Party"));
+      if (Math.abs(roundOff) > 0.000001) {
+        ledgerRows.push({
+          ...row,
+          id: `${saleId}-roundoff`,
+          _id: `${saleId}-roundoff`,
+          date: row.unloading_date || row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Sale - Round Off",
+          particulars: `Round Off against ${row.voucher_no || "Sale"}`,
+          adjustment_details: "",
+          receipt_details: [],
+          sale_id: saleId,
+          sale_amount: 0,
+          receipt_amount: 0,
+          journal_amount: Number(Math.abs(roundOff).toFixed(2)),
+          bill_balance: Number((netReceivable - receiptAmount).toFixed(2)),
+          debit: roundOff > 0 ? Number(roundOff.toFixed(2)) : 0,
+          credit: roundOff < 0 ? Number(Math.abs(roundOff).toFixed(2)) : 0,
+          party_id: String(row.buyer_id || row.company_id || ""),
+          party_name: row.buyer_name || row.company_name || "-",
+          ledger_component: "round_off",
+        });
+      }
+    });
+
+    (receipts || []).forEach((row) => {
+      const details = byReceipt.get(String(row.id)) || [];
+      const isOnAccount = !details.length && !String(row.reference_id || "").trim();
+      ledgerRows.push({
+        ...row,
+        date: row.date,
+        voucher_no: row.voucher_no,
+        voucher_type: "Receipt",
+        particulars: isOnAccount ? "Unadjusted on account" : `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
+        adjustment_details: details.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+        reference_id: row.reference_id || details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
+        receipt_details: details,
+        debit: 0,
+        credit: Number(row.amount || 0),
+        party_id: String(row.company_id || ""),
+        party_name: row.buyer_name || row.party_name || row.company_name || row.company_account_name || "-",
+        buyer_name: row.buyer_name || "-",
+      });
+    });
+
+    return res.json(buildLedgerRows(
+      ledgerRows,
+      (row) => `${row.party_id || "unknown"}::${row.company_account_id || "no-account"}`,
+      (row) => row.party_name || row.company_account_name || "Unknown Party"
+    ));
   } catch (err) {
     console.error("Sale party ledger failed:", err);
     res.status(500).json({ error: err.message || "Failed to load sale party ledger" });
@@ -5722,7 +5802,7 @@ router.get("/sale/:id/pdf", async (req, res) => {
             return [];
           }
         })();
-    const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
+    const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.transport_charge || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
     const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
     const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
     const profitLoss = netAmount - directPurchaseAmount;
@@ -5848,7 +5928,7 @@ router.get("/sale/:id/summary", async (req, res) => {
       voucherNo: row.voucher_no || row.bill_no || "",
       lorryNo: row.lorry_no || "",
     });
-    const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
+    const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.transport_charge || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
     const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
     const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
 
