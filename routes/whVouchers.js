@@ -1006,6 +1006,7 @@ async function decorateSaleRows(rows) {
     table,
     row_id: { $in: ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0) },
   });
+  const hasSqliteMirrorRow = !!(SqliteMirrorRow && typeof SqliteMirrorRow.find === "function");
 
   // Reporting must never fail because one optional master/mirror collection is
   // unavailable. Every lookup is independent and has an empty fallback.
@@ -1013,8 +1014,8 @@ async function decorateSaleRows(rows) {
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
-    buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : Promise.resolve([]),
-    consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : Promise.resolve([]),
+    hasSqliteMirrorRow && buyerIds.length ? SqliteMirrorRow.find(mirrorFilters("buyer_names", buyerIds)).lean() : Promise.resolve([]),
+    hasSqliteMirrorRow && consigneeIds.length ? SqliteMirrorRow.find(mirrorFilters("consignee_names", consigneeIds)).lean() : Promise.resolve([]),
     // Some Sale vouchers still contain the legacy SQLite buyer id directly.
     // Read buyer_names by TEXT id as a reliable fallback so the Sale Party
     // Ledger never shows a blank party merely because the mirror row is stale.
@@ -4762,7 +4763,7 @@ router.get("/report/filter-options", async (req, res) => {
       cleanAccountIds.length ? CompanyAccount.find({ _id: { $in: cleanAccountIds } }).select("_id account_name name").lean() : [],
       cleanWarehouseIds.length ? Warehouse.find({ _id: { $in: cleanWarehouseIds } }).select("_id name").lean() : [],
       cleanFarmerIds.length ? Farmer.find({ _id: { $in: cleanFarmerIds } }).select("_id name").lean() : [],
-      cleanBuyerIds.length ? SqliteMirrorRow.find({
+      SqliteMirrorRow && typeof SqliteMirrorRow.find === "function" && cleanBuyerIds.length ? SqliteMirrorRow.find({
         table: "buyer_names",
         row_id: { $in: cleanBuyerIds.map((value) => Number(value)).filter(Number.isFinite) },
       }).select("row_id data").lean() : [],
@@ -5330,7 +5331,9 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       const receipt = receiptMap.get(receiptId);
       const detail = {
         ...item,
+        sale_date: sale?.date || sale?.unloading_date || item.sale_date || "",
         sale_voucher_no: sale?.voucher_no || item.sale_voucher_no || item.sale_id,
+        sale_amount: Number(sale?.amount || sale?.total_amount || item.sale_amount || 0),
         receipt_date: receipt?.date || "",
         receipt_voucher_no: receipt?.voucher_no || item.receipt_voucher_no || "",
         receipt_amount: Number(receipt?.amount || 0),
@@ -5456,7 +5459,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         voucher_no: row.voucher_no,
         voucher_type: "Receipt",
         particulars: isOnAccount ? "Unadjusted on account" : `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
-        adjustment_details: details.map((item) => `${item.sale_voucher_no}: Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+        adjustment_details: details.map((item) => `${item.sale_date || "-"} | ${item.sale_voucher_no || "-"} | Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
         reference_id: row.reference_id || details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
         receipt_details: details,
         debit: 0,
