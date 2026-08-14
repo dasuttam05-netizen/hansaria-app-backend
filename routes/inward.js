@@ -80,6 +80,7 @@ function createLookupMaps(rows) {
     product: new Map(),
     company: new Map(),
     companyAccount: new Map(),
+    companyAccountByCompanyId: new Map(),
   };
 
   for (const row of rows || []) {
@@ -102,6 +103,7 @@ function createLookupMaps(rows) {
     add(maps.company, row.name, row.id);
     add(maps.companyAccount, row.id, row.account_name);
     add(maps.companyAccount, row.account_name, row.id);
+    add(maps.companyAccountByCompanyId, row.company_id, row.id);
   }
 
   return maps;
@@ -124,15 +126,30 @@ async function buildInwardLookupMaps(dbInstance, rows) {
       );
     });
 
-  const [employeeById, locationById, warehouseById, productById, companyById, companyAccountById] =
+  const [employeeById, locationById, warehouseById, productById, companyById, companyAccountRows] =
     await Promise.all([
       makeSqlMap("employees", "name"),
       makeSqlMap("locations", "name"),
       makeSqlMap("warehouses", "name"),
       makeSqlMap("products", "name"),
       makeSqlMap("companies", "name"),
-      makeSqlMap("company_accounts", "account_name"),
+      new Promise((resolve) => {
+        dbInstance.all(
+          `SELECT id, account_name, company_id FROM company_accounts`,
+          [],
+          (err, rowsOut) => {
+            if (err || !Array.isArray(rowsOut)) return resolve([]);
+            resolve(rowsOut);
+          }
+        );
+      }),
     ]);
+
+  const companyAccountById = new Map(
+    companyAccountRows
+      .map((row) => [String(row.id), String(row.account_name || "").trim()])
+      .filter(([k, v]) => k && v)
+  );
 
   const sqlMaps = createLookupMaps([
     ...Array.from(employeeById.entries()).map(([id, name]) => ({ id, name })),
@@ -140,7 +157,11 @@ async function buildInwardLookupMaps(dbInstance, rows) {
     ...Array.from(warehouseById.entries()).map(([id, name]) => ({ id, name })),
     ...Array.from(productById.entries()).map(([id, name]) => ({ id, name })),
     ...Array.from(companyById.entries()).map(([id, name]) => ({ id, name })),
-    ...Array.from(companyAccountById.entries()).map(([id, account_name]) => ({ id, account_name })),
+    ...companyAccountRows.map((row) => ({
+      id: row.id,
+      account_name: row.account_name,
+      company_id: row.company_id,
+    })),
   ]);
 
   return {
@@ -171,6 +192,11 @@ function resolveCompanyAccountId(row, lookupMaps, companyId) {
   const accountName = String(row?.company_account_name || "").trim().toLowerCase();
   if (accountName && lookupMaps.companyAccount.has(accountName)) {
     return lookupMaps.companyAccount.get(accountName);
+  }
+
+  const companyAccountByCompanyId = String(row?.company_id || "").trim();
+  if (companyAccountByCompanyId && lookupMaps.companyAccountByCompanyId.has(companyAccountByCompanyId)) {
+    return lookupMaps.companyAccountByCompanyId.get(companyAccountByCompanyId);
   }
 
   const companyName = String(row?.company_name || "").trim().toLowerCase();
