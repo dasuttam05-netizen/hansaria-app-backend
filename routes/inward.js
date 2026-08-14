@@ -79,6 +79,7 @@ function createLookupMaps(rows) {
     warehouse: new Map(),
     product: new Map(),
     company: new Map(),
+    companyByName: new Map(),
     companyAccount: new Map(),
     companyAccountByCompanyId: new Map(),
   };
@@ -101,6 +102,7 @@ function createLookupMaps(rows) {
     add(maps.product, row.name, row.id);
     add(maps.company, row.id, row.name);
     add(maps.company, row.name, row.id);
+    add(maps.companyByName, row.name, row.id);
     add(maps.companyAccount, row.id, row.account_name);
     add(maps.companyAccount, row.account_name, row.id);
     add(maps.companyAccountByCompanyId, row.company_id, row.id);
@@ -201,21 +203,12 @@ function resolveCompanyAccountId(row, lookupMaps, companyId) {
 
   const companyName = String(row?.company_name || "").trim().toLowerCase();
   if (companyName && lookupMaps.companyByName.has(companyName)) {
-    const matchedCompanyId = lookupMaps.companyByName.get(companyName);
     const accountByCompany = Array.from(lookupMaps.companyAccountById.entries()).find(([id, accountNameValue]) => {
       if (!id || !accountNameValue) return false;
       const normalizedAccount = String(accountNameValue || "").trim().toLowerCase();
       return normalizedAccount === companyName || normalizedAccount.includes(companyName);
     });
     if (accountByCompany) return accountByCompany[0];
-    if (matchedCompanyId && companyId) {
-      const companyNameValue = String(lookupMaps.companyById.get(String(companyId)) || "").trim().toLowerCase();
-      const accountByMatchedCompany = Array.from(lookupMaps.companyAccountById.entries()).find(([, accountNameValue]) => {
-        const normalizedAccount = String(accountNameValue || "").trim().toLowerCase();
-        return companyNameValue && normalizedAccount && (normalizedAccount === companyNameValue || normalizedAccount.includes(companyNameValue));
-      });
-      if (accountByMatchedCompany) return accountByMatchedCompany[0];
-    }
   }
 
   if (companyId) {
