@@ -304,8 +304,6 @@ async function importInwardRows(rows, res) {
     if (!warehouseId) missing.push("warehouse");
     if (!productId) missing.push("product");
     if (!companyId) missing.push("company");
-    if (!resolvedCompanyAccountId) missing.push("company account");
-
     if (missing.length > 0) {
       skipped += 1;
       errors.push({
@@ -323,7 +321,7 @@ async function importInwardRows(rows, res) {
       warehouse_id: warehouseId,
       product_id: productId,
       company_id: companyId,
-      company_account_id: resolvedCompanyAccountId,
+      company_account_id: resolvedCompanyAccountId || null,
     };
     const weight = Number(row.weight || 0) || 0;
     const lorryNo = String(row.lorry_no || "").trim() || null;
