@@ -1,9 +1,18 @@
 const express = require("express");
 const mongoose = require("mongoose");
-const router = express.Router();
-const db = require("../db");
 const multer = require("multer");
 const XLSX = require("xlsx");
+
+const router = express.Router();
+
+const {
+  userHasPermission,
+} = require("../middleware/auth");
+
+const {
+  canAccessWarehouse,
+} = require("../helpers/access");
+
 const {
   Location: MongoLocation,
   Employee: MongoEmployee,
@@ -11,1292 +20,3182 @@ const {
   Product: MongoProduct,
   Company: MongoCompany,
   CompanyAccount: MongoCompanyAccount,
+  Inward: MongoInward,
   Outward: MongoOutward,
-  SqliteMirrorRow,
+  MirrorRow,
   isMongoMirrorReady,
 } = require("../db-mongodb");
 
-const wrapAsync = (fn) => (req, res, next) => {
-  Promise.resolve(fn(req, res, next)).catch(next);
-};
-const { userHasPermission } = require("../middleware/auth");
-const { canAccessWarehouse, assignedWarehouseFilter } = require("../helpers/access");
-const { resolveEntryMasterIds, resolveWarehouseIds } = require("../helpers/sqliteMasterResolver");
+const upload = multer({
+  storage: multer.memoryStorage(),
+});
 
-const upload = multer({ storage: multer.memoryStorage() });
+/*
+====================================================
+GENERAL HELPERS
+====================================================
+*/
+
+function mongoReady() {
+  return isMongoMirrorReady();
+}
+
+function ensureMongo(res) {
+  if (!mongoReady()) {
+    res.status(503).json({
+      error: "MongoDB is not connected",
+    });
+    return false;
+  }
+
+  return true;
+}
+
+function safeNumber(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return 0;
+  }
+
+  const numberValue = Number(value);
+
+  return Number.isFinite(numberValue)
+    ? numberValue
+    : 0;
+}
+
+function safeText(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return null;
+  }
+
+  return String(value).trim() || null;
+}
+
+function normalizeId(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return null;
+  }
+
+  if (
+    typeof value === "object" &&
+    value !== null
+  ) {
+    if (
+      value._id !== undefined &&
+      value._id !== null
+    ) {
+      return String(value._id);
+    }
+
+    if (
+      value.id !== undefined &&
+      value.id !== null
+    ) {
+      return String(value.id);
+    }
+  }
+
+  return String(value);
+}
+
+function isValidObjectId(value) {
+  try {
+    return mongoose.Types.ObjectId.isValid(
+      String(value ?? "")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function formatOutwardVoucher(slNo) {
+  return `OUT-${String(slNo).padStart(4, "0")}`;
+}
+
+function normalizeDate(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    String(value).trim() === ""
+  ) {
+    return null;
+  }
+
+  if (
+    value instanceof Date &&
+    !Number.isNaN(value.getTime())
+  ) {
+    return value;
+  }
+
+  const text = String(value).trim();
+
+  const yyyyMmDd = text.match(
+    /^(\d{4})-(\d{2})-(\d{2})$/
+  );
+
+  if (yyyyMmDd) {
+    const parsed = new Date(
+      `${yyyyMmDd[1]}-${yyyyMmDd[2]}-${yyyyMmDd[3]}T00:00:00.000Z`
+    );
+
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed;
+    }
+  }
+
+  const parsed = new Date(text);
+
+  return Number.isNaN(parsed.getTime())
+    ? null
+    : parsed;
+}
+
+function normalizeSelfLoading(value) {
+  return (
+    String(value || "No")
+      .trim()
+      .toLowerCase() === "yes"
+      ? "Yes"
+      : "No"
+  );
+}
 
 function isSelfLoadingOutward(row) {
-  return String(row?.self_loading || "").trim().toLowerCase() === "yes";
+  return (
+    normalizeSelfLoading(
+      row?.self_loading
+    ) === "Yes"
+  );
 }
 
 function canAccessOutwardRow(user, row) {
-  if (!row) return false;
-  if (isSelfLoadingOutward(row)) return true;
-  return canAccessWarehouse(user, row.warehouse_id);
+  if (!row) {
+    return false;
+  }
+
+  if (isSelfLoadingOutward(row)) {
+    return true;
+  }
+
+  return canAccessWarehouse(
+    user,
+    row.warehouse_id
+  );
 }
+
+function escapeRegExp(value) {
+  return String(value).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  );
+}
+
+/*
+====================================================
+MASTER LOOKUP
+====================================================
+*/
+
+async function findMasterByIdOrLegacyOrName(
+  Model,
+  idValue,
+  nameValue,
+  legacyFields = []
+) {
+  if (!Model) {
+    return null;
+  }
+
+  const rawId =
+    normalizeId(idValue);
+
+  const rawName =
+    safeText(nameValue);
+
+  /*
+   * Mongo ObjectId
+   */
+  if (
+    rawId &&
+    isValidObjectId(rawId)
+  ) {
+    try {
+      const doc =
+        await Model.findById(
+          rawId
+        ).lean();
+
+      if (doc) {
+        return doc;
+      }
+    } catch {}
+  }
+
+  /*
+   * Legacy numeric/string ID
+   */
+  if (rawId) {
+    for (
+      const field of legacyFields
+    ) {
+      try {
+        const doc =
+          await Model.findOne({
+            [field]: rawId,
+          }).lean();
+
+        if (doc) {
+          return doc;
+        }
+      } catch {}
+
+      const numeric =
+        Number(rawId);
+
+      if (
+        Number.isFinite(numeric)
+      ) {
+        try {
+          const doc =
+            await Model.findOne({
+              [field]:
+                numeric,
+            }).lean();
+
+          if (doc) {
+            return doc;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  /*
+   * Name lookup
+   */
+  if (rawName) {
+    try {
+      const regex =
+        new RegExp(
+          `^${escapeRegExp(
+            rawName
+          )}$`,
+          "i"
+        );
+
+      const byName =
+        await Model.findOne({
+          name: regex,
+        }).lean();
+
+      if (byName) {
+        return byName;
+      }
+    } catch {}
+  }
+
+  /*
+   * Company account uses account_name
+   */
+  if (
+    rawName &&
+    Model === MongoCompanyAccount
+  ) {
+    try {
+      const regex =
+        new RegExp(
+          `^${escapeRegExp(
+            rawName
+          )}$`,
+          "i"
+        );
+
+      const byAccountName =
+        await Model.findOne({
+          account_name:
+            regex,
+        }).lean();
+
+      if (byAccountName) {
+        return byAccountName;
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+async function resolveOutwardMasters(
+  body
+) {
+  const [
+    employee,
+    location,
+    warehouse,
+    product,
+    company,
+  ] = await Promise.all([
+    findMasterByIdOrLegacyOrName(
+      MongoEmployee,
+      body?.employee_id,
+      body?.employee_name,
+      [
+        "employee_id",
+        "legacy_id",
+        "id",
+      ]
+    ),
+
+    findMasterByIdOrLegacyOrName(
+      MongoLocation,
+      body?.location_id,
+      body?.location_name,
+      [
+        "legacy_id",
+        "id",
+      ]
+    ),
+
+    findMasterByIdOrLegacyOrName(
+      MongoWarehouse,
+      body?.warehouse_id,
+      body?.warehouse_name,
+      [
+        "legacy_id",
+        "id",
+      ]
+    ),
+
+    findMasterByIdOrLegacyOrName(
+      MongoProduct,
+      body?.product_id,
+      body?.product_name,
+      [
+        "legacy_id",
+        "id",
+      ]
+    ),
+
+    findMasterByIdOrLegacyOrName(
+      MongoCompany,
+      body?.company_id,
+      body?.company_name,
+      [
+        "legacy_id",
+        "id",
+      ]
+    ),
+  ]);
+
+  let companyAccount =
+    await findMasterByIdOrLegacyOrName(
+      MongoCompanyAccount,
+      body?.company_account_id,
+      body?.company_account_name,
+      [
+        "legacy_id",
+        "id",
+      ]
+    );
+
+  /*
+   * Resolve first company account of the company
+   * when account ID is not supplied.
+   */
+  if (
+    !companyAccount &&
+    company?._id
+  ) {
+    try {
+      companyAccount =
+        await MongoCompanyAccount.findOne({
+          company_id:
+            company._id,
+        })
+          .sort({
+            _id: 1,
+          })
+          .lean();
+    } catch {}
+  }
+
+  return {
+    employee,
+    location,
+    warehouse,
+    product,
+    company,
+    companyAccount,
+  };
+}
+
+function masterNames(masters) {
+  return {
+    employee_name:
+      masters.employee?.name ||
+      "",
+
+    location_name:
+      masters.location?.name ||
+      "",
+
+    warehouse_name:
+      masters.warehouse?.name ||
+      "",
+
+    product_name:
+      masters.product?.name ||
+      "",
+
+    company_name:
+      masters.company?.name ||
+      "",
+
+    company_account_name:
+      masters.companyAccount
+        ?.account_name ||
+      "",
+  };
+}
+
+/*
+====================================================
+TEMPLATE
+====================================================
+*/
 
 function buildOutwardTemplateRows() {
   return [
     {
       date: "2026-07-21",
-      employee_name: "Employee Name",
-      location_name: "Location Name",
-      warehouse_name: "Warehouse Name",
-      product_name: "Product Name",
-      company_name: "Company Name",
-      company_account_name: "Company Account Name",
-      lorry_no: "WB00A0000",
+      employee_name:
+        "Employee Name",
+      location_name:
+        "Location Name",
+      warehouse_name:
+        "Warehouse Name",
+      product_name:
+        "Product Name",
+      company_name:
+        "Company Name",
+      company_account_name:
+        "Company Account Name",
+      lorry_no:
+        "WB00A0000",
       weight: 0,
       rate: 0,
-      inv_no: "INV-001",
-      buyer_name: "Buyer Name",
-      consignee_name: "Consignee Name",
-      self_loading: "No",
+      inv_no:
+        "INV-001",
+      buyer_name:
+        "Buyer Name",
+      consignee_name:
+        "Consignee Name",
+      self_loading:
+        "No",
     },
   ];
 }
 
-function normalizeOutwardImportRow(row) {
+/*
+====================================================
+XLSX NORMALIZATION
+====================================================
+*/
+
+function normalizeOutwardImportRow(
+  row
+) {
   return {
-    date: row.date ?? row.Date ?? "",
-    employee_id: row.employee_id ?? row.EmployeeID ?? row.EmployeeId ?? "",
-    employee_name: row.employee_name ?? row.EmployeeName ?? row.Employee ?? "",
-    location_id: row.location_id ?? row.LocationID ?? row.LocationId ?? "",
-    location_name: row.location_name ?? row.LocationName ?? row.Location ?? "",
-    warehouse_id: row.warehouse_id ?? row.WarehouseID ?? row.WarehouseId ?? "",
-    warehouse_name: row.warehouse_name ?? row.WarehouseName ?? row.Warehouse ?? "",
-    product_id: row.product_id ?? row.ProductID ?? row.ProductId ?? "",
-    product_name: row.product_name ?? row.ProductName ?? row.Product ?? "",
-    company_id: row.company_id ?? row.CompanyID ?? row.CompanyId ?? "",
-    company_name: row.company_name ?? row.CompanyName ?? row.Company ?? "",
-    company_account_id: row.company_account_id ?? row.CompanyAccountID ?? row.CompanyAccountId ?? "",
+    date:
+      row?.date ??
+      row?.Date ??
+      "",
+
+    employee_id:
+      row?.employee_id ??
+      row?.EmployeeID ??
+      row?.EmployeeId ??
+      "",
+
+    employee_name:
+      row?.employee_name ??
+      row?.EmployeeName ??
+      row?.Employee ??
+      "",
+
+    location_id:
+      row?.location_id ??
+      row?.LocationID ??
+      row?.LocationId ??
+      "",
+
+    location_name:
+      row?.location_name ??
+      row?.LocationName ??
+      row?.Location ??
+      "",
+
+    warehouse_id:
+      row?.warehouse_id ??
+      row?.WarehouseID ??
+      row?.WarehouseId ??
+      "",
+
+    warehouse_name:
+      row?.warehouse_name ??
+      row?.WarehouseName ??
+      row?.Warehouse ??
+      "",
+
+    product_id:
+      row?.product_id ??
+      row?.ProductID ??
+      row?.ProductId ??
+      "",
+
+    product_name:
+      row?.product_name ??
+      row?.ProductName ??
+      row?.Product ??
+      "",
+
+    company_id:
+      row?.company_id ??
+      row?.CompanyID ??
+      row?.CompanyId ??
+      "",
+
+    company_name:
+      row?.company_name ??
+      row?.CompanyName ??
+      row?.Company ??
+      "",
+
+    company_account_id:
+      row?.company_account_id ??
+      row?.CompanyAccountID ??
+      row?.CompanyAccountId ??
+      "",
+
     company_account_name:
-      row.company_account_name ?? row.CompanyAccountName ?? row.CompanyAccount ?? "",
-    lorry_no: row.lorry_no ?? row.LorryNo ?? "",
-    weight: row.weight ?? row.Weight ?? "",
-    rate: row.rate ?? row.Rate ?? "",
-    inv_no: row.inv_no ?? row.InvNo ?? row.InvoiceNo ?? "",
-    buyer_name: row.buyer_name ?? row.BuyerName ?? row.Buyer ?? "",
-    consignee_name: row.consignee_name ?? row.ConsigneeName ?? row.Consignee ?? "",
-    self_loading: row.self_loading ?? row.SelfLoading ?? "No",
+      row?.company_account_name ??
+      row?.CompanyAccountName ??
+      row?.CompanyAccount ??
+      "",
+
+    lorry_no:
+      row?.lorry_no ??
+      row?.LorryNo ??
+      row?.Lorry ??
+      "",
+
+    weight:
+      row?.weight ??
+      row?.Weight ??
+      "",
+
+    quantity:
+      row?.quantity ??
+      row?.Quantity ??
+      "",
+
+    rate:
+      row?.rate ??
+      row?.Rate ??
+      "",
+
+    inv_no:
+      row?.inv_no ??
+      row?.InvNo ??
+      row?.InvoiceNo ??
+      "",
+
+    buyer_name:
+      row?.buyer_name ??
+      row?.BuyerName ??
+      row?.Buyer ??
+      "",
+
+    consignee_name:
+      row?.consignee_name ??
+      row?.ConsigneeName ??
+      row?.Consignee ??
+      "",
+
+    self_loading:
+      row?.self_loading ??
+      row?.SelfLoading ??
+      "No",
   };
 }
 
-function createNameLookup(rows, keyField, valueField) {
-  const map = new Map();
-  for (const row of rows || []) {
-    const key = String(row?.[keyField] || "").trim().toLowerCase();
-    const value = String(row?.[valueField] || "").trim();
-    if (key && value && !map.has(key)) {
-      map.set(key, value);
+/*
+====================================================
+NEXT OUTWARD SERIAL
+====================================================
+*/
+
+async function getNextOutwardSlNo() {
+  const last =
+    await MongoOutward.findOne({})
+      .sort({
+        sl_no: -1,
+        legacy_id: -1,
+        _id: -1,
+      })
+      .select({
+        sl_no: 1,
+        legacy_id: 1,
+      })
+      .lean();
+
+  const current =
+    Number(
+      last?.sl_no ??
+        last?.legacy_id ??
+        0
+    ) || 0;
+
+  return current + 1;
+}
+
+/*
+====================================================
+OUTWARD IDENTIFIER
+====================================================
+*/
+
+async function findMongoOutward(
+  id
+) {
+  if (
+    isValidObjectId(id)
+  ) {
+    const byObjectId =
+      await MongoOutward.findById(
+        id
+      ).lean();
+
+    if (byObjectId) {
+      return byObjectId;
     }
   }
-  return map;
-}
 
-function createIdLookup(rows, keyField, valueField) {
-  const map = new Map();
-  for (const row of rows || []) {
-    const key = String(row?.[keyField] || "").trim();
-    const value = String(row?.[valueField] || "").trim();
-    if (key && value && !map.has(key)) {
-      map.set(key, value);
-    }
-  }
-  return map;
-}
+  const numeric =
+    Number(id);
 
-async function buildOutwardLookupMaps(rows) {
-  const makeSqlMap = (table, field) =>
-    new Promise((resolve) => {
-      db.all(
-        `SELECT id, ${field} AS label FROM ${table}`,
-        [],
-        (err, rowsOut) => {
-          if (err || !Array.isArray(rowsOut)) return resolve(new Map());
-          resolve(new Map(rowsOut.map((r) => [String(r.id), String(r.label || "").trim()]).filter(([k, v]) => k && v)));
-        }
-      );
-    });
+  if (
+    Number.isFinite(numeric)
+  ) {
+    const byLegacyId =
+      await MongoOutward.findOne({
+        legacy_id:
+          numeric,
+      }).lean();
 
-  const [employeeById, locationById, warehouseById, productById, companyById, companyAccountById] =
-    await Promise.all([
-      makeSqlMap("employees", "name"),
-      makeSqlMap("locations", "name"),
-      makeSqlMap("warehouses", "name"),
-      makeSqlMap("products", "name"),
-      makeSqlMap("companies", "name"),
-      makeSqlMap("company_accounts", "account_name"),
-    ]);
-
-  return {
-    employeeById,
-    locationById,
-    warehouseById,
-    productById,
-    companyById,
-    companyAccountById,
-    employeeByName: createNameLookup(Array.from(employeeById, ([id, name]) => ({ id, name })), "name", "id"),
-    locationByName: createNameLookup(Array.from(locationById, ([id, name]) => ({ id, name })), "name", "id"),
-    warehouseByName: createNameLookup(Array.from(warehouseById, ([id, name]) => ({ id, name })), "name", "id"),
-    productByName: createNameLookup(Array.from(productById, ([id, name]) => ({ id, name })), "name", "id"),
-    companyByName: createNameLookup(Array.from(companyById, ([id, name]) => ({ id, name })), "name", "id"),
-    companyAccountByName: createNameLookup(
-      Array.from(companyAccountById, ([id, account_name]) => ({ id, account_name })),
-      "account_name",
-      "id"
-    ),
-  };
-}
-
-function resolveIdFromLookup(row, idValue, nameValue, idMap, nameMap) {
-  const directId = String(idValue || "").trim();
-  if (directId && idMap.has(directId)) return directId;
-  const directName = String(nameValue || "").trim().toLowerCase();
-  if (directName && nameMap.has(directName)) return nameMap.get(directName);
-  return null;
-}
-
-async function importOutwardRows(rows, res) {
-  const lookupMaps = await buildOutwardLookupMaps(rows);
-  let inserted = 0;
-  let skipped = 0;
-  const errors = [];
-
-  const processRow = (index) => {
-    if (index >= rows.length) {
-      return res.json({ total: rows.length, inserted, skipped, errors });
+    if (byLegacyId) {
+      return byLegacyId;
     }
 
-    const row = rows[index] || {};
-    const date = String(row.date || "").trim();
-    const employeeId = resolveIdFromLookup(row, row.employee_id, row.employee_name, lookupMaps.employeeById, lookupMaps.employeeByName);
-    const locationId = resolveIdFromLookup(row, row.location_id, row.location_name, lookupMaps.locationById, lookupMaps.locationByName);
-    const warehouseId = resolveIdFromLookup(row, row.warehouse_id, row.warehouse_name, lookupMaps.warehouseById, lookupMaps.warehouseByName);
-    const productId = resolveIdFromLookup(row, row.product_id, row.product_name, lookupMaps.productById, lookupMaps.productByName);
-    const companyId = resolveIdFromLookup(row, row.company_id, row.company_name, lookupMaps.companyById, lookupMaps.companyByName);
-    const companyAccountId = resolveIdFromLookup(
-      row,
-      row.company_account_id,
-      row.company_account_name,
-      lookupMaps.companyAccountById,
-      lookupMaps.companyAccountByName
-    );
-    const selfLoading = String(row.self_loading || "No").trim() || "No";
-    const qty = Number(row.quantity ?? row.weight ?? 0) || 0;
-    const rateVal = Number(row.rate || 0) || 0;
+    const bySlNo =
+      await MongoOutward.findOne({
+        sl_no:
+          numeric,
+      }).lean();
 
-    if (!date || !productId || !companyId) {
-      skipped += 1;
-      errors.push({ row: index + 2, error: "Missing required outward fields" });
-      return processRow(index + 1);
+    if (bySlNo) {
+      return bySlNo;
     }
-
-    const isSelfLoading = selfLoading.toLowerCase() === "yes";
-    const normalizedWarehouseId = isSelfLoading ? null : warehouseId;
-
-    db.get(`SELECT COALESCE(MAX(sl_no), 0) AS max_sl FROM outward`, [], (slErr, slRow) => {
-      if (slErr) {
-        skipped += 1;
-        errors.push({ row: index + 2, error: slErr.message });
-        return processRow(index + 1);
-      }
-
-      const nextSl = Number(slRow?.max_sl || 0) + 1;
-      const voucherNo = `OUT-${String(nextSl).padStart(4, "0")}`;
-
-      db.run(
-        `
-        INSERT INTO outward (
-          sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
-          product_id, company_id, company_account_id,
-          lorry_no, weight, quantity, rate, amount,
-          buyer_name, consignee_name, inv_no, self_loading, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-        [
-          nextSl,
-          voucherNo,
-          date,
-          employeeId || null,
-          locationId || null,
-          normalizedWarehouseId,
-          productId || null,
-          companyId || null,
-          companyAccountId || null,
-          String(row.lorry_no || "").trim() || null,
-          qty,
-          qty,
-          rateVal,
-          qty * rateVal,
-          String(row.buyer_name || "").trim() || null,
-          String(row.consignee_name || "").trim() || null,
-          String(row.inv_no || "").trim() || null,
-          selfLoading,
-          "Pending",
-        ],
-        (insertErr) => {
-          if (insertErr) {
-            skipped += 1;
-            errors.push({ row: index + 2, error: insertErr.message });
-          } else {
-            inserted += 1;
-          }
-          return processRow(index + 1);
-        }
-      );
-    });
-  };
-
-  return processRow(0);
-}
-
-router.get("/template-xlsx", (req, res) => {
-  if (!userHasPermission(req.user, "outward.export")) {
-    return res.status(403).json({ error: "You do not have permission to download outward template" });
   }
 
-  const workbook = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet(buildOutwardTemplateRows());
-  XLSX.utils.book_append_sheet(workbook, ws, "Outward Template");
-  const buffer = XLSX.write(workbook, { bookType: "xlsx", type: "buffer" });
-
-  res.setHeader("Content-Disposition", 'attachment; filename="outward-template.xlsx"');
-  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  return res.send(buffer);
-});
-
-router.post("/import-xlsx", upload.single("file"), async (req, res) => {
-  if (!userHasPermission(req.user, "outward.import")) {
-    return res.status(403).json({ error: "You do not have permission to import outward entries" });
-  }
-  if (!req.file?.buffer) {
-    return res.status(400).json({ error: "XLSX file is required" });
-  }
-
-  let rows = [];
-  try {
-    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
-    const firstSheet = workbook.SheetNames?.[0];
-    if (!firstSheet) return res.status(400).json({ error: "No sheet found in file" });
-    rows = XLSX.utils.sheet_to_json(workbook.Sheets[firstSheet], { defval: "" });
-  } catch (err) {
-    return res.status(400).json({ error: "Invalid XLSX file" });
-  }
-
-  const normalized = (Array.isArray(rows) ? rows : []).map(normalizeOutwardImportRow);
-  if (normalized.length === 0) {
-    return res.status(400).json({ error: "No rows found in XLSX" });
-  }
-
-  return importOutwardRows(normalized, res);
-});
-
-const safeNumber = (v) => (v === undefined || v === null || v === "" ? 0 : Number(v));
-const safeText = (v) => (v ? v : null);
-const formatOutwardVoucher = (slNo) => `OUT-${String(slNo).padStart(4, "0")}`;
-const mongoReady = () => isMongoMirrorReady();
-const coerceSqlId = (value) => {
-  if (value === undefined || value === null || value === "") return null;
-  if (typeof value === "number") return Number.isFinite(value) && value > 0 ? value : null;
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) return null;
-    const num = Number(trimmed);
-    return Number.isFinite(num) && num > 0 ? num : trimmed;
-  }
-  if (typeof value === "object") {
-    return coerceSqlId(value.id || value._id || value.value);
-  }
-  return null;
-};
-
-function buildOutwardMirrorRowData(rowId, payload = {}, resolvedIds = {}, normalizedWarehouseId = null, extra = {}) {
-  const qty = safeNumber(payload?.quantity ?? payload?.qty ?? payload?.weight);
-  const rateVal = safeNumber(payload?.rate);
-  const amount = qty * rateVal;
-  const selfLoading = safeText(payload?.self_loading) || "No";
-  const voucherNo = safeText(payload?.voucher_no || payload?.outward_no || payload?.inv_no || extra?.voucher_no);
-
-  return {
-    id: Number(rowId),
-    sl_no: extra?.sl_no ?? null,
-    voucher_no: voucherNo,
-    outward_no: safeText(payload?.outward_no || payload?.voucher_no || payload?.inv_no || extra?.voucher_no),
-    date: safeText(payload?.date),
-    employee_id: resolvedIds?.employee_id || payload?.employee_id || null,
-    location_id: resolvedIds?.location_id || payload?.location_id || null,
-    warehouse_id: normalizedWarehouseId ?? payload?.warehouse_id ?? null,
-    product_id: resolvedIds?.product_id || payload?.product_id || null,
-    company_id: resolvedIds?.company_id || payload?.company_id || null,
-    company_account_id: resolvedIds?.company_account_id || payload?.company_account_id || null,
-    buyer_name: safeText(payload?.buyer_name),
-    consignee_name: safeText(payload?.consignee_name),
-    lorry_no: safeText(payload?.lorry_no),
-    weight: safeNumber(payload?.weight),
-    quantity: qty,
-    rate: rateVal,
-    amount,
-    inv_no: safeText(payload?.inv_no),
-    self_loading: selfLoading,
-    status: extra?.status || "Pending",
-    ...extra,
-  };
-}
-
-function normalizeId(value) {
-  if (value === undefined || value === null || value === "") return null;
-  if (typeof value === "object") {
-    if (typeof value.toString === "function" && value.toString() !== "[object Object]") {
-      return String(value.toString());
-    }
-    return String(value._id || value.id || "");
-  }
-  return String(value);
-}
-
-async function querySqliteLookupMap(table, idField, nameField, ids) {
-  if (!Array.isArray(ids) || ids.length === 0) {
-    return new Map();
-  }
-
-  const numericIds = ids
-    .map((id) => (typeof id === "string" ? Number(id) : Number(id)))
-    .filter((id) => Number.isFinite(id));
-  if (numericIds.length === 0) {
-    return new Map();
-  }
-
-  const placeholders = numericIds.map(() => "?").join(",");
-  const sql = `SELECT ${idField} AS id, ${nameField} AS name FROM ${table} WHERE ${idField} IN (${placeholders})`;
-
-  return new Promise((resolve) => {
-    db.all(sql, numericIds, (err, rows) => {
-      if (err || !Array.isArray(rows)) {
-        return resolve(new Map());
-      }
-      const map = new Map();
-      rows.forEach((row) => {
-        const key = normalizeId(row?.id);
-        if (key) map.set(key, row?.name || "");
-      });
-      resolve(map);
-    });
-  });
-}
-
-async function buildSqliteLookupMaps(docs) {
-  const employeeIds = new Set();
-  const locationIds = new Set();
-  const warehouseIds = new Set();
-  const productIds = new Set();
-  const companyIds = new Set();
-  const accountIds = new Set();
-
-  for (const doc of docs || []) {
-    if (!doc) continue;
-    if (doc.employee_id != null) employeeIds.add(normalizeId(doc.employee_id));
-    if (doc.location_id != null) locationIds.add(normalizeId(doc.location_id));
-    if (doc.warehouse_id != null) warehouseIds.add(normalizeId(doc.warehouse_id));
-    if (doc.product_id != null) productIds.add(normalizeId(doc.product_id));
-    if (doc.company_id != null) companyIds.add(normalizeId(doc.company_id));
-    if (doc.company_account_id != null) accountIds.add(normalizeId(doc.company_account_id));
-  }
-
-  const [employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames] = await Promise.all([
-    querySqliteLookupMap("employees", "id", "name", Array.from(employeeIds)),
-    querySqliteLookupMap("locations", "id", "name", Array.from(locationIds)),
-    querySqliteLookupMap("warehouses", "id", "name", Array.from(warehouseIds)),
-    querySqliteLookupMap("products", "id", "name", Array.from(productIds)),
-    querySqliteLookupMap("companies", "id", "name", Array.from(companyIds)),
-    querySqliteLookupMap("company_accounts", "id", "account_name", Array.from(accountIds)),
-  ]);
-
-  return { employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames };
-}
-
-function extractValidObjectIds(values) {
-  return Array.from(values)
-    .filter((value) => {
-      if (!value) return false;
-      try {
-        return mongoose.Types.ObjectId.isValid(value);
-      } catch (error) {
-        return false;
-      }
-    })
-    .map((value) => new mongoose.Types.ObjectId(value));
-}
-
-async function buildMongoLookupMaps(docs) {
-  const employeeIds = new Set();
-  const locationIds = new Set();
-  const warehouseIds = new Set();
-  const productIds = new Set();
-  const companyIds = new Set();
-  const accountIds = new Set();
-
-  for (const doc of docs || []) {
-    if (!doc) continue;
-    if (doc.employee_id != null) employeeIds.add(normalizeId(doc.employee_id));
-    if (doc.location_id != null) locationIds.add(normalizeId(doc.location_id));
-    if (doc.warehouse_id != null) warehouseIds.add(normalizeId(doc.warehouse_id));
-    if (doc.product_id != null) productIds.add(normalizeId(doc.product_id));
-    if (doc.company_id != null) companyIds.add(normalizeId(doc.company_id));
-    if (doc.company_account_id != null) accountIds.add(normalizeId(doc.company_account_id));
-  }
-
-  const mongoEmployeeIds = extractValidObjectIds(employeeIds);
-  const mongoLocationIds = extractValidObjectIds(locationIds);
-  const mongoWarehouseIds = extractValidObjectIds(warehouseIds);
-  const mongoProductIds = extractValidObjectIds(productIds);
-  const mongoCompanyIds = extractValidObjectIds(companyIds);
-  const mongoAccountIds = extractValidObjectIds(accountIds);
-
-  const [employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames] = await Promise.all([
-    MongoEmployee.find({ _id: { $in: mongoEmployeeIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoLocation.find({ _id: { $in: mongoLocationIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoWarehouse.find({ _id: { $in: mongoWarehouseIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoProduct.find({ _id: { $in: mongoProductIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoCompany.find({ _id: { $in: mongoCompanyIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.name || ""]))),
-    MongoCompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean().then((rows) => new Map(rows.map((row) => [normalizeId(row._id || row.id), row.account_name || ""]))),
-  ]);
-
-  return { employeeNames, locationNames, warehouseNames, productNames, companyNames, accountNames };
-}
-
-function mergeLookupMaps(mongoMaps, sqliteMaps) {
-  return {
-    employeeNames: new Map([...sqliteMaps.employeeNames, ...mongoMaps.employeeNames]),
-    locationNames: new Map([...sqliteMaps.locationNames, ...mongoMaps.locationNames]),
-    warehouseNames: new Map([...sqliteMaps.warehouseNames, ...mongoMaps.warehouseNames]),
-    productNames: new Map([...sqliteMaps.productNames, ...mongoMaps.productNames]),
-    companyNames: new Map([...sqliteMaps.companyNames, ...mongoMaps.companyNames]),
-    accountNames: new Map([...sqliteMaps.accountNames, ...mongoMaps.accountNames]),
-  };
-}
-
-function upsertOutwardMirrorByVoucherNo(voucherNo, payload, resolvedIds, normalizedWarehouseId, callback, existingRowId = null) {
-  const cleanedVoucherNo = safeText(voucherNo || payload?.voucher_no || payload?.outward_no || payload?.inv_no);
-  const qty = safeNumber(payload.quantity) || safeNumber(payload.weight);
-  const rateVal = safeNumber(payload.rate);
-  const amount = qty * rateVal;
-  const selfLoading = safeText(payload.self_loading) || "No";
-
-  const saveRow = (rowId = null) => {
-    const sql = rowId
-      ? `
-        UPDATE outward SET
-          date=?, employee_id=?, location_id=?, warehouse_id=?,
-          product_id=?, company_id=?, company_account_id=?,
-          buyer_name=?, consignee_name=?,
-          lorry_no=?, weight=?, quantity=?, rate=?, amount=?,
-          inv_no=?, self_loading=?,
-          status='Pending'
-        WHERE id=?
-      `
-      : `
-        INSERT INTO outward (
-          sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
-          product_id, company_id, company_account_id,
-          lorry_no, weight, quantity, rate, amount,
-          buyer_name, consignee_name,
-          inv_no, self_loading,
-          status
-        ) VALUES (
-          COALESCE((SELECT MAX(sl_no) + 1 FROM outward), 1),
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-      `;
-
-    const params = rowId
-      ? [
-          safeText(payload.date),
-          resolvedIds.employee_id || null,
-          resolvedIds.location_id || null,
-          normalizedWarehouseId,
-          resolvedIds.product_id || null,
-          resolvedIds.company_id || null,
-          resolvedIds.company_account_id || null,
-          safeText(payload.buyer_name),
-          safeText(payload.consignee_name),
-          safeText(payload.lorry_no),
-          safeNumber(payload.weight),
-          qty,
-          rateVal,
-          amount,
-          safeText(payload.inv_no),
-          selfLoading,
-          rowId,
-        ]
-      : [
-          cleanedVoucherNo,
-          safeText(payload.date),
-          resolvedIds.employee_id || null,
-          resolvedIds.location_id || null,
-          normalizedWarehouseId,
-          resolvedIds.product_id || null,
-          resolvedIds.company_id || null,
-          resolvedIds.company_account_id || null,
-          safeText(payload.lorry_no),
-          safeNumber(payload.weight),
-          qty,
-          rateVal,
-          amount,
-          safeText(payload.buyer_name),
-          safeText(payload.consignee_name),
-          cleanedVoucherNo,
-          selfLoading,
-          "Pending",
-        ];
-
-    db.run(sql, params, function onSync(err) {
-      if (err) return callback(err);
-      const savedId = rowId || this.lastID;
-      const mirrorRow = buildOutwardMirrorRowData(
-        savedId,
-        payload,
-        resolvedIds,
-        normalizedWarehouseId,
+  const byVoucher =
+    await MongoOutward.findOne({
+      $or: [
         {
-          sl_no: null,
-          voucher_no: cleanedVoucherNo,
-          status: "Pending",
-        }
-      );
+          voucher_no:
+            String(id),
+        },
+        {
+          outward_no:
+            String(id),
+        },
+        {
+          inv_no:
+            String(id),
+        },
+      ],
+    }).lean();
 
-      syncOutwardRowToMirror(savedId, mirrorRow).catch((mirrorErr) => {
-        console.error("Outward mirror row sync failed:", mirrorErr?.message || mirrorErr);
-      });
-
-      return callback(null, { id: savedId, voucher_no: cleanedVoucherNo });
-    });
-  };
-
-  const lookupId = safeNumber(existingRowId);
-  const lookupSql = lookupId > 0
-    ? `SELECT id FROM outward WHERE id = ? OR voucher_no = ? ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, id ASC LIMIT 1`
-    : `SELECT id FROM outward WHERE voucher_no = ? ORDER BY id ASC LIMIT 1`;
-  const lookupParams = lookupId > 0 ? [lookupId, cleanedVoucherNo, lookupId] : [cleanedVoucherNo];
-
-  db.get(lookupSql, lookupParams, (findErr, existing) => {
-    if (findErr) return callback(findErr);
-    if (existing?.id) return saveRow(existing.id);
-    return saveRow(null);
-  });
+  return byVoucher;
 }
 
-async function syncOutwardRowToMirror(rowId, rowData) {
-  if (!rowId || !SqliteMirrorRow || typeof SqliteMirrorRow.updateOne !== "function") {
-    return null;
+/*
+====================================================
+DISPLAY DECORATION
+====================================================
+*/
+
+async function decorateOutwardDocs(
+  docs
+) {
+  const result = [];
+
+  for (
+    const doc of docs || []
+  ) {
+    const masters =
+      await resolveOutwardMasters({
+        employee_id:
+          doc?.employee_id,
+
+        employee_name:
+          doc?.employee_name,
+
+        location_id:
+          doc?.location_id,
+
+        location_name:
+          doc?.location_name,
+
+        warehouse_id:
+          doc?.warehouse_id,
+
+        warehouse_name:
+          doc?.warehouse_name,
+
+        product_id:
+          doc?.product_id,
+
+        product_name:
+          doc?.product_name,
+
+        company_id:
+          doc?.company_id,
+
+        company_name:
+          doc?.company_name,
+
+        company_account_id:
+          doc?.company_account_id,
+
+        company_account_name:
+          doc?.company_account_name,
+      });
+
+    const names =
+      masterNames(
+        masters
+      );
+
+    const outwardNo =
+      doc?.outward_no ||
+      doc?.voucher_no ||
+      doc?.inv_no ||
+      "";
+
+    result.push({
+      ...doc,
+
+      mongo_id:
+        String(
+          doc?._id
+        ),
+
+      id:
+        doc?.legacy_id ??
+        doc?.sl_no ??
+        String(
+          doc?._id
+        ),
+
+      legacy_id:
+        doc?.legacy_id ??
+        null,
+
+      sl_no:
+        doc?.sl_no ??
+        doc?.legacy_id ??
+        null,
+
+      voucher_no:
+        outwardNo,
+
+      outward_no:
+        doc?.outward_no ||
+        outwardNo,
+
+      date:
+        normalizeDate(
+          doc?.date
+        )
+          ? normalizeDate(
+              doc?.date
+            )
+              .toISOString()
+              .slice(0, 10)
+          : safeText(
+              doc?.date
+            ) || "",
+
+      employee_name:
+        names.employee_name ||
+        doc?.employee_name ||
+        "",
+
+      location_name:
+        names.location_name ||
+        doc?.location_name ||
+        doc?.location ||
+        "",
+
+      warehouse_name:
+        names.warehouse_name ||
+        doc?.warehouse_name ||
+        "",
+
+      product_name:
+        names.product_name ||
+        doc?.product_name ||
+        doc?.product ||
+        "",
+
+      company_name:
+        names.company_name ||
+        doc?.company_name ||
+        doc?.buyer_name ||
+        doc?.buyer ||
+        "",
+
+      company_account_name:
+        names.company_account_name ||
+        doc?.company_account_name ||
+        "",
+
+      party_name:
+        names.company_account_name ||
+        doc?.party_name ||
+        doc?.company_account_name ||
+        "",
+
+      quantity:
+        safeNumber(
+          doc?.quantity ??
+            doc?.weight
+        ),
+
+      weight:
+        safeNumber(
+          doc?.weight ??
+            doc?.quantity
+        ),
+
+      rate:
+        safeNumber(
+          doc?.rate
+        ),
+
+      amount:
+        safeNumber(
+          doc?.amount
+        ),
+    });
   }
 
-  const safeRowId = Number(rowId);
-  if (!Number.isFinite(safeRowId) || safeRowId <= 0) {
-    return null;
+  return result;
+}
+
+/*
+====================================================
+MIRROR ADJUSTMENT HELPERS
+====================================================
+*/
+
+/*
+ * Existing Adjustment mongoose schema does not contain:
+ * inward_id / outward_id / qty.
+ *
+ * Therefore legacy FIFO adjustment rows are kept in
+ * MirrorRow with table = "adjustment".
+ */
+
+async function getAdjustmentRows() {
+  if (
+    !MirrorRow ||
+    typeof
+      MirrorRow.find !==
+        "function"
+  ) {
+    return [];
   }
 
-  const payload = {
-    ...(rowData || {}),
-    id: safeRowId,
-  };
+  const rows =
+    await MirrorRow.find({
+      table:
+        "adjustment",
+    })
+      .sort({
+        row_id: 1,
+      })
+      .lean();
 
-  const mirrorPayload = buildOutwardMirrorRowData(
-    safeRowId,
-    payload,
-    {
-      employee_id: payload.employee_id,
-      location_id: payload.location_id,
-      warehouse_id: payload.warehouse_id,
-      product_id: payload.product_id,
-      company_id: payload.company_id,
-      company_account_id: payload.company_account_id,
-    },
-    payload.warehouse_id,
-    payload
+  return (
+    rows || []
+  ).map(
+    (row) => ({
+      id:
+        row?.row_id,
+
+      ...(row?.data || {}),
+    })
   );
+}
 
-  return SqliteMirrorRow.updateOne(
-    { table: "outward", row_id: safeRowId },
+async function getAdjustmentsForOutward(
+  outwardId
+) {
+  const rows =
+    await getAdjustmentRows();
+
+  const normalized =
+    normalizeId(
+      outwardId
+    );
+
+  return rows.filter(
+    (row) =>
+      normalizeId(
+        row?.outward_id
+      ) === normalized
+  );
+}
+
+async function getAdjustedQtyForOutward(
+  outwardId
+) {
+  const rows =
+    await getAdjustmentsForOutward(
+      outwardId
+    );
+
+  return rows.reduce(
+    (sum, row) =>
+      sum +
+      safeNumber(
+        row?.qty
+      ),
+    0
+  );
+}
+
+async function getNextAdjustmentMirrorId() {
+  const last =
+    await MirrorRow.findOne({
+      table:
+        "adjustment",
+    })
+      .sort({
+        row_id:
+          -1,
+      })
+      .select({
+        row_id:
+          1,
+      })
+      .lean();
+
+  return (
+    Number(
+      last?.row_id ||
+        0
+    ) + 1
+  );
+}
+
+async function createAdjustmentMirrorRow(
+  payload
+) {
+  const rowId =
+    await getNextAdjustmentMirrorId();
+
+  await MirrorRow.updateOne(
+    {
+      table:
+        "adjustment",
+
+      row_id:
+        rowId,
+    },
     {
       $set: {
-        data: mirrorPayload,
-        updated_at: new Date(),
+        data:
+          payload,
+
+        updated_at:
+          new Date(),
       },
     },
-    { upsert: true }
+    {
+      upsert:
+        true,
+    }
   ).exec();
+
+  return rowId;
 }
 
-function buildMongoOutwardPayload(reqBody, resolvedIds, normalizedWarehouseId) {
-  const qty = safeNumber(reqBody.quantity) || safeNumber(reqBody.weight);
-  const rateVal = safeNumber(reqBody.rate);
-  return {
-    date: safeText(reqBody.date) ? new Date(safeText(reqBody.date)) : null,
-    location: resolvedIds.location_id ? String(resolvedIds.location_id) : safeText(reqBody.location_id),
-    outward_no:
-      safeText(reqBody.outward_no) || safeText(reqBody.voucher_no) || safeText(reqBody.inv_no) || "",
-    employee_id: resolvedIds.employee_id || safeText(reqBody.employee_id) || null,
-    location_id: resolvedIds.location_id || safeText(reqBody.location_id) || null,
-    warehouse_id: normalizedWarehouseId || safeText(reqBody.warehouse_id) || null,
-    product_id: resolvedIds.product_id || safeText(reqBody.product_id) || null,
-    company_id: resolvedIds.company_id || safeText(reqBody.company_id) || null,
-    company_account_id: resolvedIds.company_account_id || safeText(reqBody.company_account_id) || null,
-    buyer: safeText(reqBody.buyer_name) || "",
-    buyer_name: safeText(reqBody.buyer_name) || "",
-    consignee_id: safeText(reqBody.consignee_id) || null,
-    consignee_name: safeText(reqBody.consignee_name) || "",
-    product: resolvedIds.product_id ? String(resolvedIds.product_id) : safeText(reqBody.product_id),
-    quantity: qty,
-    rate: rateVal,
-    amount: qty * rateVal,
-    transporter: safeText(reqBody.lorry_no) || "",
-    lorry_no: safeText(reqBody.lorry_no) || "",
-    inv_no: safeText(reqBody.inv_no) || "",
-    self_loading: safeText(reqBody.self_loading) || "No",
-    status: "Pending",
-    narration: safeText(reqBody.narration) || "",
-  };
-}
+/*
+====================================================
+AVAILABLE STOCK
+====================================================
+*/
 
-function insertSQLiteOutwardRecord(payload, resolvedIds, normalizedWarehouseId, callback) {
-  const qty = safeNumber(payload.quantity) || safeNumber(payload.weight);
-  const rateVal = safeNumber(payload.rate);
-  const amount = qty * rateVal;
+async function getAvailableWarehouseStock({
+  warehouse_id,
+  product_id,
+  outwardId = null,
+}) {
+  if (
+    !warehouse_id ||
+    !product_id
+  ) {
+    return {
+      currentStock:
+        0,
 
-  db.get("SELECT IFNULL(MAX(sl_no),0)+1 as sl FROM outward", (err, row) => {
-    if (err) return callback(err);
+      reservedStock:
+        0,
 
-    const sl_no = row?.sl || 1;
-    const voucher_no = formatOutwardVoucher(sl_no);
+      availableStock:
+        0,
+    };
+  }
 
-    db.run(
-      `
-      INSERT INTO outward (
-        sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
-        product_id, company_id, company_account_id,
-        buyer_name, consignee_name,
-        lorry_no, weight, quantity, rate, amount,
-        inv_no, self_loading,
-        status
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        sl_no,
-        voucher_no,
-        safeText(payload.date),
-        resolvedIds.employee_id || null,
-        resolvedIds.location_id || null,
-        normalizedWarehouseId,
-        resolvedIds.product_id || null,
-        resolvedIds.company_id || null,
-        resolvedIds.company_account_id || null,
-        safeText(payload.buyer_name),
-        safeText(payload.consignee_name),
-        safeText(payload.lorry_no),
-        safeNumber(payload.weight),
-        qty,
-        rateVal,
-        amount,
-        safeText(payload.inv_no),
-        safeText(payload.self_loading) || "No",
-        "Pending",
-      ],
-      function onInsert(insertErr) {
-        if (insertErr) return callback(insertErr);
-        const savedId = this.lastID;
-        const mirrorRow = buildOutwardMirrorRowData(
-          savedId,
-          payload,
-          resolvedIds,
-          normalizedWarehouseId,
-          {
-            sl_no,
-            voucher_no,
-            status: "Pending",
-          }
-        );
-
-        syncOutwardRowToMirror(savedId, mirrorRow).catch((mirrorErr) => {
-          console.error("Outward mirror row sync failed:", mirrorErr?.message || mirrorErr);
-        });
-
-        return callback(null, { id: savedId, voucher_no });
-      }
+  const normalizedWarehouse =
+    normalizeId(
+      warehouse_id
     );
-  });
-}
 
-function buildOutwardResponse(doc, source = "mongodb") {
-  if (!doc) return null;
-  const plain = typeof doc.toObject === "function" ? doc.toObject() : doc;
+  const normalizedProduct =
+    normalizeId(
+      product_id
+    );
+
+  /*
+   * Current stock = remaining_qty from Inward.
+   */
+  const inwardRows =
+    await MongoInward.find({
+      warehouse_id:
+        normalizedWarehouse,
+
+      product_id:
+        normalizedProduct,
+    })
+      .select({
+        remaining_qty:
+          1,
+
+        weight:
+          1,
+
+        quantity:
+          1,
+
+        date:
+          1,
+
+        legacy_id:
+          1,
+      })
+      .lean();
+
+  let currentStock =
+    0;
+
+  for (
+    const row of
+      inwardRows
+  ) {
+    currentStock +=
+      safeNumber(
+        row?.remaining_qty ??
+          row?.weight ??
+          row?.quantity
+      );
+  }
+
+  /*
+   * Pending / partial reserved stock.
+   */
+  const outwardFilter = {
+    warehouse_id:
+      normalizedWarehouse,
+
+    product_id:
+      normalizedProduct,
+
+    status: {
+      $in: [
+        "Pending",
+        "Partial",
+      ],
+    },
+  };
+
+  if (
+    outwardId
+  ) {
+    const existing =
+      await findMongoOutward(
+        outwardId
+      );
+
+    if (
+      existing?._id
+    ) {
+      outwardFilter._id = {
+        $ne:
+          existing._id,
+      };
+    }
+  }
+
+  const pendingOutwards =
+    await MongoOutward.find(
+      outwardFilter
+    )
+      .select({
+        _id:
+          1,
+
+        legacy_id:
+          1,
+
+        quantity:
+          1,
+
+        weight:
+          1,
+      })
+      .lean();
+
+  let reservedStock =
+    0;
+
+  for (
+    const row of
+      pendingOutwards
+  ) {
+    const outwardIdValue =
+      row?.legacy_id ??
+      row?._id;
+
+    const adjustedQty =
+      await getAdjustedQtyForOutward(
+        outwardIdValue
+      );
+
+    const quantity =
+      safeNumber(
+        row?.quantity ??
+          row?.weight
+      );
+
+    reservedStock +=
+      Math.max(
+        quantity -
+          adjustedQty,
+        0
+      );
+  }
+
   return {
-    ...plain,
-    id: String(plain._id || plain.id || ""),
-    saved_to: source,
+    currentStock,
+
+    reservedStock,
+
+    availableStock:
+      Math.max(
+        currentStock -
+          reservedStock,
+        0
+      ),
   };
 }
 
-function getAvailableWarehouseStock({ warehouse_id, product_id, outwardId }, callback) {
-  const params = [safeNumber(product_id), safeNumber(warehouse_id)];
-  let excludeClause = "";
+async function validateOutwardStock({
+  warehouse_id,
+  product_id,
+  qty,
+  outwardId = null,
+}) {
+  const stock =
+    await getAvailableWarehouseStock({
+      warehouse_id,
+      product_id,
+      outwardId,
+    });
 
-  if (outwardId) {
-    excludeClause = "AND o.id <> ?";
-    params.push(safeNumber(outwardId));
+  const requestedQty =
+    safeNumber(qty);
+
+  if (
+    stock.availableStock <
+    requestedQty
+  ) {
+    return {
+      ok:
+        false,
+
+      error:
+        `Not enough stock in this warehouse. Available stock is ${stock.availableStock.toFixed(
+          2
+        )}.`,
+
+      stock,
+    };
   }
 
-  const sql = `
-    SELECT
-      IFNULL((
-        SELECT SUM(i.remaining_qty)
-        FROM inward i
-        WHERE i.product_id = ?
-          AND i.warehouse_id = ?
-      ), 0) AS current_stock,
-      IFNULL((
-        SELECT SUM(
-          MAX(
-            (IFNULL(o.quantity, 0) - IFNULL((
-              SELECT SUM(a.qty)
-              FROM adjustment a
-              WHERE a.outward_id = o.id
-            ), 0)),
-            0
-          )
-        )
-        FROM outward o
-        WHERE o.product_id = ?
-          AND o.warehouse_id = ?
-          AND o.status IN ('Pending', 'Partial')
-          ${excludeClause}
-      ), 0) AS reserved_stock
-  `;
+  return {
+    ok:
+      true,
 
-  const queryParams = [params[0], params[1], params[0], params[1], ...params.slice(2)];
-  db.get(sql, queryParams, (err, row) => {
-    if (err) return callback(err);
-
-    const currentStock = Number(row?.current_stock) || 0;
-    const reservedStock = Number(row?.reserved_stock) || 0;
-    return callback(null, {
-      currentStock,
-      reservedStock,
-      availableStock: Math.max(currentStock - reservedStock, 0),
-    });
-  });
+    stock,
+  };
 }
 
-function validateOutwardStock({ warehouse_id, product_id, qty, outwardId }, callback) {
-  getAvailableWarehouseStock({ warehouse_id, product_id, outwardId }, (err, stock) => {
-    if (err) return callback(err);
+/*
+====================================================
+TEMPLATE ROUTES
+====================================================
+*/
 
-    if (stock.availableStock < qty) {
-      return callback(null, {
-        ok: false,
-        error: `Not enough stock in this warehouse. Available stock is ${stock.availableStock.toFixed(2)}.`,
-      });
+router.options(
+  "/template-xlsx",
+  (req, res) =>
+    res.sendStatus(204)
+);
+
+router.options(
+  "/import-xlsx",
+  (req, res) =>
+    res.sendStatus(204)
+);
+
+router.get(
+  "/template-xlsx",
+  (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.export"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to download outward template",
+        });
     }
 
-    return callback(null, { ok: true, stock });
-  });
-}
+    const workbook =
+      XLSX.utils.book_new();
 
-router.get("/available-stock", async (req, res) => {
-  if (!userHasPermission(req.user, "outward.view") && !userHasPermission(req.user, "outward.create") && !userHasPermission(req.user, "outward.edit")) {
-    return res.status(403).json({ error: "You do not have permission to view outward stock" });
-  }
+    const ws =
+      XLSX.utils.json_to_sheet(
+        buildOutwardTemplateRows()
+      );
 
-  let resolvedIds;
-  try {
-    resolvedIds = await resolveEntryMasterIds(db, req.query);
-  } catch (resolveErr) {
-    return res.status(500).json({ error: resolveErr.message });
-  }
+    XLSX.utils.book_append_sheet(
+      workbook,
+      ws,
+      "Outward Template"
+    );
 
-  const warehouseId = resolvedIds.warehouse_id || safeNumber(req.query.warehouse_id);
-  const productId = resolvedIds.product_id || safeNumber(req.query.product_id);
-  const outwardId = safeNumber(req.query.outward_id);
+    const buffer =
+      XLSX.write(
+        workbook,
+        {
+          bookType:
+            "xlsx",
 
-  if (!warehouseId || !productId) {
-    return res.json({
-      currentStock: 0,
-      reservedStock: 0,
-      availableStock: 0,
-    });
-  }
-
-  if (!canAccessWarehouse(req.user, req.query.warehouse_id) && !canAccessWarehouse(req.user, warehouseId)) {
-    return res.status(403).json({ error: "You can only view stock for your assigned warehouse" });
-  }
-
-  getAvailableWarehouseStock({ warehouse_id: warehouseId, product_id: productId, outwardId }, (err, stock) => {
-    if (err) return res.status(500).json({ error: err.message });
-    return res.json(stock);
-  });
-});
-
-router.get("/pending", async (req, res) => {
-  if (!userHasPermission(req.user, "outward.view")) {
-    return res.status(403).json({ error: "You do not have permission to view outward entries" });
-  }
-
-  if (mongoReady()) {
-    try {
-      const docs = await MongoOutward.find({ status: { $in: ["Pending", "Partial"] } }).lean();
-      const lookup = mergeLookupMaps(await buildMongoLookupMaps(docs), await buildSqliteLookupMaps(docs));
-      const rows = (docs || [])
-        .filter((row) => canAccessOutwardRow(req.user, row))
-        .map((row) => ({
-          ...row,
-          id: String(row._id),
-          voucher_no: row.outward_no || row.voucher_no || null,
-          employee_name: lookup.employeeNames.get(normalizeId(row.employee_id)) || row.employee_name || "",
-          location_name: lookup.locationNames.get(normalizeId(row.location_id)) || row.location_name || "",
-          warehouse_name: lookup.warehouseNames.get(normalizeId(row.warehouse_id)) || row.warehouse_name || "",
-          product_name: lookup.productNames.get(normalizeId(row.product_id)) || row.product_name || row.product || "",
-          company_name: lookup.companyNames.get(normalizeId(row.company_id)) || row.company_name || row.buyer_name || row.buyer || "",
-          party_name: lookup.accountNames.get(normalizeId(row.company_account_id)) || row.party_name || row.company_account_name || "",
-          saved_from: "mongodb",
-        }));
-      if (rows.length > 0) {
-        return res.json(rows);
-      }
-    } catch (err) {
-      console.error("Mongo outward pending fetch failed, falling back to SQLite:", err.message);
-    }
-  }
-
-  const rawWarehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
-  const resolvedWarehouseIds = await resolveWarehouseIds(db, rawWarehouseScope.params).catch(() => []);
-  const warehouseScope = rawWarehouseScope.clause
-    ? resolvedWarehouseIds.length > 0
-      ? {
-          clause: ` AND (o.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")}) OR LOWER(COALESCE(o.self_loading, 'No')) = 'yes')`,
-          params: resolvedWarehouseIds,
-        }
-      : { clause: " AND LOWER(COALESCE(o.self_loading, 'No')) = 'yes'", params: [] }
-    : rawWarehouseScope;
-  const sql = `
-    SELECT o.*, 
-      w.name AS warehouse_name,
-      p.name AS product_name,
-      c.name AS company_name,
-      ca.account_name AS party_name
-    FROM outward o
-    LEFT JOIN warehouses w ON o.warehouse_id = w.id
-    LEFT JOIN products p ON o.product_id = p.id
-    LEFT JOIN companies c ON o.company_id = c.id
-    LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-    WHERE o.status IN ('Pending','Partial')
-    ${warehouseScope.clause}
-    ORDER BY o.id DESC
-  `;
-
-  db.all(sql, warehouseScope.params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    return res.json(rows);
-  });
-});
-
-router.put("/complete/:id", (req, res) => {
-  if (!userHasPermission(req.user, "outward.edit")) {
-    return res.status(403).json({ error: "You do not have permission to complete outward entries" });
-  }
-
-  const outwardId = req.params.id;
-
-  db.get(`SELECT * FROM outward WHERE id=?`, [outwardId], (err, row) => {
-    if (err || !row) {
-      return res.status(404).json({ error: "Outward not found" });
-    }
-    if (!canAccessOutwardRow(req.user, row)) {
-      return res.status(403).json({ error: "You can only update entries for your assigned warehouse" });
-    }
-
-    let remaining = Number(row.quantity) || 0;
-
-    db.serialize(() => {
-      db.run("BEGIN TRANSACTION");
-
-      db.all(
-        `
-        SELECT * FROM inward 
-        WHERE product_id=? 
-          AND warehouse_id=? 
-          AND remaining_qty > 0
-        ORDER BY id ASC
-        `,
-        [row.product_id, row.warehouse_id],
-        (err2, inwardRows) => {
-          if (err2) {
-            db.run("ROLLBACK");
-            return res.status(500).json({ error: err2.message });
-          }
-
-          const processNext = (index) => {
-            if (index >= inwardRows.length || remaining <= 0) {
-              return finish();
-            }
-
-            const inw = inwardRows[index];
-            const useQty = Math.min(Number(inw.remaining_qty), remaining);
-
-            db.run(
-              `UPDATE inward SET remaining_qty = remaining_qty - ? WHERE id=?`,
-              [useQty, inw.id],
-              (err3) => {
-                if (err3) {
-                  db.run("ROLLBACK");
-                  return res.status(500).json({ error: err3.message });
-                }
-
-                db.run(
-                  `INSERT INTO adjustment (outward_id, inward_id, qty) VALUES (?, ?, ?)`,
-                  [outwardId, inw.id, useQty],
-                  (err4) => {
-                    if (err4) {
-                      db.run("ROLLBACK");
-                      return res.status(500).json({ error: err4.message });
-                    }
-
-                    remaining -= useQty;
-                    processNext(index + 1);
-                  }
-                );
-              }
-            );
-          };
-
-          const finish = () => {
-            const status = remaining > 0 ? "Partial" : "Completed";
-
-            db.run(`UPDATE outward SET status=? WHERE id=?`, [status, outwardId], (err5) => {
-              if (err5) {
-                db.run("ROLLBACK");
-                return res.status(500).json({ error: err5.message });
-              }
-
-              db.run("COMMIT", (err6) => {
-                if (err6) return res.status(500).json({ error: err6.message });
-                return res.json({
-                  message: "FIFO Adjustment Done",
-                  remaining_qty: remaining,
-                  status,
-                });
-              });
-            });
-          };
-
-          processNext(0);
+          type:
+            "buffer",
         }
       );
-    });
-  });
-});
 
-router.get("/", async (req, res) => {
-  if (!userHasPermission(req.user, "outward.view")) {
-    return res.status(403).json({ error: "You do not have permission to view outward entries" });
-  }
-
-  if (mongoReady()) {
-    try {
-      const docs = await MongoOutward.find({}).sort({ created_at: -1, _id: -1 }).lean();
-      const lookup = mergeLookupMaps(await buildMongoLookupMaps(docs), await buildSqliteLookupMaps(docs));
-      const rows = (docs || [])
-        .filter((row) => canAccessOutwardRow(req.user, row))
-        .map((row) => ({
-          ...row,
-          id: String(row._id),
-          voucher_no: row.outward_no || row.voucher_no || null,
-          location_name: lookup.locationNames.get(normalizeId(row.location_id)) || row.location_name || "",
-          employee_name: lookup.employeeNames.get(normalizeId(row.employee_id)) || row.employee_name || "",
-          warehouse_name: lookup.warehouseNames.get(normalizeId(row.warehouse_id)) || row.warehouse_name || "",
-          product_name: lookup.productNames.get(normalizeId(row.product_id)) || row.product_name || row.product || "",
-          company_name: lookup.companyNames.get(normalizeId(row.company_id)) || row.company_name || row.buyer_name || row.buyer || "",
-          party_name: lookup.accountNames.get(normalizeId(row.company_account_id)) || row.party_name || row.company_account_name || "",
-          saved_from: "mongodb",
-        }));
-      if (rows.length > 0) {
-        return res.json(rows);
-      }
-    } catch (err) {
-      console.error("Mongo outward fetch failed, falling back to SQLite:", err.message);
-    }
-  }
-
-  const rawWarehouseScope = assignedWarehouseFilter(req.user, "o.warehouse_id");
-  const resolvedWarehouseIds = await resolveWarehouseIds(db, rawWarehouseScope.params).catch(() => []);
-  const warehouseScope = rawWarehouseScope.clause
-    ? resolvedWarehouseIds.length > 0
-      ? {
-          clause: ` AND (o.warehouse_id IN (${resolvedWarehouseIds.map(() => "?").join(",")}) OR LOWER(COALESCE(o.self_loading, 'No')) = 'yes')`,
-          params: resolvedWarehouseIds,
-        }
-      : { clause: " AND LOWER(COALESCE(o.self_loading, 'No')) = 'yes'", params: [] }
-    : rawWarehouseScope;
-  const sql = `
-    SELECT o.*, 
-      l.name AS location_name,
-      e.name AS employee_name,
-      w.name AS warehouse_name,
-      p.name AS product_name,
-      c.name AS company_name,
-      ca.account_name AS party_name
-    FROM outward o
-    LEFT JOIN locations l ON o.location_id = l.id
-    LEFT JOIN employees e ON o.employee_id = e.id
-    LEFT JOIN warehouses w ON o.warehouse_id = w.id
-    LEFT JOIN products p ON o.product_id = p.id
-    LEFT JOIN companies c ON o.company_id = c.id
-    LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-    WHERE 1=1
-    ${warehouseScope.clause}
-    ORDER BY o.id DESC
-  `;
-
-  db.all(sql, warehouseScope.params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    return res.json(rows);
-  });
-});
-
-router.post("/", wrapAsync(async (req, res) => {
-  if (!userHasPermission(req.user, "outward.create")) {
-    return res.status(403).json({ error: "You do not have permission to create outward entries" });
-  }
-
-  const {
-    date,
-    employee_id,
-    location_id,
-    warehouse_id,
-    product_id,
-    company_id,
-    company_account_id,
-    buyer_name,
-    consignee_name,
-    lorry_no,
-    weight,
-    quantity,
-    rate,
-    inv_no,
-    self_loading,
-  } = req.body;
-
-  const qty = safeNumber(quantity) || safeNumber(weight);
-  const isSelfLoading = String(self_loading || "No").trim().toLowerCase() === "yes";
-  const resolvedIds = {
-    employee_id: coerceSqlId(employee_id),
-    location_id: coerceSqlId(location_id),
-    warehouse_id: coerceSqlId(warehouse_id),
-    product_id: coerceSqlId(product_id),
-    company_id: coerceSqlId(company_id),
-    company_account_id: coerceSqlId(company_account_id),
-  };
-
-  const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
-  if (!isSelfLoading && !normalizedWarehouseId) {
-    return res.status(400).json({ error: "Warehouse could not be resolved. Please select a valid warehouse." });
-  }
-  if (!resolvedIds.product_id) {
-    return res.status(400).json({ error: "Product could not be resolved. Please select a valid product." });
-  }
-
-  if (!isSelfLoading && !canAccessWarehouse(req.user, warehouse_id) && !canAccessWarehouse(req.user, normalizedWarehouseId)) {
-    return res.status(403).json({ error: "You can only create entries for your assigned warehouse" });
-  }
-
-  const rateVal = safeNumber(rate);
-  const amount = qty * rateVal;
-
-  db.get(`SELECT IFNULL(MAX(sl_no),0)+1 AS max_sl FROM outward`, [], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-
-    const nextSl = row?.max_sl || 1;
-    const voucher_no = formatOutwardVoucher(nextSl);
-
-    db.run(
-      `
-      INSERT INTO outward (
-        sl_no, voucher_no, date, employee_id, location_id, warehouse_id,
-        product_id, company_id, company_account_id,
-        lorry_no, weight, quantity, rate, amount,
-        buyer_name, consignee_name, inv_no, self_loading, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        nextSl,
-        voucher_no,
-        date,
-        resolvedIds.employee_id || null,
-        resolvedIds.location_id || null,
-        normalizedWarehouseId,
-        resolvedIds.product_id || null,
-        resolvedIds.company_id || null,
-        resolvedIds.company_account_id || null,
-        lorry_no || null,
-        safeNumber(weight),
-        qty,
-        rateVal,
-        amount,
-        buyer_name || null,
-        consignee_name || null,
-        inv_no || null,
-        self_loading || "No",
-        "Pending",
-      ],
-      function onInsert(insertErr) {
-        if (insertErr) {
-          return res.status(500).json({ error: insertErr.message });
-        }
-
-        return res.json({
-          id: this.lastID,
-          sl_no: nextSl,
-          voucher_no,
-        });
-      }
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="outward-template.xlsx"'
     );
-  });
-}));
 
-router.put("/:id", async (req, res) => {
-  if (!userHasPermission(req.user, "outward.edit")) {
-    return res.status(403).json({ error: "You do not have permission to edit outward entries" });
-  }
-
-  const {
-    date,
-    employee_id,
-    location_id,
-    warehouse_id,
-    product_id,
-    company_id,
-    company_account_id,
-    buyer_name,
-    consignee_name,
-    lorry_no,
-    weight,
-    quantity,
-    rate,
-    inv_no,
-    self_loading,
-  } = req.body;
-
-  const qty = safeNumber(quantity) || safeNumber(weight);
-  const rateVal = safeNumber(rate);
-  const amount = qty * rateVal;
-  const isSelfLoading = String(self_loading || "No").trim().toLowerCase() === "yes";
-  const resolvedIds = {
-    employee_id: coerceSqlId(employee_id),
-    location_id: coerceSqlId(location_id),
-    warehouse_id: coerceSqlId(warehouse_id),
-    product_id: coerceSqlId(product_id),
-    company_id: coerceSqlId(company_id),
-    company_account_id: coerceSqlId(company_account_id),
-  };
-
-  const normalizedWarehouseId = isSelfLoading ? null : resolvedIds.warehouse_id;
-
-  db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [req.params.id], (findErr, row) => {
-    if (findErr) return res.status(500).json({ error: findErr.message });
-    if (!row) return res.status(404).json({ error: "Outward not found" });
-
-    if (!canAccessWarehouse(req.user, row.warehouse_id) && !canAccessWarehouse(req.user, normalizedWarehouseId)) {
-      return res.status(403).json({ error: "You can only edit entries for your assigned warehouse" });
-    }
-
-    db.run(
-      `
-      UPDATE outward SET
-        date=?, employee_id=?, location_id=?, warehouse_id=?,
-        product_id=?, company_id=?, company_account_id=?,
-        buyer_name=?, consignee_name=?,
-        lorry_no=?, weight=?, quantity=?, rate=?, amount=?,
-        inv_no=?, self_loading=?, status='Pending'
-      WHERE id=?
-      `,
-      [
-        safeText(date),
-        resolvedIds.employee_id || null,
-        resolvedIds.location_id || null,
-        normalizedWarehouseId,
-        resolvedIds.product_id || null,
-        resolvedIds.company_id || null,
-        resolvedIds.company_account_id || null,
-        safeText(buyer_name),
-        safeText(consignee_name),
-        safeText(lorry_no),
-        safeNumber(weight),
-        qty,
-        rateVal,
-        amount,
-        safeText(inv_no),
-        safeText(self_loading) || "No",
-        req.params.id,
-      ],
-      function onUpdate(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        return res.json({ message: "Updated & Reset to Pending" });
-      }
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
-  });
-});
 
-router.delete("/:id", (req, res) => {
-  if (!userHasPermission(req.user, "outward.delete")) {
-    return res.status(403).json({ error: "You do not have permission to delete outward entries" });
+    return res.send(
+      buffer
+    );
   }
+);
 
-  const id = req.params.id;
+/*
+====================================================
+XLSX IMPORT
+====================================================
+*/
 
-  if (mongoReady() && mongoose.Types.ObjectId.isValid(id)) {
-    MongoOutward.findByIdAndDelete(id)
-      .lean()
-      .then((deletedDoc) => {
-        if (!deletedDoc) {
-          return res.status(404).json({ error: "Outward not found" });
-        }
-
-        const voucherNo = deletedDoc.outward_no || deletedDoc.voucher_no || "";
-        if (!voucherNo) {
-          return res.json({ deleted: 1, deleted_from: "mongodb" });
-        }
-
-        return db.run(`DELETE FROM outward WHERE voucher_no=?`, [voucherNo], function (err2) {
-          if (err2) return res.status(500).json({ error: err2.message });
-          return res.json({ deleted: 1, deleted_from: "mongodb" });
-        });
-      })
-      .catch((mongoErr) => res.status(500).json({ error: mongoErr.message }));
+async function importOutwardRows(
+  rows,
+  req,
+  res
+) {
+  if (!ensureMongo(res)) {
     return;
   }
 
-  db.get(`SELECT warehouse_id FROM outward WHERE id = ?`, [id], (findErr, outwardRow) => {
-    if (findErr) return res.status(500).json({ error: findErr.message });
-    if (!outwardRow) return res.status(404).json({ error: "Outward not found" });
-    if (!canAccessWarehouse(req.user, outwardRow.warehouse_id)) {
-      return res.status(403).json({ error: "You can only delete entries for your assigned warehouse" });
+  let inserted =
+    0;
+
+  let skipped =
+    0;
+
+  const errors =
+    [];
+
+  let nextSl =
+    await getNextOutwardSlNo();
+
+  for (
+    let index = 0;
+    index < rows.length;
+    index += 1
+  ) {
+    const row =
+      rows[index] || {};
+
+    const date =
+      normalizeDate(
+        row?.date
+      );
+
+    const qty =
+      safeNumber(
+        row?.quantity ??
+          row?.weight
+      );
+
+    const rate =
+      safeNumber(
+        row?.rate
+      );
+
+    const amount =
+      qty * rate;
+
+    const selfLoading =
+      normalizeSelfLoading(
+        row?.self_loading
+      );
+
+    const missing =
+      [];
+
+    if (!date) {
+      missing.push(
+        "date"
+      );
     }
 
-    db.get(`SELECT COUNT(*) as cnt FROM adjustment WHERE outward_id=?`, [id], (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
+    const masters =
+      await resolveOutwardMasters(
+        row
+      );
 
-      if (row?.cnt > 0) {
-        return res.status(400).json({
-          error: "Cannot delete. Adjustment exists.",
+    if (
+      !masters.product
+    ) {
+      missing.push(
+        "product"
+      );
+    }
+
+    if (
+      !masters.company
+    ) {
+      missing.push(
+        "company"
+      );
+    }
+
+    if (
+      !selfLoading &&
+      !masters.warehouse
+    ) {
+      missing.push(
+        "warehouse"
+      );
+    }
+
+    if (
+      missing.length
+    ) {
+      skipped +=
+        1;
+
+      errors.push({
+        row:
+          index + 2,
+
+        error:
+          `Missing or unmatched required field(s): ${missing.join(
+            ", "
+          )}`,
+      });
+
+      continue;
+    }
+
+    const warehouseId =
+      selfLoading ===
+      "Yes"
+        ? null
+        : masters.warehouse
+            ?._id;
+
+    if (
+      warehouseId &&
+      !canAccessWarehouse(
+        req.user,
+        warehouseId
+      )
+    ) {
+      skipped +=
+        1;
+
+      errors.push({
+        row:
+          index + 2,
+
+        error:
+          "You can only import entries for your assigned warehouse",
+      });
+
+      continue;
+    }
+
+    const nextVoucher =
+      formatOutwardVoucher(
+        nextSl
+      );
+
+    const names =
+      masterNames(
+        masters
+      );
+
+    try {
+      await MongoOutward.create({
+        legacy_id:
+          nextSl,
+
+        sl_no:
+          nextSl,
+
+        voucher_no:
+          nextVoucher,
+
+        outward_no:
+          nextVoucher,
+
+        date,
+
+        employee_id:
+          masters.employee?._id ??
+          null,
+
+        location_id:
+          masters.location?._id ??
+          null,
+
+        warehouse_id:
+          warehouseId,
+
+        product_id:
+          masters.product?._id ??
+          null,
+
+        company_id:
+          masters.company?._id ??
+          null,
+
+        company_account_id:
+          masters.companyAccount?._id ??
+          null,
+
+        ...names,
+
+        buyer:
+          safeText(
+            row?.buyer_name
+          ) || "",
+
+        buyer_name:
+          safeText(
+            row?.buyer_name
+          ) || "",
+
+        consignee_name:
+          safeText(
+            row?.consignee_name
+          ) || "",
+
+        lorry_no:
+          safeText(
+            row?.lorry_no
+          ) || "",
+
+        transporter:
+          safeText(
+            row?.lorry_no
+          ) || "",
+
+        product:
+          names.product_name ||
+          "",
+
+        quantity:
+          qty,
+
+        weight:
+          qty,
+
+        rate,
+
+        amount,
+
+        inv_no:
+          safeText(
+            row?.inv_no
+          ) || "",
+
+        self_loading:
+          selfLoading,
+
+        status:
+          "Pending",
+
+        narration:
+          "",
+
+        created_at:
+          new Date(),
+
+        updated_at:
+          new Date(),
+      });
+
+      inserted +=
+        1;
+
+      nextSl +=
+        1;
+    } catch (error) {
+      skipped +=
+        1;
+
+      errors.push({
+        row:
+          index + 2,
+
+        error:
+          error.message,
+      });
+    }
+  }
+
+  return res.json({
+    total:
+      rows.length,
+
+    inserted,
+
+    skipped,
+
+    errors,
+
+    source:
+      "mongodb",
+  });
+}
+
+router.post(
+  "/import-xlsx",
+  upload.single("file"),
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.import"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to import outward entries",
         });
+    }
+
+    if (
+      !req.file?.buffer
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "XLSX file is required",
+        });
+    }
+
+    if (!ensureMongo(res)) {
+      return;
+    }
+
+    let rows =
+      [];
+
+    try {
+      const workbook =
+        XLSX.read(
+          req.file.buffer,
+          {
+            type:
+              "buffer",
+
+            cellDates:
+              true,
+          }
+        );
+
+      const firstSheet =
+        workbook
+          .SheetNames?.[0];
+
+      if (!firstSheet) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "No sheet found in file",
+          });
       }
 
-      db.run(`DELETE FROM outward WHERE id=?`, [id], function (err2) {
-        if (err2) return res.status(500).json({ error: err2.message });
-        return res.json({ deleted: this.changes });
+      rows =
+        XLSX.utils.sheet_to_json(
+          workbook.Sheets[
+            firstSheet
+          ],
+          {
+            defval:
+              "",
+          }
+        );
+    } catch (error) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Invalid XLSX file",
+        });
+    }
+
+    const normalized =
+      (
+        Array.isArray(
+          rows
+        )
+          ? rows
+          : []
+      ).map(
+        normalizeOutwardImportRow
+      );
+
+    if (
+      normalized.length ===
+      0
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "No rows found in XLSX",
+        });
+    }
+
+    return importOutwardRows(
+      normalized,
+      req,
+      res
+    );
+  }
+);
+
+/*
+====================================================
+AVAILABLE STOCK
+====================================================
+*/
+
+router.get(
+  "/available-stock",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.view"
+      ) &&
+      !userHasPermission(
+        req.user,
+        "outward.create"
+      ) &&
+      !userHasPermission(
+        req.user,
+        "outward.edit"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to view outward stock",
+        });
+    }
+
+    if (!ensureMongo(res)) {
+      return;
+    }
+
+    let warehouseId =
+      req.query
+        .warehouse_id;
+
+    let productId =
+      req.query
+        .product_id;
+
+    const outwardId =
+      req.query
+        .outward_id ||
+      null;
+
+    const masters =
+      await resolveOutwardMasters({
+        warehouse_id:
+          warehouseId,
+
+        product_id:
+          productId,
       });
+
+    warehouseId =
+      masters.warehouse?._id ||
+      warehouseId;
+
+    productId =
+      masters.product?._id ||
+      productId;
+
+    if (
+      !warehouseId ||
+      !productId
+    ) {
+      return res.json({
+        currentStock:
+          0,
+
+        reservedStock:
+          0,
+
+        availableStock:
+          0,
+      });
+    }
+
+    if (
+      !canAccessWarehouse(
+        req.user,
+        warehouseId
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You can only view stock for your assigned warehouse",
+        });
+    }
+
+    try {
+      const stock =
+        await getAvailableWarehouseStock({
+          warehouse_id:
+            warehouseId,
+
+          product_id:
+            productId,
+
+          outwardId,
+        });
+
+      return res.json(
+        stock
+      );
+    } catch (error) {
+      console.error(
+        "Mongo outward stock calculation failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+/*
+====================================================
+PENDING OUTWARD
+====================================================
+*/
+
+router.get(
+  "/pending",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.view"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to view outward entries",
+        });
+    }
+
+    if (!ensureMongo(res)) {
+      return;
+    }
+
+    try {
+      const docs =
+        await MongoOutward.find({
+          status: {
+            $in: [
+              "Pending",
+              "Partial",
+            ],
+          },
+        })
+          .sort({
+            created_at:
+              -1,
+
+            _id:
+              -1,
+          })
+          .lean();
+
+      const rows =
+        await decorateOutwardDocs(
+          docs
+        );
+
+      const filtered =
+        rows.filter(
+          (row) =>
+            canAccessOutwardRow(
+              req.user,
+              row
+            )
+        );
+
+      return res.json(
+        filtered
+      );
+    } catch (error) {
+      console.error(
+        "Mongo outward pending fetch failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+/*
+====================================================
+FIFO COMPLETE
+====================================================
+*/
+
+router.put(
+  "/complete/:id",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.edit"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to complete outward entries",
+        });
+    }
+
+    if (!ensureMongo(res)) {
+      return;
+    }
+
+    const outward =
+      await findMongoOutward(
+        req.params.id
+      );
+
+    if (!outward) {
+      return res
+        .status(404)
+        .json({
+          error:
+            "Outward not found",
+        });
+    }
+
+    if (
+      !canAccessOutwardRow(
+        req.user,
+        outward
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You can only update entries for your assigned warehouse",
+        });
+    }
+
+    const requestedQty =
+      safeNumber(
+        outward?.quantity ??
+          outward?.weight
+      );
+
+    const currentAdjustedQty =
+      await getAdjustedQtyForOutward(
+        outward?.legacy_id ??
+          outward?._id
+      );
+
+    let remaining =
+      Math.max(
+        requestedQty -
+          currentAdjustedQty,
+        0
+      );
+
+    if (
+      remaining <= 0
+    ) {
+      await MongoOutward.updateOne(
+        {
+          _id:
+            outward._id,
+        },
+        {
+          $set: {
+            status:
+              "Completed",
+
+            updated_at:
+              new Date(),
+          },
+        }
+      );
+
+      return res.json({
+        message:
+          "FIFO Adjustment Done",
+
+        remaining_qty:
+          0,
+
+        status:
+          "Completed",
+
+        source:
+          "mongodb",
+      });
+    }
+
+    const warehouseId =
+      normalizeId(
+        outward.warehouse_id
+      );
+
+    const productId =
+      normalizeId(
+        outward.product_id
+      );
+
+    if (
+      !warehouseId ||
+      !productId
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Warehouse or product is missing from outward entry",
+        });
+    }
+
+    /*
+     * FIFO:
+     * Oldest inward first.
+     */
+    const inwardFilter = {
+      warehouse_id:
+        warehouseId,
+
+      product_id:
+        productId,
+    };
+
+    const inwardRows =
+      await MongoInward.find(
+        inwardFilter
+      )
+        .sort({
+          date:
+            1,
+
+          sl_no:
+            1,
+
+          legacy_id:
+            1,
+
+          _id:
+            1,
+        })
+        .lean();
+
+    for (
+      const inward of
+        inwardRows
+    ) {
+      if (
+        remaining <= 0
+      ) {
+        break;
+      }
+
+      const available =
+        safeNumber(
+          inward?.remaining_qty ??
+            inward?.weight ??
+            inward?.quantity
+        );
+
+      if (
+        available <= 0
+      ) {
+        continue;
+      }
+
+      const useQty =
+        Math.min(
+          available,
+          remaining
+        );
+
+      const inwardQuery =
+        inward?._id
+          ? {
+              _id:
+                inward._id,
+            }
+          : {
+              legacy_id:
+                inward.legacy_id,
+            };
+
+      /*
+       * Atomic-ish conditional update:
+       * only consume if remaining_qty is still enough.
+       */
+      const updateResult =
+        await MongoInward.updateOne(
+          inwardQuery,
+          {
+            $set: {
+              updated_at:
+                new Date(),
+            },
+
+            $inc: {
+              remaining_qty:
+                -useQty,
+            },
+          }
+        );
+
+      if (
+        !updateResult?.matchedCount
+      ) {
+        continue;
+      }
+
+    const adjustmentOutwardId =
+  outward?.legacy_id ??
+  outward?.sl_no ??
+  String(
+    outward?._id
+  );
+
+const adjustmentInwardId =
+  inward?.legacy_id ??
+  inward?.sl_no ??
+  String(
+    inward?._id
+  );
+
+      await createAdjustmentMirrorRow({
+        outward_id:
+          adjustmentOutwardId,
+
+        inward_id:
+          adjustmentInwardId,
+
+        qty:
+          useQty,
+
+        created_at:
+          new Date(),
+
+        date:
+          new Date(),
+      });
+
+      remaining -=
+        useQty;
+    }
+
+    const status =
+      remaining > 0
+        ? "Partial"
+        : "Completed";
+
+    await MongoOutward.updateOne(
+      {
+        _id:
+          outward._id,
+      },
+      {
+        $set: {
+          status,
+
+          updated_at:
+            new Date(),
+        },
+      }
+    );
+
+    return res.json({
+      message:
+        "FIFO Adjustment Done",
+
+      remaining_qty:
+        remaining,
+
+      status,
+
+      source:
+        "mongodb",
     });
-  });
-});
+  }
+);
+
+/*
+====================================================
+OUTWARD LIST
+====================================================
+*/
+
+router.get(
+  "/",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.view"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to view outward entries",
+        });
+    }
+
+    if (!ensureMongo(res)) {
+      return;
+    }
+
+    try {
+      const docs =
+        await MongoOutward.find({})
+          .sort({
+            created_at:
+              -1,
+
+            date:
+              -1,
+
+            legacy_id:
+              -1,
+
+            _id:
+              -1,
+          })
+          .lean();
+
+      const rows =
+        await decorateOutwardDocs(
+          docs
+        );
+
+      const filtered =
+        rows.filter(
+          (row) =>
+            canAccessOutwardRow(
+              req.user,
+              row
+            )
+        );
+
+      return res.json(
+        filtered
+      );
+    } catch (error) {
+      console.error(
+        "Mongo outward fetch failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+/*
+====================================================
+CREATE OUTWARD
+====================================================
+*/
+
+router.post(
+  "/",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.create"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to create outward entries",
+        });
+    }
+
+    if (!ensureMongo(res)) {
+      return;
+    }
+
+    const {
+      date,
+      employee_id,
+      employee_name,
+      location_id,
+      location_name,
+      warehouse_id,
+      warehouse_name,
+      product_id,
+      product_name,
+      company_id,
+      company_name,
+      company_account_id,
+      company_account_name,
+      buyer_name,
+      consignee_name,
+      lorry_no,
+      weight,
+      quantity,
+      rate,
+      inv_no,
+      self_loading,
+      narration,
+    } = req.body;
+
+    const normalizedDate =
+      normalizeDate(
+        date
+      );
+
+    if (
+      !normalizedDate
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Valid date is required",
+        });
+    }
+
+    const qty =
+      safeNumber(
+        quantity ??
+          weight
+      );
+
+    const rateValue =
+      safeNumber(
+        rate
+      );
+
+    const amount =
+      qty *
+      rateValue;
+
+    const selfLoading =
+      normalizeSelfLoading(
+        self_loading
+      );
+
+    try {
+      const masters =
+        await resolveOutwardMasters({
+          employee_id,
+          employee_name,
+
+          location_id,
+          location_name,
+
+          warehouse_id,
+          warehouse_name,
+
+          product_id,
+          product_name,
+
+          company_id,
+          company_name,
+
+          company_account_id,
+          company_account_name,
+        });
+
+      if (
+        !masters.product
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Product could not be resolved. Please select a valid product.",
+          });
+      }
+
+      if (
+        !masters.company
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Company could not be resolved. Please select a valid company.",
+          });
+      }
+
+      /*
+       * Self-loading does not require a warehouse.
+       */
+      const normalizedWarehouseId =
+        selfLoading === "Yes"
+          ? null
+          : masters.warehouse?._id ||
+            warehouse_id;
+
+      if (
+        selfLoading !== "Yes" &&
+        !normalizedWarehouseId
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Warehouse could not be resolved. Please select a valid warehouse.",
+          });
+      }
+
+      if (
+        normalizedWarehouseId &&
+        !canAccessWarehouse(
+          req.user,
+          normalizedWarehouseId
+        )
+      ) {
+        return res
+          .status(403)
+          .json({
+            error:
+              "You can only create entries for your assigned warehouse",
+          });
+      }
+
+      /*
+       * Validate stock only for normal warehouse outward.
+       */
+      if (
+        normalizedWarehouseId
+      ) {
+        const stockValidation =
+          await validateOutwardStock({
+            warehouse_id:
+              normalizedWarehouseId,
+
+            product_id:
+              masters.product?._id ||
+              product_id,
+
+            qty,
+          });
+
+        if (
+          !stockValidation.ok
+        ) {
+          return res
+            .status(400)
+            .json({
+              error:
+                stockValidation.error,
+
+              stock:
+                stockValidation.stock,
+            });
+        }
+      }
+
+      const nextSl =
+        await getNextOutwardSlNo();
+
+      const voucherNo =
+        formatOutwardVoucher(
+          nextSl
+        );
+
+      const names =
+        masterNames(
+          masters
+        );
+
+      const doc =
+        await MongoOutward.create({
+          legacy_id:
+            nextSl,
+
+          sl_no:
+            nextSl,
+
+          voucher_no:
+            voucherNo,
+
+          outward_no:
+            voucherNo,
+
+          date:
+            normalizedDate,
+
+          employee_id:
+            masters.employee?._id ??
+            null,
+
+          location_id:
+            masters.location?._id ??
+            null,
+
+          warehouse_id:
+            normalizedWarehouseId,
+
+          product_id:
+            masters.product?._id ??
+            product_id ??
+            null,
+
+          company_id:
+            masters.company?._id ??
+            company_id ??
+            null,
+
+          company_account_id:
+            masters.companyAccount?._id ??
+            null,
+
+          ...names,
+
+          buyer:
+            safeText(
+              buyer_name
+            ) || "",
+
+          buyer_name:
+            safeText(
+              buyer_name
+            ) || "",
+
+          consignee_name:
+            safeText(
+              consignee_name
+            ) || "",
+
+          product:
+            names.product_name ||
+            "",
+
+          quantity:
+            qty,
+
+          weight:
+            safeNumber(
+              weight
+            ) || qty,
+
+          rate:
+            rateValue,
+
+          amount,
+
+          lorry_no:
+            safeText(
+              lorry_no
+            ) || "",
+
+          transporter:
+            safeText(
+              lorry_no
+            ) || "",
+
+          inv_no:
+            safeText(
+              inv_no
+            ) || "",
+
+          self_loading:
+            selfLoading,
+
+          status:
+            "Pending",
+
+          narration:
+            safeText(
+              narration
+            ) || "",
+
+          created_at:
+            new Date(),
+
+          updated_at:
+            new Date(),
+        });
+
+      return res.json({
+        id:
+          doc.legacy_id ??
+          String(
+            doc._id
+          ),
+
+        mongo_id:
+          String(
+            doc._id
+          ),
+
+        sl_no:
+          doc.sl_no,
+
+        voucher_no:
+          doc.voucher_no,
+
+        source:
+          "mongodb",
+      });
+    } catch (error) {
+      console.error(
+        "Mongo outward create failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+/*
+====================================================
+EDIT OUTWARD
+====================================================
+*/
+
+router.put(
+  "/:id",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.edit"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to edit outward entries",
+        });
+    }
+
+    if (!ensureMongo(res)) {
+      return;
+    }
+
+    const existing =
+      await findMongoOutward(
+        req.params.id
+      );
+
+    if (!existing) {
+      return res
+        .status(404)
+        .json({
+          error:
+            "Outward not found",
+        });
+    }
+
+    if (
+      !canAccessOutwardRow(
+        req.user,
+        existing
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You can only edit entries for your assigned warehouse",
+        });
+    }
+
+    const {
+      date,
+      employee_id,
+      employee_name,
+      location_id,
+      location_name,
+      warehouse_id,
+      warehouse_name,
+      product_id,
+      product_name,
+      company_id,
+      company_name,
+      company_account_id,
+      company_account_name,
+      buyer_name,
+      consignee_name,
+      lorry_no,
+      weight,
+      quantity,
+      rate,
+      inv_no,
+      self_loading,
+      narration,
+    } = req.body;
+
+    const normalizedDate =
+      normalizeDate(
+        date
+      );
+
+    if (
+      !normalizedDate
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Valid date is required",
+        });
+    }
+
+    const qty =
+      safeNumber(
+        quantity ??
+          weight
+      );
+
+    const rateValue =
+      safeNumber(
+        rate
+      );
+
+    const amount =
+      qty *
+      rateValue;
+
+    const selfLoading =
+      normalizeSelfLoading(
+        self_loading
+      );
+
+    try {
+      const masters =
+        await resolveOutwardMasters({
+          employee_id,
+          employee_name,
+
+          location_id,
+          location_name,
+
+          warehouse_id,
+          warehouse_name,
+
+          product_id,
+          product_name,
+
+          company_id,
+          company_name,
+
+          company_account_id,
+          company_account_name,
+        });
+
+      if (
+        !masters.product
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Product could not be resolved",
+          });
+      }
+
+      if (
+        !masters.company
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Company could not be resolved",
+          });
+      }
+
+      const normalizedWarehouseId =
+        selfLoading === "Yes"
+          ? null
+          : masters.warehouse?._id ||
+            warehouse_id;
+
+      if (
+        selfLoading !== "Yes" &&
+        !normalizedWarehouseId
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Warehouse could not be resolved",
+          });
+      }
+
+      if (
+        normalizedWarehouseId &&
+        !canAccessWarehouse(
+          req.user,
+          normalizedWarehouseId
+        )
+      ) {
+        return res
+          .status(403)
+          .json({
+            error:
+              "You can only edit entries for your assigned warehouse",
+          });
+      }
+
+      /*
+       * If changing an existing Pending outward,
+       * validate the newly requested stock.
+       *
+       * Completed/Partial outward should not silently
+       * rewrite its quantity if FIFO adjustment exists.
+       */
+      const adjustedQty =
+        await getAdjustedQtyForOutward(
+          existing?.legacy_id ??
+            existing?.sl_no ??
+            existing?._id
+        );
+
+      if (
+        adjustedQty > 0 &&
+        qty <
+          adjustedQty
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              `Cannot reduce quantity below already adjusted quantity (${adjustedQty}).`,
+          });
+      }
+
+      if (
+        normalizedWarehouseId
+      ) {
+        const stockValidation =
+          await validateOutwardStock({
+            warehouse_id:
+              normalizedWarehouseId,
+
+            product_id:
+              masters.product?._id ||
+              product_id,
+
+            qty:
+              Math.max(
+                qty -
+                  adjustedQty,
+                0
+              ),
+
+            outwardId:
+              existing?.legacy_id ??
+              existing?._id,
+          });
+
+        if (
+          !stockValidation.ok
+        ) {
+          return res
+            .status(400)
+            .json({
+              error:
+                stockValidation.error,
+
+              stock:
+                stockValidation.stock,
+            });
+        }
+      }
+
+      const names =
+        masterNames(
+          masters
+        );
+
+      const updated =
+        await MongoOutward.findByIdAndUpdate(
+          existing._id,
+          {
+            $set: {
+              date:
+                normalizedDate,
+
+              employee_id:
+                masters.employee?._id ??
+                null,
+
+              location_id:
+                masters.location?._id ??
+                null,
+
+              warehouse_id:
+                normalizedWarehouseId,
+
+              product_id:
+                masters.product?._id ??
+                product_id ??
+                null,
+
+              company_id:
+                masters.company?._id ??
+                company_id ??
+                null,
+
+              company_account_id:
+                masters.companyAccount?._id ??
+                null,
+
+              ...names,
+
+              buyer:
+                safeText(
+                  buyer_name
+                ) || "",
+
+              buyer_name:
+                safeText(
+                  buyer_name
+                ) || "",
+
+              consignee_name:
+                safeText(
+                  consignee_name
+                ) || "",
+
+              product:
+                names.product_name ||
+                "",
+
+              quantity:
+                qty,
+
+              weight:
+                safeNumber(
+                  weight
+                ) || qty,
+
+              rate:
+                rateValue,
+
+              amount,
+
+              lorry_no:
+                safeText(
+                  lorry_no
+                ) || "",
+
+              transporter:
+                safeText(
+                  lorry_no
+                ) || "",
+
+              inv_no:
+                safeText(
+                  inv_no
+                ) || "",
+
+              self_loading:
+                selfLoading,
+
+              status:
+                "Pending",
+
+              narration:
+                safeText(
+                  narration
+                ) || "",
+
+              updated_at:
+                new Date(),
+            },
+          },
+          {
+            new:
+              true,
+          }
+        ).lean();
+
+      return res.json({
+        updated:
+          1,
+
+        id:
+          updated?.legacy_id ??
+          String(
+            updated?._id
+          ),
+
+        source:
+          "mongodb",
+      });
+    } catch (error) {
+      console.error(
+        "Mongo outward update failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+/*
+====================================================
+DELETE OUTWARD
+====================================================
+*/
+
+router.delete(
+  "/:id",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.delete"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to delete outward entries",
+        });
+    }
+
+    if (!ensureMongo(res)) {
+      return;
+    }
+
+    const existing =
+      await findMongoOutward(
+        req.params.id
+      );
+
+    if (!existing) {
+      return res
+        .status(404)
+        .json({
+          error:
+            "Outward not found",
+        });
+    }
+
+    if (
+      !canAccessOutwardRow(
+        req.user,
+        existing
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You can only delete entries for your assigned warehouse",
+        });
+    }
+
+    const adjustedQty =
+      await getAdjustedQtyForOutward(
+        existing?.legacy_id ??
+          existing?.sl_no ??
+          existing?._id
+      );
+
+    if (
+      adjustedQty > 0
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Cannot delete. Adjustment exists.",
+        });
+    }
+
+    try {
+      const result =
+        await MongoOutward.deleteOne({
+          _id:
+            existing._id,
+        });
+
+      return res.json({
+        deleted:
+          Number(
+            result.deletedCount ||
+              0
+          ),
+
+        deleted_from:
+          "mongodb",
+      });
+    } catch (error) {
+      console.error(
+        "Mongo outward delete failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            error.message,
+        });
+    }
+  }
+);
 
 module.exports = router;
