@@ -1,51 +1,254 @@
 const express = require("express");
+const mongoose = require("mongoose");
+
 const router = express.Router();
-const db = require("../db");
-const { userHasPermission } = require("../middleware/auth");
 
-const num = (v) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-};
+const {
+  Outward: MongoOutward,
+  Inward: MongoInward,
+  Company: MongoCompany,
+  CompanyAccount: MongoCompanyAccount,
+  Warehouse: MongoWarehouse,
+  Location: MongoLocation,
+  Product: MongoProduct,
+  isMongoMirrorReady,
+} = require("../db-mongodb");
 
-function dbGetAsync(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) return reject(err);
-      return resolve(row || null);
+const {
+  userHasPermission,
+} = require("../middleware/auth");
+
+/*
+====================================================
+MONGO HELPERS
+====================================================
+*/
+
+function requireMongo(res) {
+  if (!isMongoMirrorReady()) {
+    res.status(503).json({
+      error:
+        "MongoDB is not connected. Please try again in a moment.",
     });
-  });
+
+    return false;
+  }
+
+  return true;
 }
 
-const safeJsonParse = (value, fallback = []) => {
-  if (Array.isArray(value)) return value;
-  if (value == null || value === "") return fallback;
-  if (typeof value === "object") return fallback;
+function getDb() {
+  if (!mongoose.connection.db) {
+    throw new Error(
+      "MongoDB database handle is not available"
+    );
+  }
 
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : fallback;
-  } catch (err) {
+  return mongoose.connection.db;
+}
+
+function getCollection(name) {
+  return getDb().collection(name);
+}
+
+function num(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function text(value) {
+  return String(value ?? "").trim();
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    if (
+      value === null ||
+      value === undefined
+    ) {
+      continue;
+    }
+
+    const t = String(value).trim();
+
+    if (
+      t &&
+      t !== "-" &&
+      t.toLowerCase() !== "null" &&
+      t.toLowerCase() !== "undefined"
+    ) {
+      return t;
+    }
+  }
+
+  return null;
+}
+
+function normalizeObjectId(value) {
+  const raw = text(value);
+
+  if (
+    !raw ||
+    !mongoose.Types.ObjectId.isValid(raw)
+  ) {
+    return null;
+  }
+
+  return new mongoose.Types.ObjectId(raw);
+}
+
+function buildIdFilter(value) {
+  const raw = text(value);
+
+  if (!raw) {
+    return null;
+  }
+
+  const conditions = [];
+
+  if (
+    mongoose.Types.ObjectId.isValid(raw)
+  ) {
+    conditions.push({
+      _id: new mongoose.Types.ObjectId(raw),
+    });
+  }
+
+  const n = Number(raw);
+
+  if (Number.isFinite(n)) {
+    conditions.push({
+      legacy_id: n,
+    });
+
+    conditions.push({
+      id: n,
+    });
+
+    conditions.push({
+      sl_no: n,
+    });
+  }
+
+  if (!conditions.length) {
+    return null;
+  }
+
+  if (conditions.length === 1) {
+    return conditions[0];
+  }
+
+  return {
+    $or: conditions,
+  };
+}
+
+/*
+====================================================
+COLLECTIONS
+====================================================
+*/
+
+const settlementCollection =
+  () => getCollection("outwardsettlements");
+
+const adjustmentCollection =
+  () => getCollection("adjustments");
+
+const buyerAdjustmentCollection =
+  () => getCollection("buyeradjustments");
+
+const expenseCollection =
+  () => getCollection("expenses");
+
+const expenseItemCollection =
+  () => getCollection("expenseitems");
+
+const paltiCollection =
+  () => getCollection("paltilorryentries");
+
+/*
+====================================================
+DETAIL HELPERS
+====================================================
+*/
+
+function safeJsonParse(
+  value,
+  fallback = []
+) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
     return fallback;
   }
-};
 
-const normalizeDetailRows = (value, fallbackAmount = 0, fallbackLabel = "") => {
-  const rows = safeJsonParse(value, []);
-  if (rows.length > 0) {
-    return rows.map((item, index) => ({
-      id: item?.id ?? `${Date.now()}-${index}`,
-      description: String(item?.description ?? item?.particular ?? item?.name ?? fallbackLabel ?? "").trim(),
-      amount: num(item?.amount),
-    }));
+  if (
+    typeof value === "object"
+  ) {
+    return fallback;
   }
 
-  const amount = num(fallbackAmount);
+  try {
+    const parsed =
+      JSON.parse(value);
+
+    return Array.isArray(parsed)
+      ? parsed
+      : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeDetailRows(
+  value,
+  fallbackAmount = 0,
+  fallbackLabel = ""
+) {
+  const rows =
+    safeJsonParse(value, []);
+
+  if (rows.length > 0) {
+    return rows.map(
+      (item, index) => ({
+        id:
+          item?.id ??
+          `${Date.now()}-${index}`,
+
+        description:
+          String(
+            item?.description ??
+              item?.particular ??
+              item?.name ??
+              fallbackLabel ??
+              ""
+          ).trim(),
+
+        amount:
+          num(item?.amount),
+      })
+    );
+  }
+
+  const amount =
+    num(fallbackAmount);
+
   if (amount > 0) {
     return [
       {
-        id: `${Date.now()}-0`,
-        description: fallbackLabel || "",
+        id:
+          `${Date.now()}-0`,
+
+        description:
+          fallbackLabel || "",
+
         amount,
       },
     ];
@@ -53,12 +256,46 @@ const normalizeDetailRows = (value, fallbackAmount = 0, fallbackLabel = "") => {
 
   return [
     {
-      id: `${Date.now()}-0`,
-      description: fallbackLabel || "",
+      id:
+        `${Date.now()}-0`,
+
+      description:
+        fallbackLabel || "",
+
       amount: 0,
     },
   ];
-};
+}
+
+function stripEmptyDetailRows(
+  rows
+) {
+  return (
+    Array.isArray(rows)
+      ? rows
+      : []
+  ).filter(
+    (row) =>
+      String(
+        row?.description || ""
+      ).trim() ||
+      num(row?.amount) !== 0
+  );
+}
+
+function sumDetailRows(
+  rows
+) {
+  return (
+    Array.isArray(rows)
+      ? rows
+      : []
+  ).reduce(
+    (sum, row) =>
+      sum + num(row?.amount),
+    0
+  );
+}
 
 const ROW_ADJUSTMENT_FIELDS = [
   "short_amt",
@@ -69,214 +306,1052 @@ const ROW_ADJUSTMENT_FIELDS = [
   "other_chgs",
 ];
 
-const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
+const hasOwn = (
+  obj,
+  key
+) =>
+  Object.prototype.hasOwnProperty.call(
+    obj || {},
+    key
+  );
 
-const normalizeRowAdjustments = (value) => {
-  const rows = Array.isArray(value) ? value : safeJsonParse(value, []);
-  if (!Array.isArray(rows)) return [];
+function normalizeRowAdjustments(
+  value
+) {
+  const rows = Array.isArray(value)
+    ? value
+    : safeJsonParse(value, []);
+
+  if (!Array.isArray(rows)) {
+    return [];
+  }
+
   return rows
     .map((item) => {
-      const adjustment_id = item?.adjustment_id ?? item?.id ?? null;
-      if (adjustment_id == null || adjustment_id === "") return null;
-      const out = { adjustment_id };
-      ROW_ADJUSTMENT_FIELDS.forEach((field) => {
-        if (!hasOwn(item, field)) return;
-        // Keep 0 / "00" / "" as manual overrides (blank => 0)
-        if (item[field] === null || item[field] === undefined) return;
-        out[field] = num(item[field]);
-      });
-      return Object.keys(out).length > 1 ? out : null;
+      const adjustment_id =
+        item?.adjustment_id ??
+        item?.id ??
+        null;
+
+      if (
+        adjustment_id === null ||
+        adjustment_id === ""
+      ) {
+        return null;
+      }
+
+      const out = {
+        adjustment_id,
+      };
+
+      ROW_ADJUSTMENT_FIELDS.forEach(
+        (field) => {
+          if (
+            !hasOwn(
+              item,
+              field
+            )
+          ) {
+            return;
+          }
+
+          if (
+            item[field] ===
+              null ||
+            item[field] ===
+              undefined
+          ) {
+            return;
+          }
+
+          out[field] =
+            num(item[field]);
+        }
+      );
+
+      return Object.keys(out).length >
+        1
+        ? out
+        : null;
     })
     .filter(Boolean);
-};
-
-const stripEmptyDetailRows = (rows) =>
-  (Array.isArray(rows) ? rows : []).filter((row) => String(row?.description || "").trim() || num(row?.amount) !== 0);
-
-const sumDetailRows = (rows) =>
-  (Array.isArray(rows) ? rows : []).reduce((sum, row) => sum + num(row?.amount), 0);
-
-function getOutwardMasterMeta(outwardId) {
-  return new Promise((resolve, reject) => {
-    db.get(
-      `
-      SELECT
-        o.id,
-        o.company_id,
-        o.company_account_id,
-        o.warehouse_id,
-        o.location_id,
-        o.product_id,
-        c.name AS company_name,
-        COALESCE(ca.account_name, '') AS account_name,
-        COALESCE(w.name, '') AS warehouse_name,
-        COALESCE(l.name, wl.name, '') AS location_name,
-        COALESCE(p.name, '') AS product_name
-      FROM outward o
-      LEFT JOIN companies c ON CAST(o.company_id AS TEXT) = CAST(c.id AS TEXT)
-      LEFT JOIN company_accounts ca ON CAST(o.company_account_id AS TEXT) = CAST(ca.id AS TEXT)
-      LEFT JOIN warehouses w ON CAST(o.warehouse_id AS TEXT) = CAST(w.id AS TEXT)
-      LEFT JOIN locations l ON CAST(o.location_id AS TEXT) = CAST(l.id AS TEXT)
-      LEFT JOIN locations wl ON CAST(w.location_id AS TEXT) = CAST(wl.id AS TEXT)
-      LEFT JOIN products p ON CAST(o.product_id AS TEXT) = CAST(p.id AS TEXT)
-      WHERE CAST(o.id AS TEXT) = ?
-      LIMIT 1
-      `,
-      [outwardId],
-      (err, row) => {
-        if (err) return reject(err);
-        return resolve(row || null);
-      }
-    );
-  });
 }
 
-function firstNonEmpty(...values) {
-  for (const value of values) {
-    if (value === null || value === undefined) continue;
-    const text = String(value).trim();
-    if (text && text !== "-" && text.toLowerCase() !== "null" && text.toLowerCase() !== "undefined") {
-      return text;
-    }
+/*
+====================================================
+OUTWARD LOOKUP
+====================================================
+*/
+
+async function findOutward(
+  outwardId
+) {
+  const filter =
+    buildIdFilter(
+      outwardId
+    );
+
+  if (!filter) {
+    return null;
   }
-  return null;
+
+  return MongoOutward.findOne(
+    filter
+  ).lean();
 }
 
-function getAdjustmentDetails(outwardId) {
-  return new Promise((resolve, reject) => {
-    db.all(
-      `
-      SELECT
-        a.id,
-        a.outward_id,
-        COALESCE(a.source_type, 'inward') AS source_type,
-        a.qty AS settlement_weight,
-        a.company_rate AS adjustment_company_rate,
-        a.whatsapp_sent_at,
-        COALESCE(i.voucher_no, p.voucher_no) AS inward_voucher_no,
-        COALESCE(i.lorry_no, p.new_lorry_no, p.reg_lorry_no) AS lorry_no,
-        COALESCE(i.date, p.expense_date) AS inward_date,
-        COALESCE(c.name, cp.name) AS company_name,
-        COALESCE(ca.account_name, cpa.account_name) AS company_account_name,
-        COALESCE(w.name, wp.name) AS warehouse_name,
-        COALESCE(l.name, wl.name) AS location_name,
-        COALESCE(pr.name, prp.name) AS product_name
-      FROM adjustment a
-      LEFT JOIN inward i ON CAST(i.id AS TEXT) = CAST(a.inward_id AS TEXT)
-      LEFT JOIN palti_lorry_entries p ON CAST(p.id AS TEXT) = CAST(a.palti_lorry_id AS TEXT)
-      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(i.company_id AS TEXT)
-      LEFT JOIN companies cp ON CAST(cp.id AS TEXT) = CAST(p.company_id AS TEXT)
-      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(i.company_account_id AS TEXT)
-      LEFT JOIN company_accounts cpa ON CAST(cpa.company_id AS TEXT) = CAST(p.company_id AS TEXT)
-      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(i.warehouse_id AS TEXT)
-      LEFT JOIN warehouses wp ON CAST(wp.id AS TEXT) = CAST(p.warehouse_id AS TEXT)
-      LEFT JOIN locations l ON CAST(l.id AS TEXT) = CAST(i.location_id AS TEXT)
-      LEFT JOIN locations wl ON CAST(wl.id AS TEXT) = CAST(wp.location_id AS TEXT)
-      LEFT JOIN products pr ON CAST(pr.id AS TEXT) = CAST(i.product_id AS TEXT)
-      LEFT JOIN products prp ON CAST(prp.id AS TEXT) = CAST(p.product_id AS TEXT)
-      WHERE CAST(a.outward_id AS TEXT) = CAST(? AS TEXT)
-      ORDER BY a.id ASC
-      `,
-      [outwardId],
-      (err, rows) => {
-        if (err) {
-          reject(err);
-          return;
-        }
+function buildOutwardIdCandidates(outward) {
+  const candidates = [
+    outward?.legacy_id,
+    outward?.id,
+    outward?.sl_no,
+  ]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value));
 
-        resolve(rows || []);
-      }
-    );
+  return Array.from(new Set(candidates));
+}
+
+async function findSettlementForOutward(outward) {
+  const candidates = buildOutwardIdCandidates(outward);
+  if (!candidates.length) return null;
+  return settlementCollection().findOne({
+    outward_id: { $in: candidates },
   });
 }
 
-function getUnloadingDetails(outwardId) {
-  return new Promise((resolve, reject) => {
-    db.all(
-      `
-      SELECT ba.*
-      FROM buyer_adjustments ba
-      WHERE ba.outward_id = ?
-        AND TRIM(COALESCE(ba.consignee_name, '')) <> ''
-        AND IFNULL(ba.rate, 0) > 0
-      ORDER BY ba.created_at DESC
-      `,
-      [outwardId],
-      (err, rows) => {
-        if (err) return reject(err);
-        return resolve(Array.isArray(rows) ? rows : []);
-      }
-    );
-  });
+/*
+====================================================
+MASTER NAME LOOKUPS
+====================================================
+*/
+
+async function lookupMaster(
+  Model,
+  value,
+  nameField = "name"
+) {
+  const filter =
+    buildIdFilter(value);
+
+  if (!filter) {
+    return null;
+  }
+
+  return Model.findOne(
+    filter
+  )
+    .select({
+      [nameField]: 1,
+      account_name: 1,
+      location_id: 1,
+    })
+    .lean();
 }
 
-function calculateSettlement(data) {
-  const dispatch_qty = num(data.dispatch_qty);
-  const unloading_qty = num(data.unloading_qty);
-  const settlement_weight = num(data.settlement_weight || unloading_qty);
-  const sale_rate = num(data.sale_rate);
-  const company_rate = num(data.company_rate);
-  const adjustment_details = Array.isArray(data.adjustment_details) ? data.adjustment_details : [];
-  const freight = num(data.freight);
-  const outward_labour_charges = num(data.outward_labour_charges);
-  const other_charges = num(data.other_charges);
-  const unloading_date = data.unloading_date || "";
-  const claim_details = Array.isArray(data.claim_details) ? data.claim_details : [];
-  const other_deduction_details = Array.isArray(data.other_deduction_details) ? data.other_deduction_details : [];
-  const row_adjustments = Array.isArray(data.row_adjustments) ? data.row_adjustments : [];
-  const claim_amount = num(data.claim_amount) || sumDetailRows(claim_details);
-  const other_deduction = num(data.other_deduction) || sumDetailRows(other_deduction_details);
-  const charge_bearer = data.charge_bearer === "company" ? "company" : "self";
+async function getOutwardMasterMeta(
+  outward
+) {
+  if (!outward) {
+    return null;
+  }
 
-  const shortage_qty = Math.max(
-    num(data.shortage_qty) || Math.max(dispatch_qty - unloading_qty, 0),
+  const [
+    company,
+    account,
+    warehouse,
+    location,
+    product,
+  ] = await Promise.all([
+    lookupMaster(
+      MongoCompany,
+      outward.company_id,
+      "name"
+    ),
+
+    lookupMaster(
+      MongoCompanyAccount,
+      outward.company_account_id,
+      "account_name"
+    ),
+
+    lookupMaster(
+      MongoWarehouse,
+      outward.warehouse_id,
+      "name"
+    ),
+
+    lookupMaster(
+      MongoLocation,
+      outward.location_id,
+      "name"
+    ),
+
+    lookupMaster(
+      MongoProduct,
+      outward.product_id,
+      "name"
+    ),
+  ]);
+
+  let locationName =
+    location?.name || "";
+
+  if (
+    !locationName &&
+    warehouse?.location_id
+  ) {
+    const warehouseLocation =
+      await lookupMaster(
+        MongoLocation,
+        warehouse.location_id,
+        "name"
+      );
+
+    locationName =
+      warehouseLocation?.name ||
+      "";
+  }
+
+  return {
+    company_name:
+      company?.name || "",
+
+    account_name:
+      account?.account_name ||
+      "",
+
+    warehouse_name:
+      warehouse?.name || "",
+
+    location_name:
+      locationName,
+
+    product_name:
+      product?.name || "",
+  };
+}
+
+/*
+====================================================
+ADJUSTMENT DETAILS
+====================================================
+*/
+
+async function getAdjustmentDetails(
+  outwardId
+) {
+  const outward =
+    await findOutward(
+      outwardId
+    );
+
+  const numericOutwardId =
+    Number(
+      outward?.legacy_id ??
+        outward?.id ??
+        outward?.sl_no ??
+        outwardId
+    );
+
+  if (
+    !Number.isFinite(
+      numericOutwardId
+    )
+  ) {
+    return [];
+  }
+
+  const rows =
+    await adjustmentCollection()
+      .find({
+        outward_id:
+          numericOutwardId,
+      })
+      .sort({
+        created_at: 1,
+        _id: 1,
+      })
+      .toArray();
+
+  const result = [];
+
+  for (const row of rows) {
+    let inward = null;
+    let palti = null;
+
+    if (
+      row.inward_id !==
+      null &&
+      row.inward_id !==
+      undefined
+    ) {
+      inward =
+        await MongoInward.findOne(
+          buildIdFilter(
+            row.inward_id
+          )
+        ).lean();
+    }
+
+    if (
+      row.palti_lorry_id !==
+      null &&
+      row.palti_lorry_id !==
+      undefined
+    ) {
+      palti =
+        await paltiCollection().findOne(
+          buildIdFilter(
+            row.palti_lorry_id
+          )
+        );
+    }
+
+    const source =
+      inward || palti;
+
+    let company = null;
+    let account = null;
+    let warehouse = null;
+    let location = null;
+    let product = null;
+
+    if (
+      source?.company_id !=
+      null
+    ) {
+      company =
+        await lookupMaster(
+          MongoCompany,
+          source.company_id,
+          "name"
+        );
+    }
+
+    if (
+      source?.company_account_id !=
+      null
+    ) {
+      account =
+        await lookupMaster(
+          MongoCompanyAccount,
+          source.company_account_id,
+          "account_name"
+        );
+    }
+
+    if (
+      source?.warehouse_id !=
+      null
+    ) {
+      warehouse =
+        await lookupMaster(
+          MongoWarehouse,
+          source.warehouse_id,
+          "name"
+        );
+    }
+
+    if (
+      source?.location_id !=
+      null
+    ) {
+      location =
+        await lookupMaster(
+          MongoLocation,
+          source.location_id,
+          "name"
+        );
+    }
+
+    if (
+      source?.product_id !=
+      null
+    ) {
+      product =
+        await lookupMaster(
+          MongoProduct,
+          source.product_id,
+          "name"
+        );
+    }
+
+    if (
+      !location &&
+      warehouse?.location_id
+    ) {
+      location =
+        await lookupMaster(
+          MongoLocation,
+          warehouse.location_id,
+          "name"
+        );
+    }
+
+    result.push({
+      id:
+        row._id
+          ? String(
+              row._id
+            )
+          : row.id,
+
+      outward_id:
+        numericOutwardId,
+
+      source_type:
+        row.source_type ||
+        "inward",
+
+      settlement_weight:
+        num(
+          row.qty ??
+            row.settlement_weight
+        ),
+
+      adjustment_company_rate:
+        num(
+          row.company_rate ??
+            row.adjustment_company_rate
+        ),
+
+      whatsapp_sent_at:
+        row.whatsapp_sent_at ||
+        null,
+
+      inward_voucher_no:
+        inward?.voucher_no ??
+        palti?.voucher_no ??
+        null,
+
+      lorry_no:
+        inward?.lorry_no ||
+        palti?.new_lorry_no ||
+        palti?.reg_lorry_no ||
+        null,
+
+      inward_date:
+        inward?.date ??
+        palti?.expense_date ??
+        null,
+
+      company_name:
+        company?.name || "",
+
+      company_account_name:
+        account?.account_name ||
+        "",
+
+      warehouse_name:
+        warehouse?.name ||
+        "",
+
+      location_name:
+        location?.name ||
+        "",
+
+      product_name:
+        product?.name ||
+        "",
+    });
+  }
+
+  return result;
+}
+
+/*
+====================================================
+UNLOADING DETAILS
+====================================================
+*/
+
+async function getUnloadingDetails(
+  outwardId
+) {
+  const outward =
+    await findOutward(
+      outwardId
+    );
+
+  const numericOutwardId =
+    Number(
+      outward?.legacy_id ??
+        outward?.id ??
+        outward?.sl_no ??
+        outwardId
+    );
+
+  if (
+    !Number.isFinite(
+      numericOutwardId
+    )
+  ) {
+    return [];
+  }
+
+  const rows =
+    await buyerAdjustmentCollection()
+      .find({
+        outward_id:
+          numericOutwardId,
+
+        consignee_name: {
+          $exists: true,
+          $nin: [
+            null,
+            "",
+          ],
+        },
+
+        rate: {
+          $gt: 0,
+        },
+      })
+      .sort({
+        created_at: -1,
+        _id: -1,
+      })
+      .toArray();
+
+  return rows;
+}
+
+/*
+====================================================
+LABOUR EXPENSE
+====================================================
+*/
+
+async function getApprovedLabourExpense(
+  outwardId
+) {
+  const outward =
+    await findOutward(
+      outwardId
+    );
+
+  const numericOutwardId =
+    Number(
+      outward?.legacy_id ??
+        outward?.id ??
+        outward?.sl_no ??
+        outwardId
+    );
+
+  if (
+    !Number.isFinite(
+      numericOutwardId
+    )
+  ) {
+    return {
+      amount: 0,
+      count: 0,
+      vouchers: [],
+      entries: [],
+    };
+  }
+
+  let expenses =
+    await expenseCollection()
+      .find({
+        outward_id:
+          numericOutwardId,
+      })
+      .sort({
+        id: 1,
+        _id: 1,
+      })
+      .toArray();
+
+  async function mapExpenses(
+    rows
+  ) {
+    const result = [];
+
+    for (
+      const expense of
+        rows
+    ) {
+      const expenseId =
+        Number(
+          expense.id ??
+            expense.legacy_id ??
+            0
+        );
+
+      let labourAmount =
+        0;
+
+      if (
+        Number.isFinite(
+          expenseId
+        ) &&
+        expenseId > 0
+      ) {
+        const items =
+          await expenseItemCollection()
+            .find({
+              expense_id:
+                expenseId,
+            })
+            .toArray();
+
+        labourAmount =
+          items.reduce(
+            (sum, item) => {
+              const particular =
+                String(
+                  item.particular_name ||
+                    item.name ||
+                    ""
+                ).toLowerCase();
+
+              if (
+                particular.includes(
+                  "labour"
+                ) ||
+                particular.includes(
+                  "labor"
+                )
+              ) {
+                return (
+                  sum +
+                  num(
+                    item.amount
+                  )
+                );
+              }
+
+              return sum;
+            },
+            0
+          );
+      }
+
+      const fallback =
+        num(
+          expense.total_expense_amount
+        ) ||
+        num(
+          expense.grand_total
+        );
+
+      const amount =
+        labourAmount > 0
+          ? labourAmount
+          : fallback;
+
+      if (
+        amount > 0
+      ) {
+        result.push({
+          id:
+            expense.id ??
+            expense.legacy_id ??
+            String(
+              expense._id
+            ),
+
+          voucher_no:
+            expense.voucher_no ||
+            null,
+
+          amount,
+
+          status:
+            expense.status ||
+            null,
+        });
+      }
+    }
+
+    return result;
+  }
+
+  let entries =
+    await mapExpenses(
+      expenses
+    );
+
+  /*
+   * Legacy fallback by lorry/date,
+   * but still MongoDB only.
+   */
+  if (
+    !entries.length &&
+    outward
+  ) {
+    const outwardLorry =
+      text(
+        outward.lorry_no
+      );
+
+    const outwardDate =
+      outward.date
+        ? new Date(
+            outward.date
+          )
+        : null;
+
+    expenses =
+      await expenseCollection()
+        .find({
+          $or: [
+            {
+              reg_lorry_no:
+                outwardLorry,
+            },
+            {
+              new_lorry_no:
+                outwardLorry,
+            },
+          ],
+        })
+        .toArray();
+
+    if (
+      outwardDate
+    ) {
+      expenses =
+        expenses.filter(
+          (expense) => {
+            const expenseDate =
+              new Date(
+                expense.expense_date ||
+                  expense.date
+              );
+
+            return (
+              !Number.isNaN(
+                expenseDate.getTime()
+              ) &&
+              expenseDate
+                .toISOString()
+                .slice(
+                  0,
+                  10
+                ) ===
+                outwardDate
+                  .toISOString()
+                  .slice(
+                    0,
+                    10
+                  )
+            );
+          }
+        );
+    }
+
+    entries =
+      await mapExpenses(
+        expenses
+      );
+  }
+
+  return {
+    amount:
+      entries.reduce(
+        (sum, item) =>
+          sum +
+          num(
+            item.amount
+          ),
+        0
+      ),
+
+    count:
+      entries.length,
+
+    vouchers:
+      entries
+        .map(
+          (item) =>
+            item.voucher_no ||
+            `EXP-${item.id}`
+        )
+        .filter(Boolean),
+
+    entries,
+  };
+}
+
+/*
+====================================================
+SETTLEMENT CALCULATION
+====================================================
+*/
+
+function calculateSettlement(
+  data
+) {
+  const dispatch_qty =
+    num(
+      data.dispatch_qty
+    );
+
+  const unloading_qty =
+    num(
+      data.unloading_qty
+    );
+
+  const settlement_weight =
+    num(
+      data.settlement_weight ||
+        unloading_qty
+    );
+
+  const sale_rate =
+    num(
+      data.sale_rate
+    );
+
+  const company_rate =
+    num(
+      data.company_rate
+    );
+
+  const adjustment_details =
+    Array.isArray(
+      data.adjustment_details
+    )
+      ? data.adjustment_details
+      : [];
+
+  const freight =
+    num(
+      data.freight
+    );
+
+  const outward_labour_charges =
+    num(
+      data.outward_labour_charges
+    );
+
+  const other_charges =
+    num(
+      data.other_charges
+    );
+
+  const unloading_date =
+    data.unloading_date ||
+    "";
+
+  const claim_details =
+    Array.isArray(
+      data.claim_details
+    )
+      ? data.claim_details
+      : [];
+
+  const other_deduction_details =
+    Array.isArray(
+      data.other_deduction_details
+    )
+      ? data.other_deduction_details
+      : [];
+
+  const row_adjustments =
+    Array.isArray(
+      data.row_adjustments
+    )
+      ? data.row_adjustments
+      : [];
+
+  const claim_amount =
+    num(
+      data.claim_amount
+    ) ||
+    sumDetailRows(
+      claim_details
+    );
+
+  const other_deduction =
+    num(
+      data.other_deduction
+    ) ||
+    sumDetailRows(
+      other_deduction_details
+    );
+
+  const charge_bearer =
+    data.charge_bearer ===
+    "company"
+      ? "company"
+      : "self";
+
+  const shortage_qty =
+    Math.max(
+      num(
+        data.shortage_qty
+      ) ||
+        Math.max(
+          dispatch_qty -
+            unloading_qty,
+          0
+        ),
+      0
+    );
+
+  const sale_amount =
+    dispatch_qty *
+    sale_rate;
+
+  const average_rate =
+    settlement_weight >
     0
-  );
-  const sale_amount = dispatch_qty * sale_rate;
-  const average_rate = settlement_weight > 0
-    ? adjustment_details.reduce((sum, item) => {
-        const weight = num(item.settlement_weight);
-        const rowRate = num(item.company_rate) || company_rate;
-        return sum + weight * rowRate;
-      }, 0) / settlement_weight
-    : company_rate;
-  const average_amount = settlement_weight * average_rate;
-  const company_amount = adjustment_details.length
-    ? adjustment_details.reduce((sum, item) => {
-        const rowRate = num(item.company_rate) || company_rate;
-        return sum + num(item.settlement_weight) * rowRate;
-      }, 0)
-    : settlement_weight * company_rate;
-  const gross_amount = Math.max(
-    dispatch_qty * sale_rate - freight - outward_labour_charges - other_charges,
-    0
-  );
-  const shortage_amount = adjustment_details.length
-    ? adjustment_details.reduce((sum, item) => {
-        const rowRate = num(item.company_rate) || company_rate;
-        const shortQty =
-          dispatch_qty > 0 ? (num(item.settlement_weight) / dispatch_qty) * shortage_qty : 0;
-        return sum + shortQty * rowRate;
-      }, 0)
-    : shortage_qty * company_rate;
+      ? adjustment_details.reduce(
+          (sum, item) => {
+            const weight =
+              num(
+                item.settlement_weight
+              );
+
+            const rowRate =
+              num(
+                item.company_rate
+              ) ||
+              company_rate;
+
+            return (
+              sum +
+              weight *
+                rowRate
+            );
+          },
+          0
+        ) /
+        settlement_weight
+      : company_rate;
+
+  const average_amount =
+    settlement_weight *
+    average_rate;
+
+  const company_amount =
+    adjustment_details.length
+      ? adjustment_details.reduce(
+          (sum, item) => {
+            const rowRate =
+              num(
+                item.company_rate
+              ) ||
+              company_rate;
+
+            return (
+              sum +
+              num(
+                item.settlement_weight
+              ) *
+                rowRate
+            );
+          },
+          0
+        )
+      : settlement_weight *
+        company_rate;
+
+  const gross_amount =
+    Math.max(
+      dispatch_qty *
+        sale_rate -
+        freight -
+        outward_labour_charges -
+        other_charges,
+      0
+    );
+
+  const shortage_amount =
+    adjustment_details.length
+      ? adjustment_details.reduce(
+          (sum, item) => {
+            const rowRate =
+              num(
+                item.company_rate
+              ) ||
+              company_rate;
+
+            const shortQty =
+              dispatch_qty >
+              0
+                ? (num(
+                    item.settlement_weight
+                  ) /
+                    dispatch_qty) *
+                  shortage_qty
+                : 0;
+
+            return (
+              sum +
+              shortQty *
+                rowRate
+            );
+          },
+          0
+        )
+      : shortage_qty *
+        company_rate;
+
   const perMtCharges =
-    dispatch_qty > 0
-      ? (freight + outward_labour_charges + other_charges) / dispatch_qty
+    dispatch_qty >
+    0
+      ? (freight +
+          outward_labour_charges +
+          other_charges) /
+        dispatch_qty
       : 0;
-  const company_payable = adjustment_details.length
-    ? adjustment_details.reduce((sum, item) => {
-        const weight = num(item.settlement_weight);
-        const rowRate = num(item.company_rate) || company_rate;
-        const shortQty = dispatch_qty > 0 ? (weight / dispatch_qty) * shortage_qty : 0;
-        return sum + weight * rowRate - weight * perMtCharges - shortQty * rowRate;
-      }, 0)
-    : company_amount - settlement_weight * perMtCharges - shortage_amount;
-  const receivable_amount = gross_amount - company_payable - claim_amount - other_deduction;
+
+  const company_payable =
+    adjustment_details.length
+      ? adjustment_details.reduce(
+          (sum, item) => {
+            const weight =
+              num(
+                item.settlement_weight
+              );
+
+            const rowRate =
+              num(
+                item.company_rate
+              ) ||
+              company_rate;
+
+            const shortQty =
+              dispatch_qty >
+              0
+                ? (weight /
+                    dispatch_qty) *
+                  shortage_qty
+                : 0;
+
+            return (
+              sum +
+              weight *
+                rowRate -
+              weight *
+                perMtCharges -
+              shortQty *
+                rowRate
+            );
+          },
+          0
+        )
+      : company_amount -
+        settlement_weight *
+          perMtCharges -
+        shortage_amount;
+
+  const receivable_amount =
+    gross_amount -
+    company_payable -
+    claim_amount -
+    other_deduction;
 
   return {
     dispatch_qty,
     unloading_qty,
-    billable_qty: shortage_qty,
+    billable_qty:
+      shortage_qty,
     settlement_weight,
     sale_rate,
     company_rate,
@@ -290,819 +1365,1710 @@ function calculateSettlement(data) {
     freight,
     outward_labour_charges,
     other_charges,
-    unloading_date,
     claim_amount,
     other_deduction,
     claim_details,
     other_deduction_details,
     shortage_qty,
     charge_bearer,
-    gross_profit: gross_amount,
-    net_profit: receivable_amount,
+    gross_profit:
+      gross_amount,
+    net_profit:
+      receivable_amount,
     company_payable,
     row_adjustments,
   };
 }
 
-function getApprovedLabourExpense(outwardId) {
-  return new Promise((resolve, reject) => {
-    const loadExpenseRows = (sql, params) =>
-      new Promise((resolveRows, rejectRows) => {
-        db.all(sql, params, (err, rows) => {
-          if (err) return rejectRows(err);
-          return resolveRows(rows || []);
+/*
+====================================================
+GET SETTLEMENT
+====================================================
+*/
+
+router.get(
+  "/:outward_id",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "settlement.view"
+      ) &&
+      !userHasPermission(
+        req.user,
+        "outward.view"
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You do not have permission to view settlement",
+      });
+    }
+
+    try {
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const outward =
+        await findOutward(
+          req.params.outward_id
+        );
+
+      if (!outward) {
+        return res.status(404).json({
+          error:
+            "Outward not found",
         });
-      });
-
-    const mapRows = (rows) =>
-      (rows || [])
-        .map((row) => {
-          const labourItemAmount = num(row.labour_item_amount);
-          const fallbackAmount = num(row.total_expense_amount || row.grand_total);
-          return {
-            id: row.id,
-            voucher_no: row.voucher_no,
-            amount: labourItemAmount > 0 ? labourItemAmount : fallbackAmount,
-            status: row.status || null,
-          };
-        })
-        .filter((row) => row.amount > 0);
-
-    (async () => {
-      const primaryRows = await loadExpenseRows(
-        `
-        SELECT
-          x.id,
-          x.voucher_no,
-          x.total_expense_amount,
-          x.grand_total,
-          x.status,
-          COALESCE(SUM(
-            CASE
-              WHEN LOWER(TRIM(ei.particular_name)) LIKE '%labour%'
-                OR LOWER(TRIM(ei.particular_name)) LIKE '%labor%'
-              THEN IFNULL(ei.amount, 0)
-              ELSE 0
-            END
-          ), 0) AS labour_item_amount
-        FROM expenses x
-        LEFT JOIN expense_items ei ON ei.expense_id = x.id
-        WHERE x.outward_id = ?
-        GROUP BY x.id
-        ORDER BY CASE WHEN UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO' THEN 0 ELSE 1 END, x.id ASC
-        `,
-        [outwardId]
-      );
-
-      let items = mapRows(primaryRows);
-
-      if (!items.length) {
-        const outwardRow = await dbGetAsync(
-          `SELECT date, lorry_no, voucher_no, company_id, warehouse_id, location_id FROM outward WHERE id = ?`,
-          [outwardId]
-        );
-
-        if (outwardRow) {
-          const fallbackRows = await loadExpenseRows(
-            `
-            SELECT
-              x.id,
-              x.voucher_no,
-              x.total_expense_amount,
-              x.grand_total,
-              x.status,
-              COALESCE(SUM(
-                CASE
-                  WHEN LOWER(TRIM(ei.particular_name)) LIKE '%labour%'
-                    OR LOWER(TRIM(ei.particular_name)) LIKE '%labor%'
-                  THEN IFNULL(ei.amount, 0)
-                  ELSE 0
-                END
-              ), 0) AS labour_item_amount
-            FROM expenses x
-            LEFT JOIN expense_items ei ON ei.expense_id = x.id
-            WHERE (
-              (TRIM(IFNULL(x.reg_lorry_no, '')) <> '' AND (
-                TRIM(IFNULL(x.reg_lorry_no, '')) = TRIM(IFNULL(?, ''))
-                OR TRIM(IFNULL(x.new_lorry_no, '')) = TRIM(IFNULL(?, ''))
-              ))
-            )
-              AND DATE(x.expense_date) = DATE(?)
-            GROUP BY x.id
-            ORDER BY CASE WHEN UPPER(TRIM(IFNULL(x.status, ''))) = 'CONFIRMED_BY_HO' THEN 0 ELSE 1 END, x.id ASC
-            `,
-            [outwardRow.lorry_no, outwardRow.lorry_no, outwardRow.date]
-          );
-
-          items = mapRows(fallbackRows);
-        }
       }
 
-      resolve({
-        amount: items.reduce((sum, item) => sum + num(item.amount), 0),
-        count: items.length,
-        vouchers: items.map((item) => item.voucher_no || `EXP-${item.id}`).filter(Boolean),
-        entries: items,
-      });
-    })().catch(reject);
-  });
-}
-
-router.get("/:outward_id", async (req, res) => {
-  const outwardId = req.params.outward_id;
-
-  const sql = `
-    SELECT
-      s.*,
-      o.date AS outward_date,
-      o.voucher_no,
-      o.inv_no,
-      o.weight AS outward_weight,
-      o.quantity AS outward_quantity,
-      o.rate AS outward_rate,
-      o.lorry_no,
-      o.buyer_name,
-      o.consignee_name,
-      c.name AS company_name,
-      COALESCE(ca.account_name, '') AS account_name,
-      COALESCE(w.name, '') AS warehouse_name,
-      COALESCE(o.location_id, w.location_id) AS effective_location_id,
-      COALESCE(l.name, wl.name, '') AS location_name,
-      COALESCE(p.name, '') AS product_name
-    FROM outward o
-    LEFT JOIN outward_settlement s ON CAST(s.outward_id AS TEXT) = CAST(o.id AS TEXT)
-    LEFT JOIN companies c ON CAST(o.company_id AS TEXT) = CAST(c.id AS TEXT)
-    LEFT JOIN company_accounts ca ON CAST(o.company_account_id AS TEXT) = CAST(ca.id AS TEXT)
-    LEFT JOIN warehouses w ON CAST(o.warehouse_id AS TEXT) = CAST(w.id AS TEXT)
-    LEFT JOIN locations l ON CAST(o.location_id AS TEXT) = CAST(l.id AS TEXT)
-    LEFT JOIN locations wl ON CAST(w.location_id AS TEXT) = CAST(wl.id AS TEXT)
-    LEFT JOIN products p ON CAST(o.product_id AS TEXT) = CAST(p.id AS TEXT)
-    WHERE CAST(o.id AS TEXT) = ?
-  `;
-
-  db.get(sql, [outwardId], async (err, row) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    if (!row) {
-      return res.status(404).json({ error: "Outward not found" });
-    }
-
-    try {
-      const adjustment_details = await getAdjustmentDetails(outwardId);
-      const labourExpense = await getApprovedLabourExpense(outwardId);
-      const unloadingDetails = await new Promise((resolve, reject) => {
-        db.all(
-          `
-          SELECT
-            ba.*,
-            COALESCE(ba.buyer_name, b.name) AS buyer_name,
-            COALESCE(ba.consignee_name, '') AS consignee_name,
-            p.name AS product_name
-          FROM buyer_adjustments ba
-          LEFT JOIN buyer_names b ON ba.buyer_id = b.id
-          LEFT JOIN outward o ON o.id = ba.outward_id
-          LEFT JOIN products p ON p.id = o.product_id
-          WHERE ba.outward_id = ?
-            AND TRIM(COALESCE(ba.consignee_name, '')) <> ''
-            AND IFNULL(ba.rate, 0) > 0
-          ORDER BY ba.created_at DESC
-          `,
-          [outwardId],
-          (buyerErr, rows) => {
-            if (buyerErr) return reject(buyerErr);
-            return resolve(Array.isArray(rows) ? rows : []);
-          }
+      const numericOutwardId =
+        Number(
+          outward.legacy_id ??
+            outward.id ??
+            outward.sl_no
         );
-      });
-      const totalSettlementWeight = adjustment_details.reduce(
-        (sum, item) => sum + num(item.settlement_weight),
-        0
-      );
-      const claimDetails = normalizeDetailRows(row.claim_details, row.claim_amount, "Claim");
-      const otherDeductionDetails = normalizeDetailRows(
-        row.other_deduction_details,
-        row.other_deduction,
-        "Deduction"
-      );
-      const rowAdjustments = normalizeRowAdjustments(row.row_adjustments);
 
-      const defaultDispatch = num(row.outward_quantity || row.outward_weight);
-
-      const payload = {
-        outward_id: Number(outwardId),
-        outward_date: row.outward_date,
-        voucher_no: row.voucher_no,
-        lorry_no: row.lorry_no,
-        buyer_name: row.buyer_name,
-        consignee_name: row.consignee_name,
-        company_name: row.company_name,
-        account_name: row.account_name || null,
-        company_account_name: row.account_name || null,
-        accountName: row.account_name || null,
-        warehouse_name: row.warehouse_name || null,
-        outward_warehouse_name: row.warehouse_name || null,
-        warehouseName: row.warehouse_name || null,
-        location_id: row.effective_location_id || null,
-        location_name: row.location_name || null,
-        outward_location_name: row.location_name || null,
-        locationName: row.location_name || null,
-        product_name: row.product_name || null,
-        outward_product_name: row.product_name || null,
-        productName: row.product_name || null,
-        outward_quantity: defaultDispatch,
-        labour_expense: labourExpense,
-          unloading_details: unloadingDetails,
-        adjustment_details: adjustment_details.map((item) => ({
-          ...item,
-          company_rate: num(item.adjustment_company_rate) || num(row.company_rate ?? 0),
-          amount: num(item.settlement_weight) * (num(item.adjustment_company_rate) || num(row.company_rate ?? 0)),
-        })),
-          settlement: {
-          id: row.id || null,
-          dispatch_qty: row.dispatch_qty ?? defaultDispatch,
-          unloading_qty: row.unloading_qty ?? totalSettlementWeight,
-          settlement_weight: totalSettlementWeight,
-          billable_qty:
-            row.billable_qty ??
-            (unloadingDetails.reduce((sum, item) => sum + num(item.shortage), 0) || 0),
-          sale_rate: row.sale_rate ?? num(row.outward_rate),
-          company_rate: row.company_rate ?? 0,
-          average_rate: row.average_rate ?? 0,
-          average_amount: row.average_amount ?? 0,
-          sale_amount: row.sale_amount ?? 0,
-          company_amount: row.company_amount ?? 0,
-          gross_amount: row.gross_amount ?? row.gross_profit ?? 0,
-          receivable_amount: row.receivable_amount ?? row.net_profit ?? 0,
-          unloading_date: row.unloading_date || "",
-          freight: row.freight ?? 0,
-          outward_labour_charges: row.outward_labour_charges == null ? null : row.outward_labour_charges,
-          other_charges: row.other_charges ?? 0,
-          claim_amount: row.claim_amount ?? 0,
-          other_deduction: row.other_deduction ?? 0,
-          claim_details: claimDetails,
-          other_deduction_details: otherDeductionDetails,
-          row_adjustments: rowAdjustments,
-          charge_bearer: row.charge_bearer || "self",
-          gross_profit: row.gross_profit ?? 0,
-          net_profit: row.net_profit ?? 0,
-          company_payable: row.company_payable ?? 0,
-          narration: row.narration || "",
-        },
-      };
-
-      return res.json(payload);
-    } catch (detailsError) {
-      console.error("Outward settlement fetch error", {
-        outwardId,
-        message: detailsError.message,
-        stack: detailsError.stack,
-      });
-      return res.status(500).json({ error: detailsError.message });
-    }
-  });
-});
-
-router.post("/save", async (req, res) => {
-  const {
-    outward_id,
-    dispatch_qty,
-    unloading_qty,
-    sale_rate,
-    company_rate,
-    adjustment_rates,
-    freight,
-    outward_labour_charges,
-    other_charges,
-    claim_amount,
-    other_deduction,
-    claim_details,
-    other_deduction_details,
-    shortage_qty,
-    row_adjustments,
-    unloading_date,
-    charge_bearer,
-    narration,
-  } = req.body;
-
-  if (!outward_id) {
-    return res.status(400).json({ error: "outward_id required" });
-  }
-
-  db.get(`SELECT * FROM outward WHERE id = ?`, [outward_id], async (err, outward) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    if (!outward) {
-      return res.status(404).json({ error: "Outward not found" });
-    }
-
-    try {
-      const existingSettlement = await new Promise((resolve, reject) => {
-        db.get(
-          `SELECT company_rate FROM outward_settlement WHERE outward_id = ?`,
-          [outward_id],
-          (existingErr, existingRow) => {
-            if (existingErr) return reject(existingErr);
-            return resolve(existingRow || null);
-          }
+      const settlement =
+        await findSettlementForOutward(
+          outward
         );
-      });
-      const canEditCompanyRate = userHasPermission(req.user, "settlement.companyRate");
-      const existingCompanyRate = num(existingSettlement?.company_rate);
-      const requestedCompanyRate = num(company_rate);
-      if (!canEditCompanyRate && requestedCompanyRate !== existingCompanyRate) {
-        return res.status(403).json({ error: "Company rate edit access required" });
-      }
 
-      const adjustment_details = await getAdjustmentDetails(outward_id);
-      const unloadingDetails = await getUnloadingDetails(outward_id);
-      const unloadingShortageQty = unloadingDetails.reduce(
-        (sum, item) => sum + num(item.shortage),
-        0
-      );
-      const unloadingClaimAmount = unloadingDetails.reduce(
-        (sum, item) => sum + num(item.claim),
-        0
-      );
-      const adjustmentRateMap = new Map(
-        (Array.isArray(adjustment_rates) ? adjustment_rates : [])
-          .map((item) => [String(item.adjustment_id || item.id || ""), num(item.company_rate)])
-          .filter(([id]) => id)
-      );
-      const adjustmentDetailsWithRates = adjustment_details.map((item) => ({
-        ...item,
-        company_rate:
-          adjustmentRateMap.has(String(item.id))
-            ? adjustmentRateMap.get(String(item.id))
-            : num(item.adjustment_company_rate) || requestedCompanyRate,
-      }));
-      if (!canEditCompanyRate) {
-        const changedRowRate = adjustmentDetailsWithRates.some(
-          (item) => num(item.company_rate) !== (num(item.adjustment_company_rate) || existingCompanyRate)
+      const [
+        adjustment_details,
+        unloadingDetails,
+        labourExpense,
+        meta,
+      ] =
+        await Promise.all([
+          getAdjustmentDetails(
+            numericOutwardId
+          ),
+
+          getUnloadingDetails(
+            numericOutwardId
+          ),
+
+          getApprovedLabourExpense(
+            numericOutwardId
+          ),
+
+          getOutwardMasterMeta(
+            outward
+          ),
+        ]);
+
+      const totalSettlementWeight =
+        adjustment_details.reduce(
+          (sum, item) =>
+            sum +
+            num(
+              item.settlement_weight
+            ),
+          0
         );
-        if (changedRowRate) {
-          return res.status(403).json({ error: "Company rate edit access required" });
-        }
-      }
-      const settlementWeight = adjustment_details.reduce(
-        (sum, item) => sum + num(item.settlement_weight),
-        0
-      );
-      const normalizedClaimDetails = stripEmptyDetailRows(
-        normalizeDetailRows(claim_details, claim_amount, "Claim")
-      );
-      const normalizedOtherDeductionDetails = stripEmptyDetailRows(
+
+      const claimDetails =
         normalizeDetailRows(
-          other_deduction_details,
-          other_deduction,
-          "Deduction"
-        )
-      );
-      const normalizedRowAdjustments = normalizeRowAdjustments(row_adjustments);
+          settlement?.claim_details,
+          settlement?.claim_amount,
+          "Claim"
+        );
 
-      const settlement = calculateSettlement({
-        dispatch_qty: dispatch_qty ?? num(outward.quantity || outward.weight),
+      const otherDeductionDetails =
+        normalizeDetailRows(
+          settlement?.other_deduction_details,
+          settlement?.other_deduction,
+          "Deduction"
+        );
+
+      const rowAdjustments =
+        normalizeRowAdjustments(
+          settlement?.row_adjustments
+        );
+
+      const defaultDispatch =
+        num(
+          outward.quantity ??
+            outward.weight
+        );
+
+      return res.json({
+        outward_id:
+          numericOutwardId,
+
+        outward_date:
+          outward.date,
+
+        voucher_no:
+          outward.outward_no ||
+          outward.voucher_no ||
+          outward.inv_no ||
+          null,
+
+        lorry_no:
+          outward.lorry_no ||
+          null,
+
+        buyer_name:
+          outward.buyer_name ||
+          outward.buyer ||
+          null,
+
+        consignee_name:
+          outward.consignee_name ||
+          null,
+
+        company_name:
+          meta?.company_name ||
+          outward.company_name ||
+          "",
+
+        account_name:
+          meta?.account_name ||
+          outward.company_account_name ||
+          null,
+
+        company_account_name:
+          meta?.account_name ||
+          outward.company_account_name ||
+          null,
+
+        accountName:
+          meta?.account_name ||
+          outward.company_account_name ||
+          null,
+
+        warehouse_name:
+          meta?.warehouse_name ||
+          outward.warehouse_name ||
+          null,
+
+        outward_warehouse_name:
+          meta?.warehouse_name ||
+          outward.warehouse_name ||
+          null,
+
+        warehouseName:
+          meta?.warehouse_name ||
+          outward.warehouse_name ||
+          null,
+
+        location_id:
+          outward.location_id ||
+          null,
+
+        location_name:
+          meta?.location_name ||
+          outward.location_name ||
+          null,
+
+        outward_location_name:
+          meta?.location_name ||
+          outward.location_name ||
+          null,
+
+        locationName:
+          meta?.location_name ||
+          outward.location_name ||
+          null,
+
+        product_name:
+          meta?.product_name ||
+          outward.product_name ||
+          outward.product ||
+          null,
+
+        outward_product_name:
+          meta?.product_name ||
+          outward.product_name ||
+          outward.product ||
+          null,
+
+        productName:
+          meta?.product_name ||
+          outward.product_name ||
+          outward.product ||
+          null,
+
+        outward_quantity:
+          defaultDispatch,
+
+        labour_expense:
+          labourExpense,
+
+        unloading_details:
+          unloadingDetails,
+
+        adjustment_details:
+          adjustment_details.map(
+            (item) => ({
+              ...item,
+
+              company_rate:
+                num(
+                  item.adjustment_company_rate
+                ) ||
+                num(
+                  settlement?.company_rate
+                ),
+
+              amount:
+                num(
+                  item.settlement_weight
+                ) *
+                (
+                  num(
+                    item.adjustment_company_rate
+                  ) ||
+                  num(
+                    settlement?.company_rate
+                  )
+                ),
+            })
+          ),
+
+        settlement: {
+          id:
+            settlement?._id
+              ? String(
+                  settlement._id
+                )
+              : null,
+
+          dispatch_qty:
+            settlement?.dispatch_qty ??
+            defaultDispatch,
+
+          unloading_qty:
+            settlement?.unloading_qty ??
+            totalSettlementWeight,
+
+          settlement_weight:
+            totalSettlementWeight,
+
+          billable_qty:
+            settlement?.billable_qty ??
+            (
+              unloadingDetails.reduce(
+                (sum, item) =>
+                  sum +
+                  num(
+                    item.shortage
+                  ),
+                0
+              ) || 0
+            ),
+
+          sale_rate:
+            settlement?.sale_rate ??
+            num(
+              outward.rate
+            ),
+
+          company_rate:
+            settlement?.company_rate ??
+            0,
+
+          average_rate:
+            settlement?.average_rate ??
+            0,
+
+          average_amount:
+            settlement?.average_amount ??
+            0,
+
+          sale_amount:
+            settlement?.sale_amount ??
+            0,
+
+          company_amount:
+            settlement?.company_amount ??
+            0,
+
+          gross_amount:
+            settlement?.gross_amount ??
+            settlement?.gross_profit ??
+            0,
+
+          receivable_amount:
+            settlement?.receivable_amount ??
+            settlement?.net_profit ??
+            0,
+
+          unloading_date:
+            settlement?.unloading_date ||
+            "",
+
+          freight:
+            settlement?.freight ??
+            0,
+
+          outward_labour_charges:
+            settlement?.outward_labour_charges ??
+            null,
+
+          other_charges:
+            settlement?.other_charges ??
+            0,
+
+          claim_amount:
+            settlement?.claim_amount ??
+            0,
+
+          other_deduction:
+            settlement?.other_deduction ??
+            0,
+
+          claim_details:
+            claimDetails,
+
+          other_deduction_details:
+            otherDeductionDetails,
+
+          row_adjustments:
+            rowAdjustments,
+
+          charge_bearer:
+            settlement?.charge_bearer ||
+            "self",
+
+          gross_profit:
+            settlement?.gross_profit ??
+            0,
+
+          net_profit:
+            settlement?.net_profit ??
+            0,
+
+          company_payable:
+            settlement?.company_payable ??
+            0,
+
+          narration:
+            settlement?.narration ||
+            "",
+        },
+      });
+    } catch (err) {
+      console.error(
+        "Outward settlement fetch failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
+      });
+    }
+  }
+);
+
+/*
+====================================================
+SAVE SETTLEMENT
+====================================================
+*/
+
+router.post(
+  "/save",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "settlement.view"
+      ) &&
+      !userHasPermission(
+        req.user,
+        "outward.edit"
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You do not have permission to save settlement",
+      });
+    }
+
+    try {
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const {
+        outward_id,
+        dispatch_qty,
         unloading_qty,
-        shortage_qty: unloadingShortageQty,
-        settlement_weight: settlementWeight,
         sale_rate,
-        company_rate: canEditCompanyRate ? company_rate : existingCompanyRate,
-        adjustment_details: adjustmentDetailsWithRates,
+        company_rate,
+        adjustment_rates,
         freight,
         outward_labour_charges,
         other_charges,
-        unloading_date,
         claim_amount,
         other_deduction,
-        claim_details: normalizedClaimDetails,
-        other_deduction_details: normalizedOtherDeductionDetails,
-        row_adjustments: normalizedRowAdjustments,
+        claim_details,
+        other_deduction_details,
+        shortage_qty,
+        row_adjustments,
+        unloading_date,
         charge_bearer,
-      });
+        narration,
+      } = req.body;
 
-      const persistAdjustmentRates = (callback) => {
-        if (!canEditCompanyRate || adjustmentDetailsWithRates.length === 0) {
-          callback();
-          return;
-        }
+      if (!outward_id) {
+        return res.status(400).json({
+          error:
+            "outward_id required",
+        });
+      }
 
-        let index = 0;
-        const next = () => {
-          if (index >= adjustmentDetailsWithRates.length) {
-            callback();
-            return;
-          }
-          const item = adjustmentDetailsWithRates[index];
-          index += 1;
-          db.run(
-            `UPDATE adjustment SET company_rate = ? WHERE id = ? AND outward_id = ?`,
-            [num(item.company_rate), item.id, outward_id],
-            (rateErr) => {
-              if (rateErr) return callback(rateErr);
-              next();
-            }
+      const outward =
+        await findOutward(
+          outward_id
+        );
+
+      if (!outward) {
+        return res.status(404).json({
+          error:
+            "Outward not found",
+        });
+      }
+
+      const numericOutwardId =
+        Number(
+          outward.legacy_id ??
+            outward.id ??
+            outward.sl_no
+        );
+
+      if (
+        !Number.isFinite(
+          numericOutwardId
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            "Invalid outward legacy id",
+        });
+      }
+
+      const existingSettlement =
+        await findSettlementForOutward(
+          outward
+        );
+
+      const canEditCompanyRate =
+        userHasPermission(
+          req.user,
+          "settlement.companyRate"
+        );
+
+      const existingCompanyRate =
+        num(
+          existingSettlement?.company_rate
+        );
+
+      const requestedCompanyRate =
+        num(
+          company_rate
+        );
+
+      if (
+        !canEditCompanyRate &&
+        requestedCompanyRate !==
+          existingCompanyRate
+      ) {
+        return res.status(403).json({
+          error:
+            "Company rate edit access required",
+        });
+      }
+
+      const adjustment_details =
+        await getAdjustmentDetails(
+          numericOutwardId
+        );
+
+      const unloadingDetails =
+        await getUnloadingDetails(
+          numericOutwardId
+        );
+
+      const unloadingShortageQty =
+        unloadingDetails.reduce(
+          (sum, item) =>
+            sum +
+            num(
+              item.shortage
+            ),
+          0
+        );
+
+      const adjustmentRateMap =
+        new Map(
+          (
+            Array.isArray(
+              adjustment_rates
+            )
+              ? adjustment_rates
+              : []
+          )
+            .map(
+              (item) => [
+                String(
+                  item.adjustment_id ||
+                    item.id ||
+                    ""
+                ),
+
+                num(
+                  item.company_rate
+                ),
+              ]
+            )
+            .filter(
+              ([id]) =>
+                Boolean(id)
+            )
+        );
+
+      const adjustmentDetailsWithRates =
+        adjustment_details.map(
+          (item) => ({
+            ...item,
+
+            company_rate:
+              adjustmentRateMap.has(
+                String(
+                  item.id
+                )
+              )
+                ? adjustmentRateMap.get(
+                    String(
+                      item.id
+                    )
+                  )
+                : num(
+                    item.adjustment_company_rate
+                  ) ||
+                  (
+                    canEditCompanyRate
+                      ? requestedCompanyRate
+                      : existingCompanyRate
+                  ),
+          })
+        );
+
+      if (
+        !canEditCompanyRate
+      ) {
+        const changed =
+          adjustmentDetailsWithRates.some(
+            (item) =>
+              num(
+                item.company_rate
+              ) !==
+              (
+                num(
+                  item.adjustment_company_rate
+                ) ||
+                existingCompanyRate
+              )
           );
-        };
-        next();
+
+        if (changed) {
+          return res.status(403).json({
+            error:
+              "Company rate edit access required",
+          });
+        }
+      }
+
+      const settlementWeight =
+        adjustmentDetailsWithRates.reduce(
+          (sum, item) =>
+            sum +
+            num(
+              item.settlement_weight
+            ),
+          0
+        );
+
+      const normalizedClaimDetails =
+        stripEmptyDetailRows(
+          normalizeDetailRows(
+            claim_details,
+            claim_amount,
+            "Claim"
+          )
+        );
+
+      const normalizedOtherDeductionDetails =
+        stripEmptyDetailRows(
+          normalizeDetailRows(
+            other_deduction_details,
+            other_deduction,
+            "Deduction"
+          )
+        );
+
+      const normalizedRowAdjustments =
+        normalizeRowAdjustments(
+          row_adjustments
+        );
+
+      const settlement =
+        calculateSettlement({
+          dispatch_qty:
+            dispatch_qty ??
+            num(
+              outward.quantity ??
+                outward.weight
+            ),
+
+          unloading_qty,
+
+          shortage_qty:
+            unloadingShortageQty,
+
+          settlement_weight:
+            settlementWeight,
+
+          sale_rate,
+
+          company_rate:
+            canEditCompanyRate
+              ? company_rate
+              : existingCompanyRate,
+
+          adjustment_details:
+            adjustmentDetailsWithRates,
+
+          freight,
+
+          outward_labour_charges,
+
+          other_charges,
+
+          unloading_date,
+
+          claim_amount,
+
+          other_deduction,
+
+          claim_details:
+            normalizedClaimDetails,
+
+          other_deduction_details:
+            normalizedOtherDeductionDetails,
+
+          row_adjustments:
+            normalizedRowAdjustments,
+
+          charge_bearer,
+        });
+
+      const settlementDoc = {
+        outward_id:
+          numericOutwardId,
+
+        dispatch_qty:
+          settlement.dispatch_qty,
+
+        unloading_qty:
+          settlement.unloading_qty,
+
+        billable_qty:
+          settlement.billable_qty,
+
+        sale_rate:
+          settlement.sale_rate,
+
+        company_rate:
+          settlement.company_rate,
+
+        average_rate:
+          settlement.average_rate,
+
+        average_amount:
+          settlement.average_amount,
+
+        sale_amount:
+          settlement.sale_amount,
+
+        company_amount:
+          settlement.company_amount,
+
+        gross_amount:
+          settlement.gross_amount,
+
+        receivable_amount:
+          settlement.receivable_amount,
+
+        unloading_date:
+          settlement.unloading_date,
+
+        freight:
+          settlement.freight,
+
+        outward_labour_charges:
+          settlement.outward_labour_charges,
+
+        other_charges:
+          settlement.other_charges,
+
+        claim_amount:
+          settlement.claim_amount,
+
+        other_deduction:
+          settlement.other_deduction,
+
+        claim_details:
+          settlement.claim_details,
+
+        other_deduction_details:
+          settlement.other_deduction_details,
+
+        row_adjustments:
+          settlement.row_adjustments,
+
+        charge_bearer:
+          settlement.charge_bearer,
+
+        gross_profit:
+          settlement.gross_profit,
+
+        net_profit:
+          settlement.net_profit,
+
+        company_payable:
+          settlement.company_payable,
+
+        narration:
+          narration || "",
+
+        updated_at:
+          new Date(),
       };
 
-      persistAdjustmentRates((ratePersistErr) => {
-        if (ratePersistErr) {
-          return res.status(500).json({ error: ratePersistErr.message });
-        }
+      if (
+        existingSettlement
+      ) {
+        await settlementCollection().updateOne(
+          {
+            _id:
+              existingSettlement._id,
+          },
+          {
+            $set:
+              settlementDoc,
 
-      db.get(
-        `SELECT id FROM outward_settlement WHERE outward_id = ?`,
-        [outward_id],
-        (checkErr, existing) => {
-          if (checkErr) {
-            return res.status(500).json({ error: checkErr.message });
+            $setOnInsert: {
+              created_at:
+                new Date(),
+            },
+          },
+          {
+            upsert:
+              false,
           }
+        );
+      } else {
+        await settlementCollection().insertOne({
+          ...settlementDoc,
 
-          const params = [
-            settlement.dispatch_qty,
-            settlement.unloading_qty,
-            settlement.billable_qty,
-            settlement.sale_rate,
-            settlement.company_rate,
-            settlement.average_rate,
-            settlement.average_amount,
-          settlement.sale_amount,
-          settlement.company_amount,
-          settlement.gross_amount,
-          settlement.receivable_amount,
-          settlement.unloading_date,
-          settlement.freight,
-            settlement.outward_labour_charges,
-            settlement.other_charges,
-            settlement.claim_amount,
-            settlement.other_deduction,
-            JSON.stringify(settlement.claim_details || []),
-            JSON.stringify(settlement.other_deduction_details || []),
-            JSON.stringify(settlement.row_adjustments || []),
-            settlement.charge_bearer,
-            settlement.gross_profit,
-            settlement.net_profit,
-            settlement.company_payable,
-            narration || "",
-          ];
+          created_at:
+            new Date(),
+        });
+      }
 
-          if (existing) {
-            db.run(
-              `
-              UPDATE outward_settlement SET
-                dispatch_qty = ?,
-                unloading_qty = ?,
-                billable_qty = ?,
-                sale_rate = ?,
-                company_rate = ?,
-                average_rate = ?,
-                average_amount = ?,
-                sale_amount = ?,
-                company_amount = ?,
-                gross_amount = ?,
-                receivable_amount = ?,
-                unloading_date = ?,
-                freight = ?,
-                outward_labour_charges = ?,
-                other_charges = ?,
-                claim_amount = ?,
-                other_deduction = ?,
-                claim_details = ?,
-                other_deduction_details = ?,
-                row_adjustments = ?,
-                charge_bearer = ?,
-                gross_profit = ?,
-                net_profit = ?,
-                company_payable = ?,
-                narration = ?,
-                updated_at = CURRENT_TIMESTAMP
-              WHERE outward_id = ?
-              `,
-              [...params, outward_id],
-              (updateErr) => {
-                if (updateErr) {
-                  return res.status(500).json({ error: updateErr.message });
-                }
-                return res.json({ message: "Settlement updated successfully" });
-              }
+      /*
+       * Save company rate against
+       * adjustment rows when allowed.
+       */
+      if (
+        canEditCompanyRate &&
+        adjustmentDetailsWithRates.length
+      ) {
+        for (
+          const item of
+            adjustmentDetailsWithRates
+        ) {
+          const adjustmentObjectId =
+            normalizeObjectId(
+              item.id
             );
-          } else {
-            db.run(
-              `
-              INSERT INTO outward_settlement (
-                outward_id,
-                dispatch_qty,
-                unloading_qty,
-                billable_qty,
-                sale_rate,
-                company_rate,
-                average_rate,
-                average_amount,
-                sale_amount,
-                company_amount,
-                gross_amount,
-                receivable_amount,
-                unloading_date,
-                freight,
-                outward_labour_charges,
-                other_charges,
-                claim_amount,
-                other_deduction,
-                claim_details,
-                other_deduction_details,
-                row_adjustments,
-                charge_bearer,
-                gross_profit,
-                net_profit,
-                company_payable,
-                narration
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              `,
-              [outward_id, ...params],
-              (insertErr) => {
-                if (insertErr) {
-                  return res.status(500).json({ error: insertErr.message });
-                }
-                return res.json({ message: "Settlement saved successfully" });
+
+          if (
+            adjustmentObjectId
+          ) {
+            await adjustmentCollection().updateOne(
+              {
+                _id:
+                  adjustmentObjectId,
+
+                outward_id:
+                  numericOutwardId,
+              },
+              {
+                $set: {
+                  company_rate:
+                    num(
+                      item.company_rate
+                    ),
+
+                  updated_at:
+                    new Date(),
+                },
               }
             );
           }
         }
-      );
+      }
+
+      return res.json({
+        message:
+          existingSettlement
+            ? "Settlement updated successfully"
+            : "Settlement saved successfully",
+
+        outward_id:
+          numericOutwardId,
+
+        settlement:
+          settlementDoc,
+
+        source:
+          "mongodb",
       });
-    } catch (detailsError) {
-      return res.status(500).json({ error: detailsError.message });
+    } catch (err) {
+      console.error(
+        "Settlement save failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
+      });
     }
-  });
-});
-
-router.post("/adjustment/:id/whatsapp-sent", (req, res) => {
-  const sentAt = new Date().toISOString();
-  db.run(
-    `UPDATE adjustment SET whatsapp_sent_at = ? WHERE id = ?`,
-    [sentAt, req.params.id],
-    function onUpdate(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!this.changes) return res.status(404).json({ error: "Adjustment not found" });
-      return res.json({ whatsapp_sent_at: sentAt });
-    }
-  );
-});
-
-router.get("/report/list", (req, res) => {
-  const { from_date, to_date, company_id, warehouse_id } = req.query;
-
-  const where = ["1=1"];
-  const params = [];
-
-  if (from_date) {
-    where.push("o.date >= ?");
-    params.push(from_date);
   }
-  if (to_date) {
-    where.push("o.date <= ?");
-    params.push(to_date);
-  }
-  if (company_id) {
-    where.push("o.company_id = ?");
-    params.push(company_id);
-  }
-  if (warehouse_id) {
-    where.push("o.warehouse_id = ?");
-    params.push(warehouse_id);
-  }
+);
 
-  const sql = `
-    SELECT
-      s.id,
-      s.outward_id,
-      o.date,
-      o.voucher_no,
-      o.inv_no,
-      o.lorry_no,
-      o.quantity AS outward_qty,
-      o.company_id,
-      o.company_account_id,
-      o.warehouse_id,
-      o.location_id,
-      o.product_id,
-      c.name AS company_name,
-      COALESCE(ca.account_name, '') AS account_name,
-      COALESCE(w.name, '') AS warehouse_name,
-      COALESCE(o.location_id, w.location_id) AS effective_location_id,
-      COALESCE(l.name, wl.name, '') AS location_name,
-      COALESCE(p.name, '') AS product_name,
-      o.buyer_name,
-      o.consignee_name,
-      s.dispatch_qty,
-      s.unloading_qty,
-      s.billable_qty,
-      s.sale_rate,
-      s.company_rate,
-      s.average_rate,
-      s.average_amount,
-      s.sale_amount,
-      s.company_amount,
-      s.gross_amount,
-      s.receivable_amount,
-      s.unloading_date,
-      s.freight,
-      s.outward_labour_charges,
-      s.other_charges,
-      s.claim_amount,
-      s.other_deduction,
-      s.claim_details,
-      s.other_deduction_details,
-      s.row_adjustments,
-      s.charge_bearer,
-      s.gross_profit,
-      s.net_profit,
-      s.company_payable,
-      s.narration
-    FROM outward_settlement s
-    INNER JOIN outward o ON CAST(o.id AS TEXT) = CAST(s.outward_id AS TEXT)
-    LEFT JOIN companies c ON CAST(o.company_id AS TEXT) = CAST(c.id AS TEXT)
-    LEFT JOIN company_accounts ca ON CAST(o.company_account_id AS TEXT) = CAST(ca.id AS TEXT)
-    LEFT JOIN warehouses w ON CAST(o.warehouse_id AS TEXT) = CAST(w.id AS TEXT)
-    LEFT JOIN locations l ON CAST(o.location_id AS TEXT) = CAST(l.id AS TEXT)
-    LEFT JOIN locations wl ON CAST(w.location_id AS TEXT) = CAST(wl.id AS TEXT)
-    LEFT JOIN products p ON CAST(o.product_id AS TEXT) = CAST(p.id AS TEXT)
-    WHERE ${where.join(" AND ")}
-    ORDER BY o.date DESC, s.id DESC
-  `;
+/*
+====================================================
+WHATSAPP SENT
+====================================================
+*/
 
-  db.all(sql, params, async (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
+router.post(
+  "/adjustment/:id/whatsapp-sent",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "settlement.view"
+      ) &&
+      !userHasPermission(
+        req.user,
+        "adjustment.manage"
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You do not have permission",
+      });
     }
 
     try {
-      const enrichedRows = await Promise.all(
-        (rows || []).map(async (row) => {
-          const outwardMeta = await getOutwardMasterMeta(row.outward_id);
-          const adjustment_details = await getAdjustmentDetails(row.outward_id);
-          const unloadingDetails = await getUnloadingDetails(row.outward_id);
-          const settlement_weight = adjustment_details.reduce(
-            (sum, item) => sum + num(item.settlement_weight),
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const adjustmentId =
+        normalizeObjectId(
+          req.params.id
+        );
+
+      if (!adjustmentId) {
+        return res.status(400).json({
+          error:
+            "Invalid adjustment id",
+        });
+      }
+
+      const sentAt =
+        new Date();
+
+      const result =
+        await adjustmentCollection().updateOne(
+          {
+            _id:
+              adjustmentId,
+          },
+          {
+            $set: {
+              whatsapp_sent_at:
+                sentAt,
+
+              updated_at:
+                sentAt,
+            },
+          }
+        );
+
+      if (
+        !result.matchedCount
+      ) {
+        return res.status(404).json({
+          error:
+            "Adjustment not found",
+        });
+      }
+
+      return res.json({
+        whatsapp_sent_at:
+          sentAt,
+      });
+    } catch (err) {
+      console.error(
+        "WhatsApp sent update failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
+      });
+    }
+  }
+);
+
+/*
+====================================================
+SETTLEMENT REPORT LIST
+====================================================
+*/
+
+router.get(
+  "/report/list",
+  async (req, res) => {
+    if (
+      !userHasPermission(
+        req.user,
+        "settlement.view"
+      ) &&
+      !userHasPermission(
+        req.user,
+        "report.outwardSettlement"
+      ) &&
+      !userHasPermission(
+        req.user,
+        "outward.view"
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You do not have permission to view outward settlement report",
+      });
+    }
+
+    try {
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const {
+        from_date,
+        to_date,
+        company_id,
+        warehouse_id,
+      } = req.query;
+
+      const filter = {};
+
+      if (
+        from_date ||
+        to_date
+      ) {
+        filter.date = {};
+
+        if (from_date) {
+          const from =
+            new Date(
+              `${from_date}T00:00:00`
+            );
+
+          if (
+            !Number.isNaN(
+              from.getTime()
+            )
+          ) {
+            filter.date.$gte =
+              from;
+          }
+        }
+
+        if (to_date) {
+          const to =
+            new Date(
+              `${to_date}T23:59:59.999`
+            );
+
+          if (
+            !Number.isNaN(
+              to.getTime()
+            )
+          ) {
+            filter.date.$lte =
+              to;
+          }
+        }
+
+        if (
+          !Object.keys(
+            filter.date
+          ).length
+        ) {
+          delete filter.date;
+        }
+      }
+
+      if (
+        company_id
+      ) {
+        const conditions =
+          [];
+
+        const n =
+          Number(
+            company_id
+          );
+
+        if (
+          Number.isFinite(
+            n
+          )
+        ) {
+          conditions.push({
+            company_id:
+              n,
+          });
+        }
+
+        if (
+          mongoose.Types.ObjectId.isValid(
+            String(
+              company_id
+            )
+          )
+        ) {
+          conditions.push({
+            company_id:
+              String(
+                company_id
+              ),
+          });
+        }
+
+        if (
+          conditions.length
+        ) {
+          filter.$or =
+            conditions;
+        }
+      }
+
+      if (
+        warehouse_id
+      ) {
+        const n =
+          Number(
+            warehouse_id
+          );
+
+        if (
+          Number.isFinite(
+            n
+          )
+        ) {
+          filter.warehouse_id =
+            n;
+        } else {
+          filter.warehouse_id =
+            String(
+              warehouse_id
+            );
+        }
+      }
+
+      const outwardRows =
+        await MongoOutward.find(
+          filter
+        )
+          .sort({
+            date: -1,
+            legacy_id: -1,
+            _id: -1,
+          })
+          .lean();
+
+      const result =
+        [];
+
+      for (
+        const outward of
+          outwardRows
+      ) {
+        const outwardId =
+          Number(
+            outward.legacy_id ??
+              outward.id ??
+              outward.sl_no
+          );
+
+        if (
+          !Number.isFinite(
+            outwardId
+          )
+        ) {
+          continue;
+        }
+
+        const settlement =
+          await findSettlementForOutward(
+            outward
+          );
+
+        if (
+          !settlement
+        ) {
+          continue;
+        }
+
+        const meta =
+          await getOutwardMasterMeta(
+            outward
+          );
+
+        const adjustmentDetails =
+          await getAdjustmentDetails(
+            outwardId
+          );
+
+        const unloadingDetails =
+          await getUnloadingDetails(
+            outwardId
+          );
+
+        const dispatchQty =
+          num(
+            settlement.dispatch_qty
+          );
+
+        const settlementWeight =
+          adjustmentDetails.reduce(
+            (sum, item) =>
+              sum +
+              num(
+                item.settlement_weight
+              ),
             0
           );
-          const dispatchQty = num(row.dispatch_qty);
-          const unloadingShortageQty = unloadingDetails.reduce(
-            (sum, item) => sum + num(item.shortage),
+
+        const unloadingShortageQty =
+          unloadingDetails.reduce(
+            (sum, item) =>
+              sum +
+              num(
+                item.shortage
+              ),
             0
           );
-          const shortage_qty =
-            unloadingShortageQty || num(row.billable_qty) || Math.max(dispatchQty - num(row.unloading_qty), 0);
-          const average_rate = num(row.average_rate);
-          const average_amount = num(row.average_amount);
-          const claim_amount =
-            num(row.claim_amount) || unloadingDetails.reduce((sum, item) => sum + num(item.claim), 0);
-          const other_deduction =
-            num(row.other_deduction) || unloadingDetails.reduce((sum, item) => sum + num(item.other_deduction), 0);
-          const unloadingDate = row.unloading_date || "";
-          const claim_details = normalizeDetailRows(row.claim_details, claim_amount, "Claim");
-          const other_deduction_details = normalizeDetailRows(
-            row.other_deduction_details,
+
+        const shortage_qty =
+          unloadingShortageQty ||
+          num(
+            settlement.billable_qty
+          ) ||
+          Math.max(
+            dispatchQty -
+              num(
+                settlement.unloading_qty
+              ),
+            0
+          );
+
+        const claim_amount =
+          num(
+            settlement.claim_amount
+          ) ||
+          unloadingDetails.reduce(
+            (sum, item) =>
+              sum +
+              num(
+                item.claim
+              ),
+            0
+          );
+
+        const other_deduction =
+          num(
+            settlement.other_deduction
+          ) ||
+          unloadingDetails.reduce(
+            (sum, item) =>
+              sum +
+              num(
+                item.other_deduction
+              ),
+            0
+          );
+
+        const claim_details =
+          normalizeDetailRows(
+            settlement.claim_details,
+            claim_amount,
+            "Claim"
+          );
+
+        const other_deduction_details =
+          normalizeDetailRows(
+            settlement.other_deduction_details,
             other_deduction,
             "Deduction"
           );
 
-          const rowAdjustments = normalizeRowAdjustments(row.row_adjustments);
-          const rowAdjById = rowAdjustments.reduce((acc, item) => {
-            acc[String(item.adjustment_id)] = item;
-            return acc;
-          }, {});
+        const rowAdjustments =
+          normalizeRowAdjustments(
+            settlement.row_adjustments
+          );
 
-          const mappedAdjustmentDetails = adjustment_details.map((item, index) => {
-            const rowCompanyRate = num(item.adjustment_company_rate) || num(row.company_rate);
-            const weight = num(item.settlement_weight);
-            const amount = weight * rowCompanyRate;
-            const perMtFreight = dispatchQty > 0 ? num(row.freight) / dispatchQty : 0;
-            const perMtLabour = dispatchQty > 0 ? num(row.outward_labour_charges) / dispatchQty : 0;
-            const perMtOther = dispatchQty > 0 ? num(row.other_charges) / dispatchQty : 0;
-            const shortQtyPerLine =
-              dispatchQty > 0 ? (weight / dispatchQty) * shortage_qty : 0;
-            const autoShortAmount = shortQtyPerLine * rowCompanyRate;
-            const autoClaim =
-              dispatchQty > 0 ? (weight / dispatchQty) * claim_amount : 0;
-            const autoFreight = weight * perMtFreight;
-            const autoLabour = weight * perMtLabour;
-            const autoOther = weight * perMtOther;
-            const manual = rowAdjById[String(item.id)] || {};
+        const rowAdjById =
+          rowAdjustments.reduce(
+            (acc, item) => {
+              acc[
+                String(
+                  item.adjustment_id
+                )
+              ] = item;
 
-            const short_amount = hasOwn(manual, "short_amt") ? num(manual.short_amt) : autoShortAmount;
-            const claim_per_line = hasOwn(manual, "s_amount") ? num(manual.s_amount) : autoClaim;
-            const deduction_per_line = hasOwn(manual, "c_deduction") ? num(manual.c_deduction) : 0;
-            const freight = hasOwn(manual, "freight") ? num(manual.freight) : autoFreight;
-            const labour_charges = hasOwn(manual, "labour_chgs") ? num(manual.labour_chgs) : autoLabour;
-            const other_charges = hasOwn(manual, "other_chgs") ? num(manual.other_chgs) : autoOther;
-            const net_payable =
-              amount - short_amount - claim_per_line - deduction_per_line - freight - labour_charges - other_charges;
+              return acc;
+            },
+            {}
+          );
 
-            return {
-              ...item,
-              sr_no: index + 1,
-              company_rate: rowCompanyRate,
-              shortQtyPerLine,
-              shortAmount: short_amount,
-              short_amount,
-              claim_per_line,
-              deduction_per_line,
-              freight,
-              labour_charges,
-              other_charges,
-              amount,
-              net_payable,
-            };
-          });
+        const mappedAdjustmentDetails =
+          adjustmentDetails.map(
+            (item, index) => {
+              const rowCompanyRate =
+                num(
+                  item.adjustment_company_rate
+                ) ||
+                num(
+                  settlement.company_rate
+                );
 
-          const company_payable = mappedAdjustmentDetails.reduce(
-            (sum, item) => sum + num(item.net_payable),
+              const weight =
+                num(
+                  item.settlement_weight
+                );
+
+              const amount =
+                weight *
+                rowCompanyRate;
+
+              const perMtFreight =
+                dispatchQty >
+                0
+                  ? num(
+                      settlement.freight
+                    ) /
+                    dispatchQty
+                  : 0;
+
+              const perMtLabour =
+                dispatchQty >
+                0
+                  ? num(
+                      settlement.outward_labour_charges
+                    ) /
+                    dispatchQty
+                  : 0;
+
+              const perMtOther =
+                dispatchQty >
+                0
+                  ? num(
+                      settlement.other_charges
+                    ) /
+                    dispatchQty
+                  : 0;
+
+              const shortQtyPerLine =
+                dispatchQty >
+                0
+                  ? (weight /
+                      dispatchQty) *
+                    shortage_qty
+                  : 0;
+
+              const autoShortAmount =
+                shortQtyPerLine *
+                rowCompanyRate;
+
+              const autoClaim =
+                dispatchQty >
+                0
+                  ? (weight /
+                      dispatchQty) *
+                    claim_amount
+                  : 0;
+
+              const autoFreight =
+                weight *
+                perMtFreight;
+
+              const autoLabour =
+                weight *
+                perMtLabour;
+
+              const autoOther =
+                weight *
+                perMtOther;
+
+              const manual =
+                rowAdjById[
+                  String(
+                    item.id
+                  )
+                ] || {};
+
+              const short_amount =
+                hasOwn(
+                  manual,
+                  "short_amt"
+                )
+                  ? num(
+                      manual.short_amt
+                    )
+                  : autoShortAmount;
+
+              const claim_per_line =
+                hasOwn(
+                  manual,
+                  "s_amount"
+                )
+                  ? num(
+                      manual.s_amount
+                    )
+                  : autoClaim;
+
+              const deduction_per_line =
+                hasOwn(
+                  manual,
+                  "c_deduction"
+                )
+                  ? num(
+                      manual.c_deduction
+                    )
+                  : 0;
+
+              const freight =
+                hasOwn(
+                  manual,
+                  "freight"
+                )
+                  ? num(
+                      manual.freight
+                    )
+                  : autoFreight;
+
+              const labour_charges =
+                hasOwn(
+                  manual,
+                  "labour_chgs"
+                )
+                  ? num(
+                      manual.labour_chgs
+                    )
+                  : autoLabour;
+
+              const other_charges =
+                hasOwn(
+                  manual,
+                  "other_chgs"
+                )
+                  ? num(
+                      manual.other_chgs
+                    )
+                  : autoOther;
+
+              const net_payable =
+                amount -
+                short_amount -
+                claim_per_line -
+                deduction_per_line -
+                freight -
+                labour_charges -
+                other_charges;
+
+              return {
+                ...item,
+
+                sr_no:
+                  index + 1,
+
+                company_rate:
+                  rowCompanyRate,
+
+                shortQtyPerLine,
+
+                shortAmount:
+                  short_amount,
+
+                short_amount,
+
+                claim_per_line,
+
+                deduction_per_line,
+
+                freight,
+
+                labour_charges,
+
+                other_charges,
+
+                amount,
+
+                net_payable,
+              };
+            }
+          );
+
+        const company_payable =
+          mappedAdjustmentDetails.reduce(
+            (sum, item) =>
+              sum +
+              num(
+                item.net_payable
+              ),
             0
           );
 
-          const saleAmount = num(row.sale_amount) || dispatchQty * num(row.sale_rate);
-          const saleShortageAmount = mappedAdjustmentDetails.reduce((sum, item) => {
-            return sum + num(item.shortQtyPerLine) * num(row.sale_rate);
-          }, 0);
-          const net_sale =
-            saleAmount -
-            saleShortageAmount -
-            claim_amount -
-            num(row.outward_labour_charges) -
-            num(row.freight) -
-            other_deduction -
-            num(row.other_charges);
-          const purchase_amount = mappedAdjustmentDetails.reduce((sum, item) => sum + num(item.amount), 0);
-          const receivable_amount = net_sale - company_payable;
+        const saleAmount =
+          num(
+            settlement.sale_amount
+          ) ||
+          dispatchQty *
+            num(
+              settlement.sale_rate
+            );
 
-          const firstAdj = mappedAdjustmentDetails[0] || {};
-          const firstUnload = unloadingDetails[0] || {};
-          const accountName = firstNonEmpty(
-            row.account_name,
-            outwardMeta?.account_name,
+        const saleShortageAmount =
+          mappedAdjustmentDetails.reduce(
+            (sum, item) =>
+              sum +
+              num(
+                item.shortQtyPerLine
+              ) *
+                num(
+                  settlement.sale_rate
+                ),
+            0
+          );
+
+        const net_sale =
+          saleAmount -
+          saleShortageAmount -
+          claim_amount -
+          num(
+            settlement.outward_labour_charges
+          ) -
+          num(
+            settlement.freight
+          ) -
+          other_deduction -
+          num(
+            settlement.other_charges
+          );
+
+        const purchase_amount =
+          mappedAdjustmentDetails.reduce(
+            (sum, item) =>
+              sum +
+              num(
+                item.amount
+              ),
+            0
+          );
+
+        const receivable_amount =
+          net_sale -
+          company_payable;
+
+        const firstAdj =
+          mappedAdjustmentDetails[0] ||
+          {};
+
+        const firstUnload =
+          unloadingDetails[0] ||
+          {};
+
+        const accountName =
+          firstNonEmpty(
+            meta?.account_name,
             firstAdj.company_account_name,
-            row.company_name,
-            outwardMeta?.company_name
-          );
-          const warehouseName = firstNonEmpty(
-            row.warehouse_name,
-            outwardMeta?.warehouse_name,
-            firstAdj.warehouse_name
-          );
-          const locationName = firstNonEmpty(
-            row.location_name,
-            outwardMeta?.location_name,
-            firstAdj.location_name
-          );
-          const productName = firstNonEmpty(
-            row.product_name,
-            outwardMeta?.product_name,
-            firstAdj.product_name,
-            firstUnload.product_name
+            settlement.account_name,
+            outward.company_account_name
           );
 
-          return {
-            ...row,
-            account_name: accountName,
-            company_account_name: accountName,
-            accountName: accountName,
-            warehouse_name: warehouseName,
-            warehouseName: warehouseName,
-            outward_warehouse_name: warehouseName,
-            location_name: locationName,
-            locationName: locationName,
-            outward_location_name: locationName,
-            product_name: productName,
-            productName: productName,
-            outward_product_name: productName,
-            shortage_qty,
-            settlement_weight,
-            sale_amount: saleAmount,
-            company_amount: purchase_amount || num(row.company_amount),
-            gross_amount: net_sale,
-            company_payable,
-            receivable_amount,
-            average_rate,
-            average_amount,
-            claim_amount,
-            other_deduction,
-            unloading_date: unloadingDate,
-            claim_details,
-            other_deduction_details,
-            row_adjustments: rowAdjustments,
-            adjustment_details: mappedAdjustmentDetails,
-          };
-        })
+        const warehouseName =
+          firstNonEmpty(
+            meta?.warehouse_name,
+            firstAdj.warehouse_name,
+            outward.warehouse_name
+          );
+
+        const locationName =
+          firstNonEmpty(
+            meta?.location_name,
+            firstAdj.location_name,
+            outward.location_name
+          );
+
+        const productName =
+          firstNonEmpty(
+            meta?.product_name,
+            firstAdj.product_name,
+            firstUnload.product_name,
+            outward.product_name,
+            outward.product
+          );
+
+        result.push({
+          ...outward,
+
+          id:
+            outwardId,
+
+          mongo_id:
+            outward._id
+              ? String(
+                  outward._id
+                )
+              : null,
+
+          settlement_id:
+            settlement._id
+              ? String(
+                  settlement._id
+                )
+              : null,
+
+          account_name:
+            accountName,
+
+          company_account_name:
+            accountName,
+
+          accountName:
+            accountName,
+
+          warehouse_name:
+            warehouseName,
+
+          warehouseName:
+            warehouseName,
+
+          outward_warehouse_name:
+            warehouseName,
+
+          location_name:
+            locationName,
+
+          locationName:
+            locationName,
+
+          outward_location_name:
+            locationName,
+
+          product_name:
+            productName,
+
+          productName:
+            productName,
+
+          outward_product_name:
+            productName,
+
+          shortage_qty,
+
+          settlement_weight:
+
+            settlementWeight,
+
+          sale_amount:
+            saleAmount,
+
+          company_amount:
+            purchase_amount ||
+            num(
+              settlement.company_amount
+            ),
+
+          gross_amount:
+            net_sale,
+
+          company_payable,
+
+          receivable_amount,
+
+          average_rate:
+            num(
+              settlement.average_rate
+            ),
+
+          average_amount:
+            num(
+              settlement.average_amount
+            ),
+
+          claim_amount,
+
+          other_deduction,
+
+          unloading_date:
+            settlement.unloading_date ||
+            "",
+
+          claim_details,
+
+          other_deduction_details,
+
+          row_adjustments:
+            rowAdjustments,
+
+          adjustment_details:
+            mappedAdjustmentDetails,
+        });
+      }
+
+      return res.json(
+        result
+      );
+    } catch (err) {
+      console.error(
+        "Outward settlement report failed:",
+        err
       );
 
-      return res.json(enrichedRows);
-    } catch (detailsError) {
-      return res.status(500).json({ error: detailsError.message });
+      return res.status(500).json({
+        error:
+          err.message,
+      });
     }
-  });
-});
+  }
+);
 
 module.exports = router;
