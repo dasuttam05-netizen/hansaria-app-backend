@@ -46,8 +46,6 @@ const allowedOrigins = new Set(
     process.env.FRONTEND_URL,
     process.env.FRONTEND_ORIGIN,
     "https://hansaria-app-frontend.vercel.app",
-    "http://localhost:3000",
-    "http://localhost:3001",
   ]
     .filter(Boolean)
     .map((origin) => origin.replace(/\/+$/, ""))
@@ -2487,11 +2485,7 @@ function startServer(port) {
     HOST,
     () => {
       console.log(
-        `Backend running at http://${
-          HOST === "0.0.0.0"
-            ? "localhost"
-            : HOST
-        }:${port}`
+        `Backend running on ${process.env.RENDER_EXTERNAL_URL || `${HOST}:${port}`}`
       );
     }
   );
