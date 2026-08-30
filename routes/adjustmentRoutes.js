@@ -1,900 +1,3362 @@
 const express = require("express");
+const mongoose = require("mongoose");
+
 const router = express.Router();
-const db = require("../db");
-const { resolveEntryMasterIds } = require("../helpers/sqliteMasterResolver");
-const { calculateAppliedShortageRate, calculateShortageQty } = require("./shortageHelper");
-const { Company, CompanyAccount } = require("../mongo");
 
-function calculateMonthSlab(inwardDateStr, outwardDateStr) {
-  const inwardDate = new Date(inwardDateStr);
-  const outwardDate = new Date(outwardDateStr);
+const {
+  Inward: MongoInward,
+  Outward: MongoOutward,
+  Company: MongoCompany,
+  CompanyAccount: MongoCompanyAccount,
+  Warehouse: MongoWarehouse,
+  isMongoMirrorReady,
+} = require("../db-mongodb");
 
-  const msPerDay = 1000 * 60 * 60 * 24;
-  const daysDiff = Math.floor((outwardDate - inwardDate) / msPerDay);
+const {
+  userHasPermission,
+} = require("../middleware/auth");
 
-  let monthsDiff = Math.floor(daysDiff / 30) + 1;
-  if (monthsDiff < 1) monthsDiff = 1;
+const {
+  calculateAppliedShortageRate,
+  calculateShortageQty,
+} = require("./shortageHelper");
 
-  return {
-    daysDiff: daysDiff < 0 ? 0 : daysDiff,
-    monthsDiff,
-  };
+/*
+====================================================
+MONGO HELPERS
+====================================================
+*/
+
+function requireMongo(res) {
+  if (!isMongoMirrorReady()) {
+    res.status(503).json({
+      error:
+        "MongoDB is not connected. Please try again in a moment.",
+    });
+
+    return false;
+  }
+
+  return true;
+}
+
+function getDb() {
+  if (
+    !mongoose.connection.db
+  ) {
+    throw new Error(
+      "MongoDB database handle is not available"
+    );
+  }
+
+  return mongoose.connection.db;
+}
+
+function getAdjustmentCollection() {
+  return getDb().collection(
+    "adjustments"
+  );
+}
+
+function getPaltiCollection() {
+  return getDb().collection(
+    "paltilorryentries"
+  );
 }
 
 function normalizeQty(value) {
   const qty = Number(value);
-  if (!Number.isFinite(qty)) return 0;
-  return Number(qty.toFixed(4));
+
+  if (!Number.isFinite(qty)) {
+    return 0;
+  }
+
+  return Number(
+    qty.toFixed(4)
+  );
 }
 
 function addQty(...values) {
-  return normalizeQty(values.reduce((sum, value) => sum + normalizeQty(value), 0));
+  return normalizeQty(
+    values.reduce(
+      (sum, value) =>
+        sum +
+        normalizeQty(
+          value
+        ),
+      0
+    )
+  );
 }
 
 const EPS = 0.0001;
 
 function getPaltiQty(row) {
-  const balance = normalizeQty(row?.balance);
-  if (balance > 0) return balance;
-  return normalizeQty(row?.new_weight);
+  const balance =
+    normalizeQty(
+      row?.balance
+    );
+
+  if (balance > 0) {
+    return balance;
+  }
+
+  return normalizeQty(
+    row?.new_weight
+  );
 }
 
-function makeAdjustmentError(message, details = {}, status = 400) {
-  const err = new Error(message);
-  err.status = status;
-  err.details = details;
-  return err;
+function makeAdjustmentError(
+  message,
+  details = {},
+  status = 400
+) {
+  const error =
+    new Error(message);
+
+  error.status =
+    status;
+
+  error.details =
+    details;
+
+  return error;
 }
 
-function pickShortagePercent(row) {
-  const mongoCompanyPercent = null;
-  const sqlitePercent = row?.shortage_percent;
-  return sqlitePercent;
+function normalizeText(value) {
+  return String(
+    value ?? ""
+  ).trim();
 }
 
-function pickEffectiveShortagePercent(...values) {
-  for (const value of values) {
-    if (value !== null && value !== undefined && String(value).trim() !== "") {
-      return value;
+function isValidObjectId(
+  value
+) {
+  return mongoose.Types.ObjectId.isValid(
+    String(value || "")
+  );
+}
+
+/*
+====================================================
+FLEXIBLE LEGACY/MONGO ID FILTER
+====================================================
+*/
+
+function buildFlexibleIdFilter(
+  value
+) {
+  const raw =
+    String(
+      value ?? ""
+    ).trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  const conditions = [];
+
+  if (
+    mongoose.Types.ObjectId.isValid(
+      raw
+    )
+  ) {
+    conditions.push({
+      _id:
+        new mongoose.Types.ObjectId(
+          raw
+        ),
+    });
+  }
+
+  const numeric =
+    Number(raw);
+
+  if (
+    Number.isFinite(
+      numeric
+    )
+  ) {
+    conditions.push({
+      legacy_id:
+        numeric,
+    });
+
+    conditions.push({
+      id:
+        numeric,
+    });
+
+    conditions.push({
+      sl_no:
+        numeric,
+    });
+  }
+
+  if (
+    conditions.length === 1
+  ) {
+    return conditions[0];
+  }
+
+  return {
+    $or:
+      conditions,
+  };
+}
+
+function buildMongoIdCandidates(
+  value
+) {
+  const filter =
+    buildFlexibleIdFilter(
+      value
+    );
+
+  if (!filter) {
+    return [];
+  }
+
+  if (filter.$or) {
+    return filter.$or;
+  }
+
+  return [filter];
+}
+
+/*
+====================================================
+DATES / SHORTAGE
+====================================================
+*/
+
+function calculateMonthSlab(
+  inwardDateStr,
+  outwardDateStr
+) {
+  const inwardDate =
+    new Date(
+      inwardDateStr
+    );
+
+  const outwardDate =
+    new Date(
+      outwardDateStr
+    );
+
+  if (
+    Number.isNaN(
+      inwardDate.getTime()
+    ) ||
+    Number.isNaN(
+      outwardDate.getTime()
+    )
+  ) {
+    return {
+      daysDiff: 0,
+      monthsDiff: 1,
+    };
+  }
+
+  const msPerDay =
+    1000 *
+    60 *
+    60 *
+    24;
+
+  const daysDiff = Math.floor(
+    (
+      outwardDate -
+      inwardDate
+    ) /
+      msPerDay
+  );
+
+  let monthsDiff =
+    Math.floor(
+      daysDiff / 30
+    ) + 1;
+
+  if (
+    monthsDiff < 1
+  ) {
+    monthsDiff = 1;
+  }
+
+  return {
+    daysDiff:
+      daysDiff < 0
+        ? 0
+        : daysDiff,
+
+    monthsDiff,
+  };
+}
+
+/*
+====================================================
+ADJUSTMENT ACCESS
+====================================================
+*/
+
+function canViewAdjustment(
+  user
+) {
+  return (
+    userHasPermission(
+      user,
+      "adjustment.manage"
+    ) ||
+    userHasPermission(
+      user,
+      "inward.view"
+    ) ||
+    userHasPermission(
+      user,
+      "outward.view"
+    )
+  );
+}
+
+function canManageAdjustment(
+  user
+) {
+  return userHasPermission(
+    user,
+    "adjustment.manage"
+  );
+}
+
+/*
+====================================================
+ADJUSTMENT QUERIES
+====================================================
+*/
+
+async function getAdjustedQtyForOutward(
+  outwardId,
+  session = null,
+  excludeAdjustmentId = null
+) {
+  const collection =
+    getAdjustmentCollection();
+
+  const filter = {
+    outward_id:
+      Number(
+        outwardId
+      ),
+  };
+
+  if (
+    excludeAdjustmentId
+  ) {
+    filter._id = {
+      $ne:
+        excludeAdjustmentId,
+    };
+  }
+
+  const result =
+    await collection
+      .aggregate(
+        [
+          {
+            $match:
+              filter,
+          },
+
+          {
+            $group: {
+              _id: null,
+
+              total: {
+                $sum: {
+                  $ifNull: [
+                    "$qty",
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ],
+        session
+          ? {
+              session,
+            }
+          : undefined
+      )
+      .toArray();
+
+  return normalizeQty(
+    result[0]?.total
+  );
+}
+
+async function getAdjustedQtyForInward(
+  inwardId,
+  session = null,
+  excludeAdjustmentId = null
+) {
+  const collection =
+    getAdjustmentCollection();
+
+  const filter = {
+    inward_id:
+      Number(
+        inwardId
+      ),
+  };
+
+  if (
+    excludeAdjustmentId
+  ) {
+    filter._id = {
+      $ne:
+        excludeAdjustmentId,
+    };
+  }
+
+  const result =
+    await collection
+      .aggregate(
+        [
+          {
+            $match:
+              filter,
+          },
+
+          {
+            $group: {
+              _id: null,
+
+              total: {
+                $sum: {
+                  $ifNull: [
+                    "$qty",
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ],
+        session
+          ? {
+              session,
+            }
+          : undefined
+      )
+      .toArray();
+
+  return normalizeQty(
+    result[0]?.total
+  );
+}
+
+async function getAdjustedQtyForPalti(
+  paltiId,
+  session = null,
+  excludeAdjustmentId = null
+) {
+  const collection =
+    getAdjustmentCollection();
+
+  const filter = {
+    palti_lorry_id:
+      Number(
+        paltiId
+      ),
+
+    $or: [
+      {
+        source_type:
+          "palti_lorry",
+      },
+
+      {
+        source_type: {
+          $exists:
+            false,
+        },
+      },
+    ],
+  };
+
+  if (
+    excludeAdjustmentId
+  ) {
+    filter._id = {
+      $ne:
+        excludeAdjustmentId,
+    };
+  }
+
+  const result =
+    await collection
+      .aggregate(
+        [
+          {
+            $match:
+              filter,
+          },
+
+          {
+            $group: {
+              _id: null,
+
+              total: {
+                $sum: {
+                  $ifNull: [
+                    "$qty",
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ],
+        session
+          ? {
+              session,
+            }
+          : undefined
+      )
+      .toArray();
+
+  return normalizeQty(
+    result[0]?.total
+  );
+}
+
+/*
+====================================================
+LOOKUP COMPANY
+====================================================
+*/
+
+async function resolveShortagePercent(
+  row
+) {
+  if (
+    row?.shortage_percent !==
+      undefined &&
+    row?.shortage_percent !==
+      null &&
+    String(
+      row.shortage_percent
+    ).trim() !== ""
+  ) {
+    return Number(
+      row.shortage_percent
+    );
+  }
+
+  let company =
+    null;
+
+  let account =
+    null;
+
+  if (
+    row?.company_id
+  ) {
+    const filter =
+      buildFlexibleIdFilter(
+        row.company_id
+      );
+
+    if (filter) {
+      company =
+        await MongoCompany.findOne(
+          filter
+        )
+          .select({
+            shortage_percent: 1,
+            name: 1,
+          })
+          .lean()
+          .catch(
+            () => null
+          );
     }
   }
+
+  if (
+    row?.company_account_id
+  ) {
+    const filter =
+      buildFlexibleIdFilter(
+        row.company_account_id
+      );
+
+    if (filter) {
+      account =
+        await MongoCompanyAccount.findOne(
+          filter
+        )
+          .select({
+            shortage_percent: 1,
+            account_name: 1,
+          })
+          .lean()
+          .catch(
+            () => null
+          );
+    }
+  }
+
+  const values = [
+    company?.shortage_percent,
+    account?.shortage_percent,
+  ];
+
+  for (
+    const value of values
+  ) {
+    if (
+      value !==
+        null &&
+      value !==
+        undefined &&
+      String(
+        value
+      ).trim() !== ""
+    ) {
+      return Number(
+        value
+      );
+    }
+  }
+
   return null;
 }
 
-router.get("/parties", (req, res) => {
-  const { warehouse_id, location_id, product_id } = req.query;
-  const resolvedIds = resolveEntryMasterIds(db, req.query).catch(() => null);
+/*
+====================================================
+GET PARTIES
+====================================================
+*/
 
-  resolvedIds
-    .then((ids) => {
-      const warehouseId = Number(ids?.warehouse_id) || null;
-      const locationId = Number(ids?.location_id) || null;
-
-      if (!warehouseId && !locationId) {
-        return res.status(400).json({ error: "warehouse_id or location_id required" });
-      }
-
-      const productId = ids?.product_id ? Number(ids.product_id) || null : null;
-      const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
-      const scopeValue = useWarehouse ? warehouseId : locationId;
-
-      const sql = `
-    SELECT DISTINCT id, name, source_type
-    FROM (
-      SELECT
-        c.id,
-        c.name,
-        'inward' AS source_type
-      FROM inward i
-      LEFT JOIN companies c ON c.id = i.company_id
-      WHERE ${useWarehouse ? 'i.warehouse_id = ?' : 'i.location_id = ?'}
-        AND i.remaining_qty > 0
-        AND i.company_id IS NOT NULL
-        AND (? IS NULL OR i.product_id = ?)
-
-      UNION
-
-      SELECT
-        c.id,
-        c.name,
-        'palti_lorry' AS source_type
-      FROM palti_lorry_entries p
-      LEFT JOIN warehouses w ON w.id = p.warehouse_id
-      LEFT JOIN companies c ON c.id = p.company_id
-      WHERE c.id IS NOT NULL
-        AND ${useWarehouse ? 'p.warehouse_id = ?' : 'w.location_id = ?'}
-        AND (CASE WHEN IFNULL(p.balance, 0) > 0 THEN IFNULL(p.balance, 0) ELSE IFNULL(p.new_weight, 0) END - IFNULL((
-          SELECT SUM(a.qty)
-          FROM adjustment a
-          WHERE a.palti_lorry_id = p.id
-            AND COALESCE(a.source_type, 'inward') = 'palti_lorry'
-        ), 0)) > 0
-        AND (? IS NULL OR p.product_id = ?)
-    )
-    ORDER BY name ASC, source_type ASC
-  `;
-
-      db.all(sql, [scopeValue, productId, productId, scopeValue, productId, productId], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows || []);
-      });
-    })
-    .catch((err) => res.status(500).json({ error: err.message }));
-});
-
-router.get("/inward/report", (req, res) => {
-  const { warehouse_id, location_id, company_id, outward_date, source_type } = req.query;
-  resolveEntryMasterIds(db, req.query)
-    .then((ids) => {
-      const warehouseId = Number(ids?.warehouse_id) || null;
-      const locationId = Number(ids?.location_id) || null;
-      const companyId = Number(ids?.company_id) || null;
-
-      if ((!warehouseId && !locationId) || !companyId || !outward_date) {
-        return res.status(400).json({
-          error: "warehouse_id or location_id, company_id and outward_date required",
-        });
-      }
-
-      if (source_type === "palti_lorry") {
-        const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
-        const scopeValue = useWarehouse ? warehouseId : locationId;
-        const paltiSql = `
-        SELECT
-        p.id,
-        p.voucher_no,
-        p.expense_date AS date,
-        p.reg_lorry_no,
-        p.new_lorry_no,
-        p.new_weight,
-        COALESCE(NULLIF(TRIM(p.new_lorry_no), ''), NULLIF(TRIM(p.reg_lorry_no), ''), '-') AS display_lorry_no,
-        COALESCE(NULLIF(TRIM(p.reg_lorry_no), ''), NULLIF(TRIM(p.new_lorry_no), ''), '-') AS lorry_no,
-        CASE WHEN IFNULL(p.balance, 0) > 0 THEN p.balance ELSE p.new_weight END AS gross_qty,
-        CASE WHEN IFNULL(p.balance, 0) > 0 THEN p.balance ELSE p.new_weight END AS remaining_qty,
-        w.name AS warehouse_name,
-        c.name AS company_name,
-        loc.name AS location_name,
-        IFNULL((
-          SELECT SUM(a.qty)
-          FROM adjustment a
-          WHERE a.palti_lorry_id = p.id
-            AND COALESCE(a.source_type, 'inward') = 'palti_lorry'
-        ), 0) AS already_adjusted
-      FROM palti_lorry_entries p
-      INNER JOIN warehouses w ON w.id = p.warehouse_id
-      LEFT JOIN locations loc ON w.location_id = loc.id
-      LEFT JOIN companies c ON c.id = p.company_id
-      WHERE p.company_id = ?
-        AND ${useWarehouse ? 'p.warehouse_id = ?' : 'w.location_id = ?'}
-      ORDER BY p.expense_date ASC, p.id ASC
-    `;
-
-        return db.all(paltiSql, [companyId, scopeValue], (err, rows) => {
-          if (err) return res.status(500).json({ error: err.message });
-
-          const result = (rows || [])
-        .map((row) => {
-          const slab = calculateMonthSlab(row.date, outward_date);
-          const grossQty = getPaltiQty(row);
-          const alreadyAdjusted = Number(row.already_adjusted) || 0;
-          const availableQty = grossQty - alreadyAdjusted;
-
-          return {
-            ...row,
-            source_type: "palti_lorry",
-            outward_date,
-            days_diff: slab.daysDiff,
-            months_diff: slab.monthsDiff,
-            applied_shortage_percent: 0,
-            shortage_qty: 0,
-            warehouse_chgs: 0,
-            net_opening_qty: Number(grossQty.toFixed(4)),
-            already_adjusted: Number(alreadyAdjusted.toFixed(4)),
-            available_qty: Number(Math.max(availableQty, 0).toFixed(4)),
-          };
-        })
-        .filter((row) => row.available_qty > 0);
-
-          return res.json(result);
-        });
-      }
-
-      const useWarehouse = Number.isFinite(warehouseId) && warehouseId > 0;
-      const scopeValue = useWarehouse ? warehouseId : locationId;
-      const sql = `
-    SELECT
-      i.id,
-      i.voucher_no,
-      i.date,
-      i.lorry_no,
-      i.weight AS inward_qty,
-      i.weight AS gross_qty,
-      i.remaining_qty,
-      i.company_account_id,
-      w.name AS warehouse_name,
-      c.name AS company_name,
-      COALESCE(i.shortage_percent, c.shortage_percent, ca.shortage_percent) AS shortage_percent,
-      IFNULL((
-        SELECT SUM(a.qty)
-        FROM adjustment a
-        WHERE a.inward_id = i.id
-      ), 0) AS already_adjusted
-    FROM inward i
-    LEFT JOIN warehouses w ON w.id = i.warehouse_id
-    LEFT JOIN companies c ON c.id = i.company_id
-    LEFT JOIN company_accounts ca ON ca.id = i.company_account_id
-    WHERE ${useWarehouse ? 'i.warehouse_id = ?' : 'i.location_id = ?'}
-      AND i.company_id = ?
-    ORDER BY i.date ASC, i.id ASC
-  `;
-
-      db.all(sql, [scopeValue, companyId], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-
-        Promise.all(
-          (rows || []).map(async (row) => {
-            let shortagePercent = pickEffectiveShortagePercent(row.shortage_percent);
-            if (shortagePercent === null) {
-              const mongoCompany = row.company_name
-                ? await Company.findOne({ name: row.company_name }).lean().catch(() => null)
-                : null;
-              const mongoAccount = row.account_name
-                ? await CompanyAccount.findOne({ account_name: row.account_name }).lean().catch(() => null)
-                : null;
-              shortagePercent = pickEffectiveShortagePercent(
-                mongoCompany?.shortage_percent,
-                mongoAccount?.shortage_percent
-              );
-            }
-
-            const slab = calculateMonthSlab(row.date, outward_date);
-            const grossQty = Number(row.gross_qty) || 0;
-            const alreadyAdjusted = Number(row.already_adjusted) || 0;
-            const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, shortagePercent);
-            const appliedShortagePercent = calculateAppliedShortageRate(shortagePercent, slab.monthsDiff);
-            const netOpeningQty = grossQty - shortageQty;
-            const availableQty = netOpeningQty - alreadyAdjusted;
-
-            return {
-              ...row,
-              shortage_percent: shortagePercent,
-              source_type: "inward",
-              outward_date,
-              days_diff: slab.daysDiff,
-              months_diff: slab.monthsDiff,
-              applied_shortage_percent: Number((appliedShortagePercent * 100).toFixed(2)),
-              gross_qty: Number(grossQty.toFixed(4)),
-              shortage_qty: Number(shortageQty.toFixed(4)),
-              warehouse_chgs: Number(shortageQty.toFixed(4)),
-              net_opening_qty: Number(netOpeningQty.toFixed(4)),
-              already_adjusted: Number(alreadyAdjusted.toFixed(4)),
-              available_qty: Number(Math.max(availableQty, 0).toFixed(4)),
-            };
-          })
-        ).then((result) => res.json(result.filter((row) => row.available_qty > 0)));
-      });
-    })
-    .catch((err) => res.status(500).json({ error: err.message }));
-});
-
-router.post("/final-save", async (req, res) => {
-  try {
-    const { outward_id, adjustments } = req.body || {};
-    const cleanAdjustments = Array.isArray(adjustments)
-      ? adjustments.map((item) => ({
-          inward_id: item?.inward_id ?? null,
-          palti_lorry_id: item?.palti_lorry_id ?? null,
-          source_type: String(item?.source_type || "inward").trim().toLowerCase(),
-          company_id: item?.company_id ?? null,
-          qty: Number(item?.qty) || 0,
-        }))
-      : [];
-
-    if (!outward_id || cleanAdjustments.length === 0) {
-      return res.status(400).json({ error: "Data required" });
-    }
-
-    const outward = await dbGetAsync(`SELECT * FROM outward WHERE id=?`, [outward_id]);
-    if (!outward) {
-      return res.status(404).json({ error: "Outward not found" });
-    }
-
-    const outwardQty = normalizeQty(outward.quantity);
-    const outwardWarehouseId = Number(outward.warehouse_id) || null;
-    const outwardLocationId = Number(outward.location_id) || null;
-    const totalAdjust = addQty(...cleanAdjustments.map((a) => normalizeQty(a.qty)));
-
-    const alreadyRow = await dbGetAsync(
-      `SELECT IFNULL(SUM(qty), 0) AS alreadyAdjusted FROM adjustment WHERE outward_id=?`,
-      [outward_id]
-    );
-
-    const alreadyAdj = normalizeQty(alreadyRow?.alreadyAdjusted);
-    const remainingToAdjust = normalizeQty(outwardQty - alreadyAdj);
-
-    if (remainingToAdjust <= 0) {
-      return res.status(400).json({ error: "This outward is already fully adjusted" });
-    }
-
-    if (totalAdjust > remainingToAdjust) {
-      return res.status(400).json({
-        error: `Total adjustment cannot exceed remaining ${remainingToAdjust}`,
+router.get(
+  "/parties",
+  async (req, res) => {
+    if (
+      !canViewAdjustment(
+        req.user
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You do not have permission to view adjustment parties",
       });
     }
-
-    await dbRunAsync("BEGIN TRANSACTION");
 
     try {
-      for (const adj of cleanAdjustments) {
-        const adjQty = normalizeQty(adj.qty);
-        const sourceType = adj.source_type;
-        const companyId = Number(adj.company_id) || null;
+      if (!requireMongo(res)) {
+        return;
+      }
 
-        if (!companyId || adjQty <= 0) {
-          throw makeAdjustmentError("Invalid adjustment row", {
-            source_type: sourceType,
-            company_id: companyId || null,
-            qty: adjQty,
-          });
+      const warehouseId =
+        normalizeText(
+          req.query
+            ?.warehouse_id
+        );
+
+      const locationId =
+        normalizeText(
+          req.query
+            ?.location_id
+        );
+
+      const productId =
+        normalizeText(
+          req.query
+            ?.product_id
+        );
+
+      if (
+        !warehouseId &&
+        !locationId
+      ) {
+        return res.status(400).json({
+          error:
+            "warehouse_id or location_id required",
+        });
+      }
+
+      /*
+       * -------------------------
+       * INWARD COMPANIES
+       * -------------------------
+       */
+      const inwardFilter = {};
+
+      if (
+        warehouseId
+      ) {
+        inwardFilter.warehouse_id =
+          Number(
+            warehouseId
+          );
+      } else {
+        inwardFilter.location_id =
+          Number(
+            locationId
+          );
+      }
+
+      inwardFilter.remaining_qty = {
+        $gt: 0,
+      };
+
+      if (
+        productId
+      ) {
+        inwardFilter.product_id =
+          Number(
+            productId
+          );
+      }
+
+      const inwardRows =
+        await MongoInward.find(
+          inwardFilter
+        )
+          .select({
+            company_id: 1,
+          })
+          .lean();
+
+      /*
+       * -------------------------
+       * PALTI COMPANIES
+       * -------------------------
+       */
+      const paltiCollection =
+        getPaltiCollection();
+
+      const paltiFilter = {};
+
+      if (
+        warehouseId
+      ) {
+        paltiFilter.warehouse_id =
+          Number(
+            warehouseId
+          );
+      }
+
+      if (
+        productId
+      ) {
+        paltiFilter.product_id =
+          Number(
+            productId
+          );
+      }
+
+      const paltiRows =
+        await paltiCollection
+          .find(
+            paltiFilter,
+            {
+              projection: {
+                company_id: 1,
+                id: 1,
+                legacy_id: 1,
+                balance: 1,
+                new_weight: 1,
+              },
+            }
+          )
+          .toArray();
+
+      const companyIds =
+        Array.from(
+          new Set(
+            [
+              ...inwardRows.map(
+                (row) =>
+                  row.company_id
+              ),
+              ...paltiRows.map(
+                (row) =>
+                  row.company_id
+              ),
+            ]
+              .map(
+                (id) =>
+                  String(
+                    id ??
+                      ""
+                  ).trim()
+              )
+              .filter(Boolean)
+          )
+        );
+
+      if (
+        companyIds.length === 0
+      ) {
+        return res.json([]);
+      }
+
+      const mongoObjectIds =
+        companyIds
+          .filter((id) =>
+            mongoose.Types.ObjectId.isValid(
+              id
+            )
+          )
+          .map(
+            (id) =>
+              new mongoose.Types.ObjectId(
+                id
+              )
+          );
+
+      const numericIds =
+        companyIds
+          .map(Number)
+          .filter(
+            Number.isFinite
+          );
+
+      const conditions = [];
+
+      if (
+        mongoObjectIds.length
+      ) {
+        conditions.push({
+          _id: {
+            $in:
+              mongoObjectIds,
+          },
+        });
+      }
+
+      if (
+        numericIds.length
+      ) {
+        conditions.push({
+          legacy_id: {
+            $in:
+              numericIds,
+          },
+        });
+
+        conditions.push({
+          id: {
+            $in:
+              numericIds,
+          },
+        });
+      }
+
+      const companies =
+        conditions.length
+          ? await MongoCompany.find({
+              $or:
+                conditions,
+            })
+              .select({
+                name: 1,
+              })
+              .lean()
+          : [];
+
+      const companyMap =
+        new Map(
+          companies.map(
+            (company) => [
+              String(
+                company._id
+              ),
+              company,
+            ]
+          )
+        );
+
+      const numericCompanyMap =
+        new Map();
+
+      for (
+        const company of
+          companies
+      ) {
+        if (
+          company.legacy_id !=
+          null
+        ) {
+          numericCompanyMap.set(
+            String(
+              company.legacy_id
+            ),
+            company
+          );
         }
 
-        if (sourceType === "palti_lorry") {
-          if (!adj.palti_lorry_id) {
-            throw makeAdjustmentError("Invalid Palti Lorry adjustment row", {
-              source_type: sourceType,
-              palti_lorry_id: adj.palti_lorry_id || null,
-              qty: adjQty,
-            });
-          }
+        if (
+          company.id != null
+        ) {
+          numericCompanyMap.set(
+            String(
+              company.id
+            ),
+            company
+          );
+        }
+      }
 
-          const paltiRow = await dbGetAsync(
-            `
-            SELECT
-              p.id,
-              p.balance,
-              p.new_weight,
-              p.warehouse_id,
-              p.company_id,
-              w.location_id,
-              IFNULL((
-                SELECT SUM(a.qty)
-                FROM adjustment a
-                WHERE a.palti_lorry_id = p.id
-                  AND COALESCE(a.source_type, 'inward') = 'palti_lorry'
-              ), 0) AS already_adjusted
-            FROM palti_lorry_entries p
-            LEFT JOIN warehouses w ON w.id = p.warehouse_id
-            WHERE p.id = ?
-            `,
-            [adj.palti_lorry_id]
+      const resultMap =
+        new Map();
+
+      for (
+        const id of
+          companyIds
+      ) {
+        const company =
+          companyMap.get(
+            id
+          ) ||
+          numericCompanyMap.get(
+            id
           );
 
-          if (!paltiRow) {
-            throw makeAdjustmentError(`Invalid palti_lorry_id ${adj.palti_lorry_id}`, {
-              source_type: sourceType,
-              palti_lorry_id: adj.palti_lorry_id || null,
-              qty: adjQty,
-            });
-          }
-          if (Number(paltiRow.company_id) !== companyId) {
-            throw makeAdjustmentError(`Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`, {
-              source_type: sourceType,
-              palti_lorry_id: adj.palti_lorry_id || null,
-              company_id: companyId,
-              row_company_id: Number(paltiRow.company_id) || null,
-              qty: adjQty,
-            });
-          }
-
-          if (outwardWarehouseId) {
-            if (Number(paltiRow.warehouse_id) !== outwardWarehouseId) {
-              throw makeAdjustmentError(`Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`, {
-                source_type: sourceType,
-                palti_lorry_id: adj.palti_lorry_id || null,
-                outward_warehouse_id: outwardWarehouseId,
-                row_warehouse_id: Number(paltiRow.warehouse_id) || null,
-                qty: adjQty,
-              });
-            }
-          } else if (outwardLocationId) {
-            if (Number(paltiRow.location_id || 0) !== outwardLocationId) {
-              throw makeAdjustmentError(`Location mismatch for palti_lorry_id ${adj.palti_lorry_id}`, {
-                source_type: sourceType,
-                palti_lorry_id: adj.palti_lorry_id || null,
-                outward_location_id: outwardLocationId,
-                row_location_id: Number(paltiRow.location_id) || null,
-                qty: adjQty,
-              });
-            }
-          }
-
-          const availableQty = normalizeQty(getPaltiQty(paltiRow) - normalizeQty(paltiRow.already_adjusted));
-          if (adjQty - availableQty > EPS) {
-            throw makeAdjustmentError(`Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`, {
-              source_type: sourceType,
-              palti_lorry_id: adj.palti_lorry_id || null,
-              voucher_no: paltiRow.voucher_no || null,
-              lorry_no: paltiRow.reg_lorry_no || paltiRow.new_lorry_no || null,
-              requested_qty: Number(adjQty.toFixed(4)),
-              available_qty: Number(availableQty.toFixed(4)),
-              difference: Number((adjQty - availableQty).toFixed(4)),
-              already_adjusted: Number(normalizeQty(paltiRow.already_adjusted).toFixed(4)),
-              gross_qty: Number(getPaltiQty(paltiRow).toFixed(4)),
-            });
-          }
-
-          await dbRunAsync(
-            `INSERT INTO adjustment (outward_id, inward_id, palti_lorry_id, source_type, qty) VALUES (?, ?, ?, ?, ?)`,
-            [outward_id, null, adj.palti_lorry_id, "palti_lorry", adj.qty]
-          );
+        if (!company) {
           continue;
         }
 
-        if (!adj.inward_id) {
-          throw makeAdjustmentError("Invalid inward adjustment row", {
-            source_type: sourceType,
-            inward_id: adj.inward_id || null,
-            qty: adjQty,
-          });
-        }
+        const key =
+          String(
+            company._id
+          );
 
-        const inwardRow = await dbGetAsync(
-          `
-          SELECT
-            i.id,
-            i.date,
-            i.weight,
-            i.remaining_qty,
-            i.warehouse_id,
-            i.location_id,
-            i.company_id,
-            COALESCE(i.shortage_percent, c.shortage_percent) AS shortage_percent,
-            w.location_id AS warehouse_location_id,
-            IFNULL((
-              SELECT SUM(a.qty)
-              FROM adjustment a
-              WHERE a.inward_id = i.id
-            ), 0) AS already_adjusted
-          FROM inward i
-          LEFT JOIN warehouses w ON w.id = i.warehouse_id
-          LEFT JOIN companies c ON c.id = i.company_id
-          WHERE i.id=?
-          `,
-          [adj.inward_id]
-        );
+        resultMap.set(
+          key,
+          {
+            id:
+              company.legacy_id ??
+              company.id ??
+              String(
+                company._id
+              ),
 
-        if (!inwardRow) {
-          throw makeAdjustmentError(`Invalid inward_id ${adj.inward_id}`, {
-            source_type: sourceType,
-            inward_id: adj.inward_id || null,
-            qty: adjQty,
-          });
-        }
+            name:
+              company.name ||
+              "",
 
-        if (outwardWarehouseId) {
-          if (Number(inwardRow.warehouse_id) !== outwardWarehouseId) {
-            throw makeAdjustmentError(`Warehouse mismatch for inward_id ${adj.inward_id}`, {
-              source_type: sourceType,
-              inward_id: adj.inward_id || null,
-              outward_warehouse_id: outwardWarehouseId,
-              row_warehouse_id: Number(inwardRow.warehouse_id) || null,
-              qty: adjQty,
-            });
+            source_type:
+              "inward",
           }
-        } else if (outwardLocationId) {
-          const inwardLocationId = inwardRow.location_id || inwardRow.warehouse_location_id;
-          if (Number(inwardLocationId || 0) !== outwardLocationId) {
-            throw makeAdjustmentError(`Location mismatch for inward_id ${adj.inward_id}`, {
-              source_type: sourceType,
-              inward_id: adj.inward_id || null,
-              outward_location_id: outwardLocationId,
-              row_location_id: Number(inwardLocationId) || null,
-              qty: adjQty,
-            });
-          }
-        }
-
-        if (Number(inwardRow.company_id) !== companyId) {
-          throw makeAdjustmentError(`Company mismatch for inward_id ${adj.inward_id}`, {
-            source_type: sourceType,
-            inward_id: adj.inward_id || null,
-            company_id: companyId,
-            row_company_id: Number(inwardRow.company_id) || null,
-            qty: adjQty,
-          });
-        }
-
-        const slab = calculateMonthSlab(inwardRow.date, outward.date);
-        const grossQty = normalizeQty(inwardRow.weight);
-        const alreadyAdjustedForThisInward = normalizeQty(inwardRow.already_adjusted);
-        const shortageQty = calculateShortageQty(grossQty, slab.monthsDiff, inwardRow.shortage_percent);
-        const netOpeningQty = normalizeQty(grossQty - shortageQty);
-        const availableQty = normalizeQty(netOpeningQty - alreadyAdjustedForThisInward);
-
-        if (adjQty - availableQty > EPS) {
-          throw makeAdjustmentError(`Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`, {
-            source_type: sourceType,
-            inward_id: adj.inward_id || null,
-            voucher_no: inwardRow.voucher_no || null,
-            lorry_no: inwardRow.lorry_no || null,
-            requested_qty: Number(adjQty.toFixed(4)),
-            available_qty: Number(availableQty.toFixed(4)),
-            difference: Number((adjQty - availableQty).toFixed(4)),
-            already_adjusted: Number(alreadyAdjustedForThisInward.toFixed(4)),
-            gross_qty: Number(grossQty.toFixed(4)),
-            shortage_qty: Number(shortageQty.toFixed(4)),
-            net_opening_qty: Number(netOpeningQty.toFixed(4)),
-          });
-        }
-
-        await dbRunAsync(`UPDATE inward SET remaining_qty = remaining_qty - ? WHERE id=?`, [
-          adj.qty,
-          adj.inward_id,
-        ]);
-
-        await dbRunAsync(
-          `INSERT INTO adjustment (outward_id, inward_id, palti_lorry_id, source_type, qty) VALUES (?, ?, ?, ?, ?)`,
-          [outward_id, adj.inward_id, null, "inward", adj.qty]
         );
       }
 
-      const finalStatus = Math.abs(totalAdjust - remainingToAdjust) < 0.0001 ? "Completed" : "Partial";
-      await dbRunAsync(`UPDATE outward SET status=? WHERE id=?`, [finalStatus, outward_id]);
-      await dbRunAsync("COMMIT");
+      return res.json(
+        Array.from(
+          resultMap.values()
+        ).sort(
+          (a, b) =>
+            String(
+              a.name
+            ).localeCompare(
+              String(
+                b.name
+              )
+            )
+        )
+      );
+    } catch (err) {
+      console.error(
+        "[adjustment parties] error:",
+        err
+      );
 
-      return res.json({
-        message: "Adjustment Saved Successfully",
-        status: finalStatus,
+      return res.status(500).json({
+        error:
+          err.message,
       });
-    } catch (error) {
-      await dbRunAsync("ROLLBACK").catch(() => {});
-      throw error;
     }
-  } catch (err) {
-    console.error("[adjustment final-save] error:", err);
-    const status = Number(err?.status) || 500;
-    return res.status(status).json({
-      error: err?.message || "Adjustment save failed",
-      details: err?.details || null,
-    });
   }
-});
+);
 
-const handleAdjustmentLogUpdate = (req, res) => {
-  const { qty } = req.body;
-  const adjustmentId = Number(req.params.id);
-  const newQty = normalizeQty(qty);
+/*
+====================================================
+GET INWARD REPORT
+====================================================
+*/
 
-  if (!Number.isFinite(adjustmentId) || adjustmentId <= 0) {
-    return res.status(400).json({ error: "Invalid adjustment id" });
-  }
+router.get(
+  "/inward/report",
+  async (req, res) => {
+    if (
+      !canViewAdjustment(
+        req.user
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You do not have permission to view adjustment report",
+      });
+    }
 
-  if (newQty <= 0) {
-    return res.status(400).json({ error: "Valid qty required" });
-  }
-
-  db.get(
-    `
-    SELECT
-      a.*,
-      o.quantity AS outward_qty,
-      o.id AS outward_id,
-      o.date AS outward_date,
-      i.remaining_qty,
-      i.date AS inward_date,
-      i.weight AS inward_weight,
-      p.balance AS palti_balance
-    FROM adjustment a
-    LEFT JOIN outward o ON o.id = a.outward_id
-    LEFT JOIN inward i ON i.id = a.inward_id
-    LEFT JOIN palti_lorry_entries p ON p.id = a.palti_lorry_id
-    WHERE a.id = ?
-    `,
-    [adjustmentId],
-    (err, row) => {
-      if (err || !row) {
-        return res.status(404).json({ error: "Adjustment not found" });
+    try {
+      if (!requireMongo(res)) {
+        return;
       }
 
-      const oldQty = normalizeQty(row.qty || 0);
-      const isPalti =
-        String(row.source_type || "").trim().toLowerCase() === "palti_lorry" ||
-        Number(row.palti_lorry_id) > 0;
-      const currentRemaining = normalizeQty(row.remaining_qty || 0);
-      const grossQty = normalizeQty(isPalti ? getPaltiQty(row) : row.inward_weight || 0);
+      const warehouseId =
+        normalizeText(
+          req.query
+            ?.warehouse_id
+        );
 
-      const slab = isPalti ? { monthsDiff: 1 } : calculateMonthSlab(row.inward_date, row.outward_date);
-      const shortageQty = isPalti ? 0 : calculateShortageQty(grossQty, slab.monthsDiff, row.shortage_percent);
-      const netOpeningQty = normalizeQty(grossQty - shortageQty);
+      const locationId =
+        normalizeText(
+          req.query
+            ?.location_id
+        );
 
-      db.get(
-        `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id=? AND id<>?`,
-        [row.outward_id, adjustmentId],
-        (err2, outwardSumRow) => {
-          if (err2) return res.status(500).json({ error: err2.message });
+      const companyId =
+        normalizeText(
+          req.query
+            ?.company_id
+        );
 
-          const otherOutwardAdjusted = normalizeQty(outwardSumRow?.totalAdj || 0);
-          const outwardQty = normalizeQty(row.outward_qty || 0);
-          if (normalizeQty(otherOutwardAdjusted + newQty - outwardQty) > EPS) {
-            return res.status(400).json({ error: "Updated qty exceeds outward qty" });
+      const outwardDate =
+        normalizeText(
+          req.query
+            ?.outward_date
+        );
+
+      const sourceType =
+        normalizeText(
+          req.query
+            ?.source_type
+        ).toLowerCase();
+
+      if (
+        (!warehouseId &&
+          !locationId) ||
+        !companyId ||
+        !outwardDate
+      ) {
+        return res.status(400).json({
+          error:
+            "warehouse_id or location_id, company_id and outward_date required",
+        });
+      }
+
+      const companyFilter =
+        buildFlexibleIdFilter(
+          companyId
+        );
+
+      /*
+       * ==================================================
+       * PALTI LORRY REPORT
+       * ==================================================
+       */
+      if (
+        sourceType ===
+        "palti_lorry"
+      ) {
+        const paltiCollection =
+          getPaltiCollection();
+
+        const paltiFilter = {
+          company_id:
+            Number(
+              companyId
+            ),
+        };
+
+        if (
+          warehouseId
+        ) {
+          paltiFilter.warehouse_id =
+            Number(
+              warehouseId
+            );
+        } else {
+          const warehouseRows =
+            await MongoWarehouse.find({
+              location_id:
+                Number(
+                  locationId
+                ),
+            })
+              .select({
+                _id: 1,
+                legacy_id: 1,
+                id: 1,
+              })
+              .lean();
+
+          const warehouseIds =
+            warehouseRows.flatMap(
+              (row) => [
+                Number(
+                  row.legacy_id
+                ),
+                Number(
+                  row.id
+                ),
+                String(
+                  row._id
+                ),
+              ]
+            );
+
+          paltiFilter.warehouse_id =
+            {
+              $in:
+                warehouseIds.filter(
+                  (id) =>
+                    id !==
+                      null &&
+                    id !==
+                      undefined &&
+                    !Number.isNaN(
+                      Number(
+                        id
+                      )
+                    )
+                ),
+            };
+        }
+
+        const paltiRows =
+          await paltiCollection
+            .find(
+              paltiFilter
+            )
+            .sort({
+              expense_date: 1,
+              id: 1,
+            })
+            .toArray();
+
+        const result =
+          [];
+
+        for (
+          const row of
+            paltiRows
+        ) {
+          const paltiId =
+            row.legacy_id ??
+            row.id ??
+            row.sl_no;
+
+          if (
+            paltiId ==
+            null
+          ) {
+            continue;
           }
 
-          db.get(
-            isPalti
-              ? `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE palti_lorry_id=? AND id<>? AND COALESCE(source_type, 'inward')='palti_lorry'`
-              : `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE inward_id=? AND id<>?`,
-            [isPalti ? row.palti_lorry_id : row.inward_id, adjustmentId],
-            (err3, inwardSumRow) => {
-              if (err3) return res.status(500).json({ error: err3.message });
+          const alreadyAdjusted =
+            await getAdjustedQtyForPalti(
+              paltiId
+            );
 
-              const otherInwardAdjusted = normalizeQty(inwardSumRow?.totalAdj || 0);
-              const availableQty = normalizeQty(netOpeningQty - otherInwardAdjusted);
+          const grossQty =
+            getPaltiQty(
+              row
+            );
 
-              if (newQty - availableQty > EPS) {
-                return res.status(400).json({ error: "Updated qty exceeds available qty" });
-              }
+          const availableQty =
+            normalizeQty(
+              grossQty -
+                alreadyAdjusted
+            );
 
-              db.serialize(() => {
-                db.run("BEGIN TRANSACTION", (beginErr) => {
-                  if (beginErr) {
-                    return res.status(500).json({ error: beginErr.message });
-                  }
+          if (
+            availableQty <=
+            0
+          ) {
+            continue;
+          }
 
-                  const rollback = (statusCode, message) => {
-                    db.run("ROLLBACK", () => res.status(statusCode).json({ error: message }));
-                  };
+          const slab =
+            calculateMonthSlab(
+              row.expense_date,
+              outwardDate
+            );
 
-                  db.run(
-                    `UPDATE adjustment SET qty=? WHERE id=?`,
-                    [newQty, adjustmentId],
-                    (uErr) => {
-                      if (uErr) {
-                        return rollback(500, uErr.message);
-                      }
+          let warehouseName =
+            "";
 
-                      const continueAfterSourceUpdate = () => {
-                        db.get(
-                          `SELECT quantity FROM outward WHERE id=?`,
-                          [row.outward_id],
-                          (oErr, oRow) => {
-                            if (oErr || !oRow) {
-                              return rollback(500, "Outward not found");
-                            }
+          if (
+            row.warehouse_id !=
+            null
+          ) {
+            const warehouse =
+              await MongoWarehouse.findOne(
+                buildFlexibleIdFilter(
+                  row.warehouse_id
+                )
+              )
+                .select({
+                  name: 1,
+                })
+                .lean();
 
-                            db.get(
-                              `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id=?`,
-                              [row.outward_id],
-                              (sErr, finalRow) => {
-                                if (sErr) {
-                                  return rollback(500, sErr.message);
-                                }
+            warehouseName =
+              warehouse?.name ||
+              "";
+          }
 
-                                const totalAdj = normalizeQty(finalRow?.totalAdj || 0);
-                                const status =
-                                  totalAdj >= normalizeQty(Number(oRow.quantity) || 0)
-                                    ? "Completed"
-                                    : totalAdj > 0
-                                    ? "Partial"
-                                    : "Pending";
+          let companyName =
+            "";
 
-                                db.run(
-                                  `UPDATE outward SET status=? WHERE id=?`,
-                                  [status, row.outward_id],
-                                  (stErr) => {
-                                    if (stErr) {
-                                      return rollback(500, stErr.message);
-                                    }
+          if (
+            companyFilter
+          ) {
+            const company =
+              await MongoCompany.findOne(
+                companyFilter
+              )
+                .select({
+                  name: 1,
+                })
+                .lean();
 
-                                    db.run("COMMIT", (cErr) => {
-                                      if (cErr) return rollback(500, cErr.message);
-                                      return res.json({ message: "Adjustment updated successfully" });
-                                    });
-                                  }
-                                );
-                              }
-                            );
-                          }
-                        );
-                      };
+            companyName =
+              company?.name ||
+              "";
+          }
 
-                      if (isPalti) {
-                        return continueAfterSourceUpdate();
-                      }
+          result.push({
+            id:
+              paltiId,
 
-                      db.run(
-                        `UPDATE inward SET remaining_qty = remaining_qty + ? WHERE id=?`,
-                        [normalizeQty(oldQty - newQty), row.inward_id],
-                        (iErr) => {
-                          if (iErr) {
-                            return rollback(500, iErr.message);
-                          }
+            _id:
+              row._id
+                ? String(
+                    row._id
+                  )
+                : null,
 
-                          return continueAfterSourceUpdate();
-                        }
-                      );
-                    }
-                  );
-                });
-              });
+            voucher_no:
+              row.voucher_no ||
+              null,
+
+            date:
+              row.expense_date ||
+              null,
+
+            reg_lorry_no:
+              row.reg_lorry_no ||
+              null,
+
+            new_lorry_no:
+              row.new_lorry_no ||
+              null,
+
+            display_lorry_no:
+              normalizeText(
+                row.new_lorry_no
+              ) ||
+              normalizeText(
+                row.reg_lorry_no
+              ) ||
+              "-",
+
+            lorry_no:
+              normalizeText(
+                row.reg_lorry_no
+              ) ||
+              normalizeText(
+                row.new_lorry_no
+              ) ||
+              "-",
+
+            gross_qty:
+              normalizeQty(
+                grossQty
+              ),
+
+            remaining_qty:
+              normalizeQty(
+                grossQty
+              ),
+
+            warehouse_name:
+              warehouseName,
+
+            company_name:
+              companyName,
+
+            source_type:
+              "palti_lorry",
+
+            outward_date:
+              outwardDate,
+
+            days_diff:
+              slab.daysDiff,
+
+            months_diff:
+              slab.monthsDiff,
+
+            applied_shortage_percent:
+              0,
+
+            shortage_qty:
+              0,
+
+            warehouse_chgs:
+              0,
+
+            net_opening_qty:
+              normalizeQty(
+                grossQty
+              ),
+
+            already_adjusted:
+              normalizeQty(
+                alreadyAdjusted
+              ),
+
+            available_qty:
+              normalizeQty(
+                availableQty
+              ),
+          });
+        }
+
+        return res.json(
+          result
+        );
+      }
+
+      /*
+       * ==================================================
+       * INWARD REPORT
+       * ==================================================
+       */
+
+      const inwardFilter = {};
+
+      if (
+        warehouseId
+      ) {
+        inwardFilter.warehouse_id =
+          Number(
+            warehouseId
+          );
+      } else {
+        inwardFilter.location_id =
+          Number(
+            locationId
+          );
+      }
+
+      if (
+        companyFilter
+      ) {
+        /*
+         * For migrated records company_id
+         * may be numeric/ObjectId.
+         */
+        const company =
+          await MongoCompany.findOne(
+            companyFilter
+          )
+            .select({
+              _id: 1,
+              legacy_id: 1,
+              id: 1,
+              name: 1,
+            })
+            .lean();
+
+        const companyIds =
+          [
+            company?._id
+              ? String(
+                  company._id
+                )
+              : null,
+            company?.legacy_id,
+            company?.id,
+          ].filter(
+            (value) =>
+              value !==
+                null &&
+              value !==
+                undefined
+          );
+
+        inwardFilter.company_id =
+          {
+            $in:
+              companyIds,
+          };
+      }
+
+      const inwardRows =
+        await MongoInward.find(
+          inwardFilter
+        )
+          .sort({
+            date: 1,
+            legacy_id: 1,
+            _id: 1,
+          })
+          .lean();
+
+      const result =
+        [];
+
+      for (
+        const row of
+          inwardRows
+      ) {
+        const inwardId =
+          row.legacy_id ??
+          row.id ??
+          row.sl_no ??
+          String(
+            row._id
+          );
+
+        const adjusted =
+          await getAdjustedQtyForInward(
+            Number(
+              row.legacy_id ??
+                row.id ??
+                row.sl_no
+            )
+          );
+
+        const shortagePercent =
+          await resolveShortagePercent(
+            row
+          );
+
+        const slab =
+          calculateMonthSlab(
+            row.date,
+            outwardDate
+          );
+
+        const grossQty =
+          normalizeQty(
+            row.weight ??
+              row.quantity
+          );
+
+        const shortageQty =
+          normalizeQty(
+            calculateShortageQty(
+              grossQty,
+              slab.monthsDiff,
+              shortagePercent
+            )
+          );
+
+        const appliedShortagePercent =
+          calculateAppliedShortageRate(
+            shortagePercent,
+            slab.monthsDiff
+          );
+
+        const netOpeningQty =
+          normalizeQty(
+            grossQty -
+              shortageQty
+          );
+
+        const availableQty =
+          normalizeQty(
+            netOpeningQty -
+              adjusted
+          );
+
+        if (
+          availableQty <=
+          0
+        ) {
+          continue;
+        }
+
+        let warehouseName =
+          row.warehouse_name ||
+          "";
+
+        if (
+          !warehouseName &&
+          row.warehouse_id !=
+            null
+        ) {
+          const warehouse =
+            await MongoWarehouse.findOne(
+              buildFlexibleIdFilter(
+                row.warehouse_id
+              )
+            )
+              .select({
+                name: 1,
+              })
+              .lean();
+
+          warehouseName =
+            warehouse?.name ||
+            "";
+        }
+
+        let companyName =
+          row.company_name ||
+          "";
+
+        if (
+          !companyName &&
+          row.company_id !=
+            null
+        ) {
+          const company =
+            await MongoCompany.findOne(
+              buildFlexibleIdFilter(
+                row.company_id
+              )
+            )
+              .select({
+                name: 1,
+              })
+              .lean();
+
+          companyName =
+            company?.name ||
+            "";
+        }
+
+        result.push({
+          id:
+            inwardId,
+
+          _id:
+            row._id
+              ? String(
+                  row._id
+                )
+              : null,
+
+          voucher_no:
+            row.voucher_no ||
+            null,
+
+          date:
+            row.date ||
+            null,
+
+          lorry_no:
+            row.lorry_no ||
+            null,
+
+          inward_qty:
+            normalizeQty(
+              row.weight ??
+                row.quantity
+            ),
+
+          gross_qty:
+            normalizeQty(
+              grossQty
+            ),
+
+          remaining_qty:
+            normalizeQty(
+              row.remaining_qty ??
+                grossQty
+            ),
+
+          company_account_id:
+            row.company_account_id ||
+            null,
+
+          warehouse_name:
+            warehouseName,
+
+          company_name:
+            companyName,
+
+          shortage_percent:
+            shortagePercent,
+
+          source_type:
+            "inward",
+
+          outward_date:
+            outwardDate,
+
+          days_diff:
+            slab.daysDiff,
+
+          months_diff:
+            slab.monthsDiff,
+
+          applied_shortage_percent:
+            Number(
+              (
+                Number(
+                  appliedShortagePercent
+                ) *
+                100
+              ).toFixed(2)
+            ),
+
+          shortage_qty:
+            Number(
+              shortageQty.toFixed(
+                4
+              )
+            ),
+
+          warehouse_chgs:
+            Number(
+              shortageQty.toFixed(
+                4
+              )
+            ),
+
+          net_opening_qty:
+            Number(
+              netOpeningQty.toFixed(
+                4
+              )
+            ),
+
+          already_adjusted:
+            Number(
+              adjusted.toFixed(
+                4
+              )
+            ),
+
+          available_qty:
+            Number(
+              Math.max(
+                availableQty,
+                0
+              ).toFixed(
+                4
+              )
+            ),
+        });
+      }
+
+      return res.json(
+        result
+      );
+    } catch (err) {
+      console.error(
+        "[adjustment inward report] error:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
+      });
+    }
+  }
+);
+
+/*
+====================================================
+FINAL SAVE
+====================================================
+*/
+
+router.post(
+  "/final-save",
+  async (req, res) => {
+    if (
+      !canManageAdjustment(
+        req.user
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You do not have permission to save adjustments",
+      });
+    }
+
+    let session = null;
+
+    try {
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const {
+        outward_id,
+        adjustments,
+      } = req.body || {};
+
+      const cleanAdjustments =
+        Array.isArray(
+          adjustments
+        )
+          ? adjustments
+              .map(
+                (item) => ({
+                  inward_id:
+                    item?.inward_id ??
+                    null,
+
+                  palti_lorry_id:
+                    item?.palti_lorry_id ??
+                    null,
+
+                  source_type:
+                    normalizeText(
+                      item?.source_type ||
+                        "inward"
+                    ).toLowerCase(),
+
+                  company_id:
+                    item?.company_id ??
+                    null,
+
+                  qty:
+                    Number(
+                      item?.qty
+                    ) || 0,
+                })
+              )
+              .filter(
+                (item) =>
+                  item.qty >
+                  0
+              )
+          : [];
+
+      if (
+        !outward_id ||
+        cleanAdjustments.length ===
+          0
+      ) {
+        return res.status(400).json({
+          error:
+            "Data required",
+        });
+      }
+
+      const outwardFilter =
+        buildFlexibleIdFilter(
+          outward_id
+        );
+
+      if (!outwardFilter) {
+        return res.status(400).json({
+          error:
+            "Invalid outward id",
+        });
+      }
+
+      const outward =
+        await MongoOutward.findOne(
+          outwardFilter
+        ).lean();
+
+      if (!outward) {
+        return res.status(404).json({
+          error:
+            "Outward not found",
+        });
+      }
+
+      const outwardNumericId =
+        Number(
+          outward.legacy_id ??
+            outward.id ??
+            outward.sl_no
+        );
+
+      if (
+        !Number.isFinite(
+          outwardNumericId
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            "Outward does not have a valid legacy ID",
+        });
+      }
+
+      const outwardQty =
+        normalizeQty(
+          outward.quantity
+        );
+
+      const totalAdjust =
+        addQty(
+          ...cleanAdjustments.map(
+            (row) =>
+              row.qty
+          )
+        );
+
+      const alreadyAdjusted =
+        await getAdjustedQtyForOutward(
+          outwardNumericId
+        );
+
+      const remainingToAdjust =
+        normalizeQty(
+          outwardQty -
+            alreadyAdjusted
+        );
+
+      if (
+        remainingToAdjust <=
+        0
+      ) {
+        return res.status(400).json({
+          error:
+            "This outward is already fully adjusted",
+        });
+      }
+
+      if (
+        totalAdjust -
+          remainingToAdjust >
+        EPS
+      ) {
+        return res.status(400).json({
+          error:
+            `Total adjustment cannot exceed remaining ${remainingToAdjust}`,
+        });
+      }
+
+      session =
+        await mongoose.startSession();
+
+      session.startTransaction();
+
+      for (
+        const adj of
+          cleanAdjustments
+      ) {
+        const adjQty =
+          normalizeQty(
+            adj.qty
+          );
+
+        const companyId =
+          String(
+            adj.company_id ||
+              ""
+          ).trim();
+
+        if (
+          !companyId ||
+          adjQty <=
+            0
+        ) {
+          throw makeAdjustmentError(
+            "Invalid adjustment row",
+            {
+              source_type:
+                adj.source_type,
+
+              company_id:
+                companyId ||
+                null,
+
+              qty:
+                adjQty,
             }
           );
         }
-      );
-    }
-  );
-};
 
-router.put("/log/:id", handleAdjustmentLogUpdate);
-router.post("/log/:id/update", handleAdjustmentLogUpdate);
+        /*
+         * ==================================================
+         * PALTI
+         * ==================================================
+         */
+        if (
+          adj.source_type ===
+          "palti_lorry"
+        ) {
+          if (
+            !adj.palti_lorry_id
+          ) {
+            throw makeAdjustmentError(
+              "Invalid Palti Lorry adjustment row",
+              {
+                source_type:
+                  adj.source_type,
 
-function dbGetAsync(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) return reject(err);
-      return resolve(row);
-    });
-  });
-}
+                palti_lorry_id:
+                  null,
 
-function dbRunAsync(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function onRun(err) {
-      if (err) return reject(err);
-      return resolve({ changes: Number(this?.changes || 0), lastID: Number(this?.lastID || 0) });
-    });
-  });
-}
+                qty:
+                  adjQty,
+              }
+            );
+          }
 
-const handleAdjustmentLogDelete = (req, res) => {
-  const adjustmentId = Number(req.params.id);
-  if (!Number.isFinite(adjustmentId) || adjustmentId <= 0) {
-    return res.status(400).json({ error: "Invalid adjustment id" });
-  }
+          const paltiCollection =
+            getPaltiCollection();
 
-  db.get(
-    `
-    SELECT
-      a.*,
-      o.quantity AS outward_qty
-    FROM adjustment a
-    LEFT JOIN outward o ON o.id = a.outward_id
-    WHERE a.id = ?
-    `,
-    [adjustmentId],
-    (err, row) => {
-      console.log("[adjustment delete] request:", {
-        adjustmentId,
-        hasError: Boolean(err),
-        rowFound: Boolean(row),
-        outwardId: row?.outward_id || null,
-        inwardId: row?.inward_id || null,
-        paltiLorryId: row?.palti_lorry_id || null,
-        sourceType: row?.source_type || null,
-      });
+          const paltiFilter =
+            buildFlexibleIdFilter(
+              adj.palti_lorry_id
+            );
 
-      if (err) {
-        console.error("[adjustment delete] lookup error:", err.message);
-        return res.status(500).json({ error: err.message });
-      }
+          const paltiRow =
+            await paltiCollection.findOne(
+              paltiFilter,
+              {
+                session,
+              }
+            );
 
-      if (!row) {
-        console.warn("[adjustment delete] row not found for id:", adjustmentId);
-        return res.json({ message: "Adjustment already deleted" });
-      }
+          if (!paltiRow) {
+            throw makeAdjustmentError(
+              `Invalid palti_lorry_id ${adj.palti_lorry_id}`,
+              {
+                source_type:
+                  adj.source_type,
 
-      const isPalti =
-        String(row.source_type || "").trim().toLowerCase() === "palti_lorry" ||
-        Number(row.palti_lorry_id) > 0;
-      const adjustmentQty = normalizeQty(row.qty || 0);
-      const outwardId = Number(row.outward_id) || null;
-      const inwardId = Number(row.inward_id) || null;
-      const outwardQty = normalizeQty(row.outward_qty || 0);
+                palti_lorry_id:
+                  adj.palti_lorry_id,
 
-      const finishSuccess = () => res.json({ message: "Adjustment deleted successfully" });
+                qty:
+                  adjQty,
+              }
+            );
+          }
 
-      const recalculateOutwardStatus = () => {
-        if (!outwardId || outwardQty <= 0) {
-          return finishSuccess();
+          if (
+            String(
+              paltiRow.company_id
+            ) !==
+            companyId
+          ) {
+            throw makeAdjustmentError(
+              `Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
+              {
+                source_type:
+                  adj.source_type,
+
+                palti_lorry_id:
+                  adj.palti_lorry_id,
+
+                company_id:
+                  companyId,
+
+                row_company_id:
+                  paltiRow.company_id,
+
+                qty:
+                  adjQty,
+              }
+            );
+          }
+
+          const outwardWarehouse =
+            String(
+              outward.warehouse_id ||
+                ""
+            );
+
+          const rowWarehouse =
+            String(
+              paltiRow.warehouse_id ||
+                ""
+            );
+
+          if (
+            outwardWarehouse
+          ) {
+            if (
+              rowWarehouse !==
+              outwardWarehouse
+            ) {
+              throw makeAdjustmentError(
+                `Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
+                {
+                  source_type:
+                    adj.source_type,
+
+                  palti_lorry_id:
+                    adj.palti_lorry_id,
+
+                  outward_warehouse_id:
+                    outwardWarehouse,
+
+                  row_warehouse_id:
+                    rowWarehouse,
+
+                  qty:
+                    adjQty,
+                }
+              );
+            }
+          }
+
+          const paltiId =
+            Number(
+              paltiRow.legacy_id ??
+                paltiRow.id ??
+                paltiRow.sl_no
+            );
+
+          if (
+            !Number.isFinite(
+              paltiId
+            )
+          ) {
+            throw makeAdjustmentError(
+              "Palti Lorry does not have a valid legacy ID",
+              {
+                palti_lorry_id:
+                  adj.palti_lorry_id,
+              }
+            );
+          }
+
+          const already =
+            await getAdjustedQtyForPalti(
+              paltiId,
+              session
+            );
+
+          const grossQty =
+            getPaltiQty(
+              paltiRow
+            );
+
+          const availableQty =
+            normalizeQty(
+              grossQty -
+                already
+            );
+
+          if (
+            adjQty -
+              availableQty >
+            EPS
+          ) {
+            throw makeAdjustmentError(
+              `Adjusted qty exceeds available qty for palti_lorry_id ${adj.palti_lorry_id}`,
+              {
+                source_type:
+                  "palti_lorry",
+
+                palti_lorry_id:
+                  adj.palti_lorry_id,
+
+                voucher_no:
+                  paltiRow.voucher_no ||
+                  null,
+
+                lorry_no:
+                  paltiRow.reg_lorry_no ||
+                  paltiRow.new_lorry_no ||
+                  null,
+
+                requested_qty:
+                  Number(
+                    adjQty.toFixed(
+                      4
+                    )
+                  ),
+
+                available_qty:
+                  Number(
+                    availableQty.toFixed(
+                      4
+                    )
+                  ),
+
+                difference:
+                  Number(
+                    (
+                      adjQty -
+                      availableQty
+                    ).toFixed(
+                      4
+                    )
+                  ),
+              }
+            );
+          }
+
+          await getAdjustmentCollection().insertOne(
+            {
+              outward_id:
+                outwardNumericId,
+
+              inward_id:
+                null,
+
+              palti_lorry_id:
+                paltiId,
+
+              source_type:
+                "palti_lorry",
+
+              qty:
+                adjQty,
+
+              company_id:
+                companyId,
+
+              created_at:
+                new Date(),
+
+              updated_at:
+                new Date(),
+            },
+            {
+              session,
+            }
+          );
+
+          continue;
         }
 
-        db.get(
-          `SELECT IFNULL(SUM(qty), 0) AS totalAdj FROM adjustment WHERE outward_id = ?`,
-          [outwardId],
-          (sumErr, finalRow) => {
-            if (sumErr) {
-              return res.status(500).json({ error: sumErr.message });
+        /*
+         * ==================================================
+         * INWARD
+         * ==================================================
+         */
+
+        if (
+          !adj.inward_id
+        ) {
+          throw makeAdjustmentError(
+            "Invalid inward adjustment row",
+            {
+              source_type:
+                adj.source_type,
+
+              inward_id:
+                null,
+
+              qty:
+                adjQty,
             }
+          );
+        }
 
-            const totalAdj = normalizeQty(finalRow?.totalAdj || 0);
-            const status =
-              totalAdj >= outwardQty
-                ? "Completed"
-                : totalAdj > 0
-                ? "Partial"
-                : "Pending";
+        const inwardFilter =
+          buildFlexibleIdFilter(
+            adj.inward_id
+          );
 
-            db.run(`UPDATE outward SET status = ? WHERE id = ?`, [status, outwardId], (statusErr) => {
-              if (statusErr) {
-                return res.status(500).json({ error: statusErr.message });
+        const inwardRow =
+          await MongoInward.findOne(
+            inwardFilter
+          )
+            .session(
+              session
+            );
+
+        if (!inwardRow) {
+          throw makeAdjustmentError(
+            `Invalid inward_id ${adj.inward_id}`,
+            {
+              source_type:
+                adj.source_type,
+
+              inward_id:
+                adj.inward_id,
+
+              qty:
+                adjQty,
+            }
+          );
+        }
+
+        const inwardNumericId =
+          Number(
+            inwardRow.legacy_id ??
+              inwardRow.id ??
+              inwardRow.sl_no
+          );
+
+        if (
+          !Number.isFinite(
+            inwardNumericId
+          )
+        ) {
+          throw makeAdjustmentError(
+            "Inward does not have a valid legacy ID",
+            {
+              inward_id:
+                adj.inward_id,
+            }
+          );
+        }
+
+        if (
+          String(
+            inwardRow.company_id
+          ) !==
+          companyId
+        ) {
+          throw makeAdjustmentError(
+            `Company mismatch for inward_id ${adj.inward_id}`,
+            {
+              source_type:
+                "inward",
+
+              inward_id:
+                adj.inward_id,
+
+              company_id:
+                companyId,
+
+              row_company_id:
+                inwardRow.company_id,
+
+              qty:
+                adjQty,
+            }
+          );
+        }
+
+        const outwardWarehouse =
+          String(
+            outward.warehouse_id ||
+              ""
+          );
+
+        const inwardWarehouse =
+          String(
+            inwardRow.warehouse_id ||
+              ""
+          );
+
+        if (
+          outwardWarehouse
+        ) {
+          if (
+            outwardWarehouse !==
+            inwardWarehouse
+          ) {
+            throw makeAdjustmentError(
+              `Warehouse mismatch for inward_id ${adj.inward_id}`,
+              {
+                outward_warehouse_id:
+                  outwardWarehouse,
+
+                row_warehouse_id:
+                  inwardWarehouse,
               }
+            );
+          }
+        }
 
-              return finishSuccess();
-            });
+        const shortagePercent =
+          await resolveShortagePercent(
+            inwardRow
+          );
+
+        const slab =
+          calculateMonthSlab(
+            inwardRow.date,
+            outward.date
+          );
+
+        const grossQty =
+          normalizeQty(
+            inwardRow.weight ??
+              inwardRow.quantity
+          );
+
+        const alreadyAdjustedForThisInward =
+          await getAdjustedQtyForInward(
+            inwardNumericId,
+            session
+          );
+
+        const shortageQty =
+          normalizeQty(
+            calculateShortageQty(
+              grossQty,
+              slab.monthsDiff,
+              shortagePercent
+            )
+          );
+
+        const netOpeningQty =
+          normalizeQty(
+            grossQty -
+              shortageQty
+          );
+
+        const availableQty =
+          normalizeQty(
+            netOpeningQty -
+              alreadyAdjustedForThisInward
+          );
+
+        if (
+          adjQty -
+            availableQty >
+          EPS
+        ) {
+          throw makeAdjustmentError(
+            `Adjusted qty exceeds available qty for inward_id ${adj.inward_id}`,
+            {
+              source_type:
+                "inward",
+
+              inward_id:
+                adj.inward_id,
+
+              voucher_no:
+                inwardRow.voucher_no ||
+                null,
+
+              lorry_no:
+                inwardRow.lorry_no ||
+                null,
+
+              requested_qty:
+                Number(
+                  adjQty.toFixed(
+                    4
+                  )
+                ),
+
+              available_qty:
+                Number(
+                  availableQty.toFixed(
+                    4
+                  )
+                ),
+
+              difference:
+                Number(
+                  (
+                    adjQty -
+                    availableQty
+                  ).toFixed(
+                    4
+                  )
+                ),
+            }
+          );
+        }
+
+        const currentRemaining =
+          normalizeQty(
+            inwardRow.remaining_qty ??
+              grossQty
+          );
+
+        if (
+          adjQty -
+            currentRemaining >
+          EPS
+        ) {
+          throw makeAdjustmentError(
+            `Adjustment exceeds current remaining quantity for inward_id ${adj.inward_id}`,
+            {
+              requested_qty:
+                adjQty,
+
+              remaining_qty:
+                currentRemaining,
+            }
+          );
+        }
+
+        await MongoInward.updateOne(
+          {
+            _id:
+              inwardRow._id,
+          },
+          {
+            $inc: {
+              remaining_qty:
+                -adjQty,
+            },
+
+            $set: {
+              updated_at:
+                new Date(),
+            },
+          },
+          {
+            session,
           }
         );
-      };
 
-      const deleteRow = () => {
-        db.run(`DELETE FROM adjustment WHERE id = ?`, [adjustmentId], (deleteErr, deleteResult) => {
-          if (deleteErr) {
-            return res.status(500).json({ error: deleteErr.message });
+        await getAdjustmentCollection().insertOne(
+          {
+            outward_id:
+              outwardNumericId,
+
+            inward_id:
+              inwardNumericId,
+
+            palti_lorry_id:
+              null,
+
+            source_type:
+              "inward",
+
+            qty:
+              adjQty,
+
+            company_id:
+              companyId,
+
+            created_at:
+              new Date(),
+
+            updated_at:
+              new Date(),
+          },
+          {
+            session,
           }
-
-          if (!deleteResult?.changes) {
-            return res.status(404).json({ error: "Adjustment not found" });
-          }
-
-          return recalculateOutwardStatus();
-        });
-      };
-
-      if (isPalti || !inwardId) {
-        return deleteRow();
+        );
       }
 
-      db.run(
-        `UPDATE inward SET remaining_qty = IFNULL(remaining_qty, 0) + ? WHERE id = ?`,
-        [adjustmentQty, inwardId],
-        (inwardErr) => {
-          if (inwardErr) {
-            console.error("[adjustment delete] inward restore failed:", inwardErr.message);
-            return res.status(500).json({ error: inwardErr.message });
-          }
+      const finalStatus =
+        Math.abs(
+          totalAdjust -
+            remainingToAdjust
+        ) <
+        0.0001
+          ? "Completed"
+          : "Partial";
 
-          return deleteRow();
+      await MongoOutward.updateOne(
+        {
+          _id:
+            outward._id,
+        },
+        {
+          $set: {
+            status:
+              finalStatus,
+
+            updated_at:
+              new Date(),
+          },
+        },
+        {
+          session,
+        }
+      );
+
+      await session.commitTransaction();
+
+      return res.json({
+        message:
+          "Adjustment Saved Successfully",
+
+        status:
+          finalStatus,
+      });
+    } catch (err) {
+      if (session) {
+        await session
+          .abortTransaction()
+          .catch(
+            () => {}
+          );
+      }
+
+      console.error(
+        "[adjustment final-save] error:",
+        err
+      );
+
+      return res.status(
+        Number(
+          err?.status
+        ) || 500
+      ).json({
+        error:
+          err?.message ||
+          "Adjustment save failed",
+
+        details:
+          err?.details ||
+          null,
+      });
+    } finally {
+      if (session) {
+        await session.endSession();
+      }
+    }
+  }
+);
+
+/*
+====================================================
+GET ADJUSTMENT LOG
+====================================================
+*/
+
+router.get(
+  "/:id",
+  async (req, res) => {
+    if (
+      !canViewAdjustment(
+        req.user
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You do not have permission to view adjustments",
+      });
+    }
+
+    try {
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const outwardFilter =
+        buildFlexibleIdFilter(
+          req.params.id
+        );
+
+      if (!outwardFilter) {
+        return res.status(400).json({
+          error:
+            "Invalid outward id",
+        });
+      }
+
+      const outward =
+        await MongoOutward.findOne(
+          outwardFilter
+        ).lean();
+
+      if (!outward) {
+        return res.status(404).json({
+          error:
+            "Outward not found",
+        });
+      }
+
+      const outwardNumericId =
+        Number(
+          outward.legacy_id ??
+            outward.id ??
+            outward.sl_no
+        );
+
+      const collection =
+        getAdjustmentCollection();
+
+      const rows =
+        await collection
+          .find({
+            outward_id:
+              outwardNumericId,
+          })
+          .sort({
+            created_at:
+              1,
+          })
+          .toArray();
+
+      const result =
+        [];
+
+      for (
+        const row of
+          rows
+      ) {
+        let inward =
+          null;
+
+        let palti =
+          null;
+
+        let company =
+          null;
+
+        let warehouse =
+          null;
+
+        if (
+          row.inward_id !=
+          null
+        ) {
+          inward =
+            await MongoInward.findOne(
+              buildFlexibleIdFilter(
+                row.inward_id
+              )
+            )
+              .lean();
+        }
+
+        if (
+          row.palti_lorry_id !=
+          null
+        ) {
+          palti =
+            await getPaltiCollection().findOne(
+              buildFlexibleIdFilter(
+                row.palti_lorry_id
+              )
+            );
+        }
+
+        const companyId =
+          inward?.company_id ??
+          palti?.company_id;
+
+        if (
+          companyId !=
+            null
+        ) {
+          company =
+            await MongoCompany.findOne(
+              buildFlexibleIdFilter(
+                companyId
+              )
+            )
+              .select({
+                name: 1,
+              })
+              .lean();
+        }
+
+        const warehouseId =
+          inward?.warehouse_id ??
+          palti?.warehouse_id;
+
+        if (
+          warehouseId !=
+            null
+        ) {
+          warehouse =
+            await MongoWarehouse.findOne(
+              buildFlexibleIdFilter(
+                warehouseId
+              )
+            )
+              .select({
+                name: 1,
+              })
+              .lean();
+        }
+
+        result.push({
+          id:
+            row._id
+              ? String(
+                  row._id
+                )
+              : null,
+
+          qty:
+            normalizeQty(
+              row.qty
+            ),
+
+          inward_voucher:
+            inward?.voucher_no ??
+            palti?.voucher_no ??
+            null,
+
+          lorry_no:
+            normalizeText(
+              inward?.lorry_no
+            ) ||
+            normalizeText(
+              palti?.reg_lorry_no
+            ) ||
+            normalizeText(
+              palti?.new_lorry_no
+            ) ||
+            "-",
+
+          inward_date:
+            inward?.date ??
+            palti?.expense_date ??
+            null,
+
+          company_name:
+            company?.name ||
+            "",
+
+          warehouse_name:
+            warehouse?.name ||
+            "",
+
+          source_type:
+            row.source_type ||
+            "inward",
+
+          outward_id:
+            outwardNumericId,
+
+          inward_id:
+            row.inward_id ??
+            null,
+
+          palti_lorry_id:
+            row.palti_lorry_id ??
+            null,
+
+          created_at:
+            row.created_at ||
+            null,
+
+          updated_at:
+            row.updated_at ||
+            null,
+        });
+      }
+
+      return res.json(
+        result
+      );
+    } catch (err) {
+      console.error(
+        "[adjustment log] error:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
+      });
+    }
+  }
+);
+
+/*
+====================================================
+UPDATE ADJUSTMENT LOG
+====================================================
+*/
+
+async function updateAdjustment(
+  req,
+  res
+) {
+  if (
+    !canManageAdjustment(
+      req.user
+    )
+  ) {
+    return res.status(403).json({
+      error:
+        "You do not have permission to update adjustments",
+    });
+  }
+
+  let session = null;
+
+  try {
+    if (!requireMongo(res)) {
+      return;
+    }
+
+    const adjustmentObjectId =
+      mongoose.Types.ObjectId.isValid(
+        String(
+          req.params.id
+        )
+      )
+        ? new mongoose.Types.ObjectId(
+            String(
+              req.params.id
+            )
+          )
+        : null;
+
+    if (!adjustmentObjectId) {
+      return res.status(400).json({
+        error:
+          "Invalid adjustment id",
+      });
+    }
+
+    const newQty =
+      normalizeQty(
+        req.body?.qty
+      );
+
+    if (
+      newQty <=
+      0
+    ) {
+      return res.status(400).json({
+        error:
+          "Valid qty required",
+      });
+    }
+
+    const collection =
+      getAdjustmentCollection();
+
+    const row =
+      await collection.findOne({
+        _id:
+          adjustmentObjectId,
+      });
+
+    if (!row) {
+      return res.status(404).json({
+        error:
+          "Adjustment not found",
+      });
+    }
+
+    const outward =
+      await MongoOutward.findOne(
+        buildFlexibleIdFilter(
+          row.outward_id
+        )
+      ).lean();
+
+    if (!outward) {
+      return res.status(404).json({
+        error:
+          "Outward not found",
+      });
+    }
+
+    const outwardNumericId =
+      Number(
+        outward.legacy_id ??
+          outward.id ??
+          outward.sl_no
+      );
+
+    const oldQty =
+      normalizeQty(
+        row.qty
+      );
+
+    const isPalti =
+      String(
+        row.source_type ||
+          ""
+      )
+        .trim()
+        .toLowerCase() ===
+        "palti_lorry" ||
+      Number(
+        row.palti_lorry_id
+      ) > 0;
+
+    const otherOutwardAdjusted =
+      await getAdjustedQtyForOutward(
+        outwardNumericId,
+        null,
+        adjustmentObjectId
+      );
+
+    const outwardQty =
+      normalizeQty(
+        outward.quantity
+      );
+
+    if (
+      otherOutwardAdjusted +
+        newQty -
+        outwardQty >
+      EPS
+    ) {
+      return res.status(400).json({
+        error:
+          "Updated qty exceeds outward qty",
+      });
+    }
+
+    let availableQty =
+      0;
+
+    let sourceRow =
+      null;
+
+    if (isPalti) {
+      sourceRow =
+        await getPaltiCollection().findOne(
+          buildFlexibleIdFilter(
+            row.palti_lorry_id
+          )
+        );
+
+      if (!sourceRow) {
+        return res.status(404).json({
+          error:
+            "Palti Lorry source not found",
+        });
+      }
+
+      const paltiId =
+        Number(
+          sourceRow.legacy_id ??
+            sourceRow.id ??
+            sourceRow.sl_no
+        );
+
+      const otherAdjusted =
+        await getAdjustedQtyForPalti(
+          paltiId,
+          null,
+          adjustmentObjectId
+        );
+
+      availableQty =
+        normalizeQty(
+          getPaltiQty(
+            sourceRow
+          ) -
+            otherAdjusted
+        );
+    } else {
+      sourceRow =
+        await MongoInward.findOne(
+          buildFlexibleIdFilter(
+            row.inward_id
+          )
+        ).lean();
+
+      if (!sourceRow) {
+        return res.status(404).json({
+          error:
+            "Inward source not found",
+        });
+      }
+
+      const inwardId =
+        Number(
+          sourceRow.legacy_id ??
+            sourceRow.id ??
+            sourceRow.sl_no
+        );
+
+      const shortagePercent =
+        await resolveShortagePercent(
+          sourceRow
+        );
+
+      const slab =
+        calculateMonthSlab(
+          sourceRow.date,
+          outward.date
+        );
+
+      const grossQty =
+        normalizeQty(
+          sourceRow.weight ??
+            sourceRow.quantity
+        );
+
+      const shortageQty =
+        normalizeQty(
+          calculateShortageQty(
+            grossQty,
+            slab.monthsDiff,
+            shortagePercent
+          )
+        );
+
+      const otherAdjusted =
+        await getAdjustedQtyForInward(
+          inwardId,
+          null,
+          adjustmentObjectId
+        );
+
+      availableQty =
+        normalizeQty(
+          grossQty -
+            shortageQty -
+            otherAdjusted
+        );
+    }
+
+    if (
+      newQty -
+        availableQty >
+      EPS
+    ) {
+      return res.status(400).json({
+        error:
+          "Updated qty exceeds available qty",
+      });
+    }
+
+    session =
+      await mongoose.startSession();
+
+    session.startTransaction();
+
+    await collection.updateOne(
+      {
+        _id:
+          adjustmentObjectId,
+      },
+      {
+        $set: {
+          qty:
+            newQty,
+
+          updated_at:
+            new Date(),
+        },
+      },
+      {
+        session,
+      }
+    );
+
+    if (
+      !isPalti
+    ) {
+      const difference =
+        normalizeQty(
+          oldQty -
+            newQty
+        );
+
+      await MongoInward.updateOne(
+        buildFlexibleIdFilter(
+          row.inward_id
+        ),
+        {
+          $inc: {
+            remaining_qty:
+              difference,
+          },
+
+          $set: {
+            updated_at:
+              new Date(),
+          },
+        },
+        {
+          session,
         }
       );
     }
-  );
-};
 
-router.delete("/log/:id", handleAdjustmentLogDelete);
-router.post("/log/:id/delete", handleAdjustmentLogDelete);
+    const finalTotal =
+      await getAdjustedQtyForOutward(
+        outwardNumericId,
+        session
+      );
 
+    const status =
+      finalTotal >=
+      outwardQty
+        ? "Completed"
+        : finalTotal >
+          0
+        ? "Partial"
+        : "Pending";
 
-router.get("/:id", (req, res) => {
-  db.all(
-    `
-    SELECT
-      a.id,
-      a.qty,
-      COALESCE(i.voucher_no, p.voucher_no) AS inward_voucher,
-      COALESCE(NULLIF(TRIM(i.lorry_no), ''), NULLIF(TRIM(p.reg_lorry_no), ''), NULLIF(TRIM(p.new_lorry_no), ''), '-') AS lorry_no,
-      COALESCE(i.date, p.expense_date) AS inward_date,
-      COALESCE(c.name, cp.name) AS company_name,
-      COALESCE(w.name, wp.name) AS warehouse_name,
-      COALESCE(a.source_type, 'inward') AS source_type
-    FROM adjustment a
-    LEFT JOIN inward i ON a.inward_id = i.id
-    LEFT JOIN palti_lorry_entries p ON a.palti_lorry_id = p.id
-    LEFT JOIN companies c ON i.company_id = c.id
-    LEFT JOIN companies cp ON p.company_id = cp.id
-    LEFT JOIN warehouses w ON i.warehouse_id = w.id
-    LEFT JOIN warehouses wp ON p.warehouse_id = wp.id
-    WHERE a.outward_id=?
-    ORDER BY a.id ASC
-    `,
-    [req.params.id],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(rows);
+    await MongoOutward.updateOne(
+      buildFlexibleIdFilter(
+        outwardNumericId
+      ),
+      {
+        $set: {
+          status,
+
+          updated_at:
+            new Date(),
+        },
+      },
+      {
+        session,
+      }
+    );
+
+    await session.commitTransaction();
+
+    return res.json({
+      message:
+        "Adjustment updated successfully",
+
+      status,
+    });
+  } catch (err) {
+    if (session) {
+      await session
+        .abortTransaction()
+        .catch(
+          () => {}
+        );
     }
-  );
-});
+
+    console.error(
+      "[adjustment update] error:",
+      err
+    );
+
+    return res.status(
+      Number(
+        err?.status
+      ) || 500
+    ).json({
+      error:
+        err?.message ||
+        "Adjustment update failed",
+    });
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
+  }
+}
+
+router.put(
+  "/log/:id",
+  updateAdjustment
+);
+
+router.post(
+  "/log/:id/update",
+  updateAdjustment
+);
+
+/*
+====================================================
+DELETE ADJUSTMENT LOG
+====================================================
+*/
+
+async function deleteAdjustment(
+  req,
+  res
+) {
+  if (
+    !canManageAdjustment(
+      req.user
+    )
+  ) {
+    return res.status(403).json({
+      error:
+        "You do not have permission to delete adjustments",
+    });
+  }
+
+  let session = null;
+
+  try {
+    if (!requireMongo(res)) {
+      return;
+    }
+
+    const adjustmentId =
+      mongoose.Types.ObjectId.isValid(
+        String(
+          req.params.id
+        )
+      )
+        ? new mongoose.Types.ObjectId(
+            String(
+              req.params.id
+            )
+          )
+        : null;
+
+    if (!adjustmentId) {
+      return res.status(400).json({
+        error:
+          "Invalid adjustment id",
+      });
+    }
+
+    const collection =
+      getAdjustmentCollection();
+
+    const row =
+      await collection.findOne({
+        _id:
+          adjustmentId,
+      });
+
+    if (!row) {
+      return res.json({
+        message:
+          "Adjustment already deleted",
+      });
+    }
+
+    const outward =
+      await MongoOutward.findOne(
+        buildFlexibleIdFilter(
+          row.outward_id
+        )
+      ).lean();
+
+    const outwardQty =
+      normalizeQty(
+        outward?.quantity
+      );
+
+    const isPalti =
+      String(
+        row.source_type ||
+          ""
+      )
+        .trim()
+        .toLowerCase() ===
+        "palti_lorry" ||
+      Number(
+        row.palti_lorry_id
+      ) > 0;
+
+    session =
+      await mongoose.startSession();
+
+    session.startTransaction();
+
+    if (
+      !isPalti &&
+      row.inward_id !=
+        null
+    ) {
+      const inwardFilter =
+        buildFlexibleIdFilter(
+          row.inward_id
+        );
+
+      await MongoInward.updateOne(
+        inwardFilter,
+        {
+          $inc: {
+            remaining_qty:
+              normalizeQty(
+                row.qty
+              ),
+          },
+
+          $set: {
+            updated_at:
+              new Date(),
+          },
+        },
+        {
+          session,
+        }
+      );
+    }
+
+    await collection.deleteOne(
+      {
+        _id:
+          adjustmentId,
+      },
+      {
+        session,
+      }
+    );
+
+    if (outward) {
+      const outwardNumericId =
+        Number(
+          outward.legacy_id ??
+            outward.id ??
+            outward.sl_no
+        );
+
+      const totalAdj =
+        await getAdjustedQtyForOutward(
+          outwardNumericId,
+          session
+        );
+
+      const status =
+        totalAdj >=
+        outwardQty
+          ? "Completed"
+          : totalAdj >
+            0
+          ? "Partial"
+          : "Pending";
+
+      await MongoOutward.updateOne(
+        {
+          _id:
+            outward._id,
+        },
+        {
+          $set: {
+            status,
+
+            updated_at:
+              new Date(),
+          },
+        },
+        {
+          session,
+        }
+      );
+    }
+
+    await session.commitTransaction();
+
+    return res.json({
+      message:
+        "Adjustment deleted successfully",
+
+      deleted:
+        1,
+
+      source:
+        "mongodb",
+    });
+  } catch (err) {
+    if (session) {
+      await session
+        .abortTransaction()
+        .catch(
+          () => {}
+        );
+    }
+
+    console.error(
+      "[adjustment delete] error:",
+      err
+    );
+
+    return res.status(
+      Number(
+        err?.status
+      ) || 500
+    ).json({
+      error:
+        err?.message ||
+        "Adjustment delete failed",
+    });
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
+  }
+}
+
+router.delete(
+  "/log/:id",
+  deleteAdjustment
+);
+
+router.post(
+  "/log/:id/delete",
+  deleteAdjustment
+);
 
 module.exports = router;
-
-
-
-
-
