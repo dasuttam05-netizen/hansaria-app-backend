@@ -1,10 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const db = require("../db");
-
 const { Company } = require("../mongo");
-const { resolveMongoMasterId } = require("../helpers/sqliteMasterResolver");
-
 const {
   userHasPermission,
   isAdminUser,
@@ -38,99 +34,10 @@ function canReadCompanies(user) {
   );
 }
 
-function dbGetAsync(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) return reject(err);
-      resolve(row || null);
-    });
-  });
-}
-
-function dbRunAsync(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function onRun(err) {
-      if (err) return reject(err);
-      resolve({
-        lastID: Number(this?.lastID),
-        changes: Number(this?.changes || 0),
-      });
-    });
-  });
-}
-
 function normalizeShortagePercent(value) {
   if (value === "" || value === undefined || value === null) return null;
   const numericValue = Number(value);
   return Number.isFinite(numericValue) ? numericValue : null;
-}
-
-async function syncCompanyShortageToSqlite(companyId, shortagePercent) {
-  const sqliteCompanyId = await resolveMongoMasterId(db, companyId, Company, "companies");
-  if (!sqliteCompanyId) return;
-  await dbRunAsync("UPDATE companies SET shortage_percent = ? WHERE id = ?", [
-    normalizeShortagePercent(shortagePercent),
-    sqliteCompanyId,
-  ]);
-}
-
-async function forceCompanyShortageToMongo(companyId, shortagePercent) {
-  const normalized = normalizeShortagePercent(shortagePercent);
-  await Company.collection.updateOne(
-    { _id: companyId },
-    { $set: { shortage_percent: normalized } }
-  );
-}
-
-async function syncCompanyToSqlite(companyDoc) {
-  const doc = companyDoc && typeof companyDoc.toObject === "function"
-    ? companyDoc.toObject()
-    : (companyDoc || {});
-
-  const mongoCompanyId = doc._id || doc.id;
-  if (!mongoCompanyId) return;
-
-  const sqliteCompanyId = await resolveMongoMasterId(db, mongoCompanyId, Company, "companies");
-  if (!sqliteCompanyId) return;
-
-  const normalizedShortagePercent = normalizeShortagePercent(doc.shortage_percent);
-
-  const openingBalance = Number(doc.opening_balance ?? 0);
-  const openingBalanceType = String(doc.opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr";
-
-  const existing = await dbGetAsync("SELECT id FROM companies WHERE id = ?", [sqliteCompanyId]);
-
-  if (existing) {
-    await dbRunAsync(
-      `UPDATE companies
-       SET name = ?, address = ?, mobile = ?, shortage_percent = ?, opening_balance = ?, opening_balance_type = ?
-       WHERE id = ?`,
-      [
-        doc.name || "",
-        doc.address || "",
-        doc.mobile || "",
-        normalizedShortagePercent,
-        openingBalance,
-        openingBalanceType,
-        sqliteCompanyId,
-      ]
-    );
-    return;
-  }
-
-  await dbRunAsync(
-    `INSERT INTO companies (id, name, address, mobile, shortage_percent, opening_balance, opening_balance_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [
-      sqliteCompanyId,
-      doc.name || "",
-      doc.address || "",
-      doc.mobile || "",
-      normalizedShortagePercent,
-      openingBalance,
-      openingBalanceType,
-    ]
-  );
 }
 
 router.get("/", async (req, res) => {
@@ -202,11 +109,6 @@ router.post("/", async (req, res) => {
       opening_balance_type: String(opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
     });
     await company.save();
-    await forceCompanyShortageToMongo(company._id, normalizedShortagePercent);
-
-    await syncCompanyToSqlite(company);
-    await syncCompanyShortageToSqlite(company._id, company.shortage_percent);
-
     const freshCompany = await Company.findById(company._id).lean();
     res.json({
       ...(freshCompany || company.toObject()),
@@ -257,11 +159,6 @@ router.put("/:id", async (req, res) => {
     updated.opening_balance = Number(opening_balance || 0);
     updated.opening_balance_type = String(opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr";
     await updated.save();
-    await forceCompanyShortageToMongo(updated._id, updated.shortage_percent);
-
-    await syncCompanyToSqlite(updated);
-    await syncCompanyShortageToSqlite(updated._id, updated.shortage_percent);
-
     const freshUpdated = await Company.findById(updated._id).lean();
     res.json({
       ...(freshUpdated || updated.toObject()),
