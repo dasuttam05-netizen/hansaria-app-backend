@@ -1,23 +1,15 @@
 const mongoose = require("mongoose");
-const dns = require("node:dns");
 
 require("dotenv").config();
 
 mongoose.set("bufferCommands", false);
 
 const rawMongoUri = process.env.MONGODB_URI?.trim() || "";
-const mongoDnsServers = String(process.env.MONGODB_DNS_SERVERS || "")
-  .split(",")
-  .map((value) => value.trim())
-  .filter(Boolean);
-
-if (mongoDnsServers.length > 0) {
-  dns.setServers(mongoDnsServers);
-  console.log(`Using custom DNS servers for MongoDB: ${mongoDnsServers.join(", ")}`);
-}
+const rawMongoLegacyUri = process.env.MONGODB_URI_LEGACY?.trim() || "";
 
 function normalizeAtlasUri(uri) {
   if (!uri || !uri.startsWith("mongodb+srv://")) return uri;
+
   return uri.replace(
     /\/([^/?#=]+)=([^/?#]+)$/,
     "/$1?retryWrites=true&w=majority&appName=$2"
@@ -25,13 +17,27 @@ function normalizeAtlasUri(uri) {
 }
 
 const mongodbUri = normalizeAtlasUri(rawMongoUri);
-const hasMongoUri = mongodbUri && !mongodbUri.includes("username:password");
+const fallbackMongoUri =
+  rawMongoLegacyUri || "";
+const hasMongoUri =
+  mongodbUri && !mongodbUri.includes("username:password");
+const hasFallbackMongoUri =
+  Boolean(fallbackMongoUri) &&
+  fallbackMongoUri.startsWith("mongodb://");
 
 if (!hasMongoUri) {
-  console.log("MongoDB URI is not configured or contains placeholder credentials.");
+  if (hasFallbackMongoUri) {
+    console.log("Using legacy MongoDB URI from MONGODB_URI_LEGACY.");
+  } else {
+  console.log(
+    "MongoDB URI is not configured or contains placeholder credentials."
+  );
+  }
 } else if (mongoose.connection.readyState === 0) {
   if (mongodbUri !== rawMongoUri) {
-    console.log("Normalized MongoDB URI format from legacy value in .env.");
+    console.log(
+      "Normalized MongoDB URI format from legacy value in .env."
+    );
   }
 
   mongoose
@@ -44,12 +50,43 @@ if (!hasMongoUri) {
       retryWrites: true,
       retryReads: true,
     })
-    .then(() => console.log("Connected to MongoDB"))
+    .then(() => {
+      console.log("Connected to MongoDB");
+    })
     .catch((err) => {
       if (err?.syscall === "querySrv") {
-        console.error("MongoDB SRV DNS lookup failed. Switch DNS server or use Atlas non-SRV URI.");
+        console.error(
+          "MongoDB SRV DNS lookup failed. If your network blocks SRV lookups, use the non-SRV Atlas connection string instead."
+        );
       }
-      console.error("MongoDB Connection Error:", err.message);
+
+      console.error(
+        "MongoDB Connection Error:",
+        err.message
+      );
+
+      if (hasFallbackMongoUri) {
+        console.log("Retrying with MONGODB_URI_LEGACY.");
+        mongoose
+          .connect(fallbackMongoUri, {
+            serverSelectionTimeoutMS: 8000,
+            socketTimeoutMS: 45000,
+            maxPoolSize: 20,
+            minPoolSize: 5,
+            maxIdleTimeMS: 45000,
+            retryWrites: true,
+            retryReads: true,
+          })
+          .then(() => {
+            console.log("Connected to MongoDB using legacy URI");
+          })
+          .catch((legacyErr) => {
+            console.error(
+              "MongoDB legacy URI connection error:",
+              legacyErr.message
+            );
+          });
+      }
     });
 }
 
@@ -59,11 +96,8 @@ if (!hasMongoUri) {
 // =========================
 const locationSchema =
   new mongoose.Schema({
-
     name: String,
-
     address: String,
-
     abbr: String,
   });
 
@@ -72,142 +106,169 @@ const locationSchema =
 // EMPLOYEE
 // =========================
 const employeeSchema =
-  new mongoose.Schema({
+  new mongoose.Schema(
+    {
+      employee_id: {
+        type: String,
+        unique: true,
+      },
 
-    // CUSTOM EMPLOYEE ID
-    employee_id: {
-      type: String,
-      unique: true,
+      name: String,
+
+      mobile: String,
+
+      address: String,
+
+      username: {
+        type: String,
+        unique: true,
+      },
+
+      password: String,
+
+      location_id: {
+        type:
+          mongoose.Schema.Types.ObjectId,
+        ref: "Location",
+      },
+
+      location_ids: [
+        {
+          type:
+            mongoose.Schema.Types.ObjectId,
+          ref: "Location",
+        },
+      ],
+
+      all_location_access: {
+        type: Boolean,
+        default: false,
+      },
+
+      role: String,
+
+      permissions: [String],
+
+      opening_balance: {
+        type: Number,
+        default: 0,
+      },
+
+      opening_balance_type: {
+        type: String,
+        default: "dr",
+      },
+
+      assigned_warehouse_ids: [
+        {
+          type:
+            mongoose.Schema.Types.ObjectId,
+          ref: "Warehouse",
+        },
+      ],
+
+      all_warehouse_access: {
+        type: Boolean,
+        default: false,
+      },
     },
-
-    name: String,
-
-    mobile: String,
-
-    address: String,
-
-    username: {
-      type: String,
-      unique: true,
-    },
-
-    password: String,
-
-    location_id: {
-      type:
-        mongoose.Schema.Types.ObjectId,
-      ref: "Location",
-    },
-
-    location_ids: [{
-      type:
-        mongoose.Schema.Types.ObjectId,
-      ref: "Location",
-    }],
-
-    all_location_access: {
-      type: Boolean,
-      default: false,
-    },
-
-    role: String,
-
-    permissions: [String],
-
-    opening_balance: {
-      type: Number,
-      default: 0,
-    },
-
-    opening_balance_type: {
-      type: String,
-      default: "dr",
-    },
-
-    assigned_warehouse_ids: [{
-      type:
-        mongoose.Schema.Types.ObjectId,
-      ref: "Warehouse",
-    }],
-
-    all_warehouse_access: {
-      type: Boolean,
-      default: false,
-    },
-  },
-  {
-    timestamps: true,
-  });
+    {
+      timestamps: true,
+    }
+  );
 
 
 // =========================
 // COMPANY
 // =========================
 const companySchema =
-  new mongoose.Schema({
+  new mongoose.Schema(
+    {
+      name: String,
 
-    name: String,
+      address: String,
 
-    address: String,
+      mobile: String,
 
-    mobile: String,
+      shortage_percent: {
+        type: Number,
+        default: null,
+      },
 
-    shortage_percent: {
-      type: Number,
-      default: null,
+      opening_balance: {
+        type: Number,
+        default: 0,
+      },
+
+      opening_balance_type: {
+        type: String,
+        default: "dr",
+      },
     },
-
-    opening_balance: {
-      type: Number,
-      default: 0,
-    },
-
-    opening_balance_type: {
-      type: String,
-      default: "dr",
-    },
-  },
-  {
-    timestamps: true,
-  });
+    {
+      timestamps: true,
+    }
+  );
 
 
 // =========================
 // FARMER
 // =========================
 const farmerSchema =
-  new mongoose.Schema({
-    name: {
-      type: String,
-      required: true,
+  new mongoose.Schema(
+    {
+      name: {
+        type: String,
+        required: true,
+      },
+
+      mobile: String,
+
+      email: String,
+
+      address: String,
+
+      village: String,
+
+      pincode: String,
+
+      state: String,
+
+      district: String,
+
+      city: String,
+
+      room_floor_building: String,
+
+      street_locality_landmark: String,
+
+      gst_no: String,
+
+      pan_no: String,
+
+      aadhar_no: String,
+
+      aadhaar_pan_link_status: {
+        type: String,
+        default: "unknown",
+      },
+
+      bank_name: String,
+
+      bank_account_no: String,
+
+      ifsc_code: String,
+
+      branch_name: String,
+
+      account_holder_name: String,
+
+      location: String,
     },
-    mobile: String,
-    email: String,
-    address: String,
-    village: String,
-    pincode: String,
-    state: String,
-    district: String,
-    city: String,
-    room_floor_building: String,
-    street_locality_landmark: String,
-    gst_no: String,
-    pan_no: String,
-    aadhar_no: String,
-    aadhaar_pan_link_status: {
-      type: String,
-      default: "unknown",
-    },
-    bank_name: String,
-    bank_account_no: String,
-    ifsc_code: String,
-    branch_name: String,
-    account_holder_name: String,
-    location: String,
-  },
-  {
-    timestamps: true,
-  });
+    {
+      timestamps: true,
+    }
+  );
 
 
 // =========================
@@ -215,7 +276,6 @@ const farmerSchema =
 // =========================
 const companyAccountSchema =
   new mongoose.Schema({
-
     account_name: String,
 
     address: String,
@@ -242,15 +302,20 @@ const companyAccountSchema =
 // =========================
 const warehouseSchema =
   new mongoose.Schema({
-
     name: String,
 
     address: String,
+
     pincode: String,
+
     state: String,
+
     district: String,
+
     city: String,
+
     room_floor_building: String,
+
     street_locality_landmark: String,
 
     company_id: {
@@ -276,11 +341,13 @@ const warehouseSchema =
       ref: "Employee",
     },
 
-    employee_ids: [{
-      type:
-        mongoose.Schema.Types.ObjectId,
-      ref: "Employee",
-    }],
+    employee_ids: [
+      {
+        type:
+          mongoose.Schema.Types.ObjectId,
+        ref: "Employee",
+      },
+    ],
 
     opening_balance: {
       type: Number,
@@ -299,7 +366,6 @@ const warehouseSchema =
 // =========================
 const productSchema =
   new mongoose.Schema({
-
     name: String,
 
     hsn_code: String,
@@ -310,162 +376,547 @@ const productSchema =
 // WAREHOUSE PURCHASE VOUCHER
 // =========================
 const purchaseVoucherSchema =
-  new mongoose.Schema({
-    voucher_no: {
-      type: String,
-      index: true,
+  new mongoose.Schema(
+    {
+      voucher_no: {
+        type: String,
+        index: true,
+      },
+
+      date: String,
+
+      warehouse_id: String,
+
+      farmer_id: String,
+
+      company_account_id: String,
+
+      product_id: String,
+
+      quantity: {
+        type: Number,
+        default: 0,
+      },
+
+      rate: {
+        type: Number,
+        default: 0,
+      },
+
+      amount: {
+        type: Number,
+        default: 0,
+      },
+
+      packet: {
+        type: Number,
+        default: 0,
+      },
+
+      gross_weight: {
+        type: Number,
+        default: 0,
+      },
+
+      tare_weight: {
+        type: Number,
+        default: 0,
+      },
+
+      dhalta: {
+        type: Number,
+        default: 0,
+      },
+
+      less_bags_weight: {
+        type: Number,
+        default: 0,
+      },
+
+      moisture: {
+        type: Number,
+        default: 0,
+      },
+
+      dunki: {
+        type: Number,
+        default: 0,
+      },
+
+      fungus: {
+        type: Number,
+        default: 0,
+      },
+
+      discolour: {
+        type: Number,
+        default: 0,
+      },
+
+      others: {
+        type: Number,
+        default: 0,
+      },
+
+      net_weight: {
+        type: Number,
+        default: 0,
+      },
+
+      bags_claim: {
+        type: Number,
+        default: 0,
+      },
+
+      labour: {
+        type: Number,
+        default: 0,
+      },
+
+      total_deduct_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      total_qty: {
+        type: Number,
+        default: 0,
+      },
+
+      total_deduction: {
+        type: Number,
+        default: 0,
+      },
+
+      round_off: {
+        type: Number,
+        default: 0,
+      },
+
+      net_amount_payable: {
+        type: Number,
+        default: 0,
+      },
+
+      employee_id: String,
+
+      location_id: String,
+
+      description: String,
     },
-    date: String,
-    warehouse_id: String,
-    farmer_id: String,
-    company_account_id: String,
-    product_id: String,
-    quantity: { type: Number, default: 0 },
-    rate: { type: Number, default: 0 },
-    amount: { type: Number, default: 0 },
-    packet: { type: Number, default: 0 },
-    gross_weight: { type: Number, default: 0 },
-    tare_weight: { type: Number, default: 0 },
-    dhalta: { type: Number, default: 0 },
-    less_bags_weight: { type: Number, default: 0 },
-    moisture: { type: Number, default: 0 },
-    dunki: { type: Number, default: 0 },
-    fungus: { type: Number, default: 0 },
-    discolour: { type: Number, default: 0 },
-    others: { type: Number, default: 0 },
-    net_weight: { type: Number, default: 0 },
-    bags_claim: { type: Number, default: 0 },
-    labour: { type: Number, default: 0 },
-    total_deduct_amount: { type: Number, default: 0 },
-    total_qty: { type: Number, default: 0 },
-    total_deduction: { type: Number, default: 0 },
-    round_off: { type: Number, default: 0 },
-    net_amount_payable: { type: Number, default: 0 },
-    employee_id: String,
-    location_id: String,
-    description: String,
-  },
-  {
-    timestamps: true,
-  });
+    {
+      timestamps: true,
+    }
+  );
 
 
 // =========================
 // WAREHOUSE SALE VOUCHER
 // =========================
 const saleVoucherSchema =
-  new mongoose.Schema({
-    voucher_no: {
-      type: String,
-      index: true,
-    },
-    date: String,
-    unloading_date: String,
-    warehouse_id: String,
-    buyer_id: String,
-    company_id: String,
-    company_account_id: String,
-    consignee_id: String,
-    po_no: String,
-    due_date: String,
-    due_days: { type: Number, default: 0 },
-    sale_type: { type: String, default: "warehouse" },
-    direct_purchase_rate: { type: Number, default: 0 },
-    direct_purchase_amount: { type: Number, default: 0 },
-    against_purchase_enabled: { type: Boolean, default: false },
-    against_purchase_farmer_id: String,
-    against_purchase_links: [
-      {
-        purchase_id: String,
-        voucher_no: String,
-        farmer_id: String,
-        quantity: { type: Number, default: 0 },
-        rate: { type: Number, default: 0 },
-        amount: { type: Number, default: 0 },
+  new mongoose.Schema(
+    {
+      voucher_no: {
+        type: String,
+        index: true,
       },
-    ],
-    lorry_no: String,
-    journey_token: {
-      type: String,
-      index: true,
+
+      date: String,
+
+      unloading_date: String,
+
+      warehouse_id: String,
+
+      buyer_id: String,
+
+      company_id: String,
+
+      company_account_id: String,
+
+      consignee_id: String,
+
+      po_no: String,
+
+      due_date: String,
+
+      due_days: {
+        type: Number,
+        default: 0,
+      },
+
+      sale_type: {
+        type: String,
+        default: "warehouse",
+      },
+
+      direct_purchase_rate: {
+        type: Number,
+        default: 0,
+      },
+
+      direct_purchase_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      against_purchase_enabled: {
+        type: Boolean,
+        default: false,
+      },
+
+      against_purchase_farmer_id: String,
+
+      against_purchase_links: [
+        {
+          purchase_id: String,
+
+          voucher_no: String,
+
+          farmer_id: String,
+
+          quantity: {
+            type: Number,
+            default: 0,
+          },
+
+          rate: {
+            type: Number,
+            default: 0,
+          },
+
+          amount: {
+            type: Number,
+            default: 0,
+          },
+        },
+      ],
+
+      lorry_no: String,
+
+      journey_token: {
+        type: String,
+        index: true,
+      },
+
+      product_id: String,
+
+      quantity: {
+        type: Number,
+        default: 0,
+      },
+
+      shortage_quantity: {
+        type: Number,
+        default: 0,
+      },
+
+      rate: {
+        type: Number,
+        default: 0,
+      },
+
+      amount: {
+        type: Number,
+        default: 0,
+      },
+
+      packet: {
+        type: Number,
+        default: 0,
+      },
+
+      gross_weight: {
+        type: Number,
+        default: 0,
+      },
+
+      tare_weight: {
+        type: Number,
+        default: 0,
+      },
+
+      net_weight: {
+        type: Number,
+        default: 0,
+      },
+
+      unloading_qty: {
+        type: Number,
+        default: 0,
+      },
+
+      reject_qty: {
+        type: Number,
+        default: 0,
+      },
+
+      moisture: {
+        type: Number,
+        default: 0,
+      },
+
+      dunki: {
+        type: Number,
+        default: 0,
+      },
+
+      fungus: {
+        type: Number,
+        default: 0,
+      },
+
+      discolour: {
+        type: Number,
+        default: 0,
+      },
+
+      others: {
+        type: Number,
+        default: 0,
+      },
+
+      total_deduction: {
+        type: Number,
+        default: 0,
+      },
+
+      bags_claim: {
+        type: Number,
+        default: 0,
+      },
+
+      other_deduction: {
+        type: Number,
+        default: 0,
+      },
+
+      claim_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      cd_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      cd_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      adjustment_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      tds_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      net_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      net_receivable_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      fifo_rate: {
+        type: Number,
+        default: 0,
+      },
+
+      fifo_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      outstanding: {
+        type: Number,
+        default: 0,
+      },
+
+      round_off: {
+        type: Number,
+        default: 0,
+      },
+
+      net_amount_payable: {
+        type: Number,
+        default: 0,
+      },
+
+      employee_id: String,
+
+      location_id: String,
+
+      description: String,
     },
-    product_id: String,
-    quantity: { type: Number, default: 0 },
-    shortage_quantity: { type: Number, default: 0 },
-    rate: { type: Number, default: 0 },
-    amount: { type: Number, default: 0 },
-    packet: { type: Number, default: 0 },
-    gross_weight: { type: Number, default: 0 },
-    tare_weight: { type: Number, default: 0 },
-    net_weight: { type: Number, default: 0 },
-    unloading_qty: { type: Number, default: 0 },
-    reject_qty: { type: Number, default: 0 },
-    moisture: { type: Number, default: 0 },
-    dunki: { type: Number, default: 0 },
-    fungus: { type: Number, default: 0 },
-    discolour: { type: Number, default: 0 },
-    others: { type: Number, default: 0 },
-    total_deduction: { type: Number, default: 0 },
-    bags_claim: { type: Number, default: 0 },
-    other_deduction: { type: Number, default: 0 },
-    claim_amount: { type: Number, default: 0 },
-    cd_percent: { type: Number, default: 0 },
-    cd_amount: { type: Number, default: 0 },
-    adjustment_amount: { type: Number, default: 0 },
-    tds_amount: { type: Number, default: 0 },
-    net_amount: { type: Number, default: 0 },
-    net_receivable_amount: { type: Number, default: 0 },
-    fifo_rate: { type: Number, default: 0 },
-    fifo_amount: { type: Number, default: 0 },
-    outstanding: { type: Number, default: 0 },
-    round_off: { type: Number, default: 0 },
-    net_amount_payable: { type: Number, default: 0 },
-    employee_id: String,
-    location_id: String,
-    description: String,
-  },
-  {
-    timestamps: true,
-  });
+    {
+      timestamps: true,
+    }
+  );
 
-// Trading list indexes: keep filter + newest-first sorting inside MongoDB.
-purchaseVoucherSchema.index({ warehouse_id: 1, date: -1, _id: -1 });
-purchaseVoucherSchema.index({ farmer_id: 1, date: -1, _id: -1 });
-purchaseVoucherSchema.index({ company_account_id: 1, date: -1, _id: -1 });
-purchaseVoucherSchema.index({ product_id: 1, date: -1, _id: -1 });
 
-saleVoucherSchema.index({ warehouse_id: 1, date: -1, _id: -1 });
-saleVoucherSchema.index({ buyer_id: 1, date: -1, _id: -1 });
-saleVoucherSchema.index({ company_account_id: 1, date: -1, _id: -1 });
-saleVoucherSchema.index({ product_id: 1, date: -1, _id: -1 });
-saleVoucherSchema.index({ journey_token: 1, date: -1, _id: -1 });
+// Trading list indexes
+purchaseVoucherSchema.index({
+  warehouse_id: 1,
+  date: -1,
+  _id: -1,
+});
+
+purchaseVoucherSchema.index({
+  farmer_id: 1,
+  date: -1,
+  _id: -1,
+});
+
+purchaseVoucherSchema.index({
+  company_account_id: 1,
+  date: -1,
+  _id: -1,
+});
+
+purchaseVoucherSchema.index({
+  product_id: 1,
+  date: -1,
+  _id: -1,
+});
+
+saleVoucherSchema.index({
+  warehouse_id: 1,
+  date: -1,
+  _id: -1,
+});
+
+saleVoucherSchema.index({
+  buyer_id: 1,
+  date: -1,
+  _id: -1,
+});
+
+saleVoucherSchema.index({
+  company_account_id: 1,
+  date: -1,
+  _id: -1,
+});
+
+saleVoucherSchema.index({
+  product_id: 1,
+  date: -1,
+  _id: -1,
+});
+
+saleVoucherSchema.index({
+  journey_token: 1,
+  date: -1,
+  _id: -1,
+});
 
 
 // =========================
 // WAREHOUSE RENT BOOKING
 // =========================
-const warehouseRentBookingSchema = new mongoose.Schema({
-  booking_no: { type: String, unique: true, index: true },
-  booking_date: { type: String, required: true },
-  rent_month: { type: String, required: true },
-  warehouse_id: { type: mongoose.Schema.Types.ObjectId, ref: "Warehouse", required: true, index: true },
-  company_id: { type: mongoose.Schema.Types.ObjectId, ref: "Company", default: null, index: true },
-  monthly_rent: { type: Number, default: 0 },
-  status: { type: String, enum: ["unpaid", "partial", "paid"], default: "unpaid", index: true },
-  paid_amount: { type: Number, default: 0 },
-  balance_amount: { type: Number, default: 0 },
-  payment_mode: { type: String, default: "" },
-  reference_no: { type: String, default: "" },
-  remarks: { type: String, default: "" },
-}, { timestamps: true });
+const warehouseRentBookingSchema =
+  new mongoose.Schema(
+    {
+      booking_no: {
+        type: String,
+        unique: true,
+        index: true,
+      },
 
-warehouseRentBookingSchema.index({ warehouse_id: 1, rent_month: 1 }, { unique: true });
+      booking_date: {
+        type: String,
+        required: true,
+      },
+
+      rent_month: {
+        type: String,
+        required: true,
+      },
+
+      warehouse_id: {
+        type:
+          mongoose.Schema.Types.ObjectId,
+        ref: "Warehouse",
+        required: true,
+        index: true,
+      },
+
+      company_id: {
+        type:
+          mongoose.Schema.Types.ObjectId,
+        ref: "Company",
+        default: null,
+        index: true,
+      },
+
+      monthly_rent: {
+        type: Number,
+        default: 0,
+      },
+
+      status: {
+        type: String,
+        enum: [
+          "unpaid",
+          "partial",
+          "paid",
+        ],
+        default: "unpaid",
+        index: true,
+      },
+
+      paid_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      balance_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      payment_mode: {
+        type: String,
+        default: "",
+      },
+
+      reference_no: {
+        type: String,
+        default: "",
+      },
+
+      remarks: {
+        type: String,
+        default: "",
+      },
+    },
+    {
+      timestamps: true,
+    }
+  );
+
+warehouseRentBookingSchema.index(
+  {
+    warehouse_id: 1,
+    rent_month: 1,
+  },
+  {
+    unique: true,
+  }
+);
+
 
 // =========================
 // EXPORTS
 // =========================
 module.exports = {
-
   mongoose,
 
   Location:
