@@ -1,13 +1,10 @@
 {
   "name": "warehouse-backend",
   "version": "1.0.0",
-
   "engines": {
     "node": "20.x"
   },
-
   "main": "server.js",
-
   "scripts": {
     "start": "node server.js",
     "start:lan": "node server.js",
@@ -16,7 +13,6 @@
     "migrate:employee-warehouse-assignments": "node scripts/migrateEmployeeWarehouseAssignments.js",
     "sync:warehouse-employee-links": "node scripts/syncWarehouseEmployeeLinks.js"
   },
-
   "dependencies": {
     "axios": "^1.12.2",
     "bcrypt": "^6.0.0",
@@ -30,10 +26,8 @@
     "multer": "^2.1.1",
     "pdfkit": "^0.13.0",
     "recharts": "^3.2.1",
-    "sqlite3": "^5.1.7",
     "xlsx": "^0.18.5"
   },
-
   "description": "",
   "keywords": [],
   "author": "",
