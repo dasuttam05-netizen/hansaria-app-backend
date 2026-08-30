@@ -1,37 +1,57 @@
 const express = require("express");
-const db = require("../db");
-const dbMongo = require("../db-mongodb");
-const { isAdminUser } = require("../middleware/auth");
+
+const {
+  Role,
+  isMongoMirrorReady,
+} = require("../db-mongodb");
+
+const {
+  isAdminUser,
+} = require("../middleware/auth");
 
 const router = express.Router();
+
+/*
+====================================================
+DEFAULT ROLES
+====================================================
+*/
 
 const DEFAULT_ROLES = [
   {
     name: "HO",
+
     is_admin: 0,
+
     permissions: [
       "dashboard.view",
+
       "employees.view",
       "employees.edit.non_admin",
+
       "companies.manage",
       "companyAccounts.manage",
       "locations.manage",
       "warehouses.manage",
       "products.manage",
+
       "inward.view",
       "inward.create",
       "inward.edit",
       "inward.delete",
       "inward.import",
       "inward.export",
+
       "outward.view",
       "outward.create",
       "outward.edit",
       "outward.delete",
       "outward.import",
       "outward.export",
+
       "adjustment.manage",
       "settlement.view",
+
       "expense.entry",
       "expense.view",
       "expense.create",
@@ -42,41 +62,51 @@ const DEFAULT_ROLES = [
       "expense.selfLoading",
       "expense.localSale",
       "expense.pending",
+
       "cash.mainBook.view",
       "cash.mainBook.create",
       "cash.mainBook.edit",
       "cash.mainBook.delete",
+
       "cash.partiesBook.view",
       "cash.partiesBook.create",
       "cash.partiesBook.edit",
       "cash.partiesBook.delete",
+
       "cash.employeeBook.view",
       "cash.employeeBook.create",
       "cash.employeeBook.edit",
       "cash.employeeBook.delete",
+
       "warehouse.trading.purchase.view",
       "warehouse.trading.purchase.create",
       "warehouse.trading.purchase.edit",
       "warehouse.trading.purchase.delete",
+
       "warehouse.trading.sale.view",
       "warehouse.trading.sale.create",
       "warehouse.trading.sale.edit",
       "warehouse.trading.sale.delete",
+
       "warehouse.trading.payment.view",
       "warehouse.trading.payment.create",
       "warehouse.trading.payment.edit",
       "warehouse.trading.payment.delete",
+
       "warehouse.trading.receipt.view",
       "warehouse.trading.receipt.create",
       "warehouse.trading.receipt.edit",
       "warehouse.trading.receipt.delete",
+
       "warehouse.trading.journal.view",
       "warehouse.trading.journal.create",
       "warehouse.trading.journal.edit",
       "warehouse.trading.journal.delete",
+
       "warehouse.trading.report.sale",
       "warehouse.trading.report.purchase",
       "warehouse.trading.report.profitLoss",
+
       "report.inward",
       "report.erp",
       "report.partyLedger",
@@ -87,26 +117,34 @@ const DEFAULT_ROLES = [
       "report.expense",
       "report.paltiLorryAdjustment",
       "report.cash",
+
       "transport.manage",
     ],
   },
+
   {
     name: "BM",
+
     is_admin: 0,
+
     permissions: [
       "dashboard.view",
+
       "inward.view",
       "inward.create",
       "inward.edit",
       "inward.import",
       "inward.export",
+
       "outward.view",
       "outward.create",
       "outward.edit",
       "outward.import",
       "outward.export",
+
       "adjustment.manage",
       "settlement.view",
+
       "expense.entry",
       "expense.view",
       "expense.create",
@@ -116,10 +154,13 @@ const DEFAULT_ROLES = [
       "expense.selfLoading",
       "expense.localSale",
       "expense.pending",
+
       "cash.mainBook.view",
       "cash.mainBook.create",
+
       "cash.employeeBook.view",
       "cash.employeeBook.create",
+
       "report.inward",
       "report.outwardSettlement",
       "report.expense",
@@ -128,191 +169,580 @@ const DEFAULT_ROLES = [
   },
 ];
 
-function formatRoleRow(row) {
+/*
+====================================================
+HELPERS
+====================================================
+*/
+
+function requireMongo(res) {
+  if (!isMongoMirrorReady()) {
+    res.status(503).json({
+      error:
+        "MongoDB is not connected. Please try again in a moment.",
+    });
+
+    return false;
+  }
+
+  return true;
+}
+
+function normalizePermissions(
+  permissions
+) {
+  const raw =
+    Array.isArray(permissions)
+      ? permissions
+      : [];
+
+  return Array.from(
+    new Set(
+      raw
+        .filter(Boolean)
+        .map((item) =>
+          String(item).trim()
+        )
+        .filter(Boolean)
+    )
+  );
+}
+
+function formatRoleRow(
+  row
+) {
+  if (!row) return null;
+
   return {
-    id: row.id || row._id,
-    name: row.name,
-    permissions: Array.isArray(row.permissions) ? row.permissions : [],
-    is_admin: Number(row.is_admin) || 0,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
+    ...row,
+
+    id:
+      row._id
+        ? String(row._id)
+        : row.id,
+
+    name:
+      row.name || "",
+
+    permissions:
+      Array.isArray(
+        row.permissions
+      )
+        ? row.permissions
+        : [],
+
+    is_admin:
+      Number(row.is_admin) || 0,
+
+    created_at:
+      row.created_at ||
+      null,
+
+    updated_at:
+      row.updated_at ||
+      null,
   };
 }
 
 function getDefaultRoleRows() {
-  return DEFAULT_ROLES.map((role, index) => ({
-    id: `default-${index + 1}`,
-    name: role.name,
-    permissions: Array.isArray(role.permissions) ? role.permissions : [],
-    is_admin: Number(role.is_admin) || 0,
-    created_at: null,
-    updated_at: null,
-  }));
+  return DEFAULT_ROLES.map(
+    (
+      role,
+      index
+    ) => ({
+      id:
+        `default-${index + 1}`,
+
+      name:
+        role.name,
+
+      permissions:
+        normalizePermissions(
+          role.permissions
+        ),
+
+      is_admin:
+        Number(
+          role.is_admin
+        ) || 0,
+
+      created_at:
+        null,
+
+      updated_at:
+        null,
+    })
+  );
 }
 
-function normalizePermissions(permissions) {
-  const raw = Array.isArray(permissions) ? permissions : [];
-  return Array.from(new Set(raw.filter(Boolean).map((item) => String(item).trim()).filter(Boolean)));
-}
+/*
+====================================================
+ENSURE DEFAULT ROLES
+====================================================
+*/
 
 async function ensureDefaultRoles() {
-  if (dbMongo.mongoose.connection.readyState !== 1) {
+  if (!isMongoMirrorReady()) {
     return;
   }
 
-  if (!db.isSqliteEnabled) {
-    const docs = await dbMongo.Role.find({
-      name: { $in: DEFAULT_ROLES.map((role) => role.name) },
+  const defaultNames =
+    DEFAULT_ROLES.map(
+      (role) =>
+        role.name
+    );
+
+  const existing =
+    await Role.find({
+      name: {
+        $in:
+          defaultNames,
+      },
     })
       .lean()
       .exec();
 
-    const existingNames = new Set((docs || []).map((doc) => String(doc.name || "").toLowerCase()));
-    const missingRoles = DEFAULT_ROLES.filter((role) => !existingNames.has(role.name.toLowerCase()));
+  const existingNames =
+    new Set(
+      (existing || []).map(
+        (role) =>
+          String(
+            role.name || ""
+          ).toLowerCase()
+      )
+    );
 
-    if (missingRoles.length > 0) {
-      await dbMongo.Role.insertMany(
-        missingRoles.map((role) => ({
-          name: role.name,
-          permissions: normalizePermissions(role.permissions),
-          is_admin: role.is_admin,
-        }))
-      );
+  const missing =
+    DEFAULT_ROLES.filter(
+      (role) =>
+        !existingNames.has(
+          String(
+            role.name
+          ).toLowerCase()
+        )
+    );
+
+  if (
+    missing.length === 0
+  ) {
+    return;
+  }
+
+  await Role.insertMany(
+    missing.map(
+      (role) => ({
+        name:
+          role.name,
+
+        permissions:
+          normalizePermissions(
+            role.permissions
+          ),
+
+        is_admin:
+          Number(
+            role.is_admin
+          ) || 0,
+
+        created_at:
+          new Date(),
+
+        updated_at:
+          new Date(),
+      })
+    ),
+    {
+      ordered: false,
     }
-
-    return;
-  }
-
-  const rows = await new Promise((resolve, reject) => {
-    db.all("SELECT LOWER(name) AS name FROM roles", [], (selectErr, resultRows) => {
-      if (selectErr) {
-        reject(selectErr);
-        return;
-      }
-      resolve(resultRows || []);
-    });
-  });
-
-  const existingNames = new Set((rows || []).map((row) => row.name));
-  const missingRoles = DEFAULT_ROLES.filter((role) => !existingNames.has(role.name.toLowerCase()));
-
-  if (!missingRoles.length) {
-    return;
-  }
-
-  const stmt = db.prepare("INSERT INTO roles (name, permissions, is_admin) VALUES (?, ?, ?)");
-  try {
-    missingRoles.forEach((role) => {
-      stmt.run([role.name, JSON.stringify(role.permissions), role.is_admin]);
-    });
-  } finally {
-    await new Promise((resolve, reject) => {
-      stmt.finalize((err) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-        resolve();
-      });
-    });
-  }
+  );
 }
 
-router.get("/", async (req, res) => {
-  if (dbMongo.mongoose.connection.readyState !== 1 && !db.isSqliteEnabled) {
-    return res.json(getDefaultRoleRows());
-  }
+/*
+====================================================
+GET ALL ROLES
+====================================================
+*/
 
-  try {
-    await ensureDefaultRoles();
-
-    if (!db.isSqliteEnabled) {
-      const docs = await dbMongo.Role.find({})
-        .sort({ name: 1 })
-        .lean()
-        .exec();
-      return res.json((docs || []).map(formatRoleRow));
-    }
-
-    db.all("SELECT * FROM roles ORDER BY LOWER(name) ASC", [], (err, rows) => {
-      if (err) {
-        console.error("Failed to load roles from SQLite:", err.message);
-        return res.json(getDefaultRoleRows());
+router.get(
+  "/",
+  async (req, res) => {
+    try {
+      if (!requireMongo(res)) {
+        return;
       }
+
+      await ensureDefaultRoles();
+
+      const docs =
+        await Role.find({})
+          .sort({
+            name: 1,
+            _id: 1,
+          })
+          .lean()
+          .exec();
+
       return res.json(
-        (rows || []).map((row) => ({
-          ...row,
-          permissions: (() => {
-            try {
-              return JSON.parse(row.permissions || "[]");
-            } catch (error) {
-              return [];
-            }
-          })(),
-        }))
+        (docs || []).map(
+          formatRoleRow
+        )
       );
-    });
-  } catch (err) {
-    console.error("Role endpoint failed:", err.message);
-    return res.json(getDefaultRoleRows());
-  }
-});
+    } catch (err) {
+      console.error(
+        "Role list failed:",
+        err
+      );
 
-router.post("/", (req, res) => {
-  if (!isAdminUser(req.user)) {
-    return res.status(403).json({ error: "Only admin can manage roles" });
-  }
-
-  const name = String(req.body?.name || "").trim();
-  const permissions = normalizePermissions(req.body?.permissions);
-  const is_admin = req.body?.is_admin ? 1 : 0;
-
-  if (!name) {
-    return res.status(400).json({ error: "Role name is required" });
-  }
-
-  db.run(
-    "INSERT INTO roles (name, permissions, is_admin) VALUES (?, ?, ?)",
-    [name, JSON.stringify(is_admin ? ["all"] : permissions), is_admin],
-    function onInsert(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      return res.json({ id: this.lastID, name, permissions: is_admin ? ["all"] : permissions, is_admin });
+      /*
+       * Do not silently switch to legacy storage.
+       * MongoDB is now the only source of truth.
+       */
+      return res.status(500).json({
+        error:
+          err.message ||
+          "Failed to load roles",
+      });
     }
-  );
-});
-
-router.put("/:id", (req, res) => {
-  if (!isAdminUser(req.user)) {
-    return res.status(403).json({ error: "Only admin can manage roles" });
   }
+);
 
-  const name = String(req.body?.name || "").trim();
-  const permissions = normalizePermissions(req.body?.permissions);
-  const is_admin = req.body?.is_admin ? 1 : 0;
+/*
+====================================================
+CREATE ROLE
+====================================================
+*/
 
-  if (!name) {
-    return res.status(400).json({ error: "Role name is required" });
-  }
+router.post(
+  "/",
+  async (req, res) => {
+    try {
+      if (
+        !isAdminUser(
+          req.user
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            "Only admin can manage roles",
+        });
+      }
 
-  db.run(
-    "UPDATE roles SET name = ?, permissions = ?, is_admin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    [name, JSON.stringify(is_admin ? ["all"] : permissions), is_admin, req.params.id],
-    function onUpdate(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      return res.json({ updated: this.changes });
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const name =
+        String(
+          req.body?.name ||
+            ""
+        ).trim();
+
+      const permissions =
+        normalizePermissions(
+          req.body?.permissions
+        );
+
+      const is_admin =
+        req.body?.is_admin
+          ? 1
+          : 0;
+
+      if (!name) {
+        return res.status(400).json({
+          error:
+            "Role name is required",
+        });
+      }
+
+      const duplicate =
+        await Role.findOne({
+          name: {
+            $regex:
+              `^${name.replace(
+                /[.*+?^${}()|[\]\\]/g,
+                "\\$&"
+              )}$`,
+
+            $options: "i",
+          },
+        }).lean();
+
+      if (duplicate) {
+        return res.status(409).json({
+          error:
+            "Role already exists",
+        });
+      }
+
+      const finalPermissions =
+        is_admin
+          ? ["all"]
+          : permissions;
+
+      const role =
+        await Role.create({
+          name,
+
+          permissions:
+            finalPermissions,
+
+          is_admin,
+
+          created_at:
+            new Date(),
+
+          updated_at:
+            new Date(),
+        });
+
+      return res.status(201).json(
+        formatRoleRow(
+          role.toObject()
+        )
+      );
+    } catch (err) {
+      console.error(
+        "Role create failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message ||
+          "Failed to create role",
+      });
     }
-  );
-});
-
-router.delete("/:id", (req, res) => {
-  if (!isAdminUser(req.user)) {
-    return res.status(403).json({ error: "Only admin can manage roles" });
   }
+);
 
-  db.run("DELETE FROM roles WHERE id = ?", [req.params.id], function onDelete(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    return res.json({ deleted: this.changes });
-  });
-});
+/*
+====================================================
+UPDATE ROLE
+====================================================
+*/
+
+router.put(
+  "/:id",
+  async (req, res) => {
+    try {
+      if (
+        !isAdminUser(
+          req.user
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            "Only admin can manage roles",
+        });
+      }
+
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const roleId =
+        String(
+          req.params.id ||
+            ""
+        ).trim();
+
+      if (!roleId) {
+        return res.status(400).json({
+          error:
+            "Role ID is required",
+        });
+      }
+
+      const name =
+        String(
+          req.body?.name ||
+            ""
+        ).trim();
+
+      const permissions =
+        normalizePermissions(
+          req.body?.permissions
+        );
+
+      const is_admin =
+        req.body?.is_admin
+          ? 1
+          : 0;
+
+      if (!name) {
+        return res.status(400).json({
+          error:
+            "Role name is required",
+        });
+      }
+
+      const existing =
+        await Role.findById(
+          roleId
+        );
+
+      if (!existing) {
+        return res.status(404).json({
+          error:
+            "Role not found",
+        });
+      }
+
+      const duplicate =
+        await Role.findOne({
+          _id: {
+            $ne:
+              existing._id,
+          },
+
+          name: {
+            $regex:
+              `^${name.replace(
+                /[.*+?^${}()|[\]\\]/g,
+                "\\$&"
+              )}$`,
+
+            $options: "i",
+          },
+        }).lean();
+
+      if (duplicate) {
+        return res.status(409).json({
+          error:
+            "Another role with the same name already exists",
+        });
+      }
+
+      existing.name =
+        name;
+
+      existing.permissions =
+        is_admin
+          ? ["all"]
+          : permissions;
+
+      existing.is_admin =
+        is_admin;
+
+      existing.updated_at =
+        new Date();
+
+      await existing.save();
+
+      return res.json(
+        formatRoleRow(
+          existing.toObject()
+        )
+      );
+    } catch (err) {
+      console.error(
+        "Role update failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message ||
+          "Failed to update role",
+      });
+    }
+  }
+);
+
+/*
+====================================================
+DELETE ROLE
+====================================================
+*/
+
+router.delete(
+  "/:id",
+  async (req, res) => {
+    try {
+      if (
+        !isAdminUser(
+          req.user
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            "Only admin can manage roles",
+        });
+      }
+
+      if (!requireMongo(res)) {
+        return;
+      }
+
+      const roleId =
+        String(
+          req.params.id ||
+            ""
+        ).trim();
+
+      if (!roleId) {
+        return res.status(400).json({
+          error:
+            "Role ID is required",
+        });
+      }
+
+      const role =
+        await Role.findById(
+          roleId
+        );
+
+      if (!role) {
+        return res.status(404).json({
+          error:
+            "Role not found",
+        });
+      }
+
+      /*
+       * Protect admin roles.
+       */
+      if (
+        Number(
+          role.is_admin
+        ) === 1
+      ) {
+        return res.status(400).json({
+          error:
+            "Admin role cannot be deleted",
+        });
+      }
+
+      await Role.deleteOne({
+        _id:
+          role._id,
+      });
+
+      return res.json({
+        deleted:
+          1,
+
+        id:
+          String(
+            role._id
+          ),
+
+        source:
+          "mongodb",
+      });
+    } catch (err) {
+      console.error(
+        "Role delete failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message ||
+          "Failed to delete role",
+      });
+    }
+  }
+);
 
 module.exports = router;
