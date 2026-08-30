@@ -1,12 +1,14 @@
 const jwt = require("jsonwebtoken");
 
-const db = require("../db");
+
 
 const { mongoose, Employee, Warehouse, Location } = require("../mongo");
 
 const SECRET =
   process.env.JWT_SECRET ||
   "supersecret";
+
+const warnedFallbackUserIds = new Set();
 
 const REPORT_PERMISSION_KEYS = [
   "report.inward",
@@ -655,7 +657,6 @@ async function loadAssignedWarehouseAccess(user) {
   if (!userId) {
     return {
       assigned_warehouse_ids: [],
-      assigned_sqlite_warehouse_ids: [],
       location_ids: [],
     };
   }
@@ -695,7 +696,6 @@ async function loadAssignedWarehouseAccess(user) {
   if (!assignedWarehouseIds.length && !user?.all_location_access) {
     return {
       assigned_warehouse_ids: [],
-      assigned_sqlite_warehouse_ids: [],
       location_ids: [],
     };
   }
@@ -710,24 +710,6 @@ async function loadAssignedWarehouseAccess(user) {
   assignedWarehouseIds = (warehouses || [])
     .map((row) => (row?._id ? String(row._id) : ""))
     .filter((item) => item);
-
-  const assignedSqliteWarehouseIds = [];
-  for (const row of warehouses || []) {
-    const warehouseName = String(row?.name || "").trim();
-    if (!warehouseName) continue;
-
-    const sqliteRow = await new Promise((resolve) => {
-      db.get(
-        "SELECT id FROM warehouses WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) ORDER BY id ASC LIMIT 1",
-        [warehouseName],
-        (err, result) => resolve(err ? null : result || null)
-      );
-    });
-
-    if (sqliteRow?.id) {
-      assignedSqliteWarehouseIds.push(Number(sqliteRow.id));
-    }
-  }
 
   let locationIds = Array.from(
     new Set(
@@ -755,7 +737,6 @@ async function loadAssignedWarehouseAccess(user) {
 
   return {
     assigned_warehouse_ids: assignedWarehouseIds,
-    assigned_sqlite_warehouse_ids: Array.from(new Set(assignedSqliteWarehouseIds)),
     location_ids: locationIds,
   };
 }
@@ -873,8 +854,6 @@ async function buildAuthenticatedUserPayload(user) {
 
   payload.assigned_warehouse_ids =
     access.assigned_warehouse_ids;
-  payload.assigned_sqlite_warehouse_ids =
-    access.assigned_sqlite_warehouse_ids;
   payload.location_ids =
     mergedLocationIds;
 
@@ -976,15 +955,22 @@ async function authenticate(
     }
 
     const user =
-      await Employee.findById(
-        decoded.id
-      );
+      await Employee.findOne({
+        $or: [
+          { _id: decoded.id },
+          { employee_id: decoded.id },
+          { username: decoded.id },
+        ],
+      });
 
     if (!user) {
-      console.warn(
-        "AUTH WARNING: user not found in MongoDB, falling back to token payload for",
-        decoded.id
-      );
+      if (!warnedFallbackUserIds.has(String(decoded.id))) {
+        warnedFallbackUserIds.add(String(decoded.id));
+        console.warn(
+          "AUTH WARNING: user not found in MongoDB, falling back to token payload for",
+          decoded.id
+        );
+      }
       req.user = decoded;
       return next();
     }
@@ -1080,3 +1066,5 @@ module.exports = {
 
   authorize,
 };
+
+
