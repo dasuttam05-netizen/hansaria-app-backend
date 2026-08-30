@@ -31,18 +31,14 @@ function waitForMongoConnection(timeoutMs = 9000) {
     return Promise.resolve();
   }
 
-  if (mongoose.connection.readyState === 0) {
-    return Promise.reject(
-      new Error("MongoDB is not connected. Please check MONGODB_URI.")
-    );
-  }
-
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       cleanup();
-      reject(
-        new Error("MongoDB connection timed out. Please check MONGODB_URI / network access.")
+      const err = new Error(
+        "MongoDB is not connected yet. Check MONGODB_URI, Atlas IP access/network restrictions, and whether the cluster allows this machine."
       );
+      err.code = "MONGODB_UNAVAILABLE";
+      reject(err);
     }, timeoutMs);
 
     function cleanup() {
@@ -64,9 +60,11 @@ function waitForMongoConnection(timeoutMs = 9000) {
 
     function handleDisconnected() {
       cleanup();
-      reject(
-        new Error("MongoDB disconnected. Please check MONGODB_URI / network access.")
+      const err = new Error(
+        "MongoDB disconnected. Check MONGODB_URI, Atlas IP access/network restrictions, and DNS connectivity."
       );
+      err.code = "MONGODB_UNAVAILABLE";
+      reject(err);
     }
 
     mongoose.connection.once("connected", handleConnected);
@@ -82,10 +80,14 @@ async function attachAssignedWarehousesMongo(user) {
         .filter((id) => id)
     : [];
 
+  const validAssignedWarehouseIds = assignedIds
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+
   const filter = user.all_warehouse_access
     ? {}
-    : assignedIds.length
-    ? { _id: { $in: assignedIds } }
+    : validAssignedWarehouseIds.length
+    ? { _id: { $in: validAssignedWarehouseIds } }
     : {
         $or: [
           { employee_id: user.id },
@@ -336,7 +338,11 @@ router.post("/login", async (req, res) => {
   } catch (err) {
 
     console.error(err);
-
+    if (err?.code === "MONGODB_UNAVAILABLE") {
+      return res.status(503).json({
+        error: err.message,
+      });
+    }
     return res.status(500).json({
       error: err.message,
     });
