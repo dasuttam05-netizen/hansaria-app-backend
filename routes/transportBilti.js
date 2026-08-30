@@ -1,901 +1,1835 @@
 const express = require("express");
+const mongoose = require("mongoose");
+
 const router = express.Router();
-const db = require("../db");
-const { mongoose, SaleVoucher, Warehouse, CompanyAccount, Product, Company } = require("../mongo");
+
+const {
+  mongoose: MongoMongoose,
+  SaleVoucher,
+  CompanyAccount,
+  Product,
+  Company,
+  Warehouse,
+} = require("../mongo");
+
+const {
+  BuyerName,
+  ConsigneeName,
+} = require("../db-mongodb");
+
+const {
+  TransportBiltiOperational,
+  TransporterOperational,
+  OutwardOperational,
+  CompanyOperational,
+  CompanyAccountOperational,
+  WarehouseOperational,
+  ProductOperational,
+} = require("../mongoOperationalModels");
+
+/*
+====================================================
+COMMON HELPERS
+====================================================
+*/
+
+const mongoReady = () =>
+  mongoose.connection.readyState === 1;
 
 const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
 
-const text = (v) => {
-  if (v === undefined || v === null) return "";
-  return String(v).trim();
-};
+const text = (v) =>
+  v === undefined ||
+  v === null
+    ? ""
+    : String(v).trim();
 
-function dbGet(query, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(query, params, (err, row) => {
-      if (err) return reject(err);
-      resolve(row || null);
+function normalizeMongoDoc(doc) {
+  if (!doc) return null;
+
+  const row = doc.toObject
+    ? doc.toObject()
+    : { ...doc };
+
+  row.id =
+    row.id ??
+    row.legacy_id ??
+    String(row._id);
+
+  row._id =
+    String(row._id);
+
+  return row;
+}
+
+function idConditions(value) {
+  const raw =
+    text(value);
+
+  if (!raw) {
+    return [];
+  }
+
+  const conditions = [];
+
+  if (
+    mongoose.Types.ObjectId.isValid(
+      raw
+    )
+  ) {
+    conditions.push({
+      _id:
+        new mongoose.Types.ObjectId(
+          raw
+        ),
     });
-  });
+  }
+
+  const numeric =
+    Number(raw);
+
+  if (
+    Number.isFinite(
+      numeric
+    )
+  ) {
+    conditions.push({
+      legacy_id:
+        numeric,
+    });
+
+    conditions.push({
+      id:
+        numeric,
+    });
+
+    conditions.push({
+      sl_no:
+        numeric,
+    });
+  }
+
+  return conditions;
 }
 
-async function decorateMongoSale(row) {
-  const buyerId = String(row.buyer_id || "");
-  const companyId = String(row.company_id || "");
-  const accountId = String(row.company_account_id || "");
-  const warehouseId = String(row.warehouse_id || "");
-  const productId = String(row.product_id || "");
-  const consigneeId = String(row.consignee_id || "");
+function idQuery(value) {
+  const conditions =
+    idConditions(value);
 
-  const [buyerRow, companySqlRow, accountSqlRow, warehouseSqlRow, productSqlRow, consigneeRow, companyMongo, accountMongo, warehouseMongo, productMongo] = await Promise.all([
-    buyerId ? dbGet(`SELECT name FROM buyer_names WHERE CAST(id AS TEXT) = ? LIMIT 1`, [buyerId]) : null,
-    companyId ? dbGet(`SELECT name FROM companies WHERE CAST(id AS TEXT) = ? LIMIT 1`, [companyId]) : null,
-    accountId ? dbGet(`SELECT account_name FROM company_accounts WHERE CAST(id AS TEXT) = ? LIMIT 1`, [accountId]) : null,
-    warehouseId ? dbGet(`SELECT name FROM warehouses WHERE CAST(id AS TEXT) = ? LIMIT 1`, [warehouseId]) : null,
-    productId ? dbGet(`SELECT name FROM products WHERE CAST(id AS TEXT) = ? LIMIT 1`, [productId]) : null,
-    consigneeId ? dbGet(`SELECT name FROM consignee_names WHERE CAST(id AS TEXT) = ? LIMIT 1`, [consigneeId]) : null,
-    companyId && mongoose.Types.ObjectId.isValid(companyId) ? Company.findById(companyId).lean() : null,
-    accountId && mongoose.Types.ObjectId.isValid(accountId) ? CompanyAccount.findById(accountId).lean() : null,
-    warehouseId && mongoose.Types.ObjectId.isValid(warehouseId) ? Warehouse.findById(warehouseId).lean() : null,
-    productId && mongoose.Types.ObjectId.isValid(productId) ? Product.findById(productId).lean() : null,
-  ]);
+  if (!conditions.length) {
+    return null;
+  }
+
+  return conditions.length === 1
+    ? conditions[0]
+    : {
+        $or: conditions,
+      };
+}
+
+async function findByIdFlexible(
+  Model,
+  value
+) {
+  const query =
+    idQuery(value);
+
+  if (!query) {
+    return null;
+  }
+
+  return Model.findOne(
+    query
+  ).lean();
+}
+
+/*
+====================================================
+MASTER LOOKUP
+====================================================
+*/
+
+async function getMongoName(
+  Model,
+  id,
+  fields = ["name"]
+) {
+  if (
+    id === undefined ||
+    id === null ||
+    id === ""
+  ) {
+    return "";
+  }
+
+  const doc =
+    await findByIdFlexible(
+      Model,
+      id
+    );
+
+  if (!doc) {
+    return "";
+  }
+
+  for (
+    const field of
+      fields
+  ) {
+    if (
+      doc[field] !==
+        undefined &&
+      doc[field] !==
+        null &&
+      String(
+        doc[field]
+      ).trim()
+    ) {
+      return String(
+        doc[field]
+      );
+    }
+  }
+
+  return "";
+}
+
+async function getMongoTransporter(
+  id
+) {
+  if (!id) {
+    return null;
+  }
+
+  const q =
+    idQuery(id);
+
+  if (!q) {
+    return null;
+  }
+
+  return TransporterOperational.findOne(
+    q
+  ).lean();
+}
+
+/*
+====================================================
+CALCULATION
+====================================================
+*/
+
+function calculateBilti(
+  data
+) {
+  const CLAIM_FREE_SHORTAGE_KG =
+    num(
+      data.shortage_free_kg
+    ) > 0
+      ? num(
+          data.shortage_free_kg
+        )
+      : 100;
+
+  const KG_PER_MT =
+    1000;
+
+  const outwardQty =
+    num(
+      data.outward_qty
+    );
+
+  const dispatchQty =
+    num(
+      data.dispatch_qty
+    );
+
+  const outwardRate =
+    num(
+      data.outward_rate
+    );
+
+  const transportRate =
+    num(
+      data.transport_rate
+    );
+
+  const detainAmount =
+    num(
+      data.detain_amount
+    );
+
+  const othersExp =
+    num(
+      data.others_exp
+    );
+
+  const advanceAmount =
+    num(
+      data.advance_amount
+    );
+
+  const tdsPercent =
+    num(
+      data.tds_percent
+    );
+
+  const shortageQty =
+    Math.max(
+      outwardQty -
+        dispatchQty,
+      0
+    );
+
+  const claimFreeQtyInMt =
+    CLAIM_FREE_SHORTAGE_KG /
+    KG_PER_MT;
+
+  const chargeableShortageQty =
+    Math.max(
+      shortageQty -
+        claimFreeQtyInMt,
+      0
+    );
+
+  const shortageAmount =
+    chargeableShortageQty *
+    outwardRate;
+
+  const grossFreight =
+    outwardQty *
+    transportRate;
+
+  const netAmount =
+    grossFreight -
+    shortageAmount +
+    detainAmount +
+    othersExp;
+
+  const tdsAmount =
+    netAmount *
+    (tdsPercent / 100);
+
+  const payableAmount =
+    netAmount -
+    advanceAmount -
+    tdsAmount;
 
   return {
-    ...row,
-    sale_buyer_name:
-      row.buyer_name || buyerRow?.name || companySqlRow?.name || row.company_name || "",
-    sale_account_name:
-      row.company_account_name || accountSqlRow?.account_name || accountMongo?.account_name || row.account_name || "",
-    sale_warehouse_name:
-      row.warehouse_name || warehouseSqlRow?.name || warehouseMongo?.name || "",
-    sale_product_name:
-      row.product_name || productSqlRow?.name || productMongo?.name || "",
-    sale_consignee_name: row.consignee_name || consigneeRow?.name || "",
+    outward_qty:
+      outwardQty,
+
+    dispatch_qty:
+      dispatchQty,
+
+    shortage_free_kg:
+      CLAIM_FREE_SHORTAGE_KG,
+
+    shortage_qty:
+      shortageQty,
+
+    outward_rate:
+      outwardRate,
+
+    shortage_amount:
+      shortageAmount,
+
+    transport_rate:
+      transportRate,
+
+    gross_freight:
+      grossFreight,
+
+    detain_amount:
+      detainAmount,
+
+    others_exp:
+      othersExp,
+
+    advance_amount:
+      advanceAmount,
+
+    tds_percent:
+      tdsPercent,
+
+    tds_amount:
+      tdsAmount,
+
+    net_amount:
+      netAmount,
+
+    payable_amount:
+      payableAmount,
   };
 }
 
-function calculateBilti(data) {
-  const CLAIM_FREE_SHORTAGE_KG = num(data.shortage_free_kg) > 0 ? num(data.shortage_free_kg) : 100;
-  const KG_PER_MT = 1000;
-  const outwardQty = num(data.outward_qty);
-  const dispatchQty = num(data.dispatch_qty);
-  const outwardRate = num(data.outward_rate);
-  const transportRate = num(data.transport_rate);
-  const detainAmount = num(data.detain_amount);
-  const othersExp = num(data.others_exp);
-  const advanceAmount = num(data.advance_amount);
-  const tdsPercent = num(data.tds_percent);
+function applyCalculatedBilti(
+  row
+) {
+  const computed =
+    calculateBilti(
+      row || {}
+    );
 
-  const shortageQty = Math.max(outwardQty - dispatchQty, 0);
-  const claimFreeQtyInMt = CLAIM_FREE_SHORTAGE_KG / KG_PER_MT;
-  const chargeableShortageQty = Math.max(shortageQty - claimFreeQtyInMt, 0);
-  const shortageAmount = chargeableShortageQty * outwardRate;
-  const grossFreight = outwardQty * transportRate;
-  const netAmount = grossFreight - shortageAmount + detainAmount + othersExp;
-  const tdsAmount = netAmount * (tdsPercent / 100);
-  const payableAmount = netAmount - advanceAmount - tdsAmount;
-
-  return {
-    outward_qty: outwardQty,
-    dispatch_qty: dispatchQty,
-    shortage_free_kg: CLAIM_FREE_SHORTAGE_KG,
-    shortage_qty: shortageQty,
-    outward_rate: outwardRate,
-    shortage_amount: shortageAmount,
-    transport_rate: transportRate,
-    gross_freight: grossFreight,
-    detain_amount: detainAmount,
-    others_exp: othersExp,
-    advance_amount: advanceAmount,
-    tds_percent: tdsPercent,
-    tds_amount: tdsAmount,
-    net_amount: netAmount,
-    payable_amount: payableAmount,
-  };
-}
-
-function applyCalculatedBilti(row) {
-  const computed = calculateBilti(row || {});
   return {
     ...row,
     ...computed,
   };
 }
 
-function nextBiltiNo(callback) {
-  db.get(
-    `SELECT IFNULL(MAX(id), 0) + 1 AS next_no FROM transport_bilti`,
-    [],
-    (err, row) => {
-      if (err) return callback(err);
-      callback(null, `BLT${String(row.next_no).padStart(4, "0")}`);
-    }
-  );
+/*
+====================================================
+BILTI DECORATION
+====================================================
+*/
+
+async function decorateMongoBilti(
+  row
+) {
+  const r =
+    normalizeMongoDoc(
+      row
+    ) || {};
+
+  const transporter =
+    await getMongoTransporter(
+      r.transporter_id
+    );
+
+  const [
+    companyName,
+    accountName,
+    warehouseName,
+    productName,
+  ] =
+    await Promise.all([
+      r.company_name
+        ? String(
+            r.company_name
+          )
+        : getMongoName(
+            CompanyOperational,
+            r.company_id,
+            ["name"]
+          ),
+
+      r.account_name
+        ? String(
+            r.account_name
+          )
+        : getMongoName(
+            CompanyAccountOperational,
+            r.company_account_id,
+            [
+              "account_name",
+              "name",
+            ]
+          ),
+
+      r.warehouse_name
+        ? String(
+            r.warehouse_name
+          )
+        : getMongoName(
+            WarehouseOperational,
+            r.warehouse_id,
+            ["name"]
+          ),
+
+      r.product_name
+        ? String(
+            r.product_name
+          )
+        : getMongoName(
+            ProductOperational,
+            r.product_id,
+            ["name"]
+          ),
+    ]);
+
+  return applyCalculatedBilti({
+    ...r,
+
+    transporter_name:
+      r.transporter_name ||
+      transporter?.name ||
+      "",
+
+    transporter_address:
+      r.transporter_address ||
+      transporter?.address ||
+      "",
+
+    transporter_pan_no:
+      r.transporter_pan_no ||
+      transporter?.pan_no ||
+      "",
+
+    transporter_mobile:
+      r.transporter_mobile ||
+      transporter?.mobile ||
+      "",
+
+    company_name:
+      companyName,
+
+    account_name:
+      accountName,
+
+    warehouse_name:
+      warehouseName,
+
+    product_name:
+      productName,
+  });
 }
 
-router.get("/outward-list", (req, res) => {
-  const sql = `
-    SELECT
-      o.id,
-      lb.bilti_id,
-      o.voucher_no,
-      o.date,
-      o.lorry_no,
-      o.quantity,
-      o.weight,
-      o.rate,
-      o.buyer_name,
-      o.consignee_name,
-      c.name AS company_name,
-      ca.account_name AS account_name,
-      w.name AS warehouse_name,
-      p.name AS product_name
-    FROM outward o
-    LEFT JOIN (
-      SELECT outward_id, MAX(id) AS bilti_id
-      FROM transport_bilti
-      GROUP BY outward_id
-    ) lb ON lb.outward_id = o.id
-    LEFT JOIN companies c ON o.company_id = c.id
-    LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-    LEFT JOIN warehouses w ON o.warehouse_id = w.id
-    LEFT JOIN products p ON o.product_id = p.id
-    ORDER BY o.id DESC
-  `;
+/*
+====================================================
+SALE DECORATION
+====================================================
+*/
 
-  db.all(sql, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
+async function decorateMongoSale(
+  row
+) {
+  const buyerId =
+    row?.buyer_id;
 
-router.get("/sale-list", async (req, res) => {
-  // Warehouse Trading Sale vouchers are stored in MongoDB.  The old
-  // implementation read this list from SQLite, which meant the returned
-  // `id` was the SQLite row id.  Transport Bilti then used that id to load
-  // the Sale from MongoDB, so the Sale details could not be found.
-  // Keep the existing response shape, but use the Mongo SaleVoucher _id
-  // whenever MongoDB is available.  No save/calculation logic is changed.
-  try {
-    if (mongoose.connection.readyState === 1) {
-      const alreadyBiltied = await new Promise((resolve, reject) => {
-        db.all(
-          `SELECT sale_id FROM transport_bilti WHERE sale_id IS NOT NULL`,
-          [],
-          (err, rows) => {
-            if (err) return reject(err);
-            resolve(new Set((rows || []).map((r) => String(r.sale_id))));
-          }
+  const companyId =
+    row?.company_id;
+
+  const accountId =
+    row?.company_account_id;
+
+  const warehouseId =
+    row?.warehouse_id;
+
+  const productId =
+    row?.product_id;
+
+  const consigneeId =
+    row?.consignee_id;
+
+  const [
+    buyerName,
+    companyName,
+    accountName,
+    warehouseName,
+    productName,
+    consigneeName,
+  ] =
+    await Promise.all([
+      getMongoName(
+        BuyerName,
+        buyerId,
+        ["name"]
+      ),
+
+      row.company_name
+        ? String(
+            row.company_name
+          )
+        : getMongoName(
+            CompanyOperational,
+            companyId,
+            ["name"]
+          ),
+
+      row.company_account_name
+        ? String(
+            row.company_account_name
+          )
+        : getMongoName(
+            CompanyAccountOperational,
+            accountId,
+            [
+              "account_name",
+              "name",
+            ]
+          ),
+
+      row.warehouse_name
+        ? String(
+            row.warehouse_name
+          )
+        : getMongoName(
+            WarehouseOperational,
+            warehouseId,
+            ["name"]
+          ),
+
+      row.product_name
+        ? String(
+            row.product_name
+          )
+        : getMongoName(
+            ProductOperational,
+            productId,
+            ["name"]
+          ),
+
+      getMongoName(
+        ConsigneeName,
+        consigneeId,
+        ["name"]
+      ),
+    ]);
+
+  return {
+    ...row,
+
+    sale_buyer_name:
+      row.buyer_name ||
+      buyerName ||
+      companyName ||
+      row.company_name ||
+      "",
+
+    sale_account_name:
+      row.company_account_name ||
+      accountName ||
+      row.account_name ||
+      "",
+
+    sale_warehouse_name:
+      row.warehouse_name ||
+      warehouseName ||
+      "",
+
+    sale_product_name:
+      row.product_name ||
+      productName ||
+      "",
+
+    sale_consignee_name:
+      row.consignee_name ||
+      consigneeName ||
+      "",
+  };
+}
+
+/*
+====================================================
+OUTWARD DECORATION
+====================================================
+*/
+
+async function decorateMongoOutward(
+  row
+) {
+  if (!row) {
+    return null;
+  }
+
+  const [
+    companyName,
+    accountName,
+    warehouseName,
+    productName,
+  ] =
+    await Promise.all([
+      row.company_name ||
+        getMongoName(
+          CompanyOperational,
+          row.company_id,
+          ["name"]
+        ),
+
+      row.company_account_name ||
+        getMongoName(
+          CompanyAccountOperational,
+          row.company_account_id,
+          [
+            "account_name",
+            "name",
+          ]
+        ),
+
+      row.warehouse_name ||
+        getMongoName(
+          WarehouseOperational,
+          row.warehouse_id,
+          ["name"]
+        ),
+
+      row.product_name ||
+        getMongoName(
+          ProductOperational,
+          row.product_id,
+          ["name"]
+        ),
+    ]);
+
+  return {
+    ...row,
+
+    company_name:
+      companyName || "",
+
+    company_account_name:
+      accountName || "",
+
+    account_name:
+      accountName || "",
+
+    warehouse_name:
+      warehouseName || "",
+
+    product_name:
+      productName || "",
+  };
+}
+
+/*
+====================================================
+NEXT BILTI NUMBER
+====================================================
+*/
+
+async function nextBiltiNo() {
+  const last =
+    await TransportBiltiOperational.findOne({
+      legacy_id: {
+        $type:
+          "number",
+      },
+    })
+      .sort({
+        legacy_id: -1,
+      })
+      .select({
+        legacy_id: 1,
+      })
+      .lean();
+
+  const next =
+    Number(
+      last?.legacy_id || 0
+    ) + 1;
+
+  return {
+    legacyId:
+      next,
+
+    biltiNo:
+      `BLT${String(
+        next
+      ).padStart(4, "0")}`,
+  };
+}
+
+/*
+====================================================
+OUTWARD LIST
+====================================================
+*/
+
+router.get(
+  "/outward-list",
+  async (req, res) => {
+    try {
+      if (!mongoReady()) {
+        return res.status(503).json({
+          error:
+            "MongoDB is not connected",
+        });
+      }
+
+      const [
+        rows,
+        biltiRows,
+      ] =
+        await Promise.all([
+          OutwardOperational.find({})
+            .sort({
+              date: -1,
+              legacy_id: -1,
+              _id: -1,
+            })
+            .lean(),
+
+          TransportBiltiOperational.find({
+            outward_id: {
+              $nin: [
+                null,
+                "",
+              ],
+            },
+          })
+            .select({
+              legacy_id: 1,
+              outward_id: 1,
+            })
+            .lean(),
+        ]);
+
+      const biltiMap =
+        new Map();
+
+      for (
+        const b of
+          biltiRows || []
+      ) {
+        biltiMap.set(
+          String(
+            b.outward_id
+          ),
+          b.legacy_id ??
+            String(
+              b._id
+            )
         );
+      }
+
+      const result =
+        [];
+
+      for (
+        const row of
+          rows || []
+      ) {
+        const id =
+          row.legacy_id ??
+          row.id ??
+          row.sl_no ??
+          row._id;
+
+        const decorated =
+          await decorateMongoOutward(
+            row
+          );
+
+        result.push({
+          id:
+            String(id),
+
+          bilti_id:
+            biltiMap.get(
+              String(id)
+            ) ||
+            null,
+
+          voucher_no:
+            decorated.voucher_no ||
+            decorated.outward_no ||
+            decorated.inv_no ||
+            "",
+
+          date:
+            decorated.date ||
+            "",
+
+          lorry_no:
+            decorated.lorry_no ||
+            "",
+
+          quantity:
+            num(
+              decorated.quantity ||
+                decorated.weight
+            ),
+
+          weight:
+            num(
+              decorated.weight ||
+                decorated.quantity
+            ),
+
+          rate:
+            num(
+              decorated.rate
+            ),
+
+          buyer_name:
+            decorated.buyer_name ||
+            decorated.company_name ||
+            "",
+
+          consignee_name:
+            decorated.consignee_name ||
+            "",
+
+          company_name:
+            decorated.company_name ||
+            "",
+
+          account_name:
+            decorated.company_account_name ||
+            decorated.account_name ||
+            "",
+
+          warehouse_name:
+            decorated.warehouse_name ||
+            "",
+
+          product_name:
+            decorated.product_name ||
+            "",
+
+          source:
+            "mongo",
+        });
+      }
+
+      return res.json(
+        result
+      );
+    } catch (err) {
+      console.error(
+        "Mongo outward-list failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
       });
+    }
+  }
+);
 
-      const docs = await SaleVoucher.find({}).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
-      const pending = [];
+/*
+====================================================
+SALE LIST
+====================================================
+*/
 
-      for (const doc of docs || []) {
-        const mongoId = String(doc._id || "");
-        if (!mongoId || alreadyBiltied.has(mongoId)) continue;
+router.get(
+  "/sale-list",
+  async (req, res) => {
+    try {
+      if (!mongoReady()) {
+        return res.status(503).json({
+          error:
+            "MongoDB is not connected",
+        });
+      }
 
-        const decorated = await decorateMongoSale(doc);
+      const biltiRows =
+        await TransportBiltiOperational.find({
+          sale_id: {
+            $nin: [
+              null,
+              "",
+            ],
+          },
+        })
+          .select({
+            sale_id: 1,
+            legacy_id: 1,
+          })
+          .lean();
+
+      const alreadyBiltied =
+        new Set(
+          (
+            biltiRows || []
+          ).map(
+            (row) =>
+              String(
+                row.sale_id
+              )
+          )
+        );
+
+      const docs =
+        await SaleVoucher.find({})
+          .sort({
+            date: -1,
+            createdAt: -1,
+            _id: -1,
+          })
+          .lean();
+
+      const pending =
+        [];
+
+      for (
+        const doc of
+          docs || []
+      ) {
+        const mongoId =
+          String(
+            doc._id || ""
+          );
+
+        if (
+          !mongoId ||
+          alreadyBiltied.has(
+            mongoId
+          )
+        ) {
+          continue;
+        }
+
+        const decorated =
+          await decorateMongoSale(
+            doc
+          );
+
         pending.push({
-          id: mongoId,
-          sale_id: mongoId,
-          bilti_id: null,
-          voucher_no: decorated.voucher_no || decorated.bill_no || "",
-          date: decorated.date || decorated.bill_date || "",
-          lorry_no: decorated.lorry_no || "",
-          quantity: num(decorated.quantity),
-          unloading_qty: num(decorated.unloading_qty),
-          rate: num(decorated.rate),
-          amount: num(decorated.amount),
+          id:
+            mongoId,
+
+          sale_id:
+            mongoId,
+
+          bilti_id:
+            null,
+
+          voucher_no:
+            decorated.voucher_no ||
+            decorated.bill_no ||
+            "",
+
+          date:
+            decorated.date ||
+            decorated.bill_date ||
+            "",
+
+          lorry_no:
+            decorated.lorry_no ||
+            "",
+
+          quantity:
+            num(
+              decorated.quantity
+            ),
+
+          unloading_qty:
+            num(
+              decorated.unloading_qty
+            ),
+
+          rate:
+            num(
+              decorated.rate
+            ),
+
+          amount:
+            num(
+              decorated.amount
+            ),
+
           buyer_name:
             decorated.sale_buyer_name ||
             decorated.buyer_name ||
             decorated.company_name ||
             "",
+
           consignee_name:
             decorated.sale_consignee_name ||
             decorated.consignee_name ||
             "",
+
           account_name:
             decorated.sale_account_name ||
             decorated.company_account_name ||
             decorated.account_name ||
             "",
+
           warehouse_name:
             decorated.sale_warehouse_name ||
             decorated.warehouse_name ||
             "",
+
           product_name:
             decorated.sale_product_name ||
             decorated.product_name ||
             "",
-          source: "mongo",
+
+          source:
+            "mongo",
         });
       }
 
-      return res.json(pending);
-    }
-  } catch (mongoErr) {
-    console.error("Mongo sale-list lookup failed; falling back to SQLite:", mongoErr.message || mongoErr);
-  }
-
-  // Keep the existing SQLite fallback for installations where MongoDB is
-  // temporarily unavailable.  This preserves the old behaviour and does not
-  // change any transport calculation/save logic.
-  const sql = `
-    SELECT
-      s.id,
-      lb.bilti_id,
-      s.voucher_no,
-      s.date,
-      s.lorry_no,
-      s.quantity,
-      s.unloading_qty,
-      s.rate,
-      s.amount,
-      COALESCE(b.name, c.name) AS buyer_name,
-      co.name AS consignee_name,
-      ca.account_name AS account_name,
-      w.name AS warehouse_name,
-      p.name AS product_name
-    FROM wh_sale_vouchers s
-    LEFT JOIN (
-      SELECT sale_id, MAX(id) AS bilti_id
-      FROM transport_bilti
-      WHERE sale_id IS NOT NULL
-      GROUP BY sale_id
-    ) lb ON lb.sale_id = s.id
-    LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(s.buyer_id AS TEXT)
-    LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
-    LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
-    LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
-    LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
-    LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
-    WHERE lb.bilti_id IS NULL
-    ORDER BY s.id DESC
-  `;
-
-  db.all(sql, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
-
-router.get("/report/list", (req, res) => {
-  const { from_date, to_date } = req.query;
-  const reportDateExpr = "COALESCE(NULLIF(tb.dispatch_date, ''), NULLIF(tb.outward_date, ''))";
-
-  const where = ["1=1"];
-  const params = [];
-
-  if (from_date) {
-    where.push(`${reportDateExpr} >= ?`);
-    params.push(from_date);
-  }
-
-  if (to_date) {
-    where.push(`${reportDateExpr} <= ?`);
-    params.push(to_date);
-  }
-
-  const sql = `
-    SELECT
-      tb.*,
-      tr.name AS transporter_name,
-      tr.address AS transporter_address,
-      tr.pan_no AS transporter_pan_no,
-      tr.mobile AS transporter_mobile,
-      o.voucher_no AS outward_voucher_no,
-      o.date AS outward_entry_date,
-      o.buyer_name AS outward_buyer_name,
-      o.consignee_name AS outward_consignee_name,
-      o.lorry_no AS outward_lorry_no,
-      c.name AS outward_company_name,
-      ca.account_name AS outward_account_name,
-      w.name AS outward_warehouse_name,
-      p.name AS outward_product_name,
-      s.voucher_no AS sale_voucher_no,
-      s.date AS sale_entry_date,
-      s.quantity AS sale_quantity,
-      s.unloading_qty AS sale_unloading_qty,
-      s.rate AS sale_master_rate,
-      s.lorry_no AS sale_lorry_no,
-      COALESCE(sb.name, sc.name) AS sale_buyer_name,
-      sco.name AS sale_consignee_name,
-      sca.account_name AS sale_account_name,
-      sw.name AS sale_warehouse_name,
-      sp.name AS sale_product_name
-    FROM transport_bilti tb
-    LEFT JOIN outward o ON o.id = tb.outward_id
-    LEFT JOIN transporters tr ON tr.id = tb.transporter_id
-    LEFT JOIN companies c ON o.company_id = c.id
-    LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-    LEFT JOIN warehouses w ON o.warehouse_id = w.id
-    LEFT JOIN products p ON o.product_id = p.id
-    LEFT JOIN wh_sale_vouchers s ON s.id = tb.sale_id
-    LEFT JOIN buyer_names sb ON CAST(sb.id AS TEXT) = CAST(s.buyer_id AS TEXT)
-    LEFT JOIN companies sc ON CAST(sc.id AS TEXT) = CAST(s.company_id AS TEXT)
-    LEFT JOIN consignee_names sco ON CAST(sco.id AS TEXT) = CAST(s.consignee_id AS TEXT)
-    LEFT JOIN company_accounts sca ON CAST(sca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
-    LEFT JOIN warehouses sw ON CAST(sw.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
-    LEFT JOIN products sp ON CAST(sp.id AS TEXT) = CAST(s.product_id AS TEXT)
-    WHERE ${where.join(" AND ")}
-    ORDER BY ${reportDateExpr} DESC, tb.id DESC
-  `;
-
-  db.all(sql, params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json((rows || []).map((row) => applyCalculatedBilti(row)));
-  });
-});
-
-router.get("/:id", (req, res) => {
-  const biltiIdOrOutwardId = req.params.id;
-
-  const biltiJoinSql = `
-    SELECT
-      tb.*,
-      tr.name AS transporter_name,
-      tr.address AS transporter_address,
-      tr.pan_no AS transporter_pan_no,
-      tr.mobile AS transporter_mobile,
-      o.id AS outward_id,
-      o.voucher_no AS outward_voucher_no,
-      o.date AS outward_entry_date,
-      o.quantity AS outward_quantity,
-      o.weight AS outward_weight,
-      o.rate AS outward_master_rate,
-      o.buyer_name AS outward_buyer_name,
-      o.consignee_name AS outward_consignee_name,
-      o.lorry_no AS outward_lorry_no,
-      c.name AS outward_company_name,
-      ca.account_name AS outward_account_name,
-      w.name AS outward_warehouse_name,
-      p.name AS outward_product_name,
-      s.id AS sale_id,
-      s.voucher_no AS sale_voucher_no,
-      s.date AS sale_entry_date,
-      s.quantity AS sale_quantity,
-      s.unloading_qty AS sale_unloading_qty,
-      s.rate AS sale_master_rate,
-      s.lorry_no AS sale_lorry_no,
-      COALESCE(sb.name, sc.name) AS sale_buyer_name,
-      sco.name AS sale_consignee_name,
-      sca.account_name AS sale_account_name,
-      sw.name AS sale_warehouse_name,
-      sp.name AS sale_product_name
-    FROM transport_bilti tb
-    LEFT JOIN outward o ON o.id = tb.outward_id
-    LEFT JOIN transporters tr ON tr.id = tb.transporter_id
-    LEFT JOIN companies c ON o.company_id = c.id
-    LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-    LEFT JOIN warehouses w ON o.warehouse_id = w.id
-    LEFT JOIN products p ON o.product_id = p.id
-    LEFT JOIN wh_sale_vouchers s ON s.id = tb.sale_id
-    LEFT JOIN buyer_names sb ON CAST(sb.id AS TEXT) = CAST(s.buyer_id AS TEXT)
-    LEFT JOIN companies sc ON CAST(sc.id AS TEXT) = CAST(s.company_id AS TEXT)
-    LEFT JOIN consignee_names sco ON CAST(sco.id AS TEXT) = CAST(s.consignee_id AS TEXT)
-    LEFT JOIN company_accounts sca ON CAST(sca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
-    LEFT JOIN warehouses sw ON CAST(sw.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
-    LEFT JOIN products sp ON CAST(sp.id AS TEXT) = CAST(s.product_id AS TEXT)
-    WHERE %WHERE_CONDITION%
-    LIMIT 1
-  `;
-
-  const loadFromOutwardTable = () => {
-    db.get(
-      `
-      SELECT
-        o.id AS outward_id,
-        o.voucher_no,
-        o.date,
-        o.lorry_no,
-        o.quantity,
-        o.weight,
-        o.rate,
-        o.buyer_name,
-        o.consignee_name,
-        c.name AS company_name,
-        ca.account_name AS account_name,
-        w.name AS warehouse_name,
-        p.name AS product_name
-      FROM outward o
-      LEFT JOIN companies c ON o.company_id = c.id
-      LEFT JOIN company_accounts ca ON o.company_account_id = ca.id
-      LEFT JOIN warehouses w ON o.warehouse_id = w.id
-      LEFT JOIN products p ON o.product_id = p.id
-      WHERE o.id = ?
-      `,
-      [biltiIdOrOutwardId],
-      (err2, outwardRow) => {
-        if (err2) return res.status(500).json({ error: err2.message });
-        if (!outwardRow) return res.status(404).json({ error: "Bilti not found" });
-
-        res.json(applyCalculatedBilti({
-          id: null,
-          outward_id: outwardRow.outward_id,
-          bilti_no: "",
-          transporter_id: "",
-          transporter_name: "",
-          transporter_address: "",
-          transporter_pan_no: "",
-          transporter_mobile: "",
-          dispatch_date: outwardRow.date || "",
-          destination: "",
-          days: 0,
-          outward_qty: num(outwardRow.quantity || outwardRow.weight),
-          dispatch_qty: num(outwardRow.quantity || outwardRow.weight),
-          shortage_free_kg: 100,
-          shortage_qty: 0,
-          outward_rate: num(outwardRow.rate),
-          shortage_amount: 0,
-          transport_rate: 0,
-          gross_freight: 0,
-          detain_amount: 0,
-          others_exp: 0,
-          advance_amount: 0,
-          tds_percent: 0,
-          tds_amount: 0,
-          net_amount: 0,
-          payable_amount: 0,
-          narration: "",
-          outward_voucher_no: outwardRow.voucher_no || "",
-          outward_entry_date: outwardRow.date || "",
-          outward_quantity: num(outwardRow.quantity || outwardRow.weight),
-          outward_weight: num(outwardRow.weight),
-          outward_master_rate: num(outwardRow.rate),
-          outward_buyer_name: outwardRow.buyer_name || "",
-          outward_consignee_name: outwardRow.consignee_name || "",
-          outward_lorry_no: outwardRow.lorry_no || "",
-          outward_company_name: outwardRow.company_name || "",
-          outward_account_name: outwardRow.account_name || "",
-          outward_warehouse_name: outwardRow.warehouse_name || "",
-          outward_product_name: outwardRow.product_name || "",
-        }));
-      }
-    );
-  };
-
-  const loadFromSaleTableMongo = () => {
-    if (mongoose.connection.readyState !== 1 || !mongoose.Types.ObjectId.isValid(biltiIdOrOutwardId)) {
-      return false;
-    }
-
-    SaleVoucher.findById(biltiIdOrOutwardId)
-      .lean()
-      .then(async (saleDoc) => {
-        if (!saleDoc) {
-          return loadFromSaleTable();
-        }
-
-        const decoratedSale = await decorateMongoSale(saleDoc);
-        const saleWeight = num(decoratedSale.unloading_qty || decoratedSale.quantity);
-        res.json(applyCalculatedBilti({
-          id: null,
-          outward_id: null,
-          sale_id: String(decoratedSale._id || decoratedSale.id),
-          bilti_no: "",
-          transporter_id: "",
-          transporter_name: "",
-          transporter_address: "",
-          transporter_pan_no: "",
-          transporter_mobile: "",
-          dispatch_date: decoratedSale.unloading_date || decoratedSale.date || "",
-          destination: "",
-          days: 0,
-          outward_qty: saleWeight,
-          dispatch_qty: saleWeight,
-          shortage_free_kg: 100,
-          shortage_qty: 0,
-          outward_rate: num(decoratedSale.rate),
-          shortage_amount: 0,
-          transport_rate: 0,
-          gross_freight: 0,
-          detain_amount: 0,
-          others_exp: 0,
-          advance_amount: 0,
-          tds_percent: 0,
-          tds_amount: 0,
-          net_amount: 0,
-          payable_amount: 0,
-          narration: "",
-          sale_voucher_no: decoratedSale.voucher_no || "",
-          sale_entry_date: decoratedSale.date || "",
-          sale_unloading_date: decoratedSale.unloading_date || "",
-          sale_quantity: num(decoratedSale.quantity),
-          sale_unloading_qty: num(decoratedSale.unloading_qty),
-          sale_master_rate: num(decoratedSale.rate),
-          sale_buyer_name: decoratedSale.sale_buyer_name || "",
-          sale_consignee_name: decoratedSale.sale_consignee_name || "",
-          sale_lorry_no: decoratedSale.lorry_no || "",
-          sale_account_name: decoratedSale.sale_account_name || "",
-          sale_warehouse_name: decoratedSale.sale_warehouse_name || "",
-          sale_product_name: decoratedSale.sale_product_name || "",
-        }));
-      })
-      .catch((mongoErr) => {
-        console.error("Mongo sale lookup failed:", mongoErr.message || mongoErr);
-        loadFromSaleTable();
-      });
-
-    return true;
-  };
-
-  const loadFromSaleTable = () => {
-    db.get(
-      `
-      SELECT
-        s.id AS sale_id,
-        s.voucher_no,
-        s.date,
-        s.unloading_date,
-        s.lorry_no,
-        s.quantity,
-        s.unloading_qty,
-        s.rate,
-        COALESCE(b.name, c.name) AS buyer_name,
-        co.name AS consignee_name,
-        ca.account_name AS account_name,
-        w.name AS warehouse_name,
-        p.name AS product_name
-      FROM wh_sale_vouchers s
-      LEFT JOIN buyer_names b ON CAST(b.id AS TEXT) = CAST(s.buyer_id AS TEXT)
-      LEFT JOIN companies c ON CAST(c.id AS TEXT) = CAST(s.company_id AS TEXT)
-      LEFT JOIN consignee_names co ON CAST(co.id AS TEXT) = CAST(s.consignee_id AS TEXT)
-      LEFT JOIN company_accounts ca ON CAST(ca.id AS TEXT) = CAST(s.company_account_id AS TEXT)
-      LEFT JOIN warehouses w ON CAST(w.id AS TEXT) = CAST(s.warehouse_id AS TEXT)
-      LEFT JOIN products p ON CAST(p.id AS TEXT) = CAST(s.product_id AS TEXT)
-      WHERE s.id = ?
-      `,
-      [biltiIdOrOutwardId],
-      (err2, saleRow) => {
-        if (err2) return res.status(500).json({ error: err2.message });
-        if (!saleRow) return res.status(404).json({ error: "Bilti not found" });
-
-        const saleWeight = num(saleRow.unloading_qty || saleRow.quantity);
-        res.json(applyCalculatedBilti({
-          id: null,
-          outward_id: null,
-          sale_id: saleRow.sale_id,
-          bilti_no: "",
-          transporter_id: "",
-          transporter_name: "",
-          transporter_address: "",
-          transporter_pan_no: "",
-          transporter_mobile: "",
-          dispatch_date: saleRow.unloading_date || saleRow.date || "",
-          destination: "",
-          days: 0,
-          outward_qty: saleWeight,
-          dispatch_qty: saleWeight,
-          shortage_free_kg: 100,
-          shortage_qty: 0,
-          outward_rate: num(saleRow.rate),
-          shortage_amount: 0,
-          transport_rate: 0,
-          gross_freight: 0,
-          detain_amount: 0,
-          others_exp: 0,
-          advance_amount: 0,
-          tds_percent: 0,
-          tds_amount: 0,
-          net_amount: 0,
-          payable_amount: 0,
-          narration: "",
-          sale_voucher_no: saleRow.voucher_no || "",
-          sale_entry_date: saleRow.date || "",
-          sale_unloading_date: saleRow.unloading_date || "",
-          sale_quantity: num(saleRow.quantity),
-          sale_unloading_qty: num(saleRow.unloading_qty),
-          sale_master_rate: num(saleRow.rate),
-          sale_buyer_name: saleRow.buyer_name || "",
-          sale_consignee_name: saleRow.consignee_name || "",
-          sale_lorry_no: saleRow.lorry_no || "",
-          sale_account_name: saleRow.account_name || "",
-          sale_warehouse_name: saleRow.warehouse_name || "",
-          sale_product_name: saleRow.product_name || "",
-        }));
-      }
-    );
-  };
-
-  if (req.query.source === "sale") {
-    if (loadFromSaleTableMongo()) return;
-    return loadFromSaleTable();
-  }
-  if (req.query.source === "outward") {
-    return loadFromOutwardTable();
-  }
-
-  const sqlByBiltiId = biltiJoinSql.replace("%WHERE_CONDITION%", "tb.id = ?");
-  db.get(sqlByBiltiId, [biltiIdOrOutwardId], (err, biltiRow) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (biltiRow) return res.json(applyCalculatedBilti(biltiRow));
-
-    const sqlByOutwardId = biltiJoinSql.replace(
-      "%WHERE_CONDITION%",
-      "tb.outward_id = ? ORDER BY tb.id DESC"
-    );
-    db.get(sqlByOutwardId, [biltiIdOrOutwardId], (err2, outwardBiltiRow) => {
-      if (err2) return res.status(500).json({ error: err2.message });
-      if (outwardBiltiRow) return res.json(applyCalculatedBilti(outwardBiltiRow));
-      const sqlBySaleId = biltiJoinSql.replace(
-        "%WHERE_CONDITION%",
-        "tb.sale_id = ? ORDER BY tb.id DESC"
+      return res.json(
+        pending
       );
-      db.get(sqlBySaleId, [biltiIdOrOutwardId], (err3, saleBiltiRow) => {
-        if (err3) return res.status(500).json({ error: err3.message });
-        if (saleBiltiRow) return res.json(applyCalculatedBilti(saleBiltiRow));
-        if (req.query.source === "sale") {
-          if (loadFromSaleTableMongo()) return;
-          return loadFromSaleTable();
-        }
-        loadFromOutwardTable();
+    } catch (err) {
+      console.error(
+        "Mongo sale-list failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
       });
-    });
-  });
-});
-
-router.post("/save", (req, res) => {
-  const {
-    id,
-    outward_id,
-    sale_id,
-    transporter_id,
-    voucher_no,
-    outward_date,
-    dispatch_date,
-    destination,
-    days,
-    company_name,
-    account_name,
-    warehouse_name,
-    product_name,
-    lorry_no,
-    buyer_name,
-    consignee_name,
-    outward_qty,
-    dispatch_qty,
-    shortage_free_kg,
-    outward_rate,
-    transport_rate,
-    detain_amount,
-    others_exp,
-    advance_amount,
-    tds_percent,
-    narration,
-  } = req.body;
-
-  if (!transporter_id) {
-    return res.status(400).json({ error: "transporter_id required" });
+    }
   }
+);
 
-  const computed = calculateBilti({
-    outward_qty,
-    dispatch_qty,
-    shortage_free_kg,
-    outward_rate,
-    transport_rate,
-    detain_amount,
-    others_exp,
-    advance_amount,
-    tds_percent,
-  });
+/*
+====================================================
+REPORT LIST
+====================================================
+*/
 
-  const commonParams = [
-    transporter_id,
-    text(voucher_no),
-    text(outward_date),
-    text(dispatch_date),
-    text(destination),
-    num(days),
-    text(company_name),
-    text(account_name),
-    text(warehouse_name),
-    text(product_name),
-    text(lorry_no),
-    text(buyer_name),
-    text(consignee_name),
-    computed.outward_qty,
-    computed.dispatch_qty,
-    computed.shortage_free_kg,
-    computed.shortage_qty,
-    computed.outward_rate,
-    computed.shortage_amount,
-    computed.transport_rate,
-    computed.gross_freight,
-    computed.detain_amount,
-    computed.others_exp,
-    computed.advance_amount,
-    computed.tds_percent,
-    computed.tds_amount,
-    computed.net_amount,
-    computed.payable_amount,
-    text(narration),
-  ];
-
-  if (id) {
-    db.run(
-      `
-      UPDATE transport_bilti SET
-        transporter_id = ?,
-        voucher_no = ?,
-        outward_date = ?,
-        dispatch_date = ?,
-        destination = ?,
-        days = ?,
-        company_name = ?,
-        account_name = ?,
-        warehouse_name = ?,
-        product_name = ?,
-        lorry_no = ?,
-        buyer_name = ?,
-        consignee_name = ?,
-        outward_qty = ?,
-        dispatch_qty = ?,
-        shortage_free_kg = ?,
-        shortage_qty = ?,
-        outward_rate = ?,
-        shortage_amount = ?,
-        transport_rate = ?,
-        gross_freight = ?,
-        detain_amount = ?,
-        others_exp = ?,
-        advance_amount = ?,
-        tds_percent = ?,
-        tds_amount = ?,
-        net_amount = ?,
-        payable_amount = ?,
-        narration = ?,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-      `,
-      [...commonParams, id],
-      function (err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: "Bilti updated successfully", id });
+router.get(
+  "/report/list",
+  async (req, res) => {
+    try {
+      if (!mongoReady()) {
+        return res.status(503).json({
+          error:
+            "MongoDB is not connected",
+        });
       }
-    );
-    return;
+
+      const fromDate =
+        text(
+          req.query.from_date
+        );
+
+      const toDate =
+        text(
+          req.query.to_date
+        );
+
+      const filter = {};
+
+      if (
+        fromDate ||
+        toDate
+      ) {
+        filter.dispatch_date = {};
+
+        if (fromDate) {
+          filter.dispatch_date.$gte =
+            fromDate;
+        }
+
+        if (toDate) {
+          filter.dispatch_date.$lte =
+            toDate;
+        }
+      }
+
+      const rows =
+        await TransportBiltiOperational.find(
+          filter
+        )
+          .sort({
+            dispatch_date: -1,
+            legacy_id: -1,
+            _id: -1,
+          })
+          .lean();
+
+      const output =
+        [];
+
+      for (
+        const row of
+          rows
+      ) {
+        const decorated =
+          await decorateMongoBilti(
+            row
+          );
+
+        let sale =
+          null;
+
+        let outward =
+          null;
+
+        if (
+          row.sale_id
+        ) {
+          sale =
+            await findByIdFlexible(
+              SaleVoucher,
+              row.sale_id
+            );
+        }
+
+        if (
+          row.outward_id
+        ) {
+          outward =
+            await findByIdFlexible(
+              OutwardOperational,
+              row.outward_id
+            );
+        }
+
+        const decoratedSale =
+          sale
+            ? await decorateMongoSale(
+                sale
+              )
+            : null;
+
+        const decoratedOutward =
+          outward
+            ? await decorateMongoOutward(
+                outward
+              )
+            : null;
+
+        output.push({
+          ...decorated,
+
+          outward_voucher_no:
+            decoratedOutward?.voucher_no ||
+            decoratedOutward?.outward_no ||
+            "",
+
+          outward_entry_date:
+            decoratedOutward?.date ||
+            "",
+
+          outward_buyer_name:
+            decoratedOutward?.buyer_name ||
+            decoratedOutward?.company_name ||
+            "",
+
+          outward_consignee_name:
+            decoratedOutward?.consignee_name ||
+            "",
+
+          outward_lorry_no:
+            decoratedOutward?.lorry_no ||
+            "",
+
+          outward_company_name:
+            decoratedOutward?.company_name ||
+            "",
+
+          outward_account_name:
+            decoratedOutward?.company_account_name ||
+            "",
+
+          outward_warehouse_name:
+            decoratedOutward?.warehouse_name ||
+            "",
+
+          outward_product_name:
+            decoratedOutward?.product_name ||
+            "",
+
+          sale_voucher_no:
+            decoratedSale?.voucher_no ||
+            decoratedSale?.bill_no ||
+            "",
+
+          sale_entry_date:
+            decoratedSale?.date ||
+            "",
+
+          sale_quantity:
+            num(
+              decoratedSale?.quantity
+            ),
+
+          sale_unloading_qty:
+            num(
+              decoratedSale?.unloading_qty
+            ),
+
+          sale_master_rate:
+            num(
+              decoratedSale?.rate
+            ),
+
+          sale_lorry_no:
+            decoratedSale?.lorry_no ||
+            "",
+
+          sale_buyer_name:
+            decoratedSale?.sale_buyer_name ||
+            "",
+
+          sale_consignee_name:
+            decoratedSale?.sale_consignee_name ||
+            "",
+
+          sale_account_name:
+            decoratedSale?.sale_account_name ||
+            "",
+
+          sale_warehouse_name:
+            decoratedSale?.sale_warehouse_name ||
+            "",
+
+          sale_product_name:
+            decoratedSale?.sale_product_name ||
+            "",
+        });
+      }
+
+      return res.json(
+        output
+      );
+    } catch (err) {
+      console.error(
+        "Mongo transport report failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
+      });
+    }
   }
+);
 
-  const saveLinkedBilti = ({ sourceColumn, sourceId, successPrefix }) => {
-    db.get(
-      `SELECT id, bilti_no FROM transport_bilti WHERE ${sourceColumn} = ?`,
-      [sourceId],
-      (err, existing) => {
-        if (err) return res.status(500).json({ error: err.message });
+/*
+====================================================
+GET ONE BILTI
+====================================================
+*/
 
-        const doSave = (biltiNo) => {
-          if (existing) {
-            db.run(
-              `
-              UPDATE transport_bilti SET
-                transporter_id = ?,
-                voucher_no = ?,
-                outward_date = ?,
-                dispatch_date = ?,
-                destination = ?,
-                days = ?,
-                company_name = ?,
-                account_name = ?,
-                warehouse_name = ?,
-                product_name = ?,
-                lorry_no = ?,
-                buyer_name = ?,
-                consignee_name = ?,
-                outward_qty = ?,
-                dispatch_qty = ?,
-                shortage_free_kg = ?,
-                shortage_qty = ?,
-                outward_rate = ?,
-                shortage_amount = ?,
-                transport_rate = ?,
-                gross_freight = ?,
-                detain_amount = ?,
-                others_exp = ?,
-                advance_amount = ?,
-                tds_percent = ?,
-                tds_amount = ?,
-                net_amount = ?,
-                payable_amount = ?,
-                narration = ?,
-                updated_at = CURRENT_TIMESTAMP
-              WHERE ${sourceColumn} = ?
-              `,
-              [...commonParams, sourceId],
-              function (updateErr) {
-                if (updateErr) return res.status(500).json({ error: updateErr.message });
-                res.json({ message: "Bilti updated successfully", id: existing.id });
-              }
-            );
-          } else {
-            db.run(
-              `
-              INSERT INTO transport_bilti (
-                outward_id,
-                sale_id,
-                bilti_no,
-                transporter_id,
-                voucher_no,
-                outward_date,
-                dispatch_date,
-                destination,
-                days,
-                company_name,
-                account_name,
-                warehouse_name,
-                product_name,
-                lorry_no,
-                buyer_name,
-                consignee_name,
-                outward_qty,
-                dispatch_qty,
-                shortage_free_kg,
-                shortage_qty,
-                outward_rate,
-                shortage_amount,
-                transport_rate,
-                gross_freight,
-                detain_amount,
-                others_exp,
-                advance_amount,
-                tds_percent,
-                tds_amount,
-                net_amount,
-                payable_amount,
-                narration
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              `,
-              [
-                sourceColumn === "outward_id" ? sourceId : null,
-                sourceColumn === "sale_id" ? sourceId : null,
-                biltiNo,
-                ...commonParams,
-              ],
-              function (insertErr) {
-                if (insertErr) return res.status(500).json({ error: insertErr.message });
-                res.json({ message: `${successPrefix} bilti created successfully`, id: this.lastID });
-              }
-            );
-          }
-        };
+router.get(
+  "/:id",
+  async (req, res) => {
+    try {
+      if (!mongoReady()) {
+        return res.status(503).json({
+          error:
+            "MongoDB is not connected",
+        });
+      }
 
-        if (existing?.bilti_no) {
-          doSave(existing.bilti_no);
-        } else {
-          nextBiltiNo((noErr, biltiNo) => {
-            if (noErr) return res.status(500).json({ error: noErr.message });
-            doSave(biltiNo);
+      const id =
+        text(
+          req.params.id
+        );
+
+      /*
+       * Source = sale
+       */
+      if (
+        req.query.source ===
+        "sale"
+      ) {
+        const sale =
+          await findByIdFlexible(
+            SaleVoucher,
+            id
+          );
+
+        if (!sale) {
+          return res.status(404).json({
+            error:
+              "Sale not found",
           });
         }
+
+        const decoratedSale =
+          await decorateMongoSale(
+            sale
+          );
+
+        const saleWeight =
+          num(
+            decoratedSale.unloading_qty ||
+              decoratedSale.quantity
+          );
+
+        return res.json(
+          applyCalculatedBilti({
+            id:
+              null,
+
+            outward_id:
+              null,
+
+            sale_id:
+              String(
+                decoratedSale._id
+              ),
+
+            bilti_no:
+              "",
+
+            transporter_id:
+              "",
+
+            transporter_name:
+              "",
+
+            transporter_address:
+              "",
+
+            transporter_pan_no:
+              "",
+
+            transporter_mobile:
+              "",
+
+            dispatch_date:
+              decoratedSale.unloading_date ||
+              decoratedSale.date ||
+              "",
+
+            destination:
+              "",
+
+            days:
+              0,
+
+            outward_qty:
+              saleWeight,
+
+            dispatch_qty:
+              saleWeight,
+
+            shortage_free_kg:
+              100,
+
+            shortage_qty:
+              0,
+
+            outward_rate:
+              num(
+                decoratedSale.rate
+              ),
+
+            transport_rate:
+              0,
+
+            detain_amount:
+              0,
+
+            others_exp:
+              0,
+
+            advance_amount:
+              0,
+
+            tds_percent:
+              0,
+
+            narration:
+              "",
+
+            sale_voucher_no:
+              decoratedSale.voucher_no ||
+              decoratedSale.bill_no ||
+              "",
+
+            sale_entry_date:
+              decoratedSale.date ||
+              "",
+
+            sale_unloading_date:
+              decoratedSale.unloading_date ||
+              "",
+
+            sale_quantity:
+              num(
+                decoratedSale.quantity
+              ),
+
+            sale_unloading_qty:
+              num(
+                decoratedSale.unloading_qty
+              ),
+
+            sale_master_rate:
+              num(
+                decoratedSale.rate
+              ),
+
+            sale_lorry_no:
+              decoratedSale.lorry_no ||
+              "",
+
+            sale_buyer_name:
+              decoratedSale.sale_buyer_name ||
+              "",
+
+            sale_consignee_name:
+              decoratedSale.sale_consignee_name ||
+              "",
+
+            sale_account_name:
+              decoratedSale.sale_account_name ||
+              "",
+
+            sale_warehouse_name:
+              decoratedSale.sale_warehouse_name ||
+              "",
+
+            sale_product_name:
+              decoratedSale.sale_product_name ||
+              "",
+          })
+        );
       }
-    );
-  };
 
-  if (outward_id) {
-    saveLinkedBilti({ sourceColumn: "outward_id", sourceId: outward_id, successPrefix: "Outward" });
-    return;
+      /*
+       * Existing Bilti
+       */
+      const bilti =
+        await findByIdFlexible(
+          TransportBiltiOperational,
+          id
+        );
+
+      if (bilti) {
+        const decorated =
+          await decorateMongoBilti(
+            bilti
+          );
+
+        /*
+         * Add linked outward/sale
+         * information.
+         */
+        if (
+          bilti.outward_id
+        ) {
+          const outward =
+            await findByIdFlexible(
+              OutwardOperational,
+              bilti.outward_id
+            );
+
+          if (outward) {
+            const decoratedOutward =
+              await decorateMongoOutward(
+                outward
+              );
+
+            decorated.outward_voucher_no =
+              decoratedOutward.voucher_no ||
+              decoratedOutward.outward_no ||
+              "";
+
+            decorated.outward_entry_date =
+              decoratedOutward.date ||
+              "";
+
+            decorated.outward_quantity =
+              num(
+                decoratedOutward.quantity ||
+                  decoratedOutward.weight
+              );
+
+            decorated.outward_weight =
+              num(
+                decoratedOutward.weight
+              );
+
+            decorated.outward_master_rate =
+              num(
+                decoratedOutward.rate
+              );
+
+            decorated.outward_buyer_name =
+              decoratedOutward.buyer_name ||
+              "";
+
+            decorated.outward_consignee_name =
+              decoratedOutward.consignee_name ||
+              "";
+
+            decorated.outward_lorry_no =
+              decoratedOutward.lorry_no ||
+              "";
+
+            decorated.outward_company_name =
+              decoratedOutward.company_name ||
+              "";
+
+            decorated.outward_account_name =
+              decoratedOutward.company_account_name ||
+              "";
+
+            decorated.outward_warehouse_name =
+              decoratedOutward.warehouse_name ||
+              "";
+
+            decorated.outward_product_name =
+              decoratedOutward.product_name ||
+              "";
+          }
+        }
+
+        if (
+          bilti.sale_id
+        ) {
+          const sale =
+            await findByIdFlexible(
+              SaleVoucher,
+              bilti.sale_id
+            );
+
+          if (sale) {
+            const decoratedSale =
+              await decorateMongoSale(
+                sale
+              );
+
+            decorated.sale_voucher_no =
+              decoratedSale.voucher_no ||
+              decoratedSale.bill_no ||
+              "";
+
+            decorated.sale_entry_date =
+              decoratedSale.date ||
+              "";
+
+            decorated.sale_unloading_date =
+              decoratedSale.unloading_date ||
+              "";
+
+            decorated.sale_quantity =
+              num(
+                decoratedSale.quantity
+              );
+
+            decorated.sale_unloading_qty =
+              num(
+                decoratedSale.unloading_qty
+              );
+
+            decorated.sale_master_rate =
+              num(
+                decoratedSale.rate
+              );
+
+            decorated.sale_lorry_no =
+              decoratedSale.lorry_no ||
+              "";
+
+            decorated.sale_buyer_name =
+              decoratedSale.sale_buyer_name ||
+              "";
+
+            decorated.sale_consignee_name =
+              decoratedSale.sale_consignee_name ||
+              "";
+
+            decorated.sale_account_name =
+              decoratedSale.sale_account_name ||
+              "";
+
+            decorated.sale_warehouse_name =
+              decoratedSale.sale_warehouse_name ||
+              "";
+
+            decorated.sale_product_name =
+              decoratedSale.sale_product_name ||
+              "";
+          }
+        }
+
+        return res.json(
+          decorated
+        );
+      }
+
+      /*
+       * Source = outward
+       * If there is no Bilti yet,
+       * return a blank Bilti form.
+       */
+      if (
+        req.query.source ===
+        "outward"
+      ) {
+        const outward =
+          await findByIdFlexible(
+            OutwardOperational,
+            id
+          );
+
+        if (!outward) {
+          return res.status(404).json({
+            error:
+              "Outward not found",
+          });
+        }
+
+        const decoratedOutward =
+          await decorateMongoOutward(
+            outward
+          );
+
+        const qty =
+          num(
+            decoratedOutward.quantity ||
+              decoratedOutward.weight
+          );
+
+        return res.json(
+          applyCalculatedBilti({
+            id:
+              null,
+
+            outward_id:
+              decoratedOutward.legacy_id ??
+              decoratedOutward.id ??
+              decoratedOutward.sl_no ??
+              String(
+                decoratedOutward._id
+              ),
+
+            bilti_no:
+              "",
+
+            transporter_id:
+              "",
+
+            transporter_name:
+              "",
+
+            transporter_address:
+              "",
+
+            transporter_pan_no:
+              "",
+
+            transporter_mobile:
+              "",
+
+            dispatch_date:
+              decoratedOutward.date ||
+              "",
+
+            destination:
+              "",
+
+            days:
+              0,
+
+            outward_qty:
+              qty,
+
+            dispatch_qty:
+              qty,
+
+            shortage_free_kg:
+              100,
+
+            shortage_qty:
+              0,
+
+            outward_rate:
+              num(
+                decoratedOutward.rate
+              ),
+
+            transport_rate:
+              0,
+
+            detain_amount:
+              0,
+
+            others_exp:
+              0,
+
+            advance_amount:
+              0,
+
+            tds_percent:
+              0,
+
+            narration:
+              "",
+
+            outward_voucher_no:
+              decoratedOutward.voucher_no ||
+              decoratedOutward.outward_no ||
+              "",
+
+            outward_entry_date:
+              decoratedOutward.date ||
+              "",
+
+            outward_quantity:
+              qty,
+
+            outward_weight:
+              num(
+                decoratedOutward.weight
+              ),
+
+            outward_master_rate:
+              num(
+                decoratedOutward.rate
+              ),
+
+            outward_buyer_name:
+              decoratedOutward.buyer_name ||
+              "",
+
+            outward_consignee_name:
+              decoratedOutward.consignee_name ||
+              "",
+
+            outward_lorry_no:
+              decoratedOutward.lorry_no ||
+              "",
+
+            outward_company_name:
+              decoratedOutward.company_name ||
+              "",
+
+            outward_account_name:
+              decoratedOutward.company_account_name ||
+              "",
+
+            outward_warehouse_name:
+              decoratedOutward.warehouse_name ||
+              "",
+
+            outward_product_name:
+              decoratedOutward.product_name ||
+              "",
+          })
+        );
+      }
+
+      return res.status(404).json({
+        error:
+          "Bilti not found",
+      });
+    } catch (err) {
+      console.error(
+        "Mongo bilti detail failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
+      });
+    }
   }
+);
 
-  if (sale_id) {
-    saveLinkedBilti({ sourceColumn: "sale_id", sourceId: sale_id, successPrefix: "Sale" });
-    return;
-  }
+/*
+====================================================
+SAVE / UPDATE BILTI
+====================================================
+*/
 
-  nextBiltiNo((err, biltiNo) => {
-    if (err) return res.status(500).json({ error: err.message });
+router.post(
+  "/save",
+  async (req, res) => {
+    try {
+      if (!mongoReady()) {
+        return res.status(503).json({
+          error:
+            "MongoDB is not connected",
+        });
+      }
 
-    db.run(
-      `
-      INSERT INTO transport_bilti (
+      const {
+        id,
         outward_id,
         sale_id,
-        bilti_no,
         transporter_id,
         voucher_no,
         outward_date,
@@ -912,36 +1846,502 @@ router.post("/save", (req, res) => {
         outward_qty,
         dispatch_qty,
         shortage_free_kg,
-        shortage_qty,
         outward_rate,
-        shortage_amount,
         transport_rate,
-        gross_freight,
         detain_amount,
         others_exp,
         advance_amount,
         tds_percent,
-        tds_amount,
-        net_amount,
-        payable_amount,
-        narration
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [null, null, biltiNo, ...commonParams],
-      function (insertErr) {
-        if (insertErr) return res.status(500).json({ error: insertErr.message });
-        res.json({ message: "Manual bilti created successfully", id: this.lastID });
-      }
-    );
-  });
-});
+        narration,
+      } = req.body || {};
 
-router.delete("/:id", (req, res) => {
-  db.run(`DELETE FROM transport_bilti WHERE id = ?`, [req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!this.changes) return res.status(404).json({ error: "Bilti not found" });
-    res.json({ message: "Bilti deleted successfully" });
-  });
-});
+      if (!transporter_id) {
+        return res.status(400).json({
+          error:
+            "transporter_id required",
+        });
+      }
+
+      const computed =
+        calculateBilti({
+          outward_qty,
+          dispatch_qty,
+          shortage_free_kg,
+          outward_rate,
+          transport_rate,
+          detain_amount,
+          others_exp,
+          advance_amount,
+          tds_percent,
+        });
+
+      let sourceOutward =
+        null;
+
+      let sourceSale =
+        null;
+
+      if (
+        outward_id
+      ) {
+        sourceOutward =
+          await findByIdFlexible(
+            OutwardOperational,
+            outward_id
+          );
+
+        if (!sourceOutward) {
+          return res.status(404).json({
+            error:
+              "Outward not found",
+          });
+        }
+      }
+
+      if (
+        sale_id
+      ) {
+        sourceSale =
+          await findByIdFlexible(
+            SaleVoucher,
+            sale_id
+          );
+
+        if (!sourceSale) {
+          return res.status(404).json({
+            error:
+              "Sale not found",
+          });
+        }
+      }
+
+      let existing =
+        null;
+
+      if (id) {
+        existing =
+          await findByIdFlexible(
+            TransportBiltiOperational,
+            id
+          );
+      }
+
+      if (
+        !existing &&
+        outward_id
+      ) {
+        existing =
+          await TransportBiltiOperational.findOne(
+            {
+              outward_id:
+                String(
+                  outward_id
+                ),
+            }
+          ).lean();
+
+        if (
+          !existing &&
+          /^\d+$/.test(
+            String(
+              outward_id
+            )
+          )
+        ) {
+          existing =
+            await TransportBiltiOperational.findOne(
+              {
+                outward_id:
+                  Number(
+                    outward_id
+                  ),
+              }
+            ).lean();
+        }
+      }
+
+      if (
+        !existing &&
+        sale_id
+      ) {
+        existing =
+          await TransportBiltiOperational.findOne(
+            {
+              sale_id:
+                String(
+                  sale_id
+                ),
+            }
+          ).lean();
+
+        if (
+          !existing &&
+          /^\d+$/.test(
+            String(
+              sale_id
+            )
+          )
+        ) {
+          existing =
+            await TransportBiltiOperational.findOne(
+              {
+                sale_id:
+                  Number(
+                    sale_id
+                  ),
+              }
+            ).lean();
+        }
+      }
+
+      let legacyId =
+        Number(
+          existing?.legacy_id
+        );
+
+      if (
+        !Number.isFinite(
+          legacyId
+        )
+      ) {
+        const next =
+          await nextBiltiNo();
+
+        legacyId =
+          next.legacyId;
+      }
+
+      const biltiNo =
+        existing?.bilti_no ||
+        text(
+          voucher_no
+        ) ||
+        `BLT${String(
+          legacyId
+        ).padStart(
+          4,
+          "0"
+        )}`;
+
+      let finalTransporterId =
+        text(
+          transporter_id
+        );
+
+      const transporter =
+        await getMongoTransporter(
+          finalTransporterId
+        );
+
+      if (
+        transporter
+      ) {
+        finalTransporterId =
+          String(
+            transporter._id
+          );
+      }
+
+      const payload = {
+        legacy_id:
+          Number(
+            legacyId
+          ),
+
+        outward_id:
+          sourceOutward
+            ? String(
+                sourceOutward.legacy_id ??
+                  sourceOutward.id ??
+                  sourceOutward.sl_no ??
+                  sourceOutward._id
+              )
+            : (
+                existing?.outward_id ??
+                (
+                  outward_id
+                    ? String(
+                        outward_id
+                      )
+                    : null
+                )
+              ),
+
+        sale_id:
+          sourceSale
+            ? String(
+                sourceSale._id
+              )
+            : (
+                existing?.sale_id ??
+                (
+                  sale_id
+                    ? String(
+                        sale_id
+                      )
+                    : null
+                )
+              ),
+
+        bilti_no:
+          biltiNo,
+
+        transporter_id:
+          finalTransporterId,
+
+        voucher_no:
+          text(
+            voucher_no
+          ),
+
+        outward_date:
+          text(
+            outward_date
+          ),
+
+        dispatch_date:
+          text(
+            dispatch_date
+          ),
+
+        destination:
+          text(
+            destination
+          ),
+
+        days:
+          num(days),
+
+        company_name:
+          text(
+            company_name
+          ),
+
+        account_name:
+          text(
+            account_name
+          ),
+
+        warehouse_name:
+          text(
+            warehouse_name
+          ),
+
+        product_name:
+          text(
+            product_name
+          ),
+
+        lorry_no:
+          text(
+            lorry_no
+          ),
+
+        buyer_name:
+          text(
+            buyer_name
+          ),
+
+        consignee_name:
+          text(
+            consignee_name
+          ),
+
+        outward_qty:
+          computed.outward_qty,
+
+        dispatch_qty:
+          computed.dispatch_qty,
+
+        shortage_free_kg:
+          computed.shortage_free_kg,
+
+        shortage_qty:
+          computed.shortage_qty,
+
+        outward_rate:
+          computed.outward_rate,
+
+        shortage_amount:
+          computed.shortage_amount,
+
+        transport_rate:
+          computed.transport_rate,
+
+        gross_freight:
+          computed.gross_freight,
+
+        detain_amount:
+          computed.detain_amount,
+
+        others_exp:
+          computed.others_exp,
+
+        advance_amount:
+          computed.advance_amount,
+
+        tds_percent:
+          computed.tds_percent,
+
+        tds_amount:
+          computed.tds_amount,
+
+        net_amount:
+          computed.net_amount,
+
+        payable_amount:
+          computed.payable_amount,
+
+        narration:
+          text(
+            narration
+          ),
+
+        updated_at:
+          new Date(),
+      };
+
+      let doc;
+
+      if (existing) {
+        doc =
+          await TransportBiltiOperational.findById(
+            existing._id
+          );
+
+        if (!doc) {
+          return res.status(404).json({
+            error:
+              "Bilti not found",
+          });
+        }
+
+        Object.assign(
+          doc,
+          payload
+        );
+
+        await doc.save();
+      } else {
+        doc =
+          await TransportBiltiOperational.create(
+            {
+              ...payload,
+              created_at:
+                new Date(),
+            }
+          );
+      }
+
+      const normalized =
+        normalizeMongoDoc(
+          doc
+        );
+
+      return res.json({
+        message:
+          existing ||
+          id
+            ? "Bilti updated successfully"
+            : `${
+                outward_id
+                  ? "Outward"
+                  : sale_id
+                  ? "Sale"
+                  : "Manual"
+              } bilti created successfully`,
+
+        id:
+          normalized.id,
+
+        _id:
+          normalized._id,
+
+        legacy_id:
+          normalized.legacy_id,
+
+        source:
+          "mongodb",
+      });
+    } catch (err) {
+      console.error(
+        "Mongo bilti save failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message ||
+          "Failed to save bilti",
+      });
+    }
+  }
+);
+
+/*
+====================================================
+DELETE BILTI
+====================================================
+*/
+
+router.delete(
+  "/:id",
+  async (req, res) => {
+    try {
+      if (!mongoReady()) {
+        return res.status(503).json({
+          error:
+            "MongoDB is not connected",
+        });
+      }
+
+      const id =
+        text(
+          req.params.id
+        );
+
+      const query =
+        idQuery(id);
+
+      if (!query) {
+        return res.status(400).json({
+          error:
+            "Invalid bilti id",
+        });
+      }
+
+      const deleted =
+        await TransportBiltiOperational.findOneAndDelete(
+          query
+        ).lean();
+
+      if (!deleted) {
+        return res.status(404).json({
+          error:
+            "Bilti not found",
+        });
+      }
+
+      return res.json({
+        message:
+          "Bilti deleted successfully",
+
+        source:
+          "mongodb",
+      });
+    } catch (err) {
+      console.error(
+        "Mongo bilti delete failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err.message,
+      });
+    }
+  }
+);
 
 module.exports = router;
+
