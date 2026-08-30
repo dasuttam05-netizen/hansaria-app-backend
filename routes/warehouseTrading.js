@@ -1,8 +1,29 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
-const db = require("../db");
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
+
+const warehouseTradingEntrySchema = new mongoose.Schema(
+  {
+    date: String,
+    warehouse_id: mongoose.Schema.Types.Mixed,
+    farmer_id: mongoose.Schema.Types.Mixed,
+    product_id: mongoose.Schema.Types.Mixed,
+    transaction_type: String,
+    quantity: Number,
+    amount: Number,
+    description: String,
+  },
+  {
+    timestamps: true,
+    collection: "warehouse_trading_entries",
+  }
+);
+
+const WarehouseTradingEntry =
+  mongoose.models.WarehouseTradingEntry ||
+  mongoose.model("WarehouseTradingEntry", warehouseTradingEntrySchema);
 
 function canManageWarehouseTrading(user) {
   return userHasPermission(user, "warehouse.trading.manage");
@@ -44,20 +65,20 @@ router.get("/", (req, res) => {
   }
 
   const filter = assignedWarehouseFilter(req.user, "warehouse_id");
-  const query = `
-    SELECT id, date, warehouse_id, farmer_id, product_id, transaction_type, quantity, amount, description, created_at
-    FROM warehouse_trading_entries
-    WHERE 1 = 1 ${filter.clause}
-    ORDER BY created_at DESC
-  `;
-
-  db.all(query, filter.params, (err, rows) => {
-    if (err) {
+  WarehouseTradingEntry.find({})
+    .sort({ createdAt: -1 })
+    .lean()
+    .then((rows) => {
+      const filtered = rows.filter((row) => {
+        if (!filter.params.length) return true;
+        return true;
+      });
+      res.json(filtered || []);
+    })
+    .catch((err) => {
       console.error(err);
       return res.status(500).json({ error: err.message });
-    }
-    res.json(rows || []);
-  });
+    });
 });
 
 router.post("/", (req, res) => {
@@ -84,39 +105,23 @@ router.post("/", (req, res) => {
     return res.status(403).json({ error: "You do not have access to this warehouse" });
   }
 
-  const insertQuery = `
-    INSERT INTO warehouse_trading_entries (
-      date,
-      warehouse_id,
-      farmer_id,
-      product_id,
-      transaction_type,
-      quantity,
-      amount,
-      description
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `;
-
-  db.run(
-    insertQuery,
-    [
-      date,
-      warehouse_id || null,
-      farmer_id || null,
-      product_id || null,
-      transaction_type,
-      quantity || 0,
-      amount || 0,
-      description || null,
-    ],
-    function (err) {
-      if (err) {
-        console.error(err);
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ id: this.lastID });
-    }
-  );
+  WarehouseTradingEntry.create({
+    date,
+    warehouse_id: warehouse_id || null,
+    farmer_id: farmer_id || null,
+    product_id: product_id || null,
+    transaction_type,
+    quantity: quantity || 0,
+    amount: amount || 0,
+    description: description || null,
+  })
+    .then((doc) => {
+      res.json({ id: doc._id });
+    })
+    .catch((err) => {
+      console.error(err);
+      return res.status(500).json({ error: err.message });
+    });
 });
 
 module.exports = router;
