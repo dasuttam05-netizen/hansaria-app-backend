@@ -2661,6 +2661,21 @@ async function getMongoPaymentRowsForUser(req) {
   });
 }
 
+router.get("/next-voucher-no", (req, res) => {
+  const { type } = req.query;
+  if (!type) return res.status(400).json({ error: "type query param is required" });
+  if (type === "purchase" && mongoReady()) {
+    nextMongoVoucherNo(type)
+      .then((voucher_no) => res.json({ voucher_no }))
+      .catch((err) => res.status(500).json({ error: err.message }));
+    return;
+  }
+  createSequentialVoucherNo(type, (err, voucher_no) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ voucher_no });
+  });
+});
+
 // ===========================
 // PURCHASE VOUCHERS
 // ===========================
@@ -3295,21 +3310,6 @@ router.post("/purchase", (req, res) => {
         if (String(err.message || "").includes("UNIQUE")) return res.status(400).json({ error: "Voucher number already exists" });
         return res.status(500).json({ error: err.message });
       });
-  });
-});
-
-router.get("/next-voucher-no", (req, res) => {
-  const { type } = req.query;
-  if (!type) return res.status(400).json({ error: "type query param is required" });
-  if (type === "purchase" && mongoReady()) {
-    nextMongoVoucherNo(type)
-      .then((voucher_no) => res.json({ voucher_no }))
-      .catch((err) => res.status(500).json({ error: err.message }));
-    return;
-  }
-  createSequentialVoucherNo(type, (err, voucher_no) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ voucher_no });
   });
 });
 
