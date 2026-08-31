@@ -2686,6 +2686,16 @@ router.get("/purchase", (req, res) => {
   getPurchaseVoucherRows(req, res);
 });
 
+router.get("/purchase/import-template", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const buffer = purchaseImportTemplateBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", 'attachment; filename="purchase_voucher_import_format.xlsx"');
+  res.send(buffer);
+});
+
 router.get("/purchase/:id", (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
     return res.status(403).json({ error: "Permission denied" });
@@ -2721,16 +2731,6 @@ router.get("/purchase/:id", (req, res) => {
       return res.status(500).json({ error: err.message });
     }
   })();
-});
-
-router.get("/purchase/import-template", (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.purchase.view")) {
-    return res.status(403).json({ error: "Permission denied" });
-  }
-  const buffer = purchaseImportTemplateBuffer();
-  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  res.setHeader("Content-Disposition", 'attachment; filename="purchase_voucher_import_format.xlsx"');
-  res.send(buffer);
 });
 
 router.get("/payment/import-template", (req, res) => {
@@ -7043,7 +7043,6 @@ router.delete("/purchase/:id", (req, res) => {
 }
 
 module.exports = router;
-
 
 
 
