@@ -333,7 +333,7 @@ const companyAccountsRoute =
   require("./routes/companyAccounts");
 
 const warehouseRoutes =
-  require("./routes/warehouses");
+  require("./routes/warehouse");
 
 const warehouseRentBookingRoutes =
   require("./routes/warehouseRentBooking");
