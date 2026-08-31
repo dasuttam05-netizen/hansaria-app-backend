@@ -724,6 +724,12 @@ app.use(
 );
 
 app.use(
+  "/api/warehouse-trading",
+  authenticate,
+  whVouchersRoutes
+);
+
+app.use(
   "/api/wh-vouchers",
   authenticate,
   authorize([
