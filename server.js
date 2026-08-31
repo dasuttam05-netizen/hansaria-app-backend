@@ -720,13 +720,13 @@ app.use(
 app.use(
   "/api/warehouse-trading",
   authenticate,
-  warehouseTradingRoutes
+  whVouchersRoutes
 );
 
 app.use(
   "/api/warehouse-trading",
   authenticate,
-  whVouchersRoutes
+  warehouseTradingRoutes
 );
 
 app.use(
