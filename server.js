@@ -717,6 +717,9 @@ app.use(
   farmersRoutes
 );
 
+// Warehouse trading vouchers are exposed through both the newer
+// /api/warehouse-trading prefix and the legacy /api/wh-vouchers prefix.
+// Keeping both mounts prevents 404s for older clients/bookmarks.
 app.use(
   "/api/warehouse-trading",
   authenticate,
