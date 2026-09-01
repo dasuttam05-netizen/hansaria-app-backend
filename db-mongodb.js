@@ -7,7 +7,7 @@ mongoose.set("bufferCommands", false);
 
 const rawMongoUri =
   process.env.MONGODB_URI?.trim() || "";
-const mongoMirrorEnabled = false;
+const mongoMirrorEnabled = true;
 
 const configuredDnsServers = String(
   process.env.MONGODB_DNS_SERVERS || ""
@@ -49,11 +49,12 @@ const hasMongoUri =
   Boolean(mongodbUri) &&
   !mongodbUri.includes("username:password");
 
+// Kept as a compatibility export for existing route modules.
+// It represents MongoDB availability only; there is no local SQL/database mirror.
+const mongoMirrorConfigured = hasMongoUri;
+
 function isMongoMirrorReady() {
-  return (
-    mongoMirrorEnabled &&
-    mongoose.connection.readyState === 1
-  );
+  return mongoose.connection.readyState === 1;
 }
 
 const mirrorRowCollectionName = "mirrorrows";
@@ -125,9 +126,66 @@ function scheduleMirrorRowMigration() {
   return mirrorRowMigrationPromise;
 }
 
-if (mongoMirrorEnabled) {
-  console.warn(
-    "MongoDB mirror mode is intentionally disabled: this deployment uses MongoDB Atlas as the only datastore."
+if (!hasMongoUri) {
+  console.error(
+    "MONGODB_URI is missing or contains placeholder credentials. Configure MongoDB Atlas in Render Environment Variables."
+  );
+} else if (
+  mongoose.connection.readyState === 0
+) {
+  if (mongodbUri !== rawMongoUri) {
+    console.log(
+      "Normalized MongoDB URI format from legacy value in .env."
+    );
+  }
+
+  mongoose
+    .connect(mongodbUri, {
+      serverSelectionTimeoutMS: 8000,
+      socketTimeoutMS: 45000,
+      maxPoolSize: 20,
+      minPoolSize: 5,
+      maxIdleTimeMS: 45000,
+      retryWrites: true,
+      retryReads: true,
+    })
+    .then(() => {
+      console.log(
+        "Connected to MongoDB"
+      );
+      scheduleMirrorRowMigration();
+    })
+    .catch((err) => {
+      if (
+        err?.syscall === "querySrv" ||
+        (
+          err?.code === "ECONNREFUSED" &&
+          /_mongodb\._tcp/i.test(
+            String(
+              err?.hostname ||
+                err?.message ||
+                ""
+            )
+          )
+        )
+      ) {
+        console.error(
+          "MongoDB SRV DNS lookup failed. Current DNS could not resolve Atlas SRV records."
+        );
+        console.error(
+          "If your network blocks SRV lookups, use the non-SRV Atlas connection string instead."
+        );
+      }
+
+
+      console.error(
+        "MongoDB Connection Error:",
+        err.message
+      );
+    });
+} else {
+  console.log(
+    "MongoDB connection already initialized."
   );
 }
 
