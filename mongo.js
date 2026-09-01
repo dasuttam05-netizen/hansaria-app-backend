@@ -22,7 +22,7 @@ const hasMongoUri =
 
 if (!hasMongoUri) {
   throw new Error(
-    "MONGODB_URI is required for cloud-only deployment. Configure the MongoDB Atlas connection string in the Render Environment Variables."
+    "MONGODB_URI is required. Configure a MongoDB Atlas connection string in Render Environment Variables."
   );
 }
 
@@ -47,14 +47,13 @@ if (mongoose.connection.readyState === 0) {
     .catch((err) => {
       if (err?.syscall === "querySrv") {
         console.error(
-          "MongoDB Atlas SRV DNS lookup failed. Use the Atlas connection string and verify network/DNS settings in the cloud runtime."
+          "MongoDB Atlas SRV DNS lookup failed. Check the Atlas connection string and Render DNS/network settings."
         );
       }
-
-      console.error("MongoDB Connection Error:", err.message);
+      console.error("MongoDB Atlas Connection Error:", err.message);
+      process.exitCode = 1;
     });
 }
-
 
 // =========================
 // LOCATION
