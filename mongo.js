@@ -5,7 +5,6 @@ require("dotenv").config();
 mongoose.set("bufferCommands", false);
 
 const rawMongoUri = process.env.MONGODB_URI?.trim() || "";
-const rawMongoLegacyUri = process.env.MONGODB_URI_LEGACY?.trim() || "";
 
 function normalizeAtlasUri(uri) {
   if (!uri || !uri.startsWith("mongodb+srv://")) return uri;
@@ -17,32 +16,24 @@ function normalizeAtlasUri(uri) {
 }
 
 const mongodbUri = normalizeAtlasUri(rawMongoUri);
-const fallbackMongoUri =
-  rawMongoLegacyUri || "";
 const hasMongoUri =
-  mongodbUri && !mongodbUri.includes("username:password");
-const hasFallbackMongoUri =
-  Boolean(fallbackMongoUri) &&
-  fallbackMongoUri.startsWith("mongodb://");
+  Boolean(mongodbUri) &&
+  !mongodbUri.includes("username:password");
 
 if (!hasMongoUri) {
-  if (hasFallbackMongoUri) {
-    console.log("Using legacy MongoDB URI from MONGODB_URI_LEGACY.");
-  } else {
-  console.log(
-    "MongoDB URI is not configured or contains placeholder credentials."
+  throw new Error(
+    "MONGODB_URI is required for cloud-only deployment. Configure the MongoDB Atlas connection string in the Render Environment Variables."
   );
-  }
-} else if (mongoose.connection.readyState === 0) {
+}
+
+if (mongoose.connection.readyState === 0) {
   if (mongodbUri !== rawMongoUri) {
-    console.log(
-      "Normalized MongoDB URI format from legacy value in .env."
-    );
+    console.log("Normalized MongoDB Atlas URI format.");
   }
 
   mongoose
     .connect(mongodbUri, {
-      serverSelectionTimeoutMS: 8000,
+      serverSelectionTimeoutMS: 15000,
       socketTimeoutMS: 45000,
       maxPoolSize: 20,
       minPoolSize: 5,
@@ -51,42 +42,16 @@ if (!hasMongoUri) {
       retryReads: true,
     })
     .then(() => {
-      console.log("Connected to MongoDB");
+      console.log("Connected to MongoDB Atlas");
     })
     .catch((err) => {
       if (err?.syscall === "querySrv") {
         console.error(
-          "MongoDB SRV DNS lookup failed. If your network blocks SRV lookups, use the non-SRV Atlas connection string instead."
+          "MongoDB Atlas SRV DNS lookup failed. Use the Atlas connection string and verify network/DNS settings in the cloud runtime."
         );
       }
 
-      console.error(
-        "MongoDB Connection Error:",
-        err.message
-      );
-
-      if (hasFallbackMongoUri) {
-        console.log("Retrying with MONGODB_URI_LEGACY.");
-        mongoose
-          .connect(fallbackMongoUri, {
-            serverSelectionTimeoutMS: 8000,
-            socketTimeoutMS: 45000,
-            maxPoolSize: 20,
-            minPoolSize: 5,
-            maxIdleTimeMS: 45000,
-            retryWrites: true,
-            retryReads: true,
-          })
-          .then(() => {
-            console.log("Connected to MongoDB using legacy URI");
-          })
-          .catch((legacyErr) => {
-            console.error(
-              "MongoDB legacy URI connection error:",
-              legacyErr.message
-            );
-          });
-      }
+      console.error("MongoDB Connection Error:", err.message);
     });
 }
 
