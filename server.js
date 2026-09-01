@@ -409,6 +409,17 @@ const warehouseTradingRoutes =
 const whVouchersRoutes =
   require("./routes/whVouchers");
 
+// Explicit diagnostics for Warehouse Trading deployments. These endpoints do
+// not touch MongoDB and make it immediately obvious whether the live Render
+// service is running this backend build.
+app.get("/api/warehouse-trading/health", (req, res) => {
+  res.json({ ok: true, module: "warehouse-trading", build: "warehouse-trading-404-fix-v5" });
+});
+
+app.get("/api/wh-vouchers/health", (req, res) => {
+  res.json({ ok: true, module: "wh-vouchers", build: "warehouse-trading-404-fix-v5" });
+});
+
 const cashEntriesRoutes =
   require("./routes/cashEntries");
 
@@ -717,9 +728,6 @@ app.use(
   farmersRoutes
 );
 
-// Warehouse trading vouchers are exposed through both the newer
-// /api/warehouse-trading prefix and the legacy /api/wh-vouchers prefix.
-// Keeping both mounts prevents 404s for older clients/bookmarks.
 app.use(
   "/api/warehouse-trading",
   authenticate,
