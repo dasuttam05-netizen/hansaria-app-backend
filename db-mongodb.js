@@ -7,13 +7,7 @@ mongoose.set("bufferCommands", false);
 
 const rawMongoUri =
   process.env.MONGODB_URI?.trim() || "";
-const rawMongoLegacyUri =
-  process.env.MONGODB_URI_LEGACY?.trim() || "";
-
-const mongoMirrorEnabled =
-  String(
-    process.env.MONGODB_MIRROR_ENABLED || "true"
-  ).toLowerCase() !== "false";
+const mongoMirrorEnabled = false;
 
 const configuredDnsServers = String(
   process.env.MONGODB_DNS_SERVERS || ""
@@ -51,19 +45,9 @@ function normalizeAtlasUri(uri) {
 
 const mongodbUri =
   normalizeAtlasUri(rawMongoUri);
-const fallbackMongoUri =
-  rawMongoLegacyUri || "";
-
 const hasMongoUri =
   Boolean(mongodbUri) &&
   !mongodbUri.includes("username:password");
-const hasFallbackMongoUri =
-  Boolean(fallbackMongoUri) &&
-  fallbackMongoUri.startsWith("mongodb://");
-
-const mongoMirrorConfigured =
-  mongoMirrorEnabled &&
-  hasMongoUri;
 
 function isMongoMirrorReady() {
   return (
@@ -141,91 +125,9 @@ function scheduleMirrorRowMigration() {
   return mirrorRowMigrationPromise;
 }
 
-if (!mongoMirrorEnabled) {
-  console.log(
-    "MongoDB mirror disabled (MONGODB_MIRROR_ENABLED=false)."
-  );
-} else if (!hasMongoUri) {
-  if (hasFallbackMongoUri) {
-    console.log("Using legacy MongoDB URI from MONGODB_URI_LEGACY.");
-  } else {
-    console.log(
-      "MongoDB URI is not configured or contains placeholder credentials. Skipping MongoDB mirror."
-    );
-  }
-} else if (
-  mongoose.connection.readyState === 0
-) {
-  if (mongodbUri !== rawMongoUri) {
-    console.log(
-      "Normalized MongoDB URI format from legacy value in .env."
-    );
-  }
-
-  mongoose
-    .connect(mongodbUri, {
-      serverSelectionTimeoutMS: 8000,
-      socketTimeoutMS: 45000,
-      maxPoolSize: 20,
-      minPoolSize: 5,
-      maxIdleTimeMS: 45000,
-      retryWrites: true,
-      retryReads: true,
-    })
-    .then(() => {
-      console.log(
-        "Connected to MongoDB"
-      );
-      scheduleMirrorRowMigration();
-    })
-    .catch((err) => {
-      if (
-        err?.syscall === "querySrv" ||
-        (
-          err?.code === "ECONNREFUSED" &&
-          /_mongodb\._tcp/i.test(
-            String(
-              err?.hostname ||
-                err?.message ||
-                ""
-            )
-          )
-        )
-      ) {
-        console.error(
-          "MongoDB SRV DNS lookup failed. Current DNS could not resolve Atlas SRV records."
-        );
-        console.error(
-          "If your network blocks SRV lookups, use the non-SRV Atlas connection string instead."
-        );
-      }
-
-      if (hasFallbackMongoUri) {
-        console.log("Retrying with MONGODB_URI_LEGACY.");
-        mongoose.connect(fallbackMongoUri, {
-          serverSelectionTimeoutMS: 15000,
-          socketTimeoutMS: 45000,
-          maxPoolSize: 20,
-          minPoolSize: 5,
-          maxIdleTimeMS: 45000,
-          retryWrites: true,
-          retryReads: true,
-        }).then(() => {
-          console.log("Connected to MongoDB using legacy URI");
-          scheduleMirrorRowMigration();
-        }).catch((legacyErr) => {
-          console.error("MongoDB legacy URI connection error:", legacyErr.message);
-        });
-      }
-
-      console.error(
-        "MongoDB Connection Error:",
-        err.message
-      );
-    });
-} else {
-  console.log(
-    "MongoDB connection already initialized."
+if (mongoMirrorEnabled) {
+  console.warn(
+    "MongoDB mirror mode is intentionally disabled: this deployment uses MongoDB Atlas as the only datastore."
   );
 }
 
