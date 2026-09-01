@@ -31,13 +31,6 @@ require("./mongo");
 
 const db = require("./db-mongodb");
 
-// Cloud-only storage guard: this application must always use MongoDB Atlas.
-if (!process.env.MONGODB_URI?.trim()) {
-  throw new Error(
-    "MONGODB_URI is required. Configure MongoDB Atlas in the Render Environment Variables."
-  );
-}
-
 /*
 ========================================
 MONGODB PRIMARY BOOTSTRAP
@@ -727,13 +720,16 @@ app.use(
 app.use(
   "/api/warehouse-trading",
   authenticate,
-  whVouchersRoutes
+  warehouseTradingRoutes
 );
 
+// Compatibility mount for Warehouse Trading report endpoints.
+// Keeps /api/wh-vouchers/report/* as the canonical API while also making
+// the same reports available from /api/warehouse-trading/report/*.
 app.use(
   "/api/warehouse-trading",
   authenticate,
-  warehouseTradingRoutes
+  whVouchersRoutes
 );
 
 app.use(
@@ -2422,21 +2418,6 @@ app.get(
     );
   }
 );
-
-/*
-========================================
-API 404 DIAGNOSTICS
-========================================
-*/
-
-app.use("/api", (req, res) => {
-  return res.status(404).json({
-    error: "API route not found",
-    method: req.method,
-    path: req.originalUrl,
-    build: "warehouse-trading-cloud-only-v6",
-  });
-});
 
 /*
 ========================================
