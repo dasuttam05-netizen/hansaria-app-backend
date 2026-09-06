@@ -298,6 +298,31 @@ function applyVoucherListFilters(query, options, type) {
   return filter;
 }
 
+function addMixedIdFilter(filter, field, value) {
+  const text = String(value || "").trim();
+  if (!text) return;
+
+  const values = [text];
+  if (/^\d+$/.test(text)) values.push(Number(text));
+  if (mongoose.Types.ObjectId.isValid(text)) values.push(text);
+
+  filter.$and = [
+    ...(filter.$and || []),
+    { $or: values.map((item) => ({ [field]: item })) },
+  ];
+}
+
+function addVoucherSearchFilter(filter, search, fields) {
+  const text = String(search || "").trim();
+  if (!text) return;
+  const safe = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rx = new RegExp(safe, "i");
+  filter.$and = [
+    ...(filter.$and || []),
+    { $or: fields.map((field) => ({ [field]: rx })) },
+  ];
+}
+
 function voucherListResponse(rows, total, options) {
   const pageCount = Math.max(1, Math.ceil(total / options.limit));
   return {
@@ -5696,10 +5721,18 @@ router.post("/journal", async (req, res) => {
 async function getPurchaseReportRowsForUser(user, options = {}) {
   if (mongoReady()) {
     const filter = { ...mongoPurchaseScope(user) };
-    if (options.farmerId) filter.farmer_id = String(options.farmerId);
-    if (options.warehouseId) filter.warehouse_id = String(options.warehouseId);
-    if (options.companyAccountId) filter.company_account_id = String(options.companyAccountId);
-    if (options.productId) filter.product_id = String(options.productId);
+    addMixedIdFilter(filter, "farmer_id", options.farmerId);
+    addMixedIdFilter(filter, "warehouse_id", options.warehouseId);
+    addMixedIdFilter(filter, "company_account_id", options.companyAccountId);
+    addMixedIdFilter(filter, "product_id", options.productId);
+    addVoucherSearchFilter(filter, options.search, [
+      "voucher_no",
+      "farmer_name",
+      "product_name",
+      "warehouse_name",
+      "company_account_name",
+      "description",
+    ]);
     if (options.fromDate || options.toDate) {
       filter.date = {};
       if (options.fromDate) filter.date.$gte = String(options.fromDate);
@@ -6184,13 +6217,23 @@ router.get("/report/purchase-summary", (req, res) => {
   const farmerId = String(req.query.farmer_id || "").trim();
   const warehouseId = String(req.query.warehouse_id || "").trim();
   const companyAccountId = String(req.query.company_account_id || "").trim();
+  const search = String(req.query.search || "").trim();
 
   if (mongoReady()) {
-    const query = PurchaseVoucher.find(mongoPurchaseScope(req.user)).sort({ date: -1, createdAt: -1, _id: -1 });
-    if (farmerId) query.where("farmer_id").equals(farmerId);
-    if (warehouseId) query.where("warehouse_id").equals(warehouseId);
-    if (companyAccountId) query.where("company_account_id").equals(companyAccountId);
-    const countPromise = usePaging ? PurchaseVoucher.countDocuments(query.getQuery()).exec() : Promise.resolve(null);
+    const filter = { ...mongoPurchaseScope(req.user) };
+    addMixedIdFilter(filter, "farmer_id", farmerId);
+    addMixedIdFilter(filter, "warehouse_id", warehouseId);
+    addMixedIdFilter(filter, "company_account_id", companyAccountId);
+    addVoucherSearchFilter(filter, search, [
+      "voucher_no",
+      "farmer_name",
+      "product_name",
+      "warehouse_name",
+      "company_account_name",
+      "description",
+    ]);
+    const query = PurchaseVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 });
+    const countPromise = usePaging ? PurchaseVoucher.countDocuments(filter).exec() : Promise.resolve(null);
     if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
     const rowsPromise = query.lean().exec();
 
