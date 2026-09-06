@@ -1,6 +1,4 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
 
 const router = express.Router();
 
@@ -8,6 +6,7 @@ const {
   mongoose,
   CashEntry,
   CashBookSettings,
+  CashActivityLog,
   Company,
   CompanyAccount,
   Warehouse,
@@ -18,13 +17,6 @@ const {
 const {
   userHasPermission,
 } = require("../middleware/auth");
-
-const AUDIT_FILE = path.join(
-  __dirname,
-  "..",
-  "logs",
-  "cash-entry-audit.log"
-);
 
 const ADJ_DETAIL_MARKER = " | Adj Details -> ";
 
@@ -1092,40 +1084,20 @@ function writeAudit({
   voucher_no = null,
   details = {},
 }) {
-  try {
-    fs.mkdirSync(
-      path.dirname(AUDIT_FILE),
-      { recursive: true }
-    );
-
-    const actor =
-      req?.user || {};
-
-    const line = JSON.stringify({
-      at: new Date().toISOString(),
-      action,
-      entry_id,
-      voucher_no,
-      actor_user_id:
-        actor.id ?? null,
-      actor_username:
-        actor.username ?? null,
-      actor_name:
-        actor.name ?? null,
-      details: details || {},
-    });
-
-    fs.appendFileSync(
-      AUDIT_FILE,
-      `${line}\n`,
-      "utf8"
-    );
-  } catch (err) {
-    console.error(
-      "Cash audit write error:",
-      err.message
-    );
-  }
+  if (!mongoReady() || !CashActivityLog) return;
+  const actor = req?.user || {};
+  CashActivityLog.create({
+    at: new Date(),
+    action,
+    entry_id,
+    voucher_no,
+    actor_user_id: actor.id ?? null,
+    actor_username: actor.username ?? null,
+    actor_name: actor.name ?? null,
+    details: details || {},
+  }).catch((err) => {
+    console.error("Cash audit write error:", err.message);
+  });
 }
 
 router.get("/", async (req, res) => {
@@ -1196,7 +1168,7 @@ router.get("/", async (req, res) => {
 
 router.get(
   "/activity-logs",
-  (req, res) => {
+  async (req, res) => {
     if (!isAdminUser(req.user)) {
       return res.status(403).json({
         error:
@@ -1205,8 +1177,8 @@ router.get(
     }
 
     try {
-      if (!fs.existsSync(AUDIT_FILE)) {
-        return res.json([]);
+      if (!mongoReady() || !CashActivityLog) {
+        return res.status(503).json({ error: "MongoDB is not connected." });
       }
 
       const {
@@ -1226,73 +1198,28 @@ router.get(
           )
         );
 
-      const lines =
-        fs.readFileSync(
-          AUDIT_FILE,
-          "utf8"
-        )
-          .split(/\r?\n/)
-          .filter(Boolean)
-          .reverse();
-
-      const output = [];
-
-      for (const line of lines) {
-        if (output.length >= safeLimit) {
-          break;
-        }
-
-        try {
-          const row =
-            JSON.parse(line);
-
-          if (
-            action &&
-            String(row.action) !==
-              String(action)
-          ) {
-            continue;
-          }
-
-          if (
-            user_id &&
-            String(
-              row.actor_user_id || ""
-            ) !==
-              String(user_id)
-          ) {
-            continue;
-          }
-
-          if (
-            from_date &&
-            String(
-              row.at || ""
-            ).slice(0, 10) <
-              String(from_date)
-          ) {
-            continue;
-          }
-
-          if (
-            to_date &&
-            String(
-              row.at || ""
-            ).slice(0, 10) >
-              String(to_date)
-          ) {
-            continue;
-          }
-
-          output.push(row);
-        } catch {
-          // ignore malformed audit lines
+      const filter = {};
+      if (action) filter.action = String(action);
+      if (user_id) {
+        filter.actor_user_id = Number.isFinite(Number(user_id))
+          ? Number(user_id)
+          : String(user_id);
+      }
+      if (from_date || to_date) {
+        filter.at = {};
+        if (from_date) filter.at.$gte = new Date(`${from_date}T00:00:00.000Z`);
+        if (to_date) {
+          filter.at.$lt = new Date(`${to_date}T00:00:00.000Z`);
+          filter.at.$lt.setUTCDate(filter.at.$lt.getUTCDate() + 1);
         }
       }
 
-      return res.json(
-        output
-      );
+      const output = await CashActivityLog.find(filter)
+        .sort({ at: -1, _id: -1 })
+        .limit(safeLimit)
+        .lean();
+
+      return res.json(output);
     } catch (err) {
       return res.status(500).json({
         error: err.message,
