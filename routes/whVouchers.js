@@ -867,7 +867,7 @@ async function nextMongoVoucherNo(type) {
       collectionName = "receiptvouchers";
       break;
     case "journal":
-      collectionName = "journalvouchers";
+      collectionName = "wh_journal_vouchers";
       break;
     default:
       throw new Error(`Unsupported voucher type: ${type}`);
@@ -5462,7 +5462,7 @@ router.get("/journal", async (req, res) => {
     const scopeIds = assignedWarehouseIdsForMongo(req.user);
 
     const rawRows = await mongoose.connection.db
-      .collection("journalvouchers")
+      .collection("wh_journal_vouchers")
       .find({})
       .sort({ "data.date": -1, legacy_id: -1, _id: -1 })
       .toArray();
@@ -5585,7 +5585,7 @@ router.post("/journal", async (req, res) => {
 
     const duplicate =
       await mongoose.connection.db
-        .collection("journalvouchers")
+        .collection("wh_journal_vouchers")
         .findOne({
           $or: [
             {
