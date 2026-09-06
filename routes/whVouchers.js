@@ -7,6 +7,8 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const tradingFilterCache = new Map();
 const TRADING_FILTER_CACHE_MS = 15 * 60 * 1000;
+const purchaseSearchCache = new Map();
+const PURCHASE_SEARCH_CACHE_MS = 5 * 60 * 1000;
 
 // Fast payment-edit/outstanding indexes. These are MongoDB indexes and
 // prevent full-collection scans when filtering by farmer + account + warehouse.
@@ -327,21 +329,42 @@ async function addPurchaseSearchFilter(filter, search) {
   const text = String(search || "").trim();
   if (!text) return;
 
+  const cacheKey = text.toLowerCase();
+  const cached = purchaseSearchCache.get(cacheKey);
+  let idClauses;
+  if (cached && Date.now() - cached.time < PURCHASE_SEARCH_CACHE_MS) {
+    idClauses = cached.idClauses;
+  } else {
+    const safe = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(safe, "i");
+    const [farmers, products, warehouses, accounts] = await Promise.all([
+      Farmer.find({ name: rx }).select("_id id legacy_id").lean(),
+      Product.find({ name: rx }).select("_id id legacy_id").lean(),
+      Warehouse.find({ name: rx }).select("_id id legacy_id").lean(),
+      CompanyAccount.find({ $or: [{ account_name: rx }, { name: rx }] }).select("_id id legacy_id").lean(),
+    ]);
+
+    const clausesFor = (field, rows) => rows.flatMap((row) => {
+      const ids = [row?._id, row?.id, row?.legacy_id]
+        .filter((value) => value !== undefined && value !== null && String(value) !== "")
+        .map(String);
+      return ids.flatMap((id) => [
+        { [field]: id },
+        ...(Number.isFinite(Number(id)) ? [{ [field]: Number(id) }] : []),
+      ]);
+    });
+
+    idClauses = [
+      ...clausesFor("farmer_id", farmers),
+      ...clausesFor("product_id", products),
+      ...clausesFor("warehouse_id", warehouses),
+      ...clausesFor("company_account_id", accounts),
+    ];
+    purchaseSearchCache.set(cacheKey, { time: Date.now(), idClauses });
+  }
+
   const safe = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const rx = new RegExp(safe, "i");
-  const [farmers, products, warehouses, accounts] = await Promise.all([
-    Farmer.find({ name: rx }).select("_id id legacy_id").lean(),
-    Product.find({ name: rx }).select("_id id legacy_id").lean(),
-    Warehouse.find({ name: rx }).select("_id id legacy_id").lean(),
-    CompanyAccount.find({ $or: [{ account_name: rx }, { name: rx }] }).select("_id id legacy_id").lean(),
-  ]);
-
-  const idClauses = (field, rows) => rows.flatMap((row) => {
-    const ids = [row?._id, row?.id, row?.legacy_id]
-      .filter((value) => value !== undefined && value !== null && String(value) !== "")
-      .map(String);
-    return ids.flatMap((id) => [{ [field]: id }, { [field]: Number(id) }]);
-  });
 
   filter.$and = [
     ...(filter.$and || []),
@@ -353,10 +376,7 @@ async function addPurchaseSearchFilter(filter, search) {
         { warehouse_name: rx },
         { company_account_name: rx },
         { description: rx },
-        ...idClauses("farmer_id", farmers),
-        ...idClauses("product_id", products),
-        ...idClauses("warehouse_id", warehouses),
-        ...idClauses("company_account_id", accounts),
+        ...idClauses,
       ],
     },
   ];
