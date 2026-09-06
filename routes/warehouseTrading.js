@@ -25,6 +25,58 @@ const WarehouseTradingEntry =
   mongoose.models.WarehouseTradingEntry ||
   mongoose.model("WarehouseTradingEntry", warehouseTradingEntrySchema);
 
+function getVoucherPrefix(type) {
+  return {
+    purchase: "PUR",
+    sale: "SAL",
+    payment: "PAY",
+    receipt: "REC",
+    journal: "JRN",
+  }[String(type || "").toLowerCase()];
+}
+
+async function nextMongoVoucherNo(type) {
+  const normalizedType = String(type || "").toLowerCase();
+  const shortPrefix = getVoucherPrefix(normalizedType);
+  const collectionName = {
+    purchase: "purchasevouchers",
+    sale: "salevouchers",
+    payment: "paymentvouchers_native",
+    receipt: "receiptvouchers",
+    journal: "journalvouchers",
+  }[normalizedType];
+
+  if (!shortPrefix || !collectionName) {
+    throw new Error(`Unsupported voucher type: ${type}`);
+  }
+  if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) {
+    throw new Error("MongoDB connection is not available");
+  }
+
+  const rows = await mongoose.connection.db
+    .collection(collectionName)
+    .find(
+      {
+        $or: [
+          { voucher_no: { $regex: `^${shortPrefix}-` } },
+          { "data.voucher_no": { $regex: `^${shortPrefix}-` } },
+        ],
+      },
+      { projection: { voucher_no: 1, "data.voucher_no": 1 } }
+    )
+    .toArray();
+
+  let next = 1;
+  for (const row of rows) {
+    const voucher = row?.voucher_no || row?.data?.voucher_no || "";
+    const number = Number(String(voucher).split("-").pop());
+    if (Number.isFinite(number) && number >= next) next = number + 1;
+  }
+
+  const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  return `${shortPrefix}-${datePart}-${String(next).padStart(4, "0")}`;
+}
+
 function canManageWarehouseTrading(user) {
   return userHasPermission(user, "warehouse.trading.manage");
 }
@@ -58,6 +110,22 @@ function canViewWarehouseTrading(user) {
     userHasPermission(user, "warehouse.trading.report.profitLoss")
   );
 }
+
+router.get("/next-voucher-no", async (req, res) => {
+  if (!req.query.type) {
+    return res.status(400).json({ error: "type query param is required" });
+  }
+
+  try {
+    const voucher_no = await nextMongoVoucherNo(req.query.type);
+    return res.json({ voucher_no });
+  } catch (err) {
+    console.error("Warehouse trading voucher number failed:", err);
+    return res.status(err.message.startsWith("Unsupported") ? 400 : 503).json({
+      error: err.message,
+    });
+  }
+});
 
 router.get("/", (req, res) => {
   if (!canViewWarehouseTrading(req.user)) {
