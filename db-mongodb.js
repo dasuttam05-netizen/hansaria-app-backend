@@ -1821,7 +1821,7 @@ const journalVoucherSchema =
     {
       strict: false,
       collection:
-        "journalvouchers",
+        "wh_journal_vouchers",
     }
   );
 
