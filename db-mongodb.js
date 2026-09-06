@@ -1424,6 +1424,20 @@ cashBookSettingsSchema.index(
   { unique: true }
 );
 
+const cashActivityLogSchema = new mongoose.Schema(
+  {
+    at: { type: Date, default: Date.now, index: true },
+    action: String,
+    entry_id: mongoose.Schema.Types.Mixed,
+    voucher_no: String,
+    actor_user_id: mongoose.Schema.Types.Mixed,
+    actor_username: String,
+    actor_name: String,
+    details: { type: mongoose.Schema.Types.Mixed, default: {} },
+  },
+  { collection: "cash_activity_logs", minimize: false }
+);
+
 /*
 ====================================================
 NATIVE PAYMENT VOUCHER
@@ -1971,6 +1985,13 @@ module.exports = {
     mongoose.model(
       "CashBookSettings",
       cashBookSettingsSchema
+    ),
+
+  CashActivityLog:
+    mongoose.models.CashActivityLog ||
+    mongoose.model(
+      "CashActivityLog",
+      cashActivityLogSchema
     ),
 
   PaymentVoucher:
