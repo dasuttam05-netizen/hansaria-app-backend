@@ -723,15 +723,6 @@ app.use(
   warehouseTradingRoutes
 );
 
-// Compatibility mount for Warehouse Trading report endpoints.
-// Keeps /api/wh-vouchers/report/* as the canonical API while also making
-// the same reports available from /api/warehouse-trading/report/*.
-app.use(
-  "/api/warehouse-trading",
-  authenticate,
-  whVouchersRoutes
-);
-
 app.use(
   "/api/wh-vouchers",
   authenticate,
