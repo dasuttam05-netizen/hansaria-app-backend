@@ -795,6 +795,8 @@ app.use(
   whVouchersRoutes
 );
 
+console.log("Warehouse voucher routes mounted: /api/wh-vouchers and /api/warehouse-trading");
+
 app.use(
   "/api/reports",
   authenticate,
