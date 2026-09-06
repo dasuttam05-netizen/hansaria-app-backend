@@ -2402,6 +2402,13 @@ async function getVoucherDisplayMaps() {
   const buildMap = (rows, fields = ["name"]) => {
     const map = new Map();
 
+    const addKey = (key, row) => {
+      if (key === undefined || key === null || String(key).trim() === "") return;
+      const text = String(key).trim();
+      map.set(text, row);
+      if (/^\d+$/.test(text)) map.set(String(Number(text)), row);
+    };
+
     for (const row of rows || []) {
       const keys = [
         row?._id,
@@ -2410,13 +2417,7 @@ async function getVoucherDisplayMaps() {
       ];
 
       for (const key of keys) {
-        if (
-          key !== undefined &&
-          key !== null &&
-          String(key) !== ""
-        ) {
-          map.set(String(key), row);
-        }
+        addKey(key, row);
       }
 
       for (const field of fields) {
@@ -2433,11 +2434,17 @@ async function getVoucherDisplayMaps() {
     return map;
   };
 
+  const resolveMapRow = (map, value) => {
+    const text = String(value ?? "").trim();
+    return map.get(text) || map.get(text.toLowerCase()) || ( /^\d+$/.test(text) ? map.get(String(Number(text))) : null) || {};
+  };
+
   return {
     warehouseMap: buildMap(warehouses),
     accountMap: buildMap(accounts, ["account_name", "name"]),
     farmerMap: buildMap(farmers),
     companyMap: buildMap(companies),
+    resolveMapRow,
   };
 }
 
@@ -2517,6 +2524,7 @@ async function getMongoPaymentRowsForUser(req) {
     warehouseMap,
     accountMap,
     farmerMap,
+    resolveMapRow,
   } = await getVoucherDisplayMaps();
 
   const rows = rawRows
@@ -2551,14 +2559,11 @@ async function getMongoPaymentRowsForUser(req) {
         .includes(String(row.warehouse_id ?? ""));
     })
     .map((row) => {
-      const warehouse =
-        warehouseMap.get(String(row.warehouse_id)) || {};
+      const warehouse = resolveMapRow(warehouseMap, row.warehouse_id);
 
-      const account =
-        accountMap.get(String(row.company_account_id)) || {};
+      const account = resolveMapRow(accountMap, row.company_account_id);
 
-      const farmer =
-        farmerMap.get(String(row.farmer_id)) || {};
+      const farmer = resolveMapRow(farmerMap, row.farmer_id);
 
       return {
         ...row,
