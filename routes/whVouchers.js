@@ -4162,22 +4162,34 @@ router.get("/payment/:id", async (req, res) => {
   }
 
   const id = req.params.id;
-  if (!mongoReady() || !MongoPaymentVoucher) {
+  if (!mongoReady() || (!MongoPaymentVoucher && !PaymentVoucherNative)) {
     return res.status(503).json({
       error: "MongoDB is not connected. Payment vouchers are MongoDB-primary.",
     });
   }
 
   try {
-    const mongoRow = await MongoPaymentVoucher.findOne({ id: Number(id) }).lean();
+    const numericId = Number(id);
+    if (!Number.isFinite(numericId)) {
+      return res.status(400).json({ error: "Invalid payment voucher ID" });
+    }
+
+    const legacyRow = MongoPaymentVoucher
+      ? await MongoPaymentVoucher.findOne({ id: numericId }).lean()
+      : null;
+    const nativeRow = !legacyRow && PaymentVoucherNative
+      ? await PaymentVoucherNative.findOne({ id: numericId }).lean()
+      : null;
+    const mongoRow = legacyRow || nativeRow;
     if (!mongoRow) {
       return res.status(404).json({ error: "Payment voucher not found" });
     }
 
     if (!ensureWarehouseAccess(req, res, mongoRow.warehouse_id)) return;
 
-    const adjustments = MongoPaymentAdjustment
-      ? await MongoPaymentAdjustment.find({ payment_id: Number(id) }).sort({ id: 1 }).lean()
+    const adjustmentModel = legacyRow ? MongoPaymentAdjustment : PaymentAdjustmentNative;
+    const adjustments = adjustmentModel
+      ? await adjustmentModel.find({ payment_id: numericId }).sort({ id: 1 }).lean()
       : [];
 
     const purchaseIds = [
