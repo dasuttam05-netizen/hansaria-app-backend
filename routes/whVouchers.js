@@ -348,6 +348,10 @@ async function addPurchaseSearchFilter(filter, search) {
     {
       $or: [
         { voucher_no: rx },
+        { farmer_name: rx },
+        { product_name: rx },
+        { warehouse_name: rx },
+        { company_account_name: rx },
         { description: rx },
         ...idClauses("farmer_id", farmers),
         ...idClauses("product_id", products),
@@ -6241,7 +6245,7 @@ router.get("/report/sale-summary", async (req, res) => {
   }
 });
 
-router.get("/report/purchase-summary", (req, res) => {
+router.get("/report/purchase-summary", async (req, res) => {
   ensureTradingIndexes();
   if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
     return res.status(403).json({ error: "Permission denied" });
@@ -6260,14 +6264,7 @@ router.get("/report/purchase-summary", (req, res) => {
     addMixedIdFilter(filter, "farmer_id", farmerId);
     addMixedIdFilter(filter, "warehouse_id", warehouseId);
     addMixedIdFilter(filter, "company_account_id", companyAccountId);
-    addVoucherSearchFilter(filter, search, [
-      "voucher_no",
-      "farmer_name",
-      "product_name",
-      "warehouse_name",
-      "company_account_name",
-      "description",
-    ]);
+    await addPurchaseSearchFilter(filter, search);
     const query = PurchaseVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 });
     const countPromise = usePaging ? PurchaseVoucher.countDocuments(filter).exec() : Promise.resolve(null);
     if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
