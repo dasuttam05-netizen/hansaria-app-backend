@@ -43,7 +43,7 @@ async function nextMongoVoucherNo(type) {
     sale: "salevouchers",
     payment: "paymentvouchers_native",
     receipt: "receiptvouchers",
-    journal: "journalvouchers",
+    journal: "wh_journal_vouchers",
   }[normalizedType];
 
   if (!shortPrefix || !collectionName) {
