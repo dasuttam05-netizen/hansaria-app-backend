@@ -1,6 +1,7 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const router = express.Router();
+const voucherRoutes = require("./whVouchers");
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
 
@@ -191,5 +192,7 @@ router.post("/", (req, res) => {
       return res.status(500).json({ error: err.message });
     });
 });
+
+  router.use(voucherRoutes);
 
 module.exports = router;
