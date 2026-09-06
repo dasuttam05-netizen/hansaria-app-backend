@@ -193,6 +193,6 @@ router.post("/", (req, res) => {
     });
 });
 
-  router.use(voucherRoutes);
+router.use(voucherRoutes);
 
 module.exports = router;
