@@ -286,7 +286,7 @@ function applyVoucherListFilters(query, options, type) {
     if (options.toDate) filter.date.$lte = options.toDate;
   }
 
-  if (options.search) {
+  if (options.search && type !== "purchase") {
     const safe = options.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const rx = new RegExp(safe, "i");
     const fields = type === "purchase"
@@ -323,6 +323,41 @@ function addVoucherSearchFilter(filter, search, fields) {
   ];
 }
 
+async function addPurchaseSearchFilter(filter, search) {
+  const text = String(search || "").trim();
+  if (!text) return;
+
+  const safe = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rx = new RegExp(safe, "i");
+  const [farmers, products, warehouses, accounts] = await Promise.all([
+    Farmer.find({ name: rx }).select("_id id legacy_id").lean(),
+    Product.find({ name: rx }).select("_id id legacy_id").lean(),
+    Warehouse.find({ name: rx }).select("_id id legacy_id").lean(),
+    CompanyAccount.find({ $or: [{ account_name: rx }, { name: rx }] }).select("_id id legacy_id").lean(),
+  ]);
+
+  const idClauses = (field, rows) => rows.flatMap((row) => {
+    const ids = [row?._id, row?.id, row?.legacy_id]
+      .filter((value) => value !== undefined && value !== null && String(value) !== "")
+      .map(String);
+    return ids.flatMap((id) => [{ [field]: id }, { [field]: Number(id) }]);
+  });
+
+  filter.$and = [
+    ...(filter.$and || []),
+    {
+      $or: [
+        { voucher_no: rx },
+        { description: rx },
+        ...idClauses("farmer_id", farmers),
+        ...idClauses("product_id", products),
+        ...idClauses("warehouse_id", warehouses),
+        ...idClauses("company_account_id", accounts),
+      ],
+    },
+  ];
+}
+
 function voucherListResponse(rows, total, options) {
   const pageCount = Math.max(1, Math.ceil(total / options.limit));
   return {
@@ -340,6 +375,7 @@ function voucherListResponse(rows, total, options) {
 async function getPurchaseVoucherPage(req) {
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "purchase");
+  await addPurchaseSearchFilter(filter, options.search);
   const [total, docs] = await Promise.all([
     PurchaseVoucher.countDocuments(filter),
     PurchaseVoucher.find(filter)
