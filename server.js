@@ -759,43 +759,16 @@ app.use(
 app.use(
   "/api/wh-vouchers",
   authenticate,
-  authorize([
-    "warehouse.trading.view",
-    "warehouse.trading.manage",
-
-    "warehouse.trading.purchase.view",
-    "warehouse.trading.purchase.create",
-    "warehouse.trading.purchase.edit",
-    "warehouse.trading.purchase.delete",
-
-    "warehouse.trading.sale.view",
-    "warehouse.trading.sale.create",
-    "warehouse.trading.sale.edit",
-    "warehouse.trading.sale.delete",
-
-    "warehouse.trading.payment.view",
-    "warehouse.trading.payment.create",
-    "warehouse.trading.payment.edit",
-    "warehouse.trading.payment.delete",
-
-    "warehouse.trading.receipt.view",
-    "warehouse.trading.receipt.create",
-    "warehouse.trading.receipt.edit",
-    "warehouse.trading.receipt.delete",
-
-    "warehouse.trading.journal.view",
-    "warehouse.trading.journal.create",
-    "warehouse.trading.journal.edit",
-    "warehouse.trading.journal.delete",
-
-    "warehouse.trading.report.sale",
-    "warehouse.trading.report.purchase",
-    "warehouse.trading.report.profitLoss",
-  ]),
   whVouchersRoutes
 );
 
-console.log("Warehouse voucher routes mounted: /api/wh-vouchers and /api/warehouse-trading");
+console.log(
+  "Warehouse voucher routes mounted:",
+  whVouchersRoutes.stack
+    .filter((layer) => layer.route)
+    .map((layer) => `${Object.keys(layer.route.methods).join(",")} ${layer.route.path}`)
+    .join(" | ")
+);
 
 app.use(
   "/api/reports",
