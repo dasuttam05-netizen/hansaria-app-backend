@@ -1086,6 +1086,8 @@ function getPurchaseVoucherRows(req, res) {
       console.error("Mongo purchase voucher page query failed:", err);
       res.status(500).json({ error: err.message || "Failed to load purchase vouchers" });
     });
+}
+
 async function resolveUserAccessibleLocationIds(user) {
   const rawLocationIds = [
     user?.location_id,
