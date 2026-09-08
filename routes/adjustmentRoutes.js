@@ -928,16 +928,16 @@ router.get(
             ?.location_id
         );
 
-      const productId =
-        normalizeText(
-          req.query
-            ?.product_id
-        );
-
       const companyId =
         normalizeText(
           req.query
             ?.company_id
+        );
+
+      const productId =
+        normalizeText(
+          req.query
+            ?.product_id
         );
 
       const outwardDate =
@@ -956,12 +956,11 @@ router.get(
         (!warehouseId &&
           !locationId) ||
         !companyId ||
-        !productId ||
         !outwardDate
       ) {
         return res.status(400).json({
           error:
-            "warehouse_id or location_id, company_id, product_id and outward_date required",
+            "warehouse_id or location_id, company_id and outward_date required",
         });
       }
 
