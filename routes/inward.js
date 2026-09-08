@@ -732,54 +732,53 @@ DECORATE MONGO INWARD
 async function decorateMongoInwardDocs(
   docs
 ) {
-  const result = [];
+  const rows = Array.isArray(docs) ? docs : [];
+  if (!rows.length) return [];
 
-  for (
-    const doc of docs || []
-  ) {
-    const masters =
-      await resolveInwardMasters({
-        employee_id:
-          doc?.employee_id,
+  const [employees, locations, warehouses, products, companies, accounts] = await Promise.all([
+    Employee.find({}).lean(),
+    Location.find({}).lean(),
+    Warehouse.find({}).lean(),
+    Product.find({}).lean(),
+    Company.find({}).lean(),
+    CompanyAccount.find({}).lean(),
+  ]);
 
-        employee_name:
-          doc?.employee_name,
+  const makeMap = (items, fields = []) => {
+    const map = new Map();
+    (items || []).forEach((item) => {
+      [item?._id, item?.id, item?.legacy_id, ...fields.map((field) => item?.[field])]
+        .filter((value) => value !== undefined && value !== null && String(value).trim())
+        .forEach((value) => map.set(String(value).trim().toLowerCase(), item));
+    });
+    return map;
+  };
+  const maps = {
+    employee: makeMap(employees, ["employee_id"]),
+    location: makeMap(locations),
+    warehouse: makeMap(warehouses),
+    product: makeMap(products),
+    company: makeMap(companies),
+    account: makeMap(accounts, ["account_name"]),
+  };
+  const lookup = (map, id, name) => map.get(String(id || "").trim().toLowerCase()) || map.get(String(name || "").trim().toLowerCase()) || null;
 
-        location_id:
-          doc?.location_id,
-
-        location_name:
-          doc?.location_name,
-
-        warehouse_id:
-          doc?.warehouse_id,
-
-        warehouse_name:
-          doc?.warehouse_name,
-
-        product_id:
-          doc?.product_id,
-
-        product_name:
-          doc?.product_name,
-
-        company_id:
-          doc?.company_id,
-
-        company_name:
-          doc?.company_name,
-
-        company_account_id:
-          doc?.company_account_id,
-
-        company_account_name:
-          doc?.company_account_name,
-      });
-
-    const names =
-      buildMasterNames(
-        masters
-      );
+  return rows.map((doc) => {
+    const employee = lookup(maps.employee, doc?.employee_id, doc?.employee_name);
+    const location = lookup(maps.location, doc?.location_id, doc?.location_name);
+    const warehouse = lookup(maps.warehouse, doc?.warehouse_id, doc?.warehouse_name);
+    const product = lookup(maps.product, doc?.product_id, doc?.product_name);
+    const company = lookup(maps.company, doc?.company_id, doc?.company_name);
+    const account = lookup(maps.account, doc?.company_account_id, doc?.company_account_name) ||
+      (company ? accounts.find((item) => String(item?.company_id || "") === String(company._id || "")) : null);
+    const names = {
+      employee_name: employee?.name || "",
+      location_name: location?.name || "",
+      warehouse_name: warehouse?.name || "",
+      product_name: product?.name || "",
+      company_name: company?.name || "",
+      company_account_name: account?.account_name || account?.name || "",
+    };
 
     const legacyId =
       doc?.legacy_id ??
@@ -805,7 +804,7 @@ async function decorateMongoInwardDocs(
               doc?.date
             ).slice(0, 10);
 
-    result.push({
+    return {
       ...doc,
 
       id:
@@ -905,10 +904,8 @@ async function decorateMongoInwardDocs(
             doc?.quantity ??
             0
         ) || 0,
-    });
-  }
-
-  return result;
+    };
+  });
 }
 
 /*
