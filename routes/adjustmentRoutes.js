@@ -928,16 +928,16 @@ router.get(
             ?.location_id
         );
 
-      const companyId =
-        normalizeText(
-          req.query
-            ?.company_id
-        );
-
       const productId =
         normalizeText(
           req.query
             ?.product_id
+        );
+
+      const companyId =
+        normalizeText(
+          req.query
+            ?.company_id
         );
 
       const outwardDate =
@@ -956,11 +956,12 @@ router.get(
         (!warehouseId &&
           !locationId) ||
         !companyId ||
+        !productId ||
         !outwardDate
       ) {
         return res.status(400).json({
           error:
-            "warehouse_id or location_id, company_id and outward_date required",
+            "warehouse_id or location_id, company_id, product_id and outward_date required",
         });
       }
 
@@ -1854,10 +1855,8 @@ router.post(
           }
 
           if (
-            String(
-              paltiRow.company_id
-            ) !==
-            companyId
+            normalizeId(paltiRow.company_id) !==
+            normalizeId(companyId)
           ) {
             throw makeAdjustmentError(
               `Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
@@ -1896,8 +1895,8 @@ router.post(
             outwardWarehouse
           ) {
             if (
-              rowWarehouse !==
-              outwardWarehouse
+              normalizeId(rowWarehouse) !==
+              normalizeId(outwardWarehouse)
             ) {
               throw makeAdjustmentError(
                 `Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
@@ -2118,10 +2117,8 @@ router.post(
         }
 
         if (
-          String(
-            inwardRow.company_id
-          ) !==
-          companyId
+          normalizeId(inwardRow.company_id) !==
+          normalizeId(companyId)
         ) {
           throw makeAdjustmentError(
             `Company mismatch for inward_id ${adj.inward_id}`,
@@ -2160,8 +2157,8 @@ router.post(
           outwardWarehouse
         ) {
           if (
-            outwardWarehouse !==
-            inwardWarehouse
+            normalizeId(outwardWarehouse) !==
+            normalizeId(inwardWarehouse)
           ) {
             throw makeAdjustmentError(
               `Warehouse mismatch for inward_id ${adj.inward_id}`,
@@ -2269,28 +2266,48 @@ router.post(
           );
         }
 
-        const currentRemaining =
-          normalizeQty(
-            inwardRow.remaining_qty ??
-              grossQty
-          );
+        /*
+         * Keep final-save validation consistent with the report.
+         * Some migrated Inward rows have remaining_qty = 0 even though
+         * the actual usable quantity is represented by gross/weight and
+         * the adjustment mirror. In that case a literal remaining_qty=0
+         * would incorrectly reject a valid adjustment.
+         */
+        const rawRemaining = Number(inwardRow.remaining_qty);
+        const reportedAvailable = normalizeQty(
+          netOpeningQty -
+            alreadyAdjustedForThisInward
+        );
+        const effectiveCurrentRemaining =
+          Number.isFinite(rawRemaining) && rawRemaining > 0
+            ? normalizeQty(rawRemaining)
+            : normalizeQty(
+                grossQty -
+                alreadyAdjustedForThisInward
+              );
 
         if (
-          adjQty -
-            currentRemaining >
+          adjQty - reportedAvailable >
           EPS
         ) {
           throw makeAdjustmentError(
-            `Adjustment exceeds current remaining quantity for inward_id ${adj.inward_id}`,
+            `Adjustment exceeds available quantity for inward_id ${adj.inward_id}`,
             {
-              requested_qty:
-                adjQty,
-
-              remaining_qty:
-                currentRemaining,
+              requested_qty: Number(adjQty.toFixed(4)),
+              available_qty: Number(reportedAvailable.toFixed(4)),
+              difference: Number((adjQty - reportedAvailable).toFixed(4)),
+              net_opening_qty: Number(netOpeningQty.toFixed(4)),
+              already_adjusted: Number(alreadyAdjustedForThisInward.toFixed(4)),
             }
           );
         }
+
+        const nextRemainingQty = normalizeQty(
+          Math.max(
+            effectiveCurrentRemaining - adjQty,
+            0
+          )
+        );
 
         await MongoInward.updateOne(
           {
@@ -2298,12 +2315,9 @@ router.post(
               inwardRow._id,
           },
           {
-            $inc: {
-              remaining_qty:
-                -adjQty,
-            },
-
             $set: {
+              remaining_qty:
+                nextRemainingQty,
               updated_at:
                 new Date(),
             },
