@@ -110,18 +110,48 @@ function normalizeId(value) {
   return String(value);
 }
 
-function mixedIdValues(value) {
-  const text = normalizeId(value);
-  if (!text) return [];
-  const values = [text];
-  if (/^\d+$/.test(text)) values.push(Number(text));
-  if (isValidObjectId(text)) values.push(text);
-  return values;
-}
+/*
+ * Mongo schemas in this project use Mixed IDs in several places, so the
+ * same logical ID can exist as an ObjectId, string, or legacy numeric value.
+ * Build all safe representations for stock queries.
+ */
+function mixedIdCandidates(value) {
+  const normalized = normalizeId(value);
 
-function mixedIdMatch(field, value) {
-  const values = mixedIdValues(value);
-  return values.length ? { [field]: { $in: values } } : { [field]: null };
+  if (!normalized) {
+    return [];
+  }
+
+  const candidates = [normalized];
+
+  if (isValidObjectId(normalized)) {
+    candidates.push(
+      new mongoose.Types.ObjectId(normalized)
+    );
+  }
+
+  const numeric = Number(normalized);
+
+  if (Number.isFinite(numeric)) {
+    candidates.push(numeric);
+  }
+
+  const unique = [];
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    const key =
+      candidate instanceof mongoose.Types.ObjectId
+        ? `objectId:${candidate.toHexString()}`
+        : `${typeof candidate}:${String(candidate)}`;
+
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(candidate);
+    }
+  }
+
+  return unique;
 }
 
 function isValidObjectId(value) {
@@ -1107,27 +1137,41 @@ async function getAvailableWarehouseStock({
       product_id
     );
 
-  /*
-   * Current stock = remaining_qty from Inward.
-   * Product is optional so the Outward form can show
-   * the selected warehouse total immediately; once a
-   * product is selected, the same endpoint returns the
-   * warehouse + product stock.
-   */
-  const inwardFilter = {
-    $and: [
-      mixedIdMatch("warehouse_id", normalizedWarehouse),
-    ],
-  };
-
-  if (normalizedProduct) {
-    inwardFilter.$and.push(
-      mixedIdMatch("product_id", normalizedProduct)
+  const warehouseCandidates =
+    mixedIdCandidates(
+      warehouse_id
     );
+
+  const productCandidates =
+    mixedIdCandidates(
+      product_id
+    );
+
+  if (
+    warehouseCandidates.length === 0 ||
+    productCandidates.length === 0
+  ) {
+    return {
+      currentStock: 0,
+      reservedStock: 0,
+      availableStock: 0,
+    };
   }
 
+  /*
+   * Current stock = remaining_qty from Inward.
+   * Match ObjectId/string/legacy numeric representations.
+   */
   const inwardRows =
-    await MongoInward.find(inwardFilter)
+    await MongoInward.find({
+      warehouse_id: {
+        $in: warehouseCandidates,
+      },
+
+      product_id: {
+        $in: productCandidates,
+      },
+    })
       .select({
         remaining_qty:
           1,
@@ -1165,9 +1209,13 @@ async function getAvailableWarehouseStock({
    * Pending / partial reserved stock.
    */
   const outwardFilter = {
-    $and: [
-      mixedIdMatch("warehouse_id", normalizedWarehouse),
-    ],
+    warehouse_id: {
+      $in: warehouseCandidates,
+    },
+
+    product_id: {
+      $in: productCandidates,
+    },
 
     status: {
       $in: [
@@ -1176,12 +1224,6 @@ async function getAvailableWarehouseStock({
       ],
     },
   };
-
-  if (normalizedProduct) {
-    outwardFilter.$and.push(
-      mixedIdMatch("product_id", normalizedProduct)
-    );
-  }
 
   if (
     outwardId
