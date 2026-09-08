@@ -792,6 +792,14 @@ inwardSchema.index({
   voucher_no: 1,
 });
 
+// Fast warehouse/product stock lookup. The stock endpoint filters on both
+// fields on every request, so keep this compound index on the Mongo-primary
+// collection.
+inwardSchema.index({
+  warehouse_id: 1,
+  product_id: 1,
+});
+
 /*
 ====================================================
 OUTWARD
@@ -1612,6 +1620,12 @@ mirrorRowSchema.index(
     unique: true,
   }
 );
+
+// Fast FIFO adjustment lookup by outward id.
+mirrorRowSchema.index({
+  table: 1,
+  "data.outward_id": 1,
+});
 
 /*
 ====================================================
