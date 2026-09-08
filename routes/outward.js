@@ -1076,7 +1076,7 @@ AVAILABLE STOCK
 ====================================================
 */
 
-async function calculateAvailableWarehouseStock({
+async function getAvailableWarehouseStock({
   warehouse_id,
   product_id,
   outwardId = null,
@@ -1109,14 +1109,25 @@ async function calculateAvailableWarehouseStock({
 
   /*
    * Current stock = remaining_qty from Inward.
+   * Product is optional so the Outward form can show
+   * the selected warehouse total immediately; once a
+   * product is selected, the same endpoint returns the
+   * warehouse + product stock.
    */
+  const inwardFilter = {
+    $and: [
+      mixedIdMatch("warehouse_id", normalizedWarehouse),
+    ],
+  };
+
+  if (normalizedProduct) {
+    inwardFilter.$and.push(
+      mixedIdMatch("product_id", normalizedProduct)
+    );
+  }
+
   const inwardRows =
-    await MongoInward.find({
-      $and: [
-        mixedIdMatch("warehouse_id", normalizedWarehouse),
-        mixedIdMatch("product_id", normalizedProduct),
-      ],
-    })
+    await MongoInward.find(inwardFilter)
       .select({
         remaining_qty:
           1,
@@ -1156,7 +1167,6 @@ async function calculateAvailableWarehouseStock({
   const outwardFilter = {
     $and: [
       mixedIdMatch("warehouse_id", normalizedWarehouse),
-      mixedIdMatch("product_id", normalizedProduct),
     ],
 
     status: {
@@ -1166,6 +1176,12 @@ async function calculateAvailableWarehouseStock({
       ],
     },
   };
+
+  if (normalizedProduct) {
+    outwardFilter.$and.push(
+      mixedIdMatch("product_id", normalizedProduct)
+    );
+  }
 
   if (
     outwardId
@@ -1255,7 +1271,7 @@ async function validateOutwardStock({
   outwardId = null,
 }) {
   const stock =
-    await calculateAvailableWarehouseStock({
+    await getAvailableWarehouseStock({
       warehouse_id,
       product_id,
       outwardId,
@@ -1865,7 +1881,7 @@ router.get(
 
     try {
       const stock =
-        await calculateAvailableWarehouseStock({
+        await getAvailableWarehouseStock({
           warehouse_id:
             warehouseId,
 
