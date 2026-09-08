@@ -206,6 +206,38 @@ function buildFlexibleIdFilter(
   };
 }
 
+function buildFlexibleFieldFilter(field, value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+
+  const conditions = [{ [field]: raw }];
+
+  if (mongoose.Types.ObjectId.isValid(raw)) {
+    conditions.push({
+      [field]: new mongoose.Types.ObjectId(raw),
+    });
+  }
+
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric)) {
+    conditions.push({ [field]: numeric });
+  }
+
+  const seen = new Set();
+  const unique = conditions.filter((condition) => {
+    const value = condition[field];
+    const key = value && typeof value === "object" && value._bsontype === "ObjectID"
+      ? `oid:${String(value)}`
+      : `${typeof value}:${String(value)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  if (unique.length === 1) return unique[0];
+  return { $or: unique };
+}
+
 function buildMongoIdCandidates(
   value
 ) {
@@ -692,39 +724,36 @@ router.get(
        * INWARD COMPANIES
        * -------------------------
        */
-      const inwardFilter = {};
+      const inwardAnd = [];
 
-      if (
-        warehouseId
-      ) {
-        inwardFilter.warehouse_id =
-          Number(
-            warehouseId
-          );
+      if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+        if (filter) inwardAnd.push(filter);
       } else {
-        inwardFilter.location_id =
-          Number(
-            locationId
-          );
+        const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) inwardAnd.push(filter);
       }
 
-      inwardFilter.remaining_qty = {
-        $gt: 0,
-      };
+      // Show inward lots that still have usable stock.
+      // Older migrated rows may not have remaining_qty; those are also eligible
+      // and the report below will calculate their opening quantity.
+      inwardAnd.push({
+        $or: [
+          { remaining_qty: { $gt: 0 } },
+          { remaining_qty: { $exists: false } },
+          { remaining_qty: null },
+        ],
+      });
 
-      if (
-        productId
-      ) {
-        inwardFilter.product_id =
-          Number(
-            productId
-          );
+      if (productId) {
+        const filter = buildFlexibleFieldFilter("product_id", productId);
+        if (filter) inwardAnd.push(filter);
       }
+
+      const inwardFilter = inwardAnd.length === 1 ? inwardAnd[0] : { $and: inwardAnd };
 
       const inwardRows =
-        await MongoInward.find(
-          inwardFilter
-        )
+        await MongoInward.find(inwardFilter)
           .select({
             company_id: 1,
           })
@@ -738,25 +767,19 @@ router.get(
       const paltiCollection =
         getPaltiCollection();
 
-      const paltiFilter = {};
+      const paltiAnd = [];
 
-      if (
-        warehouseId
-      ) {
-        paltiFilter.warehouse_id =
-          Number(
-            warehouseId
-          );
+      if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+        if (filter) paltiAnd.push(filter);
       }
 
-      if (
-        productId
-      ) {
-        paltiFilter.product_id =
-          Number(
-            productId
-          );
+      if (productId) {
+        const filter = buildFlexibleFieldFilter("product_id", productId);
+        if (filter) paltiAnd.push(filter);
       }
+
+      const paltiFilter = paltiAnd.length === 1 ? paltiAnd[0] : (paltiAnd.length ? { $and: paltiAnd } : {});
 
       const paltiRows =
         await paltiCollection
@@ -774,200 +797,85 @@ router.get(
           )
           .toArray();
 
-      const companyIds =
-        Array.from(
-          new Set(
-            [
-              ...inwardRows.map(
-                (row) =>
-                  row.company_id
-              ),
-              ...paltiRows.map(
-                (row) =>
-                  row.company_id
-              ),
-            ]
-              .map(
-                (id) =>
-                  String(
-                    id ??
-                      ""
-                  ).trim()
-              )
-              .filter(Boolean)
-          )
-        );
+      const inwardCompanyIds = Array.from(new Set(
+        (inwardRows || [])
+          .map((row) => row?.company_id)
+          .map((id) => String(id ?? "").trim())
+          .filter(Boolean)
+      ));
 
-      if (
-        companyIds.length === 0
-      ) {
+      const paltiCompanyIds = Array.from(new Set(
+        (paltiRows || [])
+          .filter((row) => getPaltiQty(row) > 0)
+          .map((row) => row?.company_id)
+          .map((id) => String(id ?? "").trim())
+          .filter(Boolean)
+      ));
+
+      const allCompanyIds = Array.from(new Set([
+        ...inwardCompanyIds,
+        ...paltiCompanyIds,
+      ]));
+
+      if (allCompanyIds.length === 0) {
         return res.json([]);
       }
 
-      const mongoObjectIds =
-        companyIds
-          .filter((id) =>
-            mongoose.Types.ObjectId.isValid(
-              id
-            )
-          )
-          .map(
-            (id) =>
-              new mongoose.Types.ObjectId(
-                id
-              )
-          );
+      const companyConditions = allCompanyIds
+        .map((id) => buildFlexibleIdFilter(id))
+        .filter(Boolean);
 
-      const numericIds =
-        companyIds
-          .map(Number)
-          .filter(
-            Number.isFinite
-          );
+      const companies = companyConditions.length
+        ? await MongoCompany.find({ $or: companyConditions }).select({ name: 1, legacy_id: 1, id: 1 }).lean()
+        : [];
 
-      const conditions = [];
+      const companyMap = new Map();
+      for (const company of companies || []) {
+        const aliases = [
+          company?._id != null ? String(company._id) : null,
+          company?.legacy_id != null ? String(company.legacy_id) : null,
+          company?.id != null ? String(company.id) : null,
+        ].filter(Boolean);
+        for (const alias of aliases) companyMap.set(alias, company);
+      }
 
-      if (
-        mongoObjectIds.length
-      ) {
-        conditions.push({
-          _id: {
-            $in:
-              mongoObjectIds,
-          },
+      const result = [];
+
+      for (const id of inwardCompanyIds) {
+        const company = companyMap.get(id);
+        if (!company) continue;
+        result.push({
+          id: company.legacy_id ?? company.id ?? String(company._id),
+          name: company.name || "",
+          source_type: "inward",
         });
       }
 
-      if (
-        numericIds.length
-      ) {
-        conditions.push({
-          legacy_id: {
-            $in:
-              numericIds,
-          },
-        });
-
-        conditions.push({
-          id: {
-            $in:
-              numericIds,
-          },
+      for (const id of paltiCompanyIds) {
+        const company = companyMap.get(id);
+        if (!company) continue;
+        result.push({
+          id: company.legacy_id ?? company.id ?? String(company._id),
+          name: company.name || "",
+          source_type: "palti_lorry",
         });
       }
 
-      const companies =
-        conditions.length
-          ? await MongoCompany.find({
-              $or:
-                conditions,
-            })
-              .select({
-                name: 1,
-              })
-              .lean()
-          : [];
-
-      const companyMap =
-        new Map(
-          companies.map(
-            (company) => [
-              String(
-                company._id
-              ),
-              company,
-            ]
-          )
-        );
-
-      const numericCompanyMap =
-        new Map();
-
-      for (
-        const company of
-          companies
-      ) {
-        if (
-          company.legacy_id !=
-          null
-        ) {
-          numericCompanyMap.set(
-            String(
-              company.legacy_id
-            ),
-            company
-          );
-        }
-
-        if (
-          company.id != null
-        ) {
-          numericCompanyMap.set(
-            String(
-              company.id
-            ),
-            company
-          );
-        }
-      }
-
-      const resultMap =
-        new Map();
-
-      for (
-        const id of
-          companyIds
-      ) {
-        const company =
-          companyMap.get(
-            id
-          ) ||
-          numericCompanyMap.get(
-            id
-          );
-
-        if (!company) {
-          continue;
-        }
-
-        const key =
-          String(
-            company._id
-          );
-
-        resultMap.set(
-          key,
-          {
-            id:
-              company.legacy_id ??
-              company.id ??
-              String(
-                company._id
-              ),
-
-            name:
-              company.name ||
-              "",
-
-            source_type:
-              "inward",
-          }
-        );
+      const deduped = [];
+      const seen = new Set();
+      for (const row of result) {
+        const key = `${row.source_type}:${String(row.id)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(row);
       }
 
       return res.json(
-        Array.from(
-          resultMap.values()
-        ).sort(
-          (a, b) =>
-            String(
-              a.name
-            ).localeCompare(
-              String(
-                b.name
-              )
-            )
-        )
+        deduped.sort((a, b) => {
+          const nameCompare = String(a.name).localeCompare(String(b.name));
+          if (nameCompare !== 0) return nameCompare;
+          return String(a.source_type).localeCompare(String(b.source_type));
+        })
       );
     } catch (err) {
       console.error(
@@ -1341,20 +1249,19 @@ router.get(
        * ==================================================
        */
 
-      const inwardFilter = {};
+      const inwardAnd = [];
 
-      if (
-        warehouseId
-      ) {
-        inwardFilter.warehouse_id =
-          Number(
-            warehouseId
-          );
+      if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+        if (filter) inwardAnd.push(filter);
       } else {
-        inwardFilter.location_id =
-          Number(
-            locationId
-          );
+        const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) inwardAnd.push(filter);
+      }
+
+      if (productId) {
+        const filter = buildFlexibleFieldFilter("product_id", productId);
+        if (filter) inwardAnd.push(filter);
       }
 
       if (
@@ -1393,17 +1300,21 @@ router.get(
                 undefined
           );
 
-        inwardFilter.company_id =
-          {
-            $in:
-              companyIds,
-          };
+        const companyConditions = companyIds
+          .map((id) => buildFlexibleFieldFilter("company_id", id))
+          .filter(Boolean);
+
+        if (companyConditions.length === 1) {
+          inwardAnd.push(companyConditions[0]);
+        } else if (companyConditions.length > 1) {
+          inwardAnd.push({ $or: companyConditions });
+        }
       }
 
+      const inwardFilter = inwardAnd.length === 1 ? inwardAnd[0] : { $and: inwardAnd };
+
       const inwardRows =
-        await MongoInward.find(
-          inwardFilter
-        )
+        await MongoInward.find(inwardFilter)
           .sort({
             date: 1,
             legacy_id: 1,
