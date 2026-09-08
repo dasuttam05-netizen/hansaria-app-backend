@@ -1,5 +1,39 @@
 const express = require("express");
 const router = express.Router();
+
+const normalizeTargetQty = (outward) =>
+  Number(outward?.unloading_qty || outward?.settlement?.unloading_qty || outward?.quantity || outward?.qty || 0) || 0;
+
+async function validateOutwardAdjustmentQty(outwardId, incomingQty, excludeId = null) {
+  const rawId = String(outwardId ?? "").trim();
+  const numericId = Number(rawId);
+  const conditions = [];
+
+  if (Number.isFinite(numericId)) {
+    conditions.push({ id: numericId });
+    conditions.push({ legacy_id: numericId });
+  }
+  if (isValidObjectId(rawId)) {
+    conditions.push({ _id: rawId });
+  }
+  if (!conditions.length) return { ok: true, target: 0, total: 0 };
+
+  const outward = await Outward.findOne({ $or: conditions }).lean().catch(() => null);
+  if (!outward) return { ok: true, target: 0, total: 0 };
+
+  const target = normalizeTargetQty(outward);
+  if (target <= 0) return { ok: true, target, total: 0 };
+
+  const query = { outward_id: Number(outwardId) };
+  const rows = await BuyerAdjustment.find(query).select({ qty: 1, _id: 1 }).lean();
+  const totalExisting = (rows || []).reduce((sum, row) => {
+    if (excludeId && String(row._id) === String(excludeId)) return sum;
+    return sum + (Number(row.qty) || 0);
+  }, 0);
+  const total = totalExisting + (Number(incomingQty) || 0);
+  return { ok: total <= target + 0.0001, target, total };
+}
+
 const { userHasPermission } = require("../middleware/auth");
 const {
   mongoose,
@@ -215,6 +249,14 @@ router.post("/", async (req, res) => {
   }
 
   try {
+    const qtyCheck = await validateOutwardAdjustmentQty(outward_id, qty);
+    if (!qtyCheck.ok) {
+      return res.status(400).json({
+        error: `Total unloading qty (${qtyCheck.total.toFixed(4)}) cannot exceed outward qty (${qtyCheck.target.toFixed(4)})`,
+        details: { requested_qty: qtyCheck.total, target_qty: qtyCheck.target },
+      });
+    }
+
     const signature = makeAdjustmentSignature({
       outward_id: safeNumber(outward_id),
       buyer_id: safeNumber(buyer_id) || null,
@@ -306,6 +348,17 @@ router.put("/:id", async (req, res) => {
   }
 
   try {
+    const current = await BuyerAdjustment.findOne({ _id: id }).lean();
+    if (!current) return res.status(404).json({ error: "Buyer adjustment not found" });
+
+    const qtyCheck = await validateOutwardAdjustmentQty(current.outward_id, qty, id);
+    if (!qtyCheck.ok) {
+      return res.status(400).json({
+        error: `Total unloading qty (${qtyCheck.total.toFixed(4)}) cannot exceed outward qty (${qtyCheck.target.toFixed(4)})`,
+        details: { requested_qty: qtyCheck.total, target_qty: qtyCheck.target },
+      });
+    }
+
     await BuyerAdjustment.updateOne(
       { _id: id },
       {
