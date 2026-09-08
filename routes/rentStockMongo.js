@@ -223,7 +223,6 @@ async function handleRentLedger(req,res,next) {
   if (!mongoReady()) return next();
   try {
     const page=Math.max(parseInt(req.query.page,10)||1,1); const pageSize=Math.min(Math.max(parseInt(req.query.page_size,10)||100,1),500); const usePaging=req.query.page!==undefined||req.query.page_size!==undefined;
-    const details=await buildRentDetails({monthList:[...new Set([String(req.query.from_date||'').slice(0,7), String(req.query.to_date||'').slice(0,7)])].filter(Boolean), filters:req.query});
     // For date-range ledgers, expand every month between range endpoints.
     let allMonths=[]; const from=req.query.from_date?String(req.query.from_date).slice(0,7):''; const to=req.query.to_date?String(req.query.to_date).slice(0,7):'';
     if(from&&to){ let cur=from; for(let i=0;i<24&&cur<=to;i++,cur=addMonths(cur,1)) allMonths.push(cur); }
