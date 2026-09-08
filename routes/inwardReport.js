@@ -1,422 +1,118 @@
 const express = require("express");
 const router = express.Router();
-const mongoose = require("mongoose");
+const { userHasPermission } = require("../middleware/auth");
+const { calculateShortageQty } = require("./shortageHelper");
+const { Inward } = require("../db-mongodb");
 
-const {
-  Inward,
-  Employee,
-  Location,
-  Warehouse,
-  Product,
-  Company,
-  CompanyAccount,
-  isMongoMirrorReady,
-} = require("../db-mongodb");
-
-function requireMongo(res) {
-  if (!isMongoMirrorReady()) {
-    res.status(503).json({
-      error:
-        "MongoDB is not connected. Please try again in a moment.",
-    });
-    return false;
-  }
-
-  return true;
+function authorizeReport(permission) {
+  return (req, res, next) => userHasPermission(req.user, permission)
+    ? next()
+    : res.status(403).json({ error: "You do not have permission to view this report" });
 }
 
-function normalizeId(value) {
-  if (
-    value === undefined ||
-    value === null ||
-    value === ""
-  ) {
-    return null;
-  }
-
-  const raw = String(value).trim();
-
-  if (!raw) {
-    return null;
-  }
-
-  return raw;
-}
-
-function buildIdConditions(value) {
-  const raw = normalizeId(value);
-
-  if (!raw) {
-    return [];
-  }
-
-  const conditions = [];
-
-  if (mongoose.Types.ObjectId.isValid(raw)) {
-    conditions.push({
-      _id: new mongoose.Types.ObjectId(raw),
-    });
-  }
-
-  const numeric = Number(raw);
-
-  if (Number.isFinite(numeric)) {
-    conditions.push({
-      legacy_id: numeric,
-    });
-
-    conditions.push({
-      id: numeric,
-    });
-
-    conditions.push({
-      sl_no: numeric,
-    });
-  }
-
-  return conditions;
-}
-
-async function findByLegacyOrObjectId(Model, value) {
-  const conditions = buildIdConditions(value);
-
-  if (!conditions.length) {
-    return null;
-  }
-
-  return Model.findOne({
-    $or: conditions,
-  }).lean();
-}
-
-function buildDateFilter(fromDate, toDate) {
+function dateFilter(query) {
   const filter = {};
-
-  if (fromDate) {
-    const start = new Date(`${fromDate}T00:00:00`);
-
-    if (!Number.isNaN(start.getTime())) {
-      filter.$gte = start;
-    }
+  if (query.from_date || query.to_date) filter.date = {};
+  if (query.from_date) filter.date.$gte = new Date(query.from_date);
+  if (query.to_date) {
+    const end = new Date(query.to_date);
+    end.setUTCHours(23, 59, 59, 999);
+    filter.date.$lte = end;
   }
-
-  if (toDate) {
-    const end = new Date(`${toDate}T23:59:59.999`);
-
-    if (!Number.isNaN(end.getTime())) {
-      filter.$lte = end;
-    }
-  }
-
-  return Object.keys(filter).length
-    ? filter
-    : null;
+  return filter;
 }
 
-async function resolveNames(rows) {
-  if (!rows.length) {
-    return [];
-  }
-
-  const employeeIds = new Set();
-  const locationIds = new Set();
-  const warehouseIds = new Set();
-  const productIds = new Set();
-  const companyIds = new Set();
-  const accountIds = new Set();
-
-  for (const row of rows) {
-    if (row.employee_id != null) {
-      employeeIds.add(
-        String(row.employee_id)
-      );
-    }
-
-    if (row.location_id != null) {
-      locationIds.add(
-        String(row.location_id)
-      );
-    }
-
-    if (row.warehouse_id != null) {
-      warehouseIds.add(
-        String(row.warehouse_id)
-      );
-    }
-
-    if (row.product_id != null) {
-      productIds.add(
-        String(row.product_id)
-      );
-    }
-
-    if (row.company_id != null) {
-      companyIds.add(
-        String(row.company_id)
-      );
-    }
-
-    if (row.company_account_id != null) {
-      accountIds.add(
-        String(row.company_account_id)
-      );
-    }
-  }
-
-  async function loadMap(Model, values) {
-    const all = Array.from(values);
-
-    if (!all.length) {
-      return new Map();
-    }
-
-    const conditions = [];
-
-    const objectIds = all
-      .filter((id) =>
-        mongoose.Types.ObjectId.isValid(id)
-      )
-      .map(
-        (id) =>
-          new mongoose.Types.ObjectId(id)
-      );
-
-    const numericIds = all
-      .map(Number)
-      .filter((id) => Number.isFinite(id));
-
-    if (objectIds.length) {
-      conditions.push({
-        _id: {
-          $in: objectIds,
-        },
-      });
-    }
-
-    if (numericIds.length) {
-      conditions.push({
-        legacy_id: {
-          $in: numericIds,
-        },
-      });
-
-      conditions.push({
-        id: {
-          $in: numericIds,
-        },
-      });
-
-      conditions.push({
-        sl_no: {
-          $in: numericIds,
-        },
-      });
-    }
-
-    if (!conditions.length) {
-      return new Map();
-    }
-
-    const docs = await Model.find({
-      $or: conditions,
-    }).lean();
-
-    const map = new Map();
-
-    for (const doc of docs) {
-      const name =
-        doc.name ||
-        doc.account_name ||
-        "";
-
-      if (doc._id) {
-        map.set(
-          String(doc._id),
-          name
-        );
-      }
-
-      if (doc.legacy_id != null) {
-        map.set(
-          String(doc.legacy_id),
-          name
-        );
-      }
-
-      if (doc.id != null) {
-        map.set(
-          String(doc.id),
-          name
-        );
-      }
-
-      if (doc.sl_no != null) {
-        map.set(
-          String(doc.sl_no),
-          name
-        );
-      }
-    }
-
-    return map;
-  }
-
-  const [
-    employeeMap,
-    locationMap,
-    warehouseMap,
-    productMap,
-    companyMap,
-    accountMap,
-  ] = await Promise.all([
-    loadMap(Employee, employeeIds),
-    loadMap(Location, locationIds),
-    loadMap(Warehouse, warehouseIds),
-    loadMap(Product, productIds),
-    loadMap(Company, companyIds),
-    loadMap(CompanyAccount, accountIds),
-  ]);
-
-  return rows.map((row) => ({
-    ...row,
-
-    id:
-      row.legacy_id ??
-      row.id ??
-      row.sl_no ??
-      String(row._id),
-
-    mongo_id:
-      row._id
-        ? String(row._id)
-        : null,
-
-    employee_name:
-      employeeMap.get(
-        String(row.employee_id)
-      ) ||
-      row.employee_name ||
-      "",
-
-    location_name:
-      locationMap.get(
-        String(row.location_id)
-      ) ||
-      row.location_name ||
-      "",
-
-    warehouse_name:
-      warehouseMap.get(
-        String(row.warehouse_id)
-      ) ||
-      row.warehouse_name ||
-      "",
-
-    product_name:
-      productMap.get(
-        String(row.product_id)
-      ) ||
-      row.product_name ||
-      row.product ||
-      "",
-
-    company_name:
-      companyMap.get(
-        String(row.company_id)
-      ) ||
-      row.company_name ||
-      "",
-
-    company_account_name:
-      accountMap.get(
-        String(row.company_account_id)
-      ) ||
-      row.company_account_name ||
-      "",
-  }));
+function addIdFilter(filter, field, value) {
+  if (value === undefined || value === null || value === "") return;
+  const values = String(value).split(",").map((item) => item.trim()).filter(Boolean);
+  filter[field] = values.length > 1 ? { $in: values } : values[0];
 }
 
-router.get("/report", async (req, res) => {
-  try {
-    if (!requireMongo(res)) {
-      return;
-    }
+async function loadInwards(query) {
+  const filter = dateFilter(query);
+  ["company_id", "warehouse_id", "product_id", "location_id", "employee_id", "company_account_id"].forEach((field) => {
+    addIdFilter(filter, field, query[field] || query[`${field}s`]);
+  });
+  return Inward.find(filter).sort({ date: 1, _id: 1 }).lean();
+}
 
-    const {
-      company_id,
-      warehouse_id,
-      from_date,
-      to_date,
-    } = req.query;
+function availableQty(row) {
+  const gross = Number(row.weight || row.quantity || 0);
+  const shortage = calculateShortageQty(gross, 1, row.shortage_percent);
+  return gross - shortage - Number(row.adjusted_qty || 0);
+}
 
-    const filter = {};
-
-    if (company_id) {
-      const conditions =
-        buildIdConditions(
-          company_id
-        );
-
-      if (conditions.length) {
-        filter.$and = [
-          {
-            $or: conditions,
-          },
-        ];
-      }
-    }
-
-    if (warehouse_id) {
-      const conditions =
-        buildIdConditions(
-          warehouse_id
-        );
-
-      if (conditions.length) {
-        filter.$and =
-          filter.$and || [];
-
-        filter.$and.push({
-          $or: conditions,
-        });
-      }
-    }
-
-    const dateFilter =
-      buildDateFilter(
-        from_date,
-        to_date
-      );
-
-    if (dateFilter) {
-      filter.date = dateFilter;
-    }
-
-    const rows = await Inward.find(
-      filter
-    )
-      .sort({
-        date: 1,
-        legacy_id: 1,
-        _id: 1,
-      })
-      .lean();
-
-    const result =
-      await resolveNames(rows);
-
-    return res.json(result);
-  } catch (err) {
-    console.error(
-      "Inward report failed:",
-      err
-    );
-
-    return res.status(500).json({
-      error:
-        err.message,
+function summaryBy(rows, keyFn, create) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const key = keyFn(row);
+    if (!map.has(key)) map.set(key, create(row));
+    const target = map.get(key);
+    Object.keys(target).forEach((field) => {
+      if (typeof target[field] === "number" && typeof row[field] === "number") target[field] += row[field];
     });
-  }
+  });
+  return [...map.values()];
+}
+
+router.get("/party-ledger", authorizeReport("report.partyLedger"), async (req, res) => {
+  try {
+    const details = await loadInwards(req.query);
+    const rows = details.map((row) => ({ ...row, balance_qty: availableQty(row) }));
+    const summary = summaryBy(rows, (row) => `${row.company_name || row.company || ""}::${row.company_account_id || row.company_account_name || ""}`, (row) => ({
+      party_name: row.company_name || row.company || "Unknown Party",
+      account_name: row.company_account_name || row.company_account || null,
+      gross_weight: Number(row.weight || row.quantity || 0),
+      balance_qty: Number(row.balance_qty || 0),
+    }));
+    return res.json({ summary, details: rows });
+  } catch (error) { return res.status(500).json({ error: error.message }); }
 });
+
+router.get("/party-stock", authorizeReport("report.partyStock"), async (req, res) => {
+  try {
+    const rows = (await loadInwards(req.query)).map((row) => ({
+      ...row,
+      inward_date: row.inward_date || row.date || null,
+      warehouse_name: row.warehouse_name || row.warehouse || "",
+      warehouse_address: row.warehouse_address || row.address || "",
+      available_balance_qty: availableQty(row),
+    }));
+    const summary = summaryBy(rows, (row) => `${row.company_name || row.company || "Unknown"}::${row.warehouse_name || row.warehouse_id || "Unknown"}`, (row) => ({
+      party_name: row.company_name || row.company || "Unknown Party",
+      warehouse_name: row.warehouse_name || "Unknown",
+      available_balance_qty: Number(row.available_balance_qty || 0),
+    }));
+    return res.json({ summary, details: rows });
+  } catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+router.get("/warehouse-stock", authorizeReport("report.partyStock"), async (req, res) => {
+  try {
+    const rows = (await loadInwards(req.query)).map((row) => ({ ...row, stock: availableQty(row) }));
+    return res.json(summaryBy(rows, (row) => `${row.warehouse_name || row.warehouse_id || "Unknown"}::${row.company_name || row.company || "Unknown"}::${row.location_name || row.location_id || "Unknown"}`, (row) => ({
+      warehouse: row.warehouse_name || "Unknown", party: row.company_name || row.company || "Unknown", location: row.location_name || "Unknown", stock: Number(row.stock || 0),
+    })));
+  } catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+router.get("/total-stock", authorizeReport("report.partyStock"), async (req, res) => {
+  try { const rows = await loadInwards(req.query); return res.json({ total: Number(rows.reduce((sum, row) => sum + availableQty(row), 0).toFixed(4)) }); }
+  catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger"), async (req, res) => {
+  try {
+    const data = (await loadInwards(req.query)).map((row) => ({ id: row._id, inward_date: row.date, party_name: row.company_name || row.company, warehouse_name: row.warehouse_name, voucher_no: row.voucher_no, original_weight: Number(row.weight || 0), balance_qty: Number(availableQty(row).toFixed(4)) }));
+    return res.json(req.query.page || req.query.page_size ? { data, pagination: { page: Number(req.query.page) || 1, pageSize: Number(req.query.page_size) || data.length, totalCount: data.length, totalPages: data.length ? 1 : 0 } } : data);
+  } catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMonthEnd"), async (req, res) => {
+  try { const details = await loadInwards(req.query); return res.json({ month: req.query.month || req.query.from_month, summary: [], details }); }
+  catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+router.get("/palti-lorry-adjustment", authorizeReport("report.paltiLorryAdjustment"), (_req, res) => res.json([]));
 
 module.exports = router;
