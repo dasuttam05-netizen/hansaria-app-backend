@@ -2118,11 +2118,36 @@ router.post(
           );
         }
 
+        const selectedCompany =
+          await MongoCompany.findOne(
+            buildFlexibleIdFilter(companyId)
+          )
+            .select({
+              _id: 1,
+              legacy_id: 1,
+              id: 1,
+            })
+            .lean();
+
+        const companyAliases = new Set(
+          [
+            companyId,
+            selectedCompany?._id
+              ? String(selectedCompany._id)
+              : null,
+            selectedCompany?.legacy_id != null
+              ? String(selectedCompany.legacy_id)
+              : null,
+            selectedCompany?.id != null
+              ? String(selectedCompany.id)
+              : null,
+          ].filter(Boolean)
+        );
+
         if (
-          String(
-            inwardRow.company_id
-          ) !==
-          companyId
+          !companyAliases.has(
+            String(inwardRow.company_id ?? "").trim()
+          )
         ) {
           throw makeAdjustmentError(
             `Company mismatch for inward_id ${adj.inward_id}`,
