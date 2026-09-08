@@ -762,531 +762,46 @@ DISPLAY DECORATION
 ====================================================
 */
 
-async function decorateOutwardDocs(
-  docs
-) {
-  const result = [];
-
-  for (
-    const doc of docs || []
-  ) {
-    const masters =
-      await resolveOutwardMasters({
-        employee_id:
-          doc?.employee_id,
-
-        employee_name:
-          doc?.employee_name,
-
-        location_id:
-          doc?.location_id,
-
-        location_name:
-          doc?.location_name,
-
-        warehouse_id:
-          doc?.warehouse_id,
-
-        warehouse_name:
-          doc?.warehouse_name,
-
-        product_id:
-          doc?.product_id,
-
-        product_name:
-          doc?.product_name,
-
-        company_id:
-          doc?.company_id,
-
-        company_name:
-          doc?.company_name,
-
-        company_account_id:
-          doc?.company_account_id,
-
-        company_account_name:
-          doc?.company_account_name,
-      });
-
-    const names =
-      masterNames(
-        masters
-      );
-
+async function decorateOutwardDocs(docs) {
+  // Outward documents already persist master display names. Re-querying
+  // employee/location/warehouse/product/company for every row created an
+  // expensive N+1 query pattern and made the list page slow.
+  return (docs || []).map((doc) => {
     const outwardNo =
       doc?.outward_no ||
       doc?.voucher_no ||
       doc?.inv_no ||
       "";
 
-    result.push({
+    const id =
+      doc?.legacy_id ??
+      doc?.sl_no ??
+      String(doc?._id);
+
+    return {
       ...doc,
-
-      mongo_id:
-        String(
-          doc?._id
-        ),
-
-      id:
-        doc?.legacy_id ??
-        doc?.sl_no ??
-        String(
-          doc?._id
-        ),
-
-      legacy_id:
-        doc?.legacy_id ??
-        null,
-
-      sl_no:
-        doc?.sl_no ??
-        doc?.legacy_id ??
-        null,
-
-      voucher_no:
-        outwardNo,
-
-      outward_no:
-        doc?.outward_no ||
-        outwardNo,
-
-      date:
-        normalizeDate(
-          doc?.date
-        )
-          ? normalizeDate(
-              doc?.date
-            )
-              .toISOString()
-              .slice(0, 10)
-          : safeText(
-              doc?.date
-            ) || "",
-
-      employee_name:
-        names.employee_name ||
-        doc?.employee_name ||
-        "",
-
-      location_name:
-        names.location_name ||
-        doc?.location_name ||
-        doc?.location ||
-        "",
-
-      warehouse_name:
-        names.warehouse_name ||
-        doc?.warehouse_name ||
-        "",
-
-      product_name:
-        names.product_name ||
-        doc?.product_name ||
-        doc?.product ||
-        "",
-
-      company_name:
-        names.company_name ||
-        doc?.company_name ||
-        doc?.buyer_name ||
-        doc?.buyer ||
-        "",
-
-      company_account_name:
-        names.company_account_name ||
-        doc?.company_account_name ||
-        "",
-
-      party_name:
-        names.company_account_name ||
-        doc?.party_name ||
-        doc?.company_account_name ||
-        "",
-
-      quantity:
-        safeNumber(
-          doc?.quantity ??
-            doc?.weight
-        ),
-
-      weight:
-        safeNumber(
-          doc?.weight ??
-            doc?.quantity
-        ),
-
-      rate:
-        safeNumber(
-          doc?.rate
-        ),
-
-      amount:
-        safeNumber(
-          doc?.amount
-        ),
-    });
-  }
-
-  return result;
-}
-
-/*
-====================================================
-MIRROR ADJUSTMENT HELPERS
-====================================================
-*/
-
-/*
- * Existing Adjustment mongoose schema does not contain:
- * inward_id / outward_id / qty.
- *
- * Therefore legacy FIFO adjustment rows are kept in
- * MirrorRow with table = "adjustment".
- */
-
-async function getAdjustmentRows() {
-  if (
-    !MirrorRow ||
-    typeof
-      MirrorRow.find !==
-        "function"
-  ) {
-    return [];
-  }
-
-  const rows =
-    await MirrorRow.find({
-      table:
-        "adjustment",
-    })
-      .sort({
-        row_id: 1,
-      })
-      .lean();
-
-  return (
-    rows || []
-  ).map(
-    (row) => ({
-      id:
-        row?.row_id,
-
-      ...(row?.data || {}),
-    })
-  );
-}
-
-async function getAdjustmentsForOutward(
-  outwardId
-) {
-  const rows =
-    await getAdjustmentRows();
-
-  const normalized =
-    normalizeId(
-      outwardId
-    );
-
-  return rows.filter(
-    (row) =>
-      normalizeId(
-        row?.outward_id
-      ) === normalized
-  );
-}
-
-async function getAdjustedQtyForOutward(
-  outwardId
-) {
-  const rows =
-    await getAdjustmentsForOutward(
-      outwardId
-    );
-
-  return rows.reduce(
-    (sum, row) =>
-      sum +
-      safeNumber(
-        row?.qty
-      ),
-    0
-  );
-}
-
-async function getNextAdjustmentMirrorId() {
-  const last =
-    await MirrorRow.findOne({
-      table:
-        "adjustment",
-    })
-      .sort({
-        row_id:
-          -1,
-      })
-      .select({
-        row_id:
-          1,
-      })
-      .lean();
-
-  return (
-    Number(
-      last?.row_id ||
-        0
-    ) + 1
-  );
-}
-
-async function createAdjustmentMirrorRow(
-  payload
-) {
-  const rowId =
-    await getNextAdjustmentMirrorId();
-
-  await MirrorRow.updateOne(
-    {
-      table:
-        "adjustment",
-
-      row_id:
-        rowId,
-    },
-    {
-      $set: {
-        data:
-          payload,
-
-        updated_at:
-          new Date(),
-      },
-    },
-    {
-      upsert:
-        true,
-    }
-  ).exec();
-
-  return rowId;
-}
-
-/*
-====================================================
-AVAILABLE STOCK
-====================================================
-*/
-
-async function getAvailableWarehouseStock({
-  warehouse_id,
-  product_id,
-  outwardId = null,
-}) {
-  if (
-    !warehouse_id ||
-    !product_id
-  ) {
-    return {
-      currentStock:
-        0,
-
-      reservedStock:
-        0,
-
-      availableStock:
-        0,
+      mongo_id: String(doc?._id),
+      id,
+      legacy_id: doc?.legacy_id ?? null,
+      sl_no: doc?.sl_no ?? doc?.legacy_id ?? null,
+      voucher_no: outwardNo,
+      outward_no: doc?.outward_no || outwardNo,
+      date: normalizeDate(doc?.date)
+        ? normalizeDate(doc?.date).toISOString().slice(0, 10)
+        : safeText(doc?.date) || "",
+      employee_name: safeText(doc?.employee_name) || "",
+      location_name: safeText(doc?.location_name) || safeText(doc?.location) || "",
+      warehouse_name: safeText(doc?.warehouse_name) || "",
+      product_name: safeText(doc?.product_name) || safeText(doc?.product) || "",
+      company_name: safeText(doc?.company_name) || safeText(doc?.buyer_name) || safeText(doc?.buyer) || "",
+      company_account_name: safeText(doc?.company_account_name) || "",
+      party_name: safeText(doc?.company_account_name) || safeText(doc?.party_name) || safeText(doc?.company_account_name) || "",
+      quantity: safeNumber(doc?.quantity ?? doc?.weight),
+      weight: safeNumber(doc?.weight ?? doc?.quantity),
+      rate: safeNumber(doc?.rate),
+      amount: safeNumber(doc?.amount),
     };
-  }
-
-  const normalizedWarehouse =
-    normalizeId(
-      warehouse_id
-    );
-
-  const normalizedProduct =
-    normalizeId(
-      product_id
-    );
-
-  /*
-   * Current stock = remaining_qty from Inward.
-   */
-  const inwardRows =
-    await MongoInward.find({
-      $and: [
-        mixedIdMatch("warehouse_id", normalizedWarehouse),
-        mixedIdMatch("product_id", normalizedProduct),
-      ],
-    })
-      .select({
-        remaining_qty:
-          1,
-
-        weight:
-          1,
-
-        quantity:
-          1,
-
-        date:
-          1,
-
-        legacy_id:
-          1,
-      })
-      .lean();
-
-  let currentStock =
-    0;
-
-  for (
-    const row of
-      inwardRows
-  ) {
-    currentStock +=
-      safeNumber(
-        row?.remaining_qty ??
-          row?.weight ??
-          row?.quantity
-      );
-  }
-
-  /*
-   * Pending / partial reserved stock.
-   */
-  const outwardFilter = {
-    $and: [
-      mixedIdMatch("warehouse_id", normalizedWarehouse),
-      mixedIdMatch("product_id", normalizedProduct),
-    ],
-
-    status: {
-      $in: [
-        "Pending",
-        "Partial",
-      ],
-    },
-  };
-
-  if (
-    outwardId
-  ) {
-    const existing =
-      await findMongoOutward(
-        outwardId
-      );
-
-    if (
-      existing?._id
-    ) {
-      outwardFilter._id = {
-        $ne:
-          existing._id,
-      };
-    }
-  }
-
-  const pendingOutwards =
-    await MongoOutward.find(
-      outwardFilter
-    )
-      .select({
-        _id:
-          1,
-
-        legacy_id:
-          1,
-
-        quantity:
-          1,
-
-        weight:
-          1,
-      })
-      .lean();
-
-  let reservedStock =
-    0;
-
-  for (
-    const row of
-      pendingOutwards
-  ) {
-    const outwardIdValue =
-      row?.legacy_id ??
-      row?._id;
-
-    const adjustedQty =
-      await getAdjustedQtyForOutward(
-        outwardIdValue
-      );
-
-    const quantity =
-      safeNumber(
-        row?.quantity ??
-          row?.weight
-      );
-
-    reservedStock +=
-      Math.max(
-        quantity -
-          adjustedQty,
-        0
-      );
-  }
-
-  return {
-    currentStock,
-
-    reservedStock,
-
-    availableStock:
-      Math.max(
-        currentStock -
-          reservedStock,
-        0
-      ),
-  };
-}
-
-async function validateOutwardStock({
-  warehouse_id,
-  product_id,
-  qty,
-  outwardId = null,
-}) {
-  const stock =
-    await getAvailableWarehouseStock({
-      warehouse_id,
-      product_id,
-      outwardId,
-    });
-
-  const requestedQty =
-    safeNumber(qty);
-
-  if (
-    stock.availableStock <
-    requestedQty
-  ) {
-    return {
-      ok:
-        false,
-
-      error:
-        `Not enough stock in this warehouse. Available stock is ${stock.availableStock.toFixed(
-          2
-        )}.`,
-
-      stock,
-    };
-  }
-
-  return {
-    ok:
-      true,
-
-    stock,
-  };
+  });
 }
 
 /*
@@ -2066,6 +1581,8 @@ router.put(
         }
       );
 
+      clearStockCache();
+
       return res.json({
         message:
           "FIFO Adjustment Done",
@@ -2254,6 +1771,8 @@ const adjustmentInwardId =
         },
       }
     );
+
+    clearStockCache();
 
     return res.json({
       message:
@@ -2671,6 +2190,8 @@ router.post(
             new Date(),
         });
 
+      clearStockCache();
+
       return res.json({
         id:
           doc.legacy_id ??
@@ -3074,6 +2595,8 @@ router.put(
               true,
           }
         ).lean();
+
+      clearStockCache();
 
       return res.json({
         updated:
