@@ -110,6 +110,20 @@ function normalizeId(value) {
   return String(value);
 }
 
+function mixedIdValues(value) {
+  const text = normalizeId(value);
+  if (!text) return [];
+  const values = [text];
+  if (/^\d+$/.test(text)) values.push(Number(text));
+  if (isValidObjectId(text)) values.push(text);
+  return values;
+}
+
+function mixedIdMatch(field, value) {
+  const values = mixedIdValues(value);
+  return values.length ? { [field]: { $in: values } } : { [field]: null };
+}
+
 function isValidObjectId(value) {
   try {
     return mongoose.Types.ObjectId.isValid(
@@ -1098,11 +1112,10 @@ async function getAvailableWarehouseStock({
    */
   const inwardRows =
     await MongoInward.find({
-      warehouse_id:
-        normalizedWarehouse,
-
-      product_id:
-        normalizedProduct,
+      $and: [
+        mixedIdMatch("warehouse_id", normalizedWarehouse),
+        mixedIdMatch("product_id", normalizedProduct),
+      ],
     })
       .select({
         remaining_qty:
@@ -1141,11 +1154,10 @@ async function getAvailableWarehouseStock({
    * Pending / partial reserved stock.
    */
   const outwardFilter = {
-    warehouse_id:
-      normalizedWarehouse,
-
-    product_id:
-      normalizedProduct,
+    $and: [
+      mixedIdMatch("warehouse_id", normalizedWarehouse),
+      mixedIdMatch("product_id", normalizedProduct),
+    ],
 
     status: {
       $in: [
