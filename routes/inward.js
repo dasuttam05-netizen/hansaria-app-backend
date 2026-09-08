@@ -870,6 +870,14 @@ async function decorateMongoInwardDocs(
         names.warehouse_name ||
         doc?.warehouse_name ||
         "",
+      warehouse_address:
+        warehouse?.address ||
+        warehouse?.location ||
+        doc?.warehouse_address ||
+        "",
+      inward_date:
+        doc?.date ||
+        null,
 
       product_name:
         names.product_name ||
