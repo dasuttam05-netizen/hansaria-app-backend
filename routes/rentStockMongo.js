@@ -81,27 +81,64 @@ function legacyValue(row, key) {
 function perm(req, value) { return userHasPermission(req.user, value) || userHasPermission(req.user, 'all'); }
 function reportAccess(req, value) { return perm(req,value) || perm(req,'dashboard.view'); }
 
-async function masterMaps() {
-  const [companies, accounts, warehouses, locations, products, employees, farmers] = await Promise.all([
-    CompanyOperational.find({}).lean(),
-    CompanyAccountOperational.find({}).lean(),
-    WarehouseOperational.find({}).lean(),
-    LocationOperational.find({}).lean(),
-    ProductOperational.find({}).lean(),
-    EmployeeOperational.find({}).lean(),
-    FarmerOperational.find({}).lean(),
-  ]);
-  const makeMap = rows => {
-    const m = new Map();
-    (rows || []).forEach(r => {
-      [r._id, r.id, r.legacy_id].filter(v => v !== undefined && v !== null && v !== '').forEach(v => m.set(String(v), r));
-      if (r.name) m.set(`name:${String(r.name).trim().toLowerCase()}`, r);
-      if (r.account_name) m.set(`name:${String(r.account_name).trim().toLowerCase()}`, r);
-    });
-    return m;
-  };
-  return { companies:makeMap(companies), accounts:makeMap(accounts), warehouses:makeMap(warehouses), locations:makeMap(locations), products:makeMap(products), employees:makeMap(employees), farmers:makeMap(farmers) };
+function queryValues(values) {
+  return Array.from(new Set((values || []).map(v => String(v ?? '').trim()).filter(Boolean)));
 }
+function masterQuery(ids, names = []) {
+  const vals = queryValues(ids);
+  const nameVals = queryValues(names).map(v => v.toLowerCase());
+  const or = [];
+  if (vals.length) {
+    or.push({ id: { $in: vals } }, { legacy_id: { $in: vals } });
+    const objectIds = vals.filter(v => mongoose.Types.ObjectId.isValid(v)).map(v => new mongoose.Types.ObjectId(v));
+    if (objectIds.length) or.push({ _id: { $in: objectIds } });
+  }
+  if (nameVals.length) {
+    or.push({ name: { $in: queryValues(names) } }, { account_name: { $in: queryValues(names) } });
+  }
+  return or.length ? { $or: or } : { _id: { $exists: false } };
+}
+function makeMap(rows) {
+  const m = new Map();
+  (rows || []).forEach(r => {
+    [r._id, r.id, r.legacy_id].filter(v => v !== undefined && v !== null && v !== '').forEach(v => m.set(String(v), r));
+    if (r.name) m.set(`name:${String(r.name).trim().toLowerCase()}`, r);
+    if (r.account_name) m.set(`name:${String(r.account_name).trim().toLowerCase()}`, r);
+  });
+  return m;
+}
+async function masterMapsForRows(rows) {
+  const pick = (idKey, nameKeys = []) => {
+    const ids = [], names = [];
+    for (const r of rows || []) {
+      if (r?.[idKey] !== undefined && r?.[idKey] !== null && r?.[idKey] !== '') ids.push(r[idKey]);
+      for (const k of nameKeys) if (r?.[k]) names.push(r[k]);
+    }
+    return { ids, names };
+  };
+  const company = pick('company_id', ['company_name', 'company']);
+  const account = pick('company_account_id', ['company_account_name', 'company_account', 'account_name']);
+  const warehouse = pick('warehouse_id', ['warehouse_name', 'warehouse']);
+  const location = pick('location_id', ['location_name', 'location']);
+  const product = pick('product_id', ['product_name', 'product']);
+  const employee = pick('employee_id', ['employee_name']);
+  const farmer = pick('farmer_id', ['farmer_name', 'farmer']);
+
+  const [companies, accounts, warehouses, locations, products, employees, farmers] = await Promise.all([
+    CompanyOperational.find(masterQuery(company.ids, company.names)).select({ name: 1, address: 1, company_address: 1, location: 1, city: 1, district: 1, id: 1, legacy_id: 1 }).lean(),
+    CompanyAccountOperational.find(masterQuery(account.ids, account.names)).select({ name: 1, account_name: 1, address: 1, location: 1, id: 1, legacy_id: 1 }).lean(),
+    WarehouseOperational.find(masterQuery(warehouse.ids, warehouse.names)).select({ name: 1, address: 1, warehouse_address: 1, location: 1, full_address: 1, city: 1, district: 1, id: 1, legacy_id: 1 }).lean(),
+    LocationOperational.find(masterQuery(location.ids, location.names)).select({ name: 1, id: 1, legacy_id: 1 }).lean(),
+    ProductOperational.find(masterQuery(product.ids, product.names)).select({ name: 1, id: 1, legacy_id: 1 }).lean(),
+    EmployeeOperational.find(masterQuery(employee.ids, employee.names)).select({ name: 1, id: 1, legacy_id: 1 }).lean(),
+    FarmerOperational.find(masterQuery(farmer.ids, farmer.names)).select({ name: 1, id: 1, legacy_id: 1 }).lean(),
+  ]);
+  return { companies: makeMap(companies), accounts: makeMap(accounts), warehouses: makeMap(warehouses), locations: makeMap(locations), products: makeMap(products), employees: makeMap(employees), farmers: makeMap(farmers) };
+}
+async function masterMaps() {
+  return masterMapsForRows([]);
+}
+
 function findMaster(map, id, name) { return map.get(String(id || '')) || map.get(`name:${String(name || '').trim().toLowerCase()}`) || null; }
 function masterAddress(map, id, name) {
   const master = findMaster(map, id, name);
@@ -110,52 +147,68 @@ function masterAddress(map, id, name) {
 function idsFromQuery(v) { return new Set(String(v || '').split(',').map(s=>s.trim()).filter(Boolean)); }
 
 async function buildInwardRows(filters = {}) {
-  const docs = await InwardOperational.find({}).lean();
-  const maps = await masterMaps();
   const from = dateOnly(filters.from_date), to = dateOnly(filters.to_date);
   const companyIds = idsFromQuery(filters.company_ids || filters.company_id);
   const warehouseIds = idsFromQuery(filters.warehouse_ids || filters.warehouse_id);
   const locationIds = idsFromQuery(filters.location_ids || filters.location_id);
   const productId = String(filters.product_id || '');
   const employeeId = String(filters.employee_id || '');
-  return docs.filter(r => {
-    const d = dateOnly(r.date);
-    if (from && d < from) return false;
-    if (to && d > to) return false;
-    if (companyIds.size && !companyIds.has(String(r.company_id || ''))) return false;
-    if (warehouseIds.size && !warehouseIds.has(String(r.warehouse_id || ''))) return false;
-    if (locationIds.size && !locationIds.has(String(r.location_id || ''))) return false;
-    if (productId && String(r.product_id || '') !== productId) return false;
-    if (employeeId && String(r.employee_id || '') !== employeeId) return false;
+  const query = {};
+  if (companyIds.size) query.company_id = { $in: Array.from(companyIds) };
+  if (warehouseIds.size) query.warehouse_id = { $in: Array.from(warehouseIds) };
+  if (locationIds.size) query.location_id = { $in: Array.from(locationIds) };
+  if (productId) query.product_id = productId;
+  if (employeeId) query.employee_id = employeeId;
+
+  // Keep date filtering in JS because this legacy collection contains mixed date types.
+  // The projection and other DB-side filters avoid shipping unnecessary document fields.
+  const docs = await InwardOperational.find(query).select({
+    _id: 1, id: 1, legacy_id: 1, date: 1, inward_date: 1, weight: 1, shortage_percent: 1,
+    company_id: 1, company_name: 1, company: 1, company_account_id: 1, company_account_name: 1, company_account: 1,
+    warehouse_id: 1, warehouse_name: 1, warehouse: 1, location_id: 1, location_name: 1, location: 1,
+    product_id: 1, product_name: 1, product: 1, employee_id: 1, employee_name: 1,
+    lorry_no: 1, voucher_no: 1, outward_date: 1, company_address: 1, warehouse_address: 1,
+  }).lean();
+  const filtered = docs.filter(r => {
+    const d = dateOnly(r.inward_date) || dateOnly(r.date);
+    if (from && (!d || d < from)) return false;
+    if (to && (!d || d > to)) return false;
     return true;
-  }).map(r => {
+  });
+  const maps = await masterMapsForRows(filtered);
+  return filtered.map(r => {
     const c = findMaster(maps.companies, r.company_id, r.company_name || r.company);
-    const a = findMaster(maps.accounts, r.company_account_id, r.company_account_name || r.company_account);
-    const w = findMaster(maps.warehouses, r.warehouse_id, r.warehouse_name);
+    const a = findMaster(maps.accounts, r.company_account_id, r.company_account_name || r.company_account || r.account_name);
+    const w = findMaster(maps.warehouses, r.warehouse_id, r.warehouse_name || r.warehouse);
     const l = findMaster(maps.locations, r.location_id, r.location_name || r.location);
     const p = findMaster(maps.products, r.product_id, r.product_name || r.product);
     const e = findMaster(maps.employees, r.employee_id, r.employee_name);
+    const inwardDate = dateOnly(r.inward_date) || dateOnly(r.date);
     return {
       ...r,
-      id:String(r.legacy_id ?? r.id ?? r._id),
-      legacy_id:r.legacy_id ?? r.id,
-      company_name:c?.name || r.company_name || r.company || '',
-      company_address:c?.address || c?.company_address || c?.location || a?.address || r.company_address || r.address || '',
-      account_name:a?.account_name || a?.name || r.company_account_name || '',
-      warehouse_name:w?.name || r.warehouse_name || '',
-      warehouse_address:masterAddress(maps.warehouses, r.warehouse_id, r.warehouse_name) || r.warehouse_address || '',
-      location_name:l?.name || r.location_name || r.location || '',
-      product_name:p?.name || r.product_name || r.product || '',
-      employee_name:e?.name || r.employee_name || '',
-      date:dateOnly(r.date),
-      inward_date:dateOnly(r.inward_date) || dateOnly(r.date),
-      outward_date:dateOnly(r.outward_date),
+      id: String(r.legacy_id ?? r.id ?? r._id),
+      legacy_id: r.legacy_id ?? r.id,
+      company_name: c?.name || r.company_name || r.company || '',
+      company_address: c?.address || c?.company_address || c?.location || a?.address || r.company_address || r.address || '',
+      account_name: a?.account_name || a?.name || r.company_account_name || r.company_account || '',
+      warehouse_name: w?.name || r.warehouse_name || r.warehouse || '',
+      warehouse_address: masterAddress(maps.warehouses, r.warehouse_id, r.warehouse_name || r.warehouse) || r.warehouse_address || '',
+      location_name: l?.name || r.location_name || r.location || '',
+      product_name: p?.name || r.product_name || r.product || '',
+      employee_name: e?.name || r.employee_name || '',
+      date: inwardDate,
+      inward_date: inwardDate,
+      outward_date: dateOnly(r.outward_date),
     };
   });
 }
 
-async function adjustmentMap() {
-  const rows = await AdjustmentOperational.find({}).lean();
+async function adjustmentMap(inwardIds = null) {
+  const ids = inwardIds ? queryValues(inwardIds) : null;
+  const query = ids && ids.length ? { inward_id: { $in: ids } } : {};
+  const rows = await AdjustmentOperational.find(query).select({
+    _id: 1, id: 1, legacy_id: 1, inward_id: 1, outward_id: 1, qty: 1, outward_date: 1, created_at: 1,
+  }).lean();
   const m = new Map();
   rows.forEach(r => { const k = String(r.inward_id ?? ''); if (!m.has(k)) m.set(k, []); m.get(k).push(r); });
   return m;
@@ -208,12 +261,17 @@ router.get('/party-stock', async (req,res,next) => {
   if (!reportAccess(req,'report.partyStock')) return res.status(403).json({error:'Permission denied'});
   if (!mongoReady()) return next();
   try {
-    const [rows, adjMap, outwards, buyers, maps] = await Promise.all([
-      buildInwardRows(req.query),
-      adjustmentMap(),
-      OutwardOperational.find({}).lean(),
-      BuyerAdjustmentOperational.find({}).lean(),
-      masterMaps(),
+    const rows = await buildInwardRows(req.query);
+    const adjMap = await adjustmentMap(rows.map(r => r.legacy_id ?? r.id));
+    const outwardIds = [];
+    for (const list of adjMap.values()) for (const a of list) if (a.outward_id) outwardIds.push(a.outward_id);
+    const uniqueOutwardIds = queryValues(outwardIds);
+    const [outwards, buyers] = await Promise.all([
+      uniqueOutwardIds.length ? OutwardOperational.find({ $or: [
+        { id: { $in: uniqueOutwardIds } }, { legacy_id: { $in: uniqueOutwardIds } }, { outward_id: { $in: uniqueOutwardIds } },
+        ...(uniqueOutwardIds.filter(v => mongoose.Types.ObjectId.isValid(v)).length ? [{ _id: { $in: uniqueOutwardIds.filter(v => mongoose.Types.ObjectId.isValid(v)).map(v => new mongoose.Types.ObjectId(v)) } }] : [])
+      ] }).select({ _id: 1, id: 1, legacy_id: 1, outward_id: 1, date: 1, outward_date: 1 }).lean() : [],
+      uniqueOutwardIds.length ? BuyerAdjustmentOperational.find({ outward_id: { $in: uniqueOutwardIds } }).select({ outward_id: 1, unloading_date: 1, outward_date: 1 }).lean() : [],
     ]);
     const outById = new Map();
     outwards.forEach(o => {
@@ -249,7 +307,7 @@ router.get('/party-stock', async (req,res,next) => {
         date:r.date,
         inward_date:r.inward_date || r.date || '',
         outward_date:latestOutwardDate || '',
-        warehouse_address:r.warehouse_address || masterAddress(maps.warehouses,r.warehouse_id,r.warehouse_name) || '',
+        warehouse_address:r.warehouse_address || '',
         company_address:r.company_address || '',
       };
       details.push(detail);
