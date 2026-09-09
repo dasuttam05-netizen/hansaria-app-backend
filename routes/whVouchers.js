@@ -7,6 +7,8 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const tradingFilterCache = new Map();
 const TRADING_FILTER_CACHE_MS = 15 * 60 * 1000;
+const purchaseSearchCache = new Map();
+const PURCHASE_SEARCH_CACHE_MS = 5 * 60 * 1000;
 
 // Fast payment-edit/outstanding indexes. These are MongoDB indexes and
 // prevent full-collection scans when filtering by farmer + account + warehouse.
@@ -286,7 +288,7 @@ function applyVoucherListFilters(query, options, type) {
     if (options.toDate) filter.date.$lte = options.toDate;
   }
 
-  if (options.search) {
+  if (options.search && type !== "purchase") {
     const safe = options.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const rx = new RegExp(safe, "i");
     const fields = type === "purchase"
@@ -296,6 +298,88 @@ function applyVoucherListFilters(query, options, type) {
   }
 
   return filter;
+}
+
+function addMixedIdFilter(filter, field, value) {
+  const text = String(value || "").trim();
+  if (!text) return;
+
+  const values = [text];
+  if (/^\d+$/.test(text)) values.push(Number(text));
+  if (mongoose.Types.ObjectId.isValid(text)) values.push(text);
+
+  filter.$and = [
+    ...(filter.$and || []),
+    { $or: values.map((item) => ({ [field]: item })) },
+  ];
+}
+
+function addVoucherSearchFilter(filter, search, fields) {
+  const text = String(search || "").trim();
+  if (!text) return;
+  const safe = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rx = new RegExp(safe, "i");
+  filter.$and = [
+    ...(filter.$and || []),
+    { $or: fields.map((field) => ({ [field]: rx })) },
+  ];
+}
+
+async function addPurchaseSearchFilter(filter, search) {
+  const text = String(search || "").trim();
+  if (!text) return;
+
+  const cacheKey = text.toLowerCase();
+  const cached = purchaseSearchCache.get(cacheKey);
+  let idClauses;
+  if (cached && Date.now() - cached.time < PURCHASE_SEARCH_CACHE_MS) {
+    idClauses = cached.idClauses;
+  } else {
+    const safe = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(safe, "i");
+    const [farmers, products, warehouses, accounts] = await Promise.all([
+      Farmer.find({ name: rx }).select("_id id legacy_id").lean(),
+      Product.find({ name: rx }).select("_id id legacy_id").lean(),
+      Warehouse.find({ name: rx }).select("_id id legacy_id").lean(),
+      CompanyAccount.find({ $or: [{ account_name: rx }, { name: rx }] }).select("_id id legacy_id").lean(),
+    ]);
+
+    const clausesFor = (field, rows) => rows.flatMap((row) => {
+      const ids = [row?._id, row?.id, row?.legacy_id]
+        .filter((value) => value !== undefined && value !== null && String(value) !== "")
+        .map(String);
+      return ids.flatMap((id) => [
+        { [field]: id },
+        ...(Number.isFinite(Number(id)) ? [{ [field]: Number(id) }] : []),
+      ]);
+    });
+
+    idClauses = [
+      ...clausesFor("farmer_id", farmers),
+      ...clausesFor("product_id", products),
+      ...clausesFor("warehouse_id", warehouses),
+      ...clausesFor("company_account_id", accounts),
+    ];
+    purchaseSearchCache.set(cacheKey, { time: Date.now(), idClauses });
+  }
+
+  const safe = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rx = new RegExp(safe, "i");
+
+  filter.$and = [
+    ...(filter.$and || []),
+    {
+      $or: [
+        { voucher_no: rx },
+        { farmer_name: rx },
+        { product_name: rx },
+        { warehouse_name: rx },
+        { company_account_name: rx },
+        { description: rx },
+        ...idClauses,
+      ],
+    },
+  ];
 }
 
 function voucherListResponse(rows, total, options) {
@@ -315,6 +399,7 @@ function voucherListResponse(rows, total, options) {
 async function getPurchaseVoucherPage(req) {
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "purchase");
+  await addPurchaseSearchFilter(filter, options.search);
   const [total, docs] = await Promise.all([
     PurchaseVoucher.countDocuments(filter),
     PurchaseVoucher.find(filter)
@@ -867,7 +952,7 @@ async function nextMongoVoucherNo(type) {
       collectionName = "receiptvouchers";
       break;
     case "journal":
-      collectionName = "journalvouchers";
+      collectionName = "wh_journal_vouchers";
       break;
     default:
       throw new Error(`Unsupported voucher type: ${type}`);
@@ -1086,6 +1171,8 @@ function getPurchaseVoucherRows(req, res) {
       console.error("Mongo purchase voucher page query failed:", err);
       res.status(500).json({ error: err.message || "Failed to load purchase vouchers" });
     });
+}
+
 async function resolveUserAccessibleLocationIds(user) {
   const rawLocationIds = [
     user?.location_id,
@@ -2315,6 +2402,13 @@ async function getVoucherDisplayMaps() {
   const buildMap = (rows, fields = ["name"]) => {
     const map = new Map();
 
+    const addKey = (key, row) => {
+      if (key === undefined || key === null || String(key).trim() === "") return;
+      const text = String(key).trim();
+      map.set(text, row);
+      if (/^\d+$/.test(text)) map.set(String(Number(text)), row);
+    };
+
     for (const row of rows || []) {
       const keys = [
         row?._id,
@@ -2323,13 +2417,7 @@ async function getVoucherDisplayMaps() {
       ];
 
       for (const key of keys) {
-        if (
-          key !== undefined &&
-          key !== null &&
-          String(key) !== ""
-        ) {
-          map.set(String(key), row);
-        }
+        addKey(key, row);
       }
 
       for (const field of fields) {
@@ -2346,11 +2434,17 @@ async function getVoucherDisplayMaps() {
     return map;
   };
 
+  const resolveMapRow = (map, value) => {
+    const text = String(value ?? "").trim();
+    return map.get(text) || map.get(text.toLowerCase()) || ( /^\d+$/.test(text) ? map.get(String(Number(text))) : null) || {};
+  };
+
   return {
     warehouseMap: buildMap(warehouses),
     accountMap: buildMap(accounts, ["account_name", "name"]),
     farmerMap: buildMap(farmers),
     companyMap: buildMap(companies),
+    resolveMapRow,
   };
 }
 
@@ -2430,6 +2524,7 @@ async function getMongoPaymentRowsForUser(req) {
     warehouseMap,
     accountMap,
     farmerMap,
+    resolveMapRow,
   } = await getVoucherDisplayMaps();
 
   const rows = rawRows
@@ -2464,14 +2559,11 @@ async function getMongoPaymentRowsForUser(req) {
         .includes(String(row.warehouse_id ?? ""));
     })
     .map((row) => {
-      const warehouse =
-        warehouseMap.get(String(row.warehouse_id)) || {};
+      const warehouse = resolveMapRow(warehouseMap, row.warehouse_id);
 
-      const account =
-        accountMap.get(String(row.company_account_id)) || {};
+      const account = resolveMapRow(accountMap, row.company_account_id);
 
-      const farmer =
-        farmerMap.get(String(row.farmer_id)) || {};
+      const farmer = resolveMapRow(farmerMap, row.farmer_id);
 
       return {
         ...row,
@@ -4075,22 +4167,34 @@ router.get("/payment/:id", async (req, res) => {
   }
 
   const id = req.params.id;
-  if (!mongoReady() || !MongoPaymentVoucher) {
+  if (!mongoReady() || (!MongoPaymentVoucher && !PaymentVoucherNative)) {
     return res.status(503).json({
       error: "MongoDB is not connected. Payment vouchers are MongoDB-primary.",
     });
   }
 
   try {
-    const mongoRow = await MongoPaymentVoucher.findOne({ id: Number(id) }).lean();
+    const numericId = Number(id);
+    if (!Number.isFinite(numericId)) {
+      return res.status(400).json({ error: "Invalid payment voucher ID" });
+    }
+
+    const legacyRow = MongoPaymentVoucher
+      ? await MongoPaymentVoucher.findOne({ id: numericId }).lean()
+      : null;
+    const nativeRow = !legacyRow && PaymentVoucherNative
+      ? await PaymentVoucherNative.findOne({ id: numericId }).lean()
+      : null;
+    const mongoRow = legacyRow || nativeRow;
     if (!mongoRow) {
       return res.status(404).json({ error: "Payment voucher not found" });
     }
 
     if (!ensureWarehouseAccess(req, res, mongoRow.warehouse_id)) return;
 
-    const adjustments = MongoPaymentAdjustment
-      ? await MongoPaymentAdjustment.find({ payment_id: Number(id) }).sort({ id: 1 }).lean()
+    const adjustmentModel = legacyRow ? MongoPaymentAdjustment : PaymentAdjustmentNative;
+    const adjustments = adjustmentModel
+      ? await adjustmentModel.find({ payment_id: numericId }).sort({ id: 1 }).lean()
       : [];
 
     const purchaseIds = [
@@ -5462,7 +5566,7 @@ router.get("/journal", async (req, res) => {
     const scopeIds = assignedWarehouseIdsForMongo(req.user);
 
     const rawRows = await mongoose.connection.db
-      .collection("journalvouchers")
+      .collection("wh_journal_vouchers")
       .find({})
       .sort({ "data.date": -1, legacy_id: -1, _id: -1 })
       .toArray();
@@ -5585,7 +5689,7 @@ router.post("/journal", async (req, res) => {
 
     const duplicate =
       await mongoose.connection.db
-        .collection("journalvouchers")
+        .collection("wh_journal_vouchers")
         .findOne({
           $or: [
             {
@@ -5694,10 +5798,18 @@ router.post("/journal", async (req, res) => {
 async function getPurchaseReportRowsForUser(user, options = {}) {
   if (mongoReady()) {
     const filter = { ...mongoPurchaseScope(user) };
-    if (options.farmerId) filter.farmer_id = String(options.farmerId);
-    if (options.warehouseId) filter.warehouse_id = String(options.warehouseId);
-    if (options.companyAccountId) filter.company_account_id = String(options.companyAccountId);
-    if (options.productId) filter.product_id = String(options.productId);
+    addMixedIdFilter(filter, "farmer_id", options.farmerId);
+    addMixedIdFilter(filter, "warehouse_id", options.warehouseId);
+    addMixedIdFilter(filter, "company_account_id", options.companyAccountId);
+    addMixedIdFilter(filter, "product_id", options.productId);
+    addVoucherSearchFilter(filter, options.search, [
+      "voucher_no",
+      "farmer_name",
+      "product_name",
+      "warehouse_name",
+      "company_account_name",
+      "description",
+    ]);
     if (options.fromDate || options.toDate) {
       filter.date = {};
       if (options.fromDate) filter.date.$gte = String(options.fromDate);
@@ -6170,7 +6282,7 @@ router.get("/report/sale-summary", async (req, res) => {
   }
 });
 
-router.get("/report/purchase-summary", (req, res) => {
+router.get("/report/purchase-summary", async (req, res) => {
   ensureTradingIndexes();
   if (!userHasPermission(req.user, "warehouse.trading.report.purchase")) {
     return res.status(403).json({ error: "Permission denied" });
@@ -6182,13 +6294,16 @@ router.get("/report/purchase-summary", (req, res) => {
   const farmerId = String(req.query.farmer_id || "").trim();
   const warehouseId = String(req.query.warehouse_id || "").trim();
   const companyAccountId = String(req.query.company_account_id || "").trim();
+  const search = String(req.query.search || "").trim();
 
   if (mongoReady()) {
-    const query = PurchaseVoucher.find(mongoPurchaseScope(req.user)).sort({ date: -1, createdAt: -1, _id: -1 });
-    if (farmerId) query.where("farmer_id").equals(farmerId);
-    if (warehouseId) query.where("warehouse_id").equals(warehouseId);
-    if (companyAccountId) query.where("company_account_id").equals(companyAccountId);
-    const countPromise = usePaging ? PurchaseVoucher.countDocuments(query.getQuery()).exec() : Promise.resolve(null);
+    const filter = { ...mongoPurchaseScope(req.user) };
+    addMixedIdFilter(filter, "farmer_id", farmerId);
+    addMixedIdFilter(filter, "warehouse_id", warehouseId);
+    addMixedIdFilter(filter, "company_account_id", companyAccountId);
+    await addPurchaseSearchFilter(filter, search);
+    const query = PurchaseVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 });
+    const countPromise = usePaging ? PurchaseVoucher.countDocuments(filter).exec() : Promise.resolve(null);
     if (usePaging) query.skip((page - 1) * pageSize).limit(pageSize);
     const rowsPromise = query.lean().exec();
 
@@ -7040,31 +7155,4 @@ router.delete("/purchase/:id", (req, res) => {
     .catch((err) => res.status(500).json({ error: err.message }));
 });
 
-}
-
 module.exports = router;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
