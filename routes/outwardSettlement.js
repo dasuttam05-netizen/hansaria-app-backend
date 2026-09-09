@@ -538,226 +538,180 @@ ADJUSTMENT DETAILS
 ====================================================
 */
 
-async function getAdjustmentDetails(
-  outwardId
-) {
-  const outward =
-    await findOutward(
-      outwardId
-    );
+async function buildBatchModelMap(Model, values, fields = []) {
+  const rawValues = (Array.isArray(values) ? values : [])
+    .filter((value) => value !== null && value !== undefined && text(value) !== "");
 
-  const numericOutwardId =
-    Number(
-      outward?.legacy_id ??
-        outward?.id ??
-        outward?.sl_no ??
-        outwardId
-    );
+  if (!rawValues.length) return new Map();
 
-  if (
-    !Number.isFinite(
-      numericOutwardId
+  const numericValues = Array.from(
+    new Set(
+      rawValues
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value))
     )
-  ) {
-    return [];
+  );
+
+  const objectIds = Array.from(
+    new Set(
+      rawValues
+        .map((value) => text(value))
+        .filter((value) => mongoose.Types.ObjectId.isValid(value))
+        .map((value) => new mongoose.Types.ObjectId(value).toString())
+    )
+  ).map((value) => new mongoose.Types.ObjectId(value));
+
+  const conditions = [];
+  if (objectIds.length) conditions.push({ _id: { $in: objectIds } });
+  if (numericValues.length) {
+    conditions.push({ legacy_id: { $in: numericValues } });
+    conditions.push({ id: { $in: numericValues } });
+    conditions.push({ sl_no: { $in: numericValues } });
   }
 
-  const rows =
-    await adjustmentCollection()
-      .find({
-        outward_id:
-          numericOutwardId,
-      })
-      .sort({
-        created_at: 1,
-        _id: 1,
-      })
-      .toArray();
+  if (!conditions.length) return new Map();
 
-  const result = [];
+  const projection = { _id: 1 };
+  for (const field of fields) projection[field] = 1;
+  // These identifiers are needed to safely match legacy numeric records.
+  projection.legacy_id = 1;
+  projection.id = 1;
+  projection.sl_no = 1;
 
-  for (const row of rows) {
-    let inward = null;
-    let palti = null;
+  const rows = await Model.find({ $or: conditions }).select(projection).lean();
+  const map = new Map();
 
-    if (
-      row.inward_id !==
-      null &&
-      row.inward_id !==
-      undefined
-    ) {
-      inward =
-        await MongoInward.findOne(
-          buildIdFilter(
-            row.inward_id
-          )
-        ).lean();
-    }
+  const add = (key, row) => {
+    if (key === null || key === undefined || key === "") return;
+    map.set(String(key), row);
+    const n = Number(key);
+    if (Number.isFinite(n)) map.set(String(n), row);
+  };
 
-    if (
-      row.palti_lorry_id !==
-      null &&
-      row.palti_lorry_id !==
-      undefined
-    ) {
-      palti =
-        await paltiCollection().findOne(
-          buildIdFilter(
-            row.palti_lorry_id
-          )
-        );
-    }
-
-    const source =
-      inward || palti;
-
-    let company = null;
-    let account = null;
-    let warehouse = null;
-    let location = null;
-    let product = null;
-
-    if (
-      source?.company_id !=
-      null
-    ) {
-      company =
-        await lookupMaster(
-          MongoCompany,
-          source.company_id,
-          "name"
-        );
-    }
-
-    if (
-      source?.company_account_id !=
-      null
-    ) {
-      account =
-        await lookupMaster(
-          MongoCompanyAccount,
-          source.company_account_id,
-          "account_name"
-        );
-    }
-
-    if (
-      source?.warehouse_id !=
-      null
-    ) {
-      warehouse =
-        await lookupMaster(
-          MongoWarehouse,
-          source.warehouse_id,
-          "name"
-        );
-    }
-
-    if (
-      source?.location_id !=
-      null
-    ) {
-      location =
-        await lookupMaster(
-          MongoLocation,
-          source.location_id,
-          "name"
-        );
-    }
-
-    if (
-      source?.product_id !=
-      null
-    ) {
-      product =
-        await lookupMaster(
-          MongoProduct,
-          source.product_id,
-          "name"
-        );
-    }
-
-    if (
-      !location &&
-      warehouse?.location_id
-    ) {
-      location =
-        await lookupMaster(
-          MongoLocation,
-          warehouse.location_id,
-          "name"
-        );
-    }
-
-    result.push({
-      id:
-        row._id
-          ? String(
-              row._id
-            )
-          : row.id,
-
-      outward_id:
-        numericOutwardId,
-
-      source_type:
-        row.source_type ||
-        "inward",
-
-      settlement_weight:
-        num(
-          row.qty ??
-            row.settlement_weight
-        ),
-
-      adjustment_company_rate:
-        num(
-          row.company_rate ??
-            row.adjustment_company_rate
-        ),
-
-      whatsapp_sent_at:
-        row.whatsapp_sent_at ||
-        null,
-
-      inward_voucher_no:
-        inward?.voucher_no ??
-        palti?.voucher_no ??
-        null,
-
-      lorry_no:
-        inward?.lorry_no ||
-        palti?.new_lorry_no ||
-        palti?.reg_lorry_no ||
-        null,
-
-      inward_date:
-        inward?.date ??
-        palti?.expense_date ??
-        null,
-
-      company_name:
-        company?.name || "",
-
-      company_account_name:
-        account?.account_name ||
-        "",
-
-      warehouse_name:
-        warehouse?.name ||
-        "",
-
-      location_name:
-        location?.name ||
-        "",
-
-      product_name:
-        product?.name ||
-        "",
-    });
+  for (const row of rows || []) {
+    add(row?._id, row);
+    add(row?.legacy_id, row);
+    add(row?.id, row);
+    add(row?.sl_no, row);
   }
 
-  return result;
+  return map;
+}
+
+function getMapValue(map, value) {
+  if (!map || value === null || value === undefined || value === "") return null;
+  return map.get(String(value)) || map.get(String(Number(value))) || null;
+}
+
+async function getAdjustmentDetails(outward, outwardId) {
+  const numericOutwardId = Number(
+    outward?.legacy_id ?? outward?.id ?? outward?.sl_no ?? outwardId
+  );
+
+  if (!Number.isFinite(numericOutwardId)) return [];
+
+  const rows = await adjustmentCollection()
+    .find({ outward_id: numericOutwardId })
+    .sort({ created_at: 1, _id: 1 })
+    .project({
+      _id: 1,
+      id: 1,
+      inward_id: 1,
+      palti_lorry_id: 1,
+      source_type: 1,
+      qty: 1,
+      settlement_weight: 1,
+      company_rate: 1,
+      adjustment_company_rate: 1,
+      whatsapp_sent_at: 1,
+    })
+    .toArray();
+
+  if (!rows.length) return [];
+
+  const inwardIds = rows.map((row) => row.inward_id).filter((value) => value !== null && value !== undefined && text(value) !== "");
+  const paltiIds = rows.map((row) => row.palti_lorry_id).filter((value) => value !== null && value !== undefined && text(value) !== "");
+
+  const inwardMap = await buildBatchModelMap(MongoInward, inwardIds, [
+    "voucher_no", "lorry_no", "date", "expense_date",
+    "company_id", "company_account_id", "warehouse_id", "location_id", "product_id",
+  ]);
+
+  const paltiObjectIds = paltiIds
+    .map((value) => text(value))
+    .filter((value) => mongoose.Types.ObjectId.isValid(value))
+    .map((value) => new mongoose.Types.ObjectId(value));
+  const paltiNumericIds = paltiIds.map(Number).filter(Number.isFinite);
+  const paltiConditions = [];
+  if (paltiObjectIds.length) paltiConditions.push({ _id: { $in: paltiObjectIds } });
+  if (paltiNumericIds.length) {
+    paltiConditions.push({ legacy_id: { $in: paltiNumericIds } });
+    paltiConditions.push({ id: { $in: paltiNumericIds } });
+    paltiConditions.push({ sl_no: { $in: paltiNumericIds } });
+  }
+
+  const paltiRows = paltiConditions.length
+    ? await paltiCollection()
+        .find({ $or: paltiConditions })
+        .project({ _id: 1, id: 1, legacy_id: 1, sl_no: 1, voucher_no: 1, new_lorry_no: 1, reg_lorry_no: 1, expense_date: 1, company_id: 1, company_account_id: 1, warehouse_id: 1, location_id: 1, product_id: 1 })
+        .toArray()
+    : [];
+
+  const actualPaltiMap = new Map();
+  for (const row of paltiRows || []) {
+    for (const key of [row?._id, row?.legacy_id, row?.id, row?.sl_no]) {
+      if (key !== null && key !== undefined && key !== "") {
+        actualPaltiMap.set(String(key), row);
+        const n = Number(key);
+        if (Number.isFinite(n)) actualPaltiMap.set(String(n), row);
+      }
+    }
+  }
+
+  const sources = rows.map((row) => getMapValue(inwardMap, row.inward_id) || getMapValue(actualPaltiMap, row.palti_lorry_id)).filter(Boolean);
+  const masterValues = (field) => sources.map((source) => source?.[field]).filter((value) => value !== null && value !== undefined && text(value) !== "");
+
+  const [companyMap, accountMap, warehouseMap, locationMap, productMap] = await Promise.all([
+    buildBatchModelMap(MongoCompany, masterValues("company_id"), ["name"]),
+    buildBatchModelMap(MongoCompanyAccount, masterValues("company_account_id"), ["account_name"]),
+    buildBatchModelMap(MongoWarehouse, masterValues("warehouse_id"), ["name", "location_id"]),
+    buildBatchModelMap(MongoLocation, masterValues("location_id"), ["name"]),
+    buildBatchModelMap(MongoProduct, masterValues("product_id"), ["name"]),
+  ]);
+
+  // A warehouse may carry the location reference even when the source row does not.
+  const warehouseRows = Array.from(warehouseMap.values());
+  const warehouseLocationIds = warehouseRows.map((warehouse) => warehouse?.location_id).filter((value) => value !== null && value !== undefined && text(value) !== "");
+  const missingWarehouseLocations = await buildBatchModelMap(MongoLocation, warehouseLocationIds, ["name"]);
+
+  return rows.map((row) => {
+    const inward = getMapValue(inwardMap, row.inward_id);
+    const palti = getMapValue(actualPaltiMap, row.palti_lorry_id);
+    const source = inward || palti || {};
+
+    const company = getMapValue(companyMap, source.company_id);
+    const account = getMapValue(accountMap, source.company_account_id);
+    const warehouse = getMapValue(warehouseMap, source.warehouse_id);
+    const location = getMapValue(locationMap, source.location_id) || getMapValue(missingWarehouseLocations, warehouse?.location_id);
+    const product = getMapValue(productMap, source.product_id);
+
+    return {
+      id: row._id ? String(row._id) : row.id,
+      outward_id: numericOutwardId,
+      source_type: row.source_type || "inward",
+      settlement_weight: num(row.qty ?? row.settlement_weight),
+      adjustment_company_rate: num(row.company_rate ?? row.adjustment_company_rate),
+      whatsapp_sent_at: row.whatsapp_sent_at || null,
+      inward_voucher_no: inward?.voucher_no ?? palti?.voucher_no ?? null,
+      lorry_no: inward?.lorry_no || palti?.new_lorry_no || palti?.reg_lorry_no || null,
+      inward_date: inward?.date ?? palti?.expense_date ?? null,
+      company_name: company?.name || "",
+      company_account_name: account?.account_name || "",
+      warehouse_name: warehouse?.name || "",
+      location_name: location?.name || "",
+      product_name: product?.name || "",
+    };
+  });
 }
 
 /*
@@ -766,55 +720,26 @@ UNLOADING DETAILS
 ====================================================
 */
 
-async function getUnloadingDetails(
-  outwardId
-) {
-  const outward =
-    await findOutward(
-      outwardId
-    );
+async function getUnloadingDetails(outward, outwardId) {
+  const numericOutwardId = Number(
+    outward?.legacy_id ?? outward?.id ?? outward?.sl_no ?? outwardId
+  );
 
-  const numericOutwardId =
-    Number(
-      outward?.legacy_id ??
-        outward?.id ??
-        outward?.sl_no ??
-        outwardId
-    );
+  if (!Number.isFinite(numericOutwardId)) return [];
 
-  if (
-    !Number.isFinite(
-      numericOutwardId
-    )
-  ) {
-    return [];
-  }
-
-  const rows =
-    await buyerAdjustmentCollection()
-      .find({
-        outward_id:
-          numericOutwardId,
-
-        consignee_name: {
-          $exists: true,
-          $nin: [
-            null,
-            "",
-          ],
-        },
-
-        rate: {
-          $gt: 0,
-        },
-      })
-      .sort({
-        created_at: -1,
-        _id: -1,
-      })
-      .toArray();
-
-  return rows;
+  return buyerAdjustmentCollection()
+    .find({
+      outward_id: numericOutwardId,
+      consignee_name: { $exists: true, $nin: [null, ""] },
+      rate: { $gt: 0 },
+    })
+    .sort({ created_at: -1, _id: -1 })
+    .project({
+      _id: 1, outward_id: 1, consignee_name: 1, qty: 1, weight: 1,
+      rate: 1, claim: 1, other_deduction: 1, shortage: 1, shortage_amount: 1,
+      unloading_date: 1, status: 1, created_at: 1, updated_at: 1,
+    })
+    .toArray();
 }
 
 /*
@@ -823,255 +748,93 @@ LABOUR EXPENSE
 ====================================================
 */
 
-async function getApprovedLabourExpense(
-  outwardId
-) {
-  const outward =
-    await findOutward(
-      outwardId
-    );
+async function getApprovedLabourExpense(outward, outwardId) {
+  const numericOutwardId = Number(
+    outward?.legacy_id ?? outward?.id ?? outward?.sl_no ?? outwardId
+  );
 
-  const numericOutwardId =
-    Number(
-      outward?.legacy_id ??
-        outward?.id ??
-        outward?.sl_no ??
-        outwardId
-    );
-
-  if (
-    !Number.isFinite(
-      numericOutwardId
-    )
-  ) {
-    return {
-      amount: 0,
-      count: 0,
-      vouchers: [],
-      entries: [],
-    };
+  if (!Number.isFinite(numericOutwardId)) {
+    return { amount: 0, count: 0, vouchers: [], entries: [] };
   }
 
-  let expenses =
-    await expenseCollection()
-      .find({
-        outward_id:
-          numericOutwardId,
-      })
-      .sort({
-        id: 1,
-        _id: 1,
+  let expenses = await expenseCollection()
+    .find({ outward_id: numericOutwardId })
+    .sort({ id: 1, _id: 1 })
+    .project({
+      _id: 1, id: 1, legacy_id: 1, voucher_no: 1, status: 1,
+      total_expense_amount: 1, grand_total: 1, expense_date: 1, date: 1,
+      reg_lorry_no: 1, new_lorry_no: 1,
+    })
+    .toArray();
+
+  const loadEntries = async (rows) => {
+    if (!rows.length) return [];
+
+    const expenseIds = rows
+      .map((expense) => Number(expense.id ?? expense.legacy_id ?? 0))
+      .filter((value) => Number.isFinite(value) && value > 0);
+
+    const itemRows = expenseIds.length
+      ? await expenseItemCollection()
+          .find({ expense_id: { $in: expenseIds } })
+          .project({ expense_id: 1, particular_name: 1, name: 1, amount: 1 })
+          .toArray()
+      : [];
+
+    const labourByExpense = new Map();
+    for (const item of itemRows || []) {
+      const particular = String(item.particular_name || item.name || "").toLowerCase();
+      if (!particular.includes("labour") && !particular.includes("labor")) continue;
+      const id = Number(item.expense_id);
+      labourByExpense.set(id, (labourByExpense.get(id) || 0) + num(item.amount));
+    }
+
+    return rows.flatMap((expense) => {
+      const expenseId = Number(expense.id ?? expense.legacy_id ?? 0);
+      const labourAmount = labourByExpense.get(expenseId) || 0;
+      const fallback = num(expense.total_expense_amount) || num(expense.grand_total);
+      const amount = labourAmount > 0 ? labourAmount : fallback;
+
+      if (amount <= 0) return [];
+      return [{
+        id: expense.id ?? expense.legacy_id ?? String(expense._id),
+        voucher_no: expense.voucher_no || null,
+        amount,
+        status: expense.status || null,
+      }];
+    });
+  };
+
+  let entries = await loadEntries(expenses);
+
+  // Legacy fallback by lorry/date, also batched for expense items.
+  if (!entries.length && outward) {
+    const outwardLorry = text(outward.lorry_no);
+    const outwardDate = outward.date ? new Date(outward.date) : null;
+
+    expenses = await expenseCollection()
+      .find({ $or: [{ reg_lorry_no: outwardLorry }, { new_lorry_no: outwardLorry }] })
+      .project({
+        _id: 1, id: 1, legacy_id: 1, voucher_no: 1, status: 1,
+        total_expense_amount: 1, grand_total: 1, expense_date: 1, date: 1,
       })
       .toArray();
 
-  async function mapExpenses(
-    rows
-  ) {
-    const result = [];
-
-    for (
-      const expense of
-        rows
-    ) {
-      const expenseId =
-        Number(
-          expense.id ??
-            expense.legacy_id ??
-            0
-        );
-
-      let labourAmount =
-        0;
-
-      if (
-        Number.isFinite(
-          expenseId
-        ) &&
-        expenseId > 0
-      ) {
-        const items =
-          await expenseItemCollection()
-            .find({
-              expense_id:
-                expenseId,
-            })
-            .toArray();
-
-        labourAmount =
-          items.reduce(
-            (sum, item) => {
-              const particular =
-                String(
-                  item.particular_name ||
-                    item.name ||
-                    ""
-                ).toLowerCase();
-
-              if (
-                particular.includes(
-                  "labour"
-                ) ||
-                particular.includes(
-                  "labor"
-                )
-              ) {
-                return (
-                  sum +
-                  num(
-                    item.amount
-                  )
-                );
-              }
-
-              return sum;
-            },
-            0
-          );
-      }
-
-      const fallback =
-        num(
-          expense.total_expense_amount
-        ) ||
-        num(
-          expense.grand_total
-        );
-
-      const amount =
-        labourAmount > 0
-          ? labourAmount
-          : fallback;
-
-      if (
-        amount > 0
-      ) {
-        result.push({
-          id:
-            expense.id ??
-            expense.legacy_id ??
-            String(
-              expense._id
-            ),
-
-          voucher_no:
-            expense.voucher_no ||
-            null,
-
-          amount,
-
-          status:
-            expense.status ||
-            null,
-        });
-      }
+    if (outwardDate) {
+      const targetDate = outwardDate.toISOString().slice(0, 10);
+      expenses = expenses.filter((expense) => {
+        const expenseDate = new Date(expense.expense_date || expense.date);
+        return !Number.isNaN(expenseDate.getTime()) && expenseDate.toISOString().slice(0, 10) === targetDate;
+      });
     }
 
-    return result;
-  }
-
-  let entries =
-    await mapExpenses(
-      expenses
-    );
-
-  /*
-   * Legacy fallback by lorry/date,
-   * but still MongoDB only.
-   */
-  if (
-    !entries.length &&
-    outward
-  ) {
-    const outwardLorry =
-      text(
-        outward.lorry_no
-      );
-
-    const outwardDate =
-      outward.date
-        ? new Date(
-            outward.date
-          )
-        : null;
-
-    expenses =
-      await expenseCollection()
-        .find({
-          $or: [
-            {
-              reg_lorry_no:
-                outwardLorry,
-            },
-            {
-              new_lorry_no:
-                outwardLorry,
-            },
-          ],
-        })
-        .toArray();
-
-    if (
-      outwardDate
-    ) {
-      expenses =
-        expenses.filter(
-          (expense) => {
-            const expenseDate =
-              new Date(
-                expense.expense_date ||
-                  expense.date
-              );
-
-            return (
-              !Number.isNaN(
-                expenseDate.getTime()
-              ) &&
-              expenseDate
-                .toISOString()
-                .slice(
-                  0,
-                  10
-                ) ===
-                outwardDate
-                  .toISOString()
-                  .slice(
-                    0,
-                    10
-                  )
-            );
-          }
-        );
-    }
-
-    entries =
-      await mapExpenses(
-        expenses
-      );
+    entries = await loadEntries(expenses);
   }
 
   return {
-    amount:
-      entries.reduce(
-        (sum, item) =>
-          sum +
-          num(
-            item.amount
-          ),
-        0
-      ),
-
-    count:
-      entries.length,
-
-    vouchers:
-      entries
-        .map(
-          (item) =>
-            item.voucher_no ||
-            `EXP-${item.id}`
-        )
-        .filter(Boolean),
-
+    amount: entries.reduce((sum, item) => sum + num(item.amount), 0),
+    count: entries.length,
+    vouchers: entries.map((item) => item.voucher_no || `EXP-${item.id}`).filter(Boolean),
     entries,
   };
 }
@@ -1439,23 +1202,34 @@ router.get(
         unloadingDetails,
         labourExpense,
         meta,
+        bilti,
       ] =
         await Promise.all([
           getAdjustmentDetails(
+            outward,
             numericOutwardId
           ),
 
           getUnloadingDetails(
+            outward,
             numericOutwardId
           ),
 
           getApprovedLabourExpense(
+            outward,
             numericOutwardId
           ),
 
           getOutwardMasterMeta(
             outward
           ),
+
+          getCollection("transportbilti")
+            .findOne(
+              { outward_id: numericOutwardId },
+              { projection: { net_amount: 1, payable_amount: 1 } }
+            )
+            .catch(() => null),
         ]);
 
       const totalSettlementWeight =
@@ -1597,6 +1371,14 @@ router.get(
         labour_expense:
           labourExpense,
 
+        transport_bilti:
+          bilti
+            ? {
+                net_amount: num(bilti.net_amount),
+                payable_amount: num(bilti.payable_amount),
+              }
+            : null,
+
         unloading_details:
           unloadingDetails,
 
@@ -1702,7 +1484,7 @@ router.get(
 
           freight:
             settlement?.freight ??
-            0,
+            (num(bilti?.net_amount) > 0 ? num(bilti.net_amount) : 0),
 
           outward_labour_charges:
             settlement?.outward_labour_charges ??
