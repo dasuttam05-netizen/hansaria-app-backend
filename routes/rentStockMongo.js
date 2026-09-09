@@ -21,9 +21,28 @@ const { calculateShortageQty } = require('../routes/shortageHelper');
 function mongoReady() { return mongoose.connection.readyState === 1; }
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 function dateOnly(v) {
-  if (!v) return '';
-  const s = String(v).slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : '';
+  if (v === undefined || v === null || v === '') return '';
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return '';
+    return v.toISOString().slice(0, 10);
+  }
+  if (typeof v === 'number' && Number.isFinite(v)) {
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10);
+  }
+  if (typeof v === 'object') {
+    if (v.$date) return dateOnly(v.$date);
+    if (v.date) return dateOnly(v.date);
+    if (v.value) return dateOnly(v.value);
+  }
+  const s = String(v).trim();
+  const iso = s.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (iso) return `${iso[1]}-${String(iso[2]).padStart(2, '0')}-${String(iso[3]).padStart(2, '0')}`;
+  const dmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+  if (dmy) return `${dmy[3]}-${String(dmy[2]).padStart(2, '0')}-${String(dmy[1]).padStart(2, '0')}`;
+  const parsed = new Date(s);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  return '';
 }
 function monthEnd(month) {
   const [y,m] = String(month || '').split('-').map(Number);
