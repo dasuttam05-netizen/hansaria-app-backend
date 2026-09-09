@@ -36,6 +36,19 @@ GENERAL HELPERS
 ====================================================
 */
 
+let outwardIndexesStarted = false;
+function ensureOutwardIndexes() {
+  if (outwardIndexesStarted || !mongoReady()) return;
+  outwardIndexesStarted = true;
+  Promise.allSettled([
+    MongoOutward.collection.createIndex({ warehouse_id: 1, product_id: 1, status: 1, created_at: -1 }, { name: "outward_stock_lookup" }),
+    MongoOutward.collection.createIndex({ warehouse_id: 1, created_at: -1, date: -1 }, { name: "outward_warehouse_date" }),
+    MongoInward.collection.createIndex({ warehouse_id: 1, product_id: 1, date: 1 }, { name: "inward_stock_lookup" }),
+    MirrorRow.collection.createIndex({ table: 1, "data.outward_id": 1 }, { name: "adjustment_outward_lookup" }),
+  ]).catch(() => {});
+}
+setImmediate(ensureOutwardIndexes);
+
 function mongoReady() {
   return isMongoMirrorReady();
 }
@@ -796,12 +809,24 @@ async function decorateOutwardDocs(
   docs
 ) {
   const result = [];
+  // Master records repeat across many outward rows. Reuse them within this
+  // request instead of issuing the same Mongo lookups for every row.
+  const masterCache = new Map();
 
   for (
     const doc of docs || []
   ) {
-    const masters =
-      await resolveOutwardMasters({
+    const masterKey = JSON.stringify([
+      doc?.employee_id, doc?.employee_name,
+      doc?.location_id, doc?.location_name,
+      doc?.warehouse_id, doc?.warehouse_name,
+      doc?.product_id, doc?.product_name,
+      doc?.company_id, doc?.company_name,
+      doc?.company_account_id, doc?.company_account_name,
+    ]);
+    let masters = masterCache.get(masterKey);
+    if (!masters) {
+      masters = await resolveOutwardMasters({
         employee_id:
           doc?.employee_id,
 
@@ -838,6 +863,8 @@ async function decorateOutwardDocs(
         company_account_name:
           doc?.company_account_name,
       });
+      masterCache.set(masterKey, masters);
+    }
 
     const names =
       masterNames(
@@ -1106,6 +1133,13 @@ AVAILABLE STOCK
 ====================================================
 */
 
+const availableStockCache = new Map();
+const AVAILABLE_STOCK_CACHE_MS = 1500;
+
+function availableStockCacheKey(warehouseId, productId, outwardId) {
+  return `${normalizeId(warehouseId) || ""}|${normalizeId(productId) || ""}|${normalizeId(outwardId) || ""}`;
+}
+
 async function getAvailableWarehouseStock({
   warehouse_id,
   product_id,
@@ -1156,6 +1190,14 @@ async function getAvailableWarehouseStock({
       reservedStock: 0,
       availableStock: 0,
     };
+  }
+
+  if (!outwardId) {
+    const cacheKey = availableStockCacheKey(warehouse_id, product_id, outwardId);
+    const cached = availableStockCache.get(cacheKey);
+    if (cached && Date.now() - cached.time < AVAILABLE_STOCK_CACHE_MS) {
+      return cached.result;
+    }
   }
 
   /*
@@ -1262,48 +1304,48 @@ async function getAvailableWarehouseStock({
       })
       .lean();
 
-  let reservedStock =
-    0;
+  // One adjustment query for all pending outwards (avoids N+1 queries).
+  const outwardIds = (pendingOutwards || []).flatMap((row) => [row?.legacy_id, row?._id])
+    .filter((value) => value !== undefined && value !== null && value !== "");
 
-  for (
-    const row of
-      pendingOutwards
-  ) {
-    const outwardIdValue =
-      row?.legacy_id ??
-      row?._id;
-
-    const adjustedQty =
-      await getAdjustedQtyForOutward(
-        outwardIdValue
-      );
-
-    const quantity =
-      safeNumber(
-        row?.quantity ??
-          row?.weight
-      );
-
-    reservedStock +=
-      Math.max(
-        quantity -
-          adjustedQty,
-        0
-      );
+  let adjustmentRows = [];
+  if (outwardIds.length && MirrorRow) {
+    const normalizedIds = outwardIds.map(normalizeId).filter(Boolean);
+    try {
+      adjustmentRows = await MirrorRow.find({
+        table: "adjustment",
+        "data.outward_id": { $in: normalizedIds },
+      }).select({ data: 1 }).lean();
+    } catch (err) {
+      console.warn("Fast adjustment lookup failed:", err?.message || err);
+      adjustmentRows = [];
+    }
   }
 
-  return {
+  const adjustedByOutward = new Map();
+  for (const row of adjustmentRows || []) {
+    const id = normalizeId(row?.data?.outward_id);
+    if (!id) continue;
+    adjustedByOutward.set(id, (adjustedByOutward.get(id) || 0) + safeNumber(row?.data?.qty));
+  }
+
+  let reservedStock = 0;
+  for (const row of pendingOutwards || []) {
+    const outwardIdValue = row?.legacy_id ?? row?._id;
+    const adjustedQty = adjustedByOutward.get(normalizeId(outwardIdValue)) || 0;
+    const quantity = safeNumber(row?.quantity ?? row?.weight);
+    reservedStock += Math.max(quantity - adjustedQty, 0);
+  }
+
+  const result = {
     currentStock,
-
     reservedStock,
-
-    availableStock:
-      Math.max(
-        currentStock -
-          reservedStock,
-        0
-      ),
+    availableStock: Math.max(currentStock - reservedStock, 0),
   };
+  if (!outwardId) {
+    availableStockCache.set(availableStockCacheKey(warehouse_id, product_id, outwardId), { time: Date.now(), result });
+  }
+  return result;
 }
 
 async function validateOutwardStock({
