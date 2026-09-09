@@ -84,6 +84,10 @@ async function masterMaps() {
   return { companies:makeMap(companies), accounts:makeMap(accounts), warehouses:makeMap(warehouses), locations:makeMap(locations), products:makeMap(products), employees:makeMap(employees), farmers:makeMap(farmers) };
 }
 function findMaster(map, id, name) { return map.get(String(id || '')) || map.get(`name:${String(name || '').trim().toLowerCase()}`) || null; }
+function masterAddress(map, id, name) {
+  const master = findMaster(map, id, name);
+  return master?.address || master?.warehouse_address || master?.location || master?.full_address || master?.city || master?.district || '';
+}
 function idsFromQuery(v) { return new Set(String(v || '').split(',').map(s=>s.trim()).filter(Boolean)); }
 
 async function buildInwardRows(filters = {}) {
@@ -112,7 +116,22 @@ async function buildInwardRows(filters = {}) {
     const l = findMaster(maps.locations, r.location_id, r.location_name || r.location);
     const p = findMaster(maps.products, r.product_id, r.product_name || r.product);
     const e = findMaster(maps.employees, r.employee_id, r.employee_name);
-    return { ...r, id:String(r.legacy_id ?? r.id ?? r._id), legacy_id:r.legacy_id ?? r.id, company_name:c?.name || r.company_name || r.company || '', account_name:a?.account_name || a?.name || r.company_account_name || '', warehouse_name:w?.name || r.warehouse_name || '', location_name:l?.name || r.location_name || r.location || '', product_name:p?.name || r.product_name || r.product || '', employee_name:e?.name || r.employee_name || '', date:dateOnly(r.date) };
+    return {
+      ...r,
+      id:String(r.legacy_id ?? r.id ?? r._id),
+      legacy_id:r.legacy_id ?? r.id,
+      company_name:c?.name || r.company_name || r.company || '',
+      company_address:c?.address || c?.company_address || c?.location || a?.address || r.company_address || r.address || '',
+      account_name:a?.account_name || a?.name || r.company_account_name || '',
+      warehouse_name:w?.name || r.warehouse_name || '',
+      warehouse_address:masterAddress(maps.warehouses, r.warehouse_id, r.warehouse_name) || r.warehouse_address || '',
+      location_name:l?.name || r.location_name || r.location || '',
+      product_name:p?.name || r.product_name || r.product || '',
+      employee_name:e?.name || r.employee_name || '',
+      date:dateOnly(r.date),
+      inward_date:dateOnly(r.inward_date) || dateOnly(r.date),
+      outward_date:dateOnly(r.outward_date),
+    };
   });
 }
 
@@ -170,106 +189,81 @@ router.get('/party-stock', async (req,res,next) => {
   if (!reportAccess(req,'report.partyStock')) return res.status(403).json({error:'Permission denied'});
   if (!mongoReady()) return next();
   try {
-    const [rows, adjMap, outwards, buyerAdjustments] = await Promise.all([
+    const [rows, adjMap, outwards, buyers, maps] = await Promise.all([
       buildInwardRows(req.query),
       adjustmentMap(),
       OutwardOperational.find({}).lean(),
       BuyerAdjustmentOperational.find({}).lean(),
+      masterMaps(),
     ]);
+    const outById = new Map();
+    outwards.forEach(o => {
+      [o._id, o.id, o.legacy_id, o.outward_id].filter(v => v !== undefined && v !== null && v !== '').forEach(v => outById.set(String(v), o));
+    });
+    const buyerByOutward = new Map();
+    buyers.forEach(b => {
+      if (b.outward_id !== undefined && b.outward_id !== null && b.outward_id !== '') buyerByOutward.set(String(b.outward_id), b);
+    });
 
-    const outwardById = new Map(
-      outwards.map((row) => [String(row.legacy_id ?? row.id ?? row._id), row])
-    );
-    const buyerByOutwardId = new Map(
-      buyerAdjustments.map((row) => [String(row.outward_id ?? ''), row])
-    );
-
-    const summaryMap = new Map();
-    const details = [];
-    const refDate = dateOnly(req.query.to_date) || new Date().toISOString().slice(0,10);
-
+    const summaryMap=new Map(); const details=[]; const refDate=dateOnly(req.query.to_date)||new Date().toISOString().slice(0,10);
     for (const r of rows) {
-      const adjustments = adjMap.get(String(r.legacy_id ?? r.id)) || [];
-      let adjusted = 0;
-      let latestOutwardDate = null;
-
-      for (const a of adjustments) {
+      const adjustments=adjMap.get(String(r.legacy_id ?? r.id))||[];
+      let adjusted=0;
+      let latestOutwardDate=dateOnly(r.outward_date);
+      adjustments.forEach(a => {
         adjusted += num(a.qty);
-        const outwardId = String(a.outward_id ?? '');
-        const outward = outwardById.get(outwardId);
-        const buyer = buyerByOutwardId.get(outwardId);
-        const candidate =
-          dateOnly(buyer?.unloading_date) ||
-          dateOnly(outward?.date) ||
-          dateOnly(a.outward_date) ||
-          dateOnly(a.created_at);
-        if (candidate && (!latestOutwardDate || candidate > latestOutwardDate)) {
-          latestOutwardDate = candidate;
-        }
-      }
-
-      const gross = num(r.weight ?? r.quantity);
-      const shortageQty = Math.max(0, gross - Math.max(availableQty(r.weight, r.date, adjusted, r.shortage_percent, refDate), 0) - adjusted);
-      const netOpeningQty = Math.max(gross - shortageQty, 0);
-      const availableBalanceQty = Math.max(netOpeningQty - adjusted, 0);
-      const detail = {
+        const outwardId=String(a.outward_id || '');
+        const out=outById.get(outwardId);
+        const buyer=buyerByOutward.get(outwardId);
+        const candidate=dateOnly(a.outward_date) || dateOnly(buyer?.outward_date) || dateOnly(buyer?.unloading_date) || dateOnly(out?.outward_date) || dateOnly(out?.date) || dateOnly(a.created_at);
+        if (candidate && (!latestOutwardDate || candidate > latestOutwardDate)) latestOutwardDate=candidate;
+      });
+      const avail=availableQty(r.weight,r.date,adjusted,r.shortage_percent,refDate);
+      const shortageQty=Math.max(0,num(r.weight)-avail-adjusted);
+      const detail={
         ...r,
-        company_address:
-          r.company_address ||
-          r.company_account_address ||
-          r.address ||
-          '',
-        warehouse_address: r.warehouse_address || '',
-        inward_date: r.date || r.inward_date || null,
-        outward_date: latestOutwardDate,
-        date: r.date || r.inward_date || null,
-        gross_qty: Number(gross.toFixed(4)),
-        shortage_qty: Number(shortageQty.toFixed(4)),
-        net_opening_qty: Number(netOpeningQty.toFixed(4)),
-        already_adjusted_qty: Number(adjusted.toFixed(4)),
-        available_balance_qty: Number(availableBalanceQty.toFixed(4)),
+        gross_qty:num(r.weight),
+        shortage_qty:Number(shortageQty.toFixed(4)),
+        net_opening_qty:Number((num(r.weight)-shortageQty).toFixed(4)),
+        already_adjusted_qty:Number(adjusted.toFixed(4)),
+        available_balance_qty:Number(avail.toFixed(4)),
+        date:r.date,
+        inward_date:r.inward_date || r.date || '',
+        outward_date:latestOutwardDate || '',
+        warehouse_address:r.warehouse_address || masterAddress(maps.warehouses,r.warehouse_id,r.warehouse_name) || '',
+        company_address:r.company_address || '',
       };
       details.push(detail);
 
-      const party = r.company_name || r.account_name || 'Unknown Party';
-      const warehouse = r.warehouse_name || 'Unknown';
-      const key = `${party}::${warehouse}`;
-      const existing = summaryMap.get(key);
-      if (!existing) {
-        summaryMap.set(key, {
-          party_name: party,
-          company_address: detail.company_address,
-          warehouse_name: warehouse,
-          gross_qty: gross,
-          shortage_qty: shortageQty,
-          net_opening_qty: netOpeningQty,
-          already_adjusted_qty: adjusted,
-          available_balance_qty: availableBalanceQty,
-        });
-      } else {
-        existing.gross_qty += gross;
-        existing.shortage_qty += shortageQty;
-        existing.net_opening_qty += netOpeningQty;
-        existing.already_adjusted_qty += adjusted;
-        existing.available_balance_qty += availableBalanceQty;
-        if (!existing.company_address && detail.company_address) existing.company_address = detail.company_address;
-      }
+      const party=r.company_name||r.account_name||'Unknown';
+      const warehouse=r.warehouse_name||'Unknown';
+      const key=`${party}::${warehouse}`;
+      if (!summaryMap.has(key)) summaryMap.set(key,{
+        party_name:party,
+        company_address:detail.company_address,
+        warehouse_name:warehouse,
+        gross_qty:0, shortage_qty:0, net_opening_qty:0, already_adjusted_qty:0, available_balance_qty:0,
+      });
+      const sum=summaryMap.get(key);
+      sum.gross_qty += detail.gross_qty;
+      sum.shortage_qty += detail.shortage_qty;
+      sum.net_opening_qty += detail.net_opening_qty;
+      sum.already_adjusted_qty += detail.already_adjusted_qty;
+      sum.available_balance_qty += detail.available_balance_qty;
+      if (!sum.company_address && detail.company_address) sum.company_address=detail.company_address;
     }
-
-    const summary = [...summaryMap.values()].map((row) => ({
-      ...row,
-      gross_qty: Number(row.gross_qty.toFixed(4)),
-      shortage_qty: Number(row.shortage_qty.toFixed(4)),
-      net_opening_qty: Number(row.net_opening_qty.toFixed(4)),
-      already_adjusted_qty: Number(row.already_adjusted_qty.toFixed(4)),
-      available_balance_qty: Number(row.available_balance_qty.toFixed(4)),
+    const summary=Array.from(summaryMap.values()).map(s => ({
+      ...s,
+      gross_qty:Number(s.gross_qty.toFixed(4)),
+      shortage_qty:Number(s.shortage_qty.toFixed(4)),
+      net_opening_qty:Number(s.net_opening_qty.toFixed(4)),
+      already_adjusted_qty:Number(s.already_adjusted_qty.toFixed(4)),
+      available_balance_qty:Number(s.available_balance_qty.toFixed(4)),
+      party:s.party_name,
+      stock:Number(s.available_balance_qty.toFixed(4)),
     }));
-
-    return res.json({ summary, details });
-  } catch(e){
-    console.error('Mongo party stock failed:',e);
-    return next();
-  }
+    res.json({ summary, details });
+  } catch(e){ console.error('Mongo party stock failed:',e); return next(); }
 });
 
 router.get('/warehouse-stock', async (req,res,next) => {
