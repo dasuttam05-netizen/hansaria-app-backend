@@ -170,18 +170,106 @@ router.get('/party-stock', async (req,res,next) => {
   if (!reportAccess(req,'report.partyStock')) return res.status(403).json({error:'Permission denied'});
   if (!mongoReady()) return next();
   try {
-    const [rows, adjMap] = await Promise.all([buildInwardRows(req.query), adjustmentMap()]);
-    const summaryMap=new Map(); const details=[]; const refDate=dateOnly(req.query.to_date)||new Date().toISOString().slice(0,10);
+    const [rows, adjMap, outwards, buyerAdjustments] = await Promise.all([
+      buildInwardRows(req.query),
+      adjustmentMap(),
+      OutwardOperational.find({}).lean(),
+      BuyerAdjustmentOperational.find({}).lean(),
+    ]);
+
+    const outwardById = new Map(
+      outwards.map((row) => [String(row.legacy_id ?? row.id ?? row._id), row])
+    );
+    const buyerByOutwardId = new Map(
+      buyerAdjustments.map((row) => [String(row.outward_id ?? ''), row])
+    );
+
+    const summaryMap = new Map();
+    const details = [];
+    const refDate = dateOnly(req.query.to_date) || new Date().toISOString().slice(0,10);
+
     for (const r of rows) {
-      const adjusted=(adjMap.get(String(r.legacy_id ?? r.id))||[]).reduce((s,a)=>s+num(a.qty),0);
-      const avail=availableQty(r.weight,r.date,adjusted,r.shortage_percent,refDate);
-      const detail={...r,gross_qty:num(r.weight),shortage_qty:Math.max(0,num(r.weight)-avail-adjusted),net_opening_qty:num(r.weight)-Math.max(0,num(r.weight)-avail-adjusted),already_adjusted_qty:adjusted,available_balance_qty:avail,date:r.date};
+      const adjustments = adjMap.get(String(r.legacy_id ?? r.id)) || [];
+      let adjusted = 0;
+      let latestOutwardDate = null;
+
+      for (const a of adjustments) {
+        adjusted += num(a.qty);
+        const outwardId = String(a.outward_id ?? '');
+        const outward = outwardById.get(outwardId);
+        const buyer = buyerByOutwardId.get(outwardId);
+        const candidate =
+          dateOnly(buyer?.unloading_date) ||
+          dateOnly(outward?.date) ||
+          dateOnly(a.outward_date) ||
+          dateOnly(a.created_at);
+        if (candidate && (!latestOutwardDate || candidate > latestOutwardDate)) {
+          latestOutwardDate = candidate;
+        }
+      }
+
+      const gross = num(r.weight ?? r.quantity);
+      const shortageQty = Math.max(0, gross - Math.max(availableQty(r.weight, r.date, adjusted, r.shortage_percent, refDate), 0) - adjusted);
+      const netOpeningQty = Math.max(gross - shortageQty, 0);
+      const availableBalanceQty = Math.max(netOpeningQty - adjusted, 0);
+      const detail = {
+        ...r,
+        company_address:
+          r.company_address ||
+          r.company_account_address ||
+          r.address ||
+          '',
+        warehouse_address: r.warehouse_address || '',
+        inward_date: r.date || r.inward_date || null,
+        outward_date: latestOutwardDate,
+        date: r.date || r.inward_date || null,
+        gross_qty: Number(gross.toFixed(4)),
+        shortage_qty: Number(shortageQty.toFixed(4)),
+        net_opening_qty: Number(netOpeningQty.toFixed(4)),
+        already_adjusted_qty: Number(adjusted.toFixed(4)),
+        available_balance_qty: Number(availableBalanceQty.toFixed(4)),
+      };
       details.push(detail);
-      const key=r.company_name||r.account_name||'Unknown';
-      summaryMap.set(key,(summaryMap.get(key)||0)+avail);
+
+      const party = r.company_name || r.account_name || 'Unknown Party';
+      const warehouse = r.warehouse_name || 'Unknown';
+      const key = `${party}::${warehouse}`;
+      const existing = summaryMap.get(key);
+      if (!existing) {
+        summaryMap.set(key, {
+          party_name: party,
+          company_address: detail.company_address,
+          warehouse_name: warehouse,
+          gross_qty: gross,
+          shortage_qty: shortageQty,
+          net_opening_qty: netOpeningQty,
+          already_adjusted_qty: adjusted,
+          available_balance_qty: availableBalanceQty,
+        });
+      } else {
+        existing.gross_qty += gross;
+        existing.shortage_qty += shortageQty;
+        existing.net_opening_qty += netOpeningQty;
+        existing.already_adjusted_qty += adjusted;
+        existing.available_balance_qty += availableBalanceQty;
+        if (!existing.company_address && detail.company_address) existing.company_address = detail.company_address;
+      }
     }
-    res.json({ summary:Array.from(summaryMap,([party,stock])=>({party,stock:Number(stock.toFixed(4)),party_name:party,available_balance_qty:Number(stock.toFixed(4))})), details });
-  } catch(e){ console.error('Mongo party stock failed:',e); return next(); }
+
+    const summary = [...summaryMap.values()].map((row) => ({
+      ...row,
+      gross_qty: Number(row.gross_qty.toFixed(4)),
+      shortage_qty: Number(row.shortage_qty.toFixed(4)),
+      net_opening_qty: Number(row.net_opening_qty.toFixed(4)),
+      already_adjusted_qty: Number(row.already_adjusted_qty.toFixed(4)),
+      available_balance_qty: Number(row.available_balance_qty.toFixed(4)),
+    }));
+
+    return res.json({ summary, details });
+  } catch(e){
+    console.error('Mongo party stock failed:',e);
+    return next();
+  }
 });
 
 router.get('/warehouse-stock', async (req,res,next) => {
