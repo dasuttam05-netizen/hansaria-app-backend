@@ -1,6 +1,26 @@
 const express = require("express");
 const router = express.Router();
-const db = require("../db");
+// Legacy SQLite is optional in the cloud/MongoDB runtime. Do not crash startup
+// when the old ../db module is not deployed. MongoDB paths remain the primary path.
+let db = null;
+try {
+  db = require("../db");
+} catch (err) {
+  db = {
+    run: (_sql, _params, cb) => {
+      if (typeof _params === "function") cb = _params;
+      if (typeof cb === "function") cb(null);
+    },
+    all: (_sql, _params, cb) => {
+      if (typeof _params === "function") cb = _params;
+      if (typeof cb === "function") cb(null, []);
+    },
+    get: (_sql, _params, cb) => {
+      if (typeof _params === "function") cb = _params;
+      if (typeof cb === "function") cb(null, null);
+    },
+  };
+}
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
 const PDFDocument = require('pdfkit');
