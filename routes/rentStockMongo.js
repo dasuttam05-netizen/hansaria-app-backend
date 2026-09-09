@@ -81,6 +81,25 @@ function legacyValue(row, key) {
 function perm(req, value) { return userHasPermission(req.user, value) || userHasPermission(req.user, 'all'); }
 function reportAccess(req, value) { return perm(req,value) || perm(req,'dashboard.view'); }
 
+
+function nativeCollection(name) {
+  if (!mongoose.connection.db) throw new Error('MongoDB database handle is not available');
+  return mongoose.connection.db.collection(name);
+}
+function idVariants(values) {
+  const raw = queryValues(values);
+  const out = new Set(raw);
+  for (const v of raw) {
+    if (/^-?\d+$/.test(v)) out.add(Number(v));
+    if (mongoose.Types.ObjectId.isValid(v)) out.add(new mongoose.Types.ObjectId(v));
+  }
+  return Array.from(out);
+}
+function flexibleRefs(fieldNames, values) {
+  const variants = idVariants(values);
+  if (!variants.length) return { _id: { $exists: false } };
+  return { $or: fieldNames.map(field => ({ [field]: { $in: variants } })) };
+}
 function queryValues(values) {
   return Array.from(new Set((values || []).map(v => String(v ?? '').trim()).filter(Boolean)));
 }
@@ -205,14 +224,25 @@ async function buildInwardRows(filters = {}) {
 
 async function adjustmentMap(inwardIds = null) {
   const ids = inwardIds ? queryValues(inwardIds) : null;
-  const query = ids && ids.length ? { inward_id: { $in: ids } } : {};
-  const rows = await AdjustmentOperational.find(query).select({
-    _id: 1, id: 1, legacy_id: 1, inward_id: 1, outward_id: 1, qty: 1, outward_date: 1, created_at: 1,
-  }).lean();
+  const query = ids && ids.length
+    ? flexibleRefs(['inward_id','inwardId','source_inward_id','sourceInwardId'], ids)
+    : {};
+  // Use the native collection here because the legacy adjustment documents contain
+  // fields such as inward_id/outward_id/qty that are not declared in the Mongoose schema.
+  const rows = await nativeCollection('adjustments')
+    .find(query)
+    .project({ _id: 1, id: 1, legacy_id: 1, inward_id: 1, inwardId: 1, source_inward_id: 1, sourceInwardId: 1, outward_id: 1, outwardId: 1, qty: 1, quantity: 1, adjusted_qty: 1, adjustment_qty: 1, adjusted_quantity: 1, outward_date: 1, date: 1, created_at: 1, createdAt: 1 })
+    .toArray();
   const m = new Map();
-  rows.forEach(r => { const k = String(r.inward_id ?? ''); if (!m.has(k)) m.set(k, []); m.get(k).push(r); });
+  rows.forEach(r => {
+    const key = String(r.inward_id ?? r.inwardId ?? r.source_inward_id ?? r.sourceInwardId ?? '').trim();
+    if (!key) return;
+    if (!m.has(key)) m.set(key, []);
+    m.get(key).push(r);
+  });
   return m;
 }
+
 
 async function buildRentDetails({ monthList, filters }) {
   const rows = await buildInwardRows(filters);
@@ -267,19 +297,21 @@ router.get('/party-stock', async (req,res,next) => {
     for (const list of adjMap.values()) for (const a of list) if (a.outward_id) outwardIds.push(a.outward_id);
     const uniqueOutwardIds = queryValues(outwardIds);
     const [outwards, buyers] = await Promise.all([
-      uniqueOutwardIds.length ? OutwardOperational.find({ $or: [
-        { id: { $in: uniqueOutwardIds } }, { legacy_id: { $in: uniqueOutwardIds } }, { outward_id: { $in: uniqueOutwardIds } },
-        ...(uniqueOutwardIds.filter(v => mongoose.Types.ObjectId.isValid(v)).length ? [{ _id: { $in: uniqueOutwardIds.filter(v => mongoose.Types.ObjectId.isValid(v)).map(v => new mongoose.Types.ObjectId(v)) } }] : [])
-      ] }).select({ _id: 1, id: 1, legacy_id: 1, outward_id: 1, date: 1, outward_date: 1 }).lean() : [],
-      uniqueOutwardIds.length ? BuyerAdjustmentOperational.find({ outward_id: { $in: uniqueOutwardIds } }).select({ outward_id: 1, unloading_date: 1, outward_date: 1 }).lean() : [],
+      uniqueOutwardIds.length ? nativeCollection('outwards').find(
+        flexibleRefs(['_id','id','legacy_id','sl_no','outward_id'], uniqueOutwardIds)
+      ).project({ _id: 1, id: 1, legacy_id: 1, sl_no: 1, outward_id: 1, date: 1, outward_date: 1, unloading_date: 1 }).toArray() : [],
+      uniqueOutwardIds.length ? nativeCollection('buyeradjustments').find(
+        flexibleRefs(['outward_id','outwardId','outward_no'], uniqueOutwardIds)
+      ).project({ _id: 1, outward_id: 1, outwardId: 1, outward_date: 1, unloading_date: 1, date: 1, qty: 1, quantity: 1, weight: 1 }).toArray() : [],
     ]);
     const outById = new Map();
     outwards.forEach(o => {
-      [o._id, o.id, o.legacy_id, o.outward_id].filter(v => v !== undefined && v !== null && v !== '').forEach(v => outById.set(String(v), o));
+      [o._id, o.id, o.legacy_id, o.sl_no, o.outward_id].filter(v => v !== undefined && v !== null && v !== '').forEach(v => outById.set(String(v), o));
     });
     const buyerByOutward = new Map();
     buyers.forEach(b => {
-      if (b.outward_id !== undefined && b.outward_id !== null && b.outward_id !== '') buyerByOutward.set(String(b.outward_id), b);
+      const ref = b.outward_id ?? b.outwardId ?? b.outward_no;
+      if (ref !== undefined && ref !== null && ref !== '') buyerByOutward.set(String(ref), b);
     });
 
     const summaryMap=new Map(); const details=[]; const refDate=dateOnly(req.query.to_date)||new Date().toISOString().slice(0,10);
@@ -288,11 +320,11 @@ router.get('/party-stock', async (req,res,next) => {
       let adjusted=0;
       let latestOutwardDate=dateOnly(r.outward_date);
       adjustments.forEach(a => {
-        adjusted += num(a.qty);
-        const outwardId=String(a.outward_id || '');
+        adjusted += num(a.adjusted_qty ?? a.adjustment_qty ?? a.adjusted_quantity ?? a.qty ?? a.quantity);
+        const outwardId=String(a.outward_id ?? a.outwardId ?? a.outward_no ?? '');
         const out=outById.get(outwardId);
         const buyer=buyerByOutward.get(outwardId);
-        const candidate=dateOnly(a.outward_date) || dateOnly(buyer?.outward_date) || dateOnly(buyer?.unloading_date) || dateOnly(out?.outward_date) || dateOnly(out?.date) || dateOnly(a.created_at);
+        const candidate=dateOnly(a.outward_date) || dateOnly(a.date) || dateOnly(buyer?.outward_date) || dateOnly(buyer?.unloading_date) || dateOnly(buyer?.date) || dateOnly(out?.outward_date) || dateOnly(out?.unloading_date) || dateOnly(out?.date) || dateOnly(a.created_at) || dateOnly(a.createdAt);
         if (candidate && (!latestOutwardDate || candidate > latestOutwardDate)) latestOutwardDate=candidate;
       });
       const avail=availableQty(r.weight,r.date,adjusted,r.shortage_percent,refDate);
