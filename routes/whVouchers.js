@@ -34,6 +34,18 @@ function ensurePaymentMongoIndexes() {
           { name: "payment_adjustments_purchase_payment" }
         )
       : Promise.resolve(),
+    PaymentVoucherNative
+      ? PaymentVoucherNative.collection.createIndex(
+          { warehouse_id: 1, company_account_id: 1, farmer_id: 1, date: -1, id: -1 },
+          { name: "payment_filter_warehouse_account_farmer_date" }
+        )
+      : Promise.resolve(),
+    mongoose.connection?.db
+      ? mongoose.connection.db.collection("paymentvouchers").createIndex(
+          { "data.warehouse_id": 1, "data.company_account_id": 1, "data.farmer_id": 1, "data.date": -1 },
+          { name: "legacy_payment_filter_warehouse_account_farmer_date" }
+        ).catch(() => null)
+      : Promise.resolve(),
   ]).catch(() => {});
 }
 setImmediate(ensurePaymentMongoIndexes);
@@ -2469,7 +2481,7 @@ function normalizeMongoMirrorVoucher(doc) {
       data?.id,
   };
 }
-async function getMongoPaymentRowsForUser(req) {
+async function getMongoPaymentRowsForUser(req, options = {}) {
   if (!mongoReady()) return [];
 
   const scopeIds = assignedWarehouseIdsForMongo(req.user);
@@ -2478,24 +2490,51 @@ async function getMongoPaymentRowsForUser(req) {
     req.user?.role === "admin" ||
     userHasPermission(req.user, "warehouses.manage");
 
+  const makeMixedClause = (field, value, nestedPrefix = "") => {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    const paths = nestedPrefix ? [`${nestedPrefix}.${field}`, field] : [field];
+    const values = [raw];
+    if (mongoose.Types.ObjectId.isValid(raw)) values.push(new mongoose.Types.ObjectId(raw));
+    return { $or: paths.flatMap((path) => values.map((v) => ({ [path]: v }))) };
+  };
+
+  const scopeIdsText = scopeIds.map((id) => String(id)).filter(Boolean);
+  const scopeIdsObject = scopeIdsText.filter((id) => mongoose.Types.ObjectId.isValid(id)).map((id) => new mongoose.Types.ObjectId(id));
+  if (!isAdmin && !scopeIdsText.length) return [];
+  const buildPaymentFilter = (nestedPrefix = "") => {
+    const clauses = [];
+    if (!isAdmin && scopeIdsText.length) {
+      const paths = nestedPrefix ? [`${nestedPrefix}.warehouse_id`, "warehouse_id"] : ["warehouse_id"];
+      const vals = [...scopeIdsText, ...scopeIdsObject];
+      clauses.push({ $or: paths.map((path) => ({ [path]: { $in: vals } })) });
+    }
+    for (const [field, value] of [["farmer_id", options.farmerId], ["warehouse_id", options.warehouseId], ["company_account_id", options.companyAccountId]]) {
+      const clause = makeMixedClause(field, value, nestedPrefix);
+      if (clause) clauses.push(clause);
+    }
+    if (options.fromDate || options.toDate) {
+      const path = nestedPrefix ? `${nestedPrefix}.date` : "date";
+      const dateFilter = {};
+      if (options.fromDate) dateFilter.$gte = String(options.fromDate);
+      if (options.toDate) dateFilter.$lte = String(options.toDate);
+      clauses.push({ [path]: dateFilter });
+    }
+    return clauses.length ? { $and: clauses } : {};
+  };
+
+  const legacyFilter = buildPaymentFilter("data");
+  const nativeFilter = buildPaymentFilter("");
   const [legacyRows, nativeRows] = await Promise.all([
     mongoose.connection.db
       .collection("paymentvouchers")
-      .find({})
-      .sort({
-        "data.date": -1,
-        legacy_id: -1,
-        _id: -1,
-      })
+      .find(legacyFilter, { projection: { data: 1, legacy_id: 1, _id: 1 } })
+      .sort({ "data.date": -1, legacy_id: -1, _id: -1 })
       .toArray(),
     mongoose.connection.db
       .collection("paymentvouchers_native")
-      .find({})
-      .sort({
-        date: -1,
-        id: -1,
-        _id: -1,
-      })
+      .find(nativeFilter, { projection: { date: 1, id: 1, warehouse_id: 1, farmer_id: 1, company_account_id: 1, amount: 1, voucher_no: 1, reference_id: 1, _id: 1 } })
+      .sort({ date: -1, id: -1, _id: -1 })
       .toArray()
       .catch(() => []),
   ]);
@@ -6395,35 +6434,15 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const detailsOfDeduction = ["1", "true", "yes", "details"].includes(String(req.query.details_of_deduction || "").trim().toLowerCase());
     const purchasePromise = getPurchaseReportRowsForUser(req.user, { farmerId, warehouseId, companyAccountId });
 
-    const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
-    const paymentParams = [...filter.params];
-    let farmerClause = "";
-    let warehouseClause = "";
-    let accountClause = "";
-    if (farmerId) {
-      farmerClause = " AND CAST(p.farmer_id AS TEXT) = CAST(? AS TEXT)";
-      paymentParams.push(farmerId);
-    }
-    if (warehouseId) {
-      warehouseClause = " AND CAST(p.warehouse_id AS TEXT) = CAST(? AS TEXT)";
-      paymentParams.push(warehouseId);
-    }
-    if (companyAccountId) {
-      accountClause = " AND CAST(p.company_account_id AS TEXT) = CAST(? AS TEXT)";
-      paymentParams.push(companyAccountId);
-    }
-
-    const [purchases, allPayments] = await Promise.all([
+    const [purchases, payments] = await Promise.all([
       purchasePromise,
-      getMongoPaymentRowsForUser(req),
+      getMongoPaymentRowsForUser(req, {
+        farmerId,
+        warehouseId,
+        companyAccountId,
+      }),
     ]);
-    const payments = (allPayments || []).filter((row) => {
-      if (farmerId && String(row.farmer_id || "") !== farmerId) return false;
-      if (warehouseId && String(row.warehouse_id || "") !== warehouseId) return false;
-      if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
-      return true;
-    });
-    const paymentIds = payments.map((row) => row.id);
+    const paymentIds = (payments || []).map((row) => row.id);
     const mongoAdjustments = paymentIds.length && MongoPaymentAdjustment
       ? await MongoPaymentAdjustment.find({ payment_id: { $in: paymentIds.map((id) => Number(id)).filter((id) => Number.isFinite(id)) } })
           .sort({ id: 1 })
