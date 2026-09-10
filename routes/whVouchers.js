@@ -4229,9 +4229,12 @@ router.get("/payment/:id", async (req, res) => {
         ],
       }).select("_id id voucher_no date farmer_id farmer_name warehouse_id warehouse_name company_account_id company_account_name product_id product_name total_qty total_quantity net_weight quantity rate gross_amount amount claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable net_amount description bill_no lorry_no deduction_details").lean();
       (mongoRows || []).forEach((purchase) => {
-        purchaseMap.set(String(purchase._id || purchase.id), purchase.voucher_no || "");
+        // Keep the complete purchase row, not only the voucher number.
+        // Payment PDF/WhatsApp needs gross, qty, rate, every deduction,
+        // net payable and bill balance for the bill being adjusted.
+        purchaseMap.set(String(purchase._id || purchase.id), purchase);
         if (purchase.id !== undefined && purchase.id !== null) {
-          purchaseMap.set(String(purchase.id), purchase.voucher_no || "");
+          purchaseMap.set(String(purchase.id), purchase);
         }
       });
     }
