@@ -4426,9 +4426,35 @@ router.get("/payment/:id/pdf", async (req, res) => {
     const paymentAmount = Number(row.amount || 0);
     const totalAdjusted = billRows.reduce((s, br) => s + Number(br.adjusted || 0), 0);
     const balanceOnAccount = Math.max(paymentAmount - totalAdjusted, 0);
-    const farmer = row.farmer_name || row.party_name || "-";
-    const account = row.company_account_name || row.account_name || "-";
-    const warehouse = row.warehouse_name || "-";
+
+    // Payment vouchers often store only *_id values. Resolve the names here so
+    // the PDF never shows blank Farmer / Company / Warehouse fields.
+    const flexibleLookup = async (Model, value, labelFields = []) => {
+      if (!Model || value === undefined || value === null || String(value).trim() === "") return null;
+      const raw = String(value).trim();
+      const or = [];
+      if (mongoose.Types.ObjectId.isValid(raw)) or.push({ _id: raw });
+      if (/^-?\d+(\.\d+)?$/.test(raw)) {
+        const n = Number(raw);
+        if (Number.isFinite(n)) or.push({ id: n });
+      }
+      if (!or.length) or.push({ _id: raw });
+      try {
+        return await Model.findOne({ $or: or }).select(labelFields.join(" ")).lean();
+      } catch (_) {
+        return null;
+      }
+    };
+
+    const [farmerDoc, accountDoc, warehouseDoc] = await Promise.all([
+      flexibleLookup(Farmer, row.farmer_id, ["name", "account_holder_name"]),
+      flexibleLookup(CompanyAccount, row.company_account_id, ["account_name", "name"]),
+      flexibleLookup(Warehouse, row.warehouse_id, ["name"]),
+    ]);
+
+    const farmer = row.farmer_name || row.party_name || farmerDoc?.name || farmerDoc?.account_holder_name || "-";
+    const account = row.company_account_name || row.account_name || accountDoc?.account_name || accountDoc?.name || "-";
+    const warehouse = row.warehouse_name || warehouseDoc?.name || "-";
 
     // Header
     doc.roundedRect(left, 18, W, 42, 7).fill(C.teal);
@@ -4458,7 +4484,8 @@ router.get("/payment/:id/pdf", async (req, res) => {
     // Purchase + deductions in compact single-page blocks.
     section("PURCHASE DETAILS");
     if (billRows.length) {
-      billRows.forEach((br, idx) => {
+      for (let idx = 0; idx < billRows.length; idx++) {
+        const br = billRows[idx];
         const p = br.purchase || {};
         const qty = Number(p.total_qty ?? p.total_quantity ?? p.net_weight ?? p.quantity ?? 0) || 0;
         const rate = Number(p.rate || 0) || 0;
@@ -4478,7 +4505,8 @@ router.get("/payment/:id/pdf", async (req, res) => {
         const net = Math.max(gross - ded + round, 0);
         const paid = Number(br.adjusted || 0) || 0;
         const balance = Math.max(net - paid, 0);
-        const product = p.product_name || p.product || p.item_name || "-";
+        const productDoc = await flexibleLookup(Product, p.product_id, ["name"]);
+        const product = p.product_name || p.product || p.item_name || productDoc?.name || "-";
         const lorry = p.lorry_no || p.lorry_number || p.vehicle_no || "-";
         const pdate = fmtDate(p.date || p.bill_date || p.purchase_date);
 
@@ -4522,7 +4550,7 @@ router.get("/payment/:id/pdf", async (req, res) => {
         doc.text(`Payment: Rs. ${money(paid || paymentAmount)}`,left+205,y+7);
         doc.fillColor(C.dark).text(`Balance: Rs. ${money(balance)}`,right-140,y+7,{width:133,align:"right"});
         y += 29;
-      });
+      }
     } else {
       doc.roundedRect(left,y,W,30,2).fillAndStroke(C.pale,C.line);
       doc.fillColor(C.text).font("Helvetica-Bold").fontSize(8).text(`Purchase Bill: ${reference || "No purchase bill linked"}`,left+8,y+8);
