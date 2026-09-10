@@ -4220,60 +4220,24 @@ router.get("/payment/:id", async (req, res) => {
       ...new Set((adjustments || []).map((row) => String(row.purchase_id || "")).filter(Boolean)),
     ];
 
-    const purchaseSelect = "_id id voucher_no date farmer_id farmer_name warehouse_id warehouse_name company_account_id company_account_name product_id product_name total_qty total_quantity net_weight quantity rate gross_weight tare_weight gross_amount total_amount amount claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable net_amount description bill_no lorry_no moisture less_bags_weight dunki fungus discolour others deduction_details";
     const purchaseMap = new Map();
-    if (PurchaseVoucher) {
-      const or = [];
-      const objectIds = purchaseIds.filter((value) => mongoose.Types.ObjectId.isValid(value));
-      const numericIds = purchaseIds.map((value) => Number(value)).filter(Number.isFinite);
-      if (objectIds.length) or.push({ _id: { $in: objectIds } });
-      if (numericIds.length) or.push({ id: { $in: numericIds } });
-
-      // Some older payments were saved as "Against" with only reference_id
-      // (the purchase voucher number) and without a PaymentAdjustment row.
-      // Resolve that bill as a fallback so old vouchers also print full details.
-      const referenceVoucher = String(mongoRow.reference_id || mongoRow.reference || "").trim();
-      if (referenceVoucher) {
-        or.push({ voucher_no: referenceVoucher });
-        or.push({ bill_no: referenceVoucher });
-        // Older imported bills can contain leading/trailing spaces or casing differences.
-        const escapedReference = referenceVoucher.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        or.push({ voucher_no: { $regex: `^\\s*${escapedReference}\\s*$`, $options: "i" } });
-        or.push({ bill_no: { $regex: `^\\s*${escapedReference}\\s*$`, $options: "i" } });
-      }
-
-      if (or.length) {
-        const mongoRows = await PurchaseVoucher.find({ $or: or }).select(purchaseSelect).lean();
-        (mongoRows || []).forEach((purchase) => {
-          // Keep the complete purchase row, not only the voucher number.
-          purchaseMap.set(String(purchase._id || purchase.id), purchase);
-          if (purchase.id !== undefined && purchase.id !== null) {
-            purchaseMap.set(String(purchase.id), purchase);
-          }
-          if (purchase.voucher_no) purchaseMap.set(`voucher:${String(purchase.voucher_no)}`, purchase);
-        });
-      }
+    if (purchaseIds.length && PurchaseVoucher) {
+      const mongoRows = await PurchaseVoucher.find({
+        $or: [
+          { _id: { $in: purchaseIds.filter((value) => mongoose.Types.ObjectId.isValid(value)) } },
+          { id: { $in: purchaseIds.map((value) => Number(value)).filter(Number.isFinite) } },
+        ],
+      }).select("_id id voucher_no date farmer_id farmer_name warehouse_id warehouse_name company_account_id company_account_name product_id product_name total_qty total_quantity net_weight quantity rate gross_amount amount claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable net_amount description bill_no lorry_no deduction_details").lean();
+      (mongoRows || []).forEach((purchase) => {
+        purchaseMap.set(String(purchase._id || purchase.id), purchase.voucher_no || "");
+        if (purchase.id !== undefined && purchase.id !== null) {
+          purchaseMap.set(String(purchase.id), purchase.voucher_no || "");
+        }
+      });
     }
 
-    // If no adjustment rows exist, use the payment's purchase reference as a
-    // bill-wise adjustment. This is specifically for legacy "Against" payments.
-    let effectiveAdjustments = adjustments || [];
-    const paymentModeText = String(mongoRow.payment_mode || mongoRow.reference_type || "").toLowerCase();
-    if (!effectiveAdjustments.length && (paymentModeText === "against" || paymentModeText.includes("against"))) {
-      const ref = String(mongoRow.reference_id || mongoRow.reference || "").trim();
-      const purchase = ref ? purchaseMap.get(`voucher:${ref}`) : null;
-      if (purchase) {
-        effectiveAdjustments = [{
-          purchase_id: String(purchase._id || purchase.id),
-          voucher_no: purchase.voucher_no || ref,
-          adjusted_amount: Number(mongoRow.amount || 0),
-          __legacy_reference_fallback: true,
-        }];
-      }
-    }
-
-    const normalizedAdjustments = effectiveAdjustments.map((item) => {
-      const purchase = purchaseMap.get(String(item.purchase_id || "")) || purchaseMap.get(`voucher:${String(item.voucher_no || "")}`);
+    const normalizedAdjustments = (adjustments || []).map((item) => {
+      const purchase = purchaseMap.get(String(item.purchase_id || ""));
       const adjustedAmount = Number(item.adjusted_amount || 0);
       if (!purchase) {
         return {
@@ -4288,7 +4252,7 @@ router.get("/payment/:id", async (req, res) => {
       const totalDeduction = purchaseDeductionTotalFromRow(purchase);
       const roundOff = Number(purchase.round_off || 0) || 0;
       const netPayable = purchaseNetPayableFromRow(purchase);
-      const previousAdjustments = effectiveAdjustments
+      const previousAdjustments = (adjustments || [])
         .filter((entry) => String(entry.purchase_id || "") === String(item.purchase_id || ""))
         .reduce((sum, entry) => sum + Number(entry.adjusted_amount || 0), 0);
       return {
