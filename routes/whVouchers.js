@@ -4327,24 +4327,34 @@ router.get("/payment/:id/pdf", async (req, res) => {
     return res.status(403).json({ error: "Permission denied" });
   }
   try {
-    const numericId = Number(req.params.id);
-    if (!Number.isFinite(numericId) || !mongoReady()) {
+    const rawId = String(req.params.id || "").trim();
+    if (!rawId || !mongoReady()) {
+      return res.status(400).json({ error: "Invalid payment voucher ID" });
+    }
+
+    const numericId = Number(rawId);
+    const idQueries = [];
+    if (Number.isFinite(numericId)) idQueries.push({ id: numericId });
+    if (mongoose.Types.ObjectId.isValid(rawId)) idQueries.push({ _id: rawId });
+
+    if (!idQueries.length) {
       return res.status(400).json({ error: "Invalid payment voucher ID" });
     }
 
     const payment = PaymentVoucherNative
-      ? await PaymentVoucherNative.findOne({ id: numericId }).lean()
+      ? await PaymentVoucherNative.findOne({ $or: idQueries }).lean()
       : null;
     const legacyPayment = !payment && MongoPaymentVoucher
-      ? await MongoPaymentVoucher.findOne({ id: numericId }).lean()
+      ? await MongoPaymentVoucher.findOne({ $or: idQueries }).lean()
       : null;
     const row = payment || legacyPayment;
     if (!row) return res.status(404).json({ error: "Payment voucher not found" });
     if (!ensureWarehouseAccess(req, res, row.warehouse_id)) return;
 
     const adjustmentModel = payment ? PaymentAdjustmentNative : MongoPaymentAdjustment;
-    const rawAdjustments = adjustmentModel
-      ? await adjustmentModel.find({ payment_id: numericId }).sort({ id: 1 }).lean()
+    const paymentLookupId = Number(row.id ?? numericId);
+    const rawAdjustments = adjustmentModel && Number.isFinite(paymentLookupId)
+      ? await adjustmentModel.find({ payment_id: paymentLookupId }).sort({ id: 1 }).lean()
       : [];
 
     const refs = [];
