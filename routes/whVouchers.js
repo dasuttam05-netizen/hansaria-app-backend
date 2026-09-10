@@ -4414,41 +4414,141 @@ router.get("/payment/:id/pdf", async (req, res) => {
       return `${parts.join(" ")} Rupees Only`;
     };
 
-    const doc = new PDFDocument({ size: "A4", margin: 30 });
+    // Compact, guaranteed-single-page Payment Voucher PDF.
+    const doc = new PDFDocument({ size: "A4", margin: 24 });
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="payment_voucher_${String(row.voucher_no || numericId).replace(/[/\\?%*:|"<>]/g, "-")}.pdf"`);
+    res.setHeader("Content-Disposition", `attachment; filename="payment_voucher_${String(row.voucher_no || rawId).replace(/[/\\?%*:|"<>]/g, "-")}.pdf"`);
     doc.pipe(res);
-    const pageW=doc.page.width, left=30, right=pageW-30, contentW=right-left;
-    const teal="#087C73", dark="#064F4A", pale="#EEF9F7", line="#C8DDDA", text="#17333A", muted="#60757B";
-    const section=(label)=>{ doc.roundedRect(left, doc.y, contentW, 24, 6).fill(teal); doc.fillColor("#fff").font("Helvetica-Bold").fontSize(12).text(label,left+12,doc.y+7); doc.moveDown(1.6); };
-    const kv=(label,value)=>{ const y=doc.y; doc.roundedRect(left,y,contentW,20,2).fillAndStroke("#fff",line); doc.fillColor(dark).font("Helvetica-Bold").fontSize(8.5).text(label,left+8,y+6,{width:115}); doc.fillColor(text).font("Helvetica").text(String(value ?? "-"),left+128,y+6,{width:contentW-138}); doc.y=y+20; };
-    const ensure=(need=70)=>{ if(doc.y+need>doc.page.height-55){doc.addPage();} };
 
-    doc.rect(0,0,pageW,70).fill(teal); doc.fillColor("#fff").font("Helvetica-Bold").fontSize(21).text("PAYMENT VOUCHER",left,24); doc.font("Helvetica").fontSize(8).text("Warehouse Trading • Payment Against Purchase Bill",left,49); doc.font("Helvetica-Bold").fontSize(9).text(`Voucher No: ${row.voucher_no || "-"}`,right-150,27,{width:150,align:"right"}); doc.font("Helvetica").text(`Payment Date: ${fmtDate(row.date)}`,right-150,48,{width:150,align:"right"}); doc.y=88;
+    const pageW = doc.page.width, pageH = doc.page.height;
+    const left = 24, right = pageW - 24, W = right - left;
+    const C = { teal: "#087C73", dark: "#064F4A", pale: "#EEF9F7", line: "#C9DDDA", text: "#17333A", gold: "#D5A92E", white: "#FFFFFF", muted: "#65787E" };
+    const paymentAmount = Number(row.amount || 0);
+    const totalAdjusted = billRows.reduce((s, br) => s + Number(br.adjusted || 0), 0);
+    const balanceOnAccount = Math.max(paymentAmount - totalAdjusted, 0);
+    const farmer = row.farmer_name || row.party_name || "-";
+    const account = row.company_account_name || row.account_name || "-";
+    const warehouse = row.warehouse_name || "-";
 
+    // Header
+    doc.roundedRect(left, 18, W, 42, 7).fill(C.teal);
+    doc.fillColor(C.white).font("Helvetica-Bold").fontSize(18).text("PAYMENT VOUCHER", left+12, 29);
+    doc.font("Helvetica").fontSize(7.5).text("Warehouse Trading • Payment Against Purchase Bill", left+12, 49);
+    doc.font("Helvetica-Bold").fontSize(9).text(`Voucher No: ${row.voucher_no || "-"}`, right-150, 31, {width:150, align:"right"});
+    doc.font("Helvetica").text(`Payment Date: ${fmtDate(row.date)}`, right-150, 47, {width:150, align:"right"});
+
+    let y = 68;
+    const section = (label) => {
+      doc.roundedRect(left, y, W, 18, 4).fill(C.dark);
+      doc.fillColor(C.white).font("Helvetica-Bold").fontSize(9.2).text(label, left+9, y+5.3);
+      y += 23;
+    };
+    const infoCell = (x, w, label, value) => {
+      doc.roundedRect(x, y, w, 23, 2).fillAndStroke(C.pale, C.line);
+      doc.fillColor(C.dark).font("Helvetica-Bold").fontSize(6.6).text(label.toUpperCase(), x+6, y+5, {width:w-12});
+      doc.fillColor(C.text).font("Helvetica").fontSize(8).text(String(value ?? "-"), x+6, y+12, {width:w-12, lineBreak:false, ellipsis:true});
+    };
+
+    // Party block (compact 2-row grid)
     section("PARTY & PAYMENT DETAILS");
-    kv("Farmer Name", row.farmer_name || row.party_name || "-"); kv("Company / Account", row.company_account_name || row.account_name || "-"); kv("Warehouse", row.warehouse_name || "-"); kv("Payment Mode", row.payment_mode || row.reference_type || "-"); kv("Reference", reference || "-"); kv("Narration", row.description || "-"); doc.moveDown(8);
+    const cw = W/3;
+    infoCell(left, cw-2, "Farmer Name", farmer); infoCell(left+cw+1, cw-2, "Company / Account", account); infoCell(left+2*cw+4, cw-4, "Warehouse", warehouse); y += 27;
+    infoCell(left, cw-2, "Payment Mode", row.payment_mode || row.reference_type || "Against"); infoCell(left+cw+1, cw-2, "Reference", reference || "-"); infoCell(left+2*cw+4, cw-4, "Narration", row.description || "-"); y += 27;
 
-    const totalAmount=Number(row.amount||0); let totalAdjusted=0;
-    if(billRows.length){
-      billRows.forEach((br,idx)=>{
-        const p=br.purchase; ensure(95); section(`PURCHASE DETAILS${billRows.length>1?` • BILL ${idx+1}`:""}`);
-        const qty=Number(p.total_qty ?? p.total_quantity ?? p.net_weight ?? p.quantity ?? 0)||0; const rate=Number(p.rate||0)||0; const gross=Number(p.gross_amount||p.total_amount||p.amount||0)||qty*rate;
-        const deductions=[["Claim",Number(p.claim_amount||p.bags_claim||0)],["Labour",Number(p.labour||0)],["Freight / Transport",Number(p.transport_charge||0)],["Cash Discount (CD)",Number(p.cd_amount||0)],["TDS",Number(p.tds_amount||0)],["Other Deduction",Number(p.other_deduction||0)],["Adjustment",Number(p.adjustment_amount||0)]];
-        const ded=Number(p.total_deduction||deductions.reduce((s,x)=>s+x[1],0)); const round=Number(p.round_off||0); const net=Math.max(gross-ded+round,0); const paid=Number(br.adjusted||0); totalAdjusted+=paid; const bal=Math.max(net-paid,0);
-        kv("Purchase Voucher",p.voucher_no||p.bill_no||"-"); kv("Lorry No",p.lorry_no||p.lorry_number||p.vehicle_no||"-"); kv("Purchase Date",fmtDate(p.date)); kv("Product",p.product_name||p.product||"-"); kv("Net Quantity",`${qty.toFixed(4)} ${p.unit||p.qty_unit||""}`.trim()); kv("Rate",`Rs. ${money(rate)}`); kv("Amount",`Rs. ${money(gross)}`); doc.moveDown(6);
-        ensure(90); doc.fillColor(dark).font("Helvetica-Bold").fontSize(10).text("DEDUCTION DETAILS",left,doc.y); doc.moveDown(5);
-        deductions.forEach(([name,val])=>{ doc.fillColor(text).font("Helvetica").fontSize(8.5).text(name,left+8,doc.y,{width:230}); doc.text(`Rs. ${money(val)}`,right-100,doc.y,{width:92,align:"right"}); doc.moveDown(15); });
-        doc.moveDown(2); doc.strokeColor(line).moveTo(left,doc.y).lineTo(right,doc.y).stroke(); doc.moveDown(7);
-        kv("Total Deduction",`Rs. ${money(ded)}`); kv("Round Off",`Rs. ${money(round)}`); kv("NET PAYABLE",`Rs. ${money(net)}`); doc.moveDown(6); kv("Payment Date",fmtDate(row.date)); kv("Payment Amount",`Rs. ${money(paid || totalAmount)}`); kv("Balance",`Rs. ${money(bal)}`); doc.moveDown(8);
+    // Purchase + deductions in compact single-page blocks.
+    section("PURCHASE DETAILS");
+    if (billRows.length) {
+      billRows.forEach((br, idx) => {
+        const p = br.purchase || {};
+        const qty = Number(p.total_qty ?? p.total_quantity ?? p.net_weight ?? p.quantity ?? 0) || 0;
+        const rate = Number(p.rate || 0) || 0;
+        const gross = Number(p.gross_amount ?? p.total_amount ?? p.amount ?? 0) || qty * rate;
+        const deductions = [
+          ["Claim", Number(p.claim_amount || p.bags_claim || 0)],
+          ["Labour", Number(p.labour || 0)],
+          ["Freight / Transport", Number(p.transport_charge || 0)],
+          ["Cash Discount (CD)", Number(p.cd_amount || 0)],
+          ["TDS", Number(p.tds_amount || 0)],
+          ["Other Deduction", Number(p.other_deduction || 0)],
+          ["Adjustment", Number(p.adjustment_amount || 0)]
+        ];
+        const actualDeductions = deductions.filter(([,v]) => Math.abs(v) > 0.000001);
+        const ded = Number(p.total_deduction || actualDeductions.reduce((s,x)=>s+x[1],0)) || 0;
+        const round = Number(p.round_off || 0) || 0;
+        const net = Math.max(gross - ded + round, 0);
+        const paid = Number(br.adjusted || 0) || 0;
+        const balance = Math.max(net - paid, 0);
+        const product = p.product_name || p.product || p.item_name || "-";
+        const lorry = p.lorry_no || p.lorry_number || p.vehicle_no || "-";
+        const pdate = fmtDate(p.date || p.bill_date || p.purchase_date);
+
+        // Each bill header strip.
+        doc.roundedRect(left, y, W, 16, 3).fill("#DFF2EF");
+        doc.fillColor(C.dark).font("Helvetica-Bold").fontSize(8.3).text(`Bill ${idx+1}: ${p.voucher_no || p.bill_no || reference || "-"}`, left+7, y+5);
+        doc.fillColor(C.text).font("Helvetica").fontSize(7.2).text(`Lorry: ${lorry}`, left+170, y+5);
+        doc.text(`Purchase Date: ${pdate}`, right-175, y+5, {width:168, align:"right"});
+        y += 20;
+
+        // Purchase detail row.
+        const cols = [W*0.23, W*0.19, W*0.18, W*0.20, W*0.20];
+        let x=left;
+        [["PRODUCT",product],["NET QTY",`${qty.toFixed(4)} ${p.unit || p.qty_unit || ""}`.trim()],["RATE",`Rs. ${money(rate)}`],["AMOUNT",`Rs. ${money(gross)}`],["NET PAYABLE",`Rs. ${money(net)}`]].forEach(([lab,val],i)=>{
+          const w=cols[i]-2; doc.roundedRect(x,y,w,28,2).fillAndStroke(i===4?"#E5F7F4":"#FFFFFF",C.line); doc.fillColor(C.muted).font("Helvetica-Bold").fontSize(6.2).text(lab,x+5,y+5); doc.fillColor(i===4?C.teal:C.text).font("Helvetica-Bold").fontSize(i===4?10:7.7).text(String(val),x+5,y+14,{width:w-10,ellipsis:true}); x+=cols[i];
+        });
+        y += 34;
+
+        // Deductions only when there are actual deductions.
+        if (actualDeductions.length) {
+          doc.fillColor(C.dark).font("Helvetica-Bold").fontSize(7.7).text("DEDUCTION DETAILS", left, y); y += 10;
+          const dw = W/actualDeductions.length;
+          let dx = left;
+          actualDeductions.forEach(([name,val],i)=>{
+            const w = i===actualDeductions.length-1 ? right-dx : dw-2;
+            doc.roundedRect(dx,y,w,24,2).fillAndStroke("#FFF9EA", "#E6D9AC");
+            doc.fillColor(C.muted).font("Helvetica-Bold").fontSize(6).text(name.toUpperCase(),dx+4,y+5,{width:w-8,ellipsis:true});
+            doc.fillColor(C.text).font("Helvetica-Bold").fontSize(8).text(`Rs. ${money(val)}`,dx+4,y+13,{width:w-8,ellipsis:true});
+            dx += dw;
+          });
+          y += 30;
+        }
+        doc.roundedRect(left,y,W,22,2).fillAndStroke("#F7FBFA",C.line);
+        doc.fillColor(C.text).font("Helvetica-Bold").fontSize(7.2).text(`Total Deduction: Rs. ${money(ded)}`,left+7,y+7);
+        doc.font("Helvetica").text(`Round Off: Rs. ${money(round)}`,left+190,y+7);
+        doc.font("Helvetica-Bold").fillColor(C.teal).text(`Net Payable: Rs. ${money(net)}`,right-170,y+7,{width:163,align:"right"});
+        y += 27;
+
+        doc.roundedRect(left,y,W,22,2).fillAndStroke("#F1FAFF", "#C7DCE8");
+        doc.fillColor(C.text).font("Helvetica-Bold").fontSize(7.2).text(`Payment Date: ${fmtDate(row.date)}`,left+7,y+7);
+        doc.text(`Payment: Rs. ${money(paid || paymentAmount)}`,left+205,y+7);
+        doc.fillColor(C.dark).text(`Balance: Rs. ${money(balance)}`,right-140,y+7,{width:133,align:"right"});
+        y += 29;
       });
     } else {
-      section("PURCHASE DETAILS"); kv("Purchase Bill",reference||"No purchase bill linked"); kv("Payment Date",fmtDate(row.date)); kv("Payment Amount",`Rs. ${money(totalAmount)}`); doc.moveDown(8);
+      doc.roundedRect(left,y,W,30,2).fillAndStroke(C.pale,C.line);
+      doc.fillColor(C.text).font("Helvetica-Bold").fontSize(8).text(`Purchase Bill: ${reference || "No purchase bill linked"}`,left+8,y+8);
+      doc.text(`Payment: Rs. ${money(paymentAmount)}`,right-150,y+8,{width:142,align:"right"});
+      y += 37;
     }
 
-    ensure(70); doc.roundedRect(left,doc.y,contentW,78,8).fillAndStroke(pale,"#78C8C0"); const fy=doc.y; doc.fillColor(dark).font("Helvetica-Bold").fontSize(10).text("FINAL PAYMENT",left+12,fy+13); doc.fillColor(teal).fontSize(18).text(`Rs. ${money(totalAmount)}`,right-190,fy+11,{width:178,align:"right"}); doc.fillColor(text).font("Helvetica").fontSize(9).text(`Payment Date: ${fmtDate(row.date)}`,left+12,fy+34); doc.font("Helvetica-Bold").text(`Adjusted Against Bills: Rs. ${money(totalAdjusted)}`,left+12,fy+51); doc.text(`Balance / On Account: Rs. ${money(Math.max(totalAmount-totalAdjusted,0))}`,right-250,fy+51,{width:238,align:"right"}); doc.y=fy+91;
-    doc.fillColor(dark).font("Helvetica-Bold").fontSize(9).text("AMOUNT IN WORDS",left,doc.y); doc.fillColor(text).font("Helvetica").fontSize(9).text(amountWords(totalAmount),left,doc.y+14,{width:contentW}); doc.y+=42;
-    doc.strokeColor("#E2B22F").lineWidth(1).moveTo(left+55,doc.y).lineTo(right-55,doc.y).stroke(); doc.fillColor(teal).font("Helvetica-Bold").fontSize(15).text("THANK YOU",left,doc.y+10,{width:contentW,align:"center"}); doc.fillColor(muted).font("Helvetica").fontSize(8).text("Thank you for your continued trust and support.",left,doc.y+29,{width:contentW,align:"center"});
+    // Final summary, compact and single-page.
+    const remaining = Math.max(pageH - y - 62, 0);
+    const summaryH = Math.min(58, Math.max(52, remaining));
+    doc.roundedRect(left,y,W,summaryH,5).fillAndStroke(C.pale,"#78C8C0");
+    doc.fillColor(C.dark).font("Helvetica-Bold").fontSize(9).text("FINAL PAYMENT",left+9,y+9);
+    doc.fillColor(C.teal).fontSize(15).text(`Rs. ${money(paymentAmount)}`,right-175,y+8,{width:166,align:"right"});
+    doc.fillColor(C.text).font("Helvetica").fontSize(7.7).text(`Payment Date: ${fmtDate(row.date)}`,left+9,y+22);
+    doc.font("Helvetica-Bold").text(`Adjusted Against Bills: Rs. ${money(totalAdjusted)}`,left+9,y+35);
+    doc.text(`Balance / On Account: Rs. ${money(balanceOnAccount)}`,right-185,y+35,{width:176,align:"right"});
+    y += summaryH + 6;
+
+    doc.fillColor(C.dark).font("Helvetica-Bold").fontSize(7.5).text("AMOUNT IN WORDS",left,y);
+    doc.fillColor(C.text).font("Helvetica").fontSize(7.7).text(amountWords(paymentAmount),left,y+11,{width:W});
+    y += 29;
+    doc.strokeColor(C.gold).lineWidth(0.9).moveTo(left+70,y).lineTo(right-70,y).stroke();
+    doc.fillColor(C.teal).font("Helvetica-Bold").fontSize(13).text("THANK YOU",left,y+7,{width:W,align:"center"});
+    doc.fillColor(C.muted).font("Helvetica").fontSize(6.8).text("Thank you for your continued trust and support.",left,y+21,{width:W,align:"center"});
+    doc.fillColor(C.muted).fontSize(6.2).text(`Computer generated payment voucher • Voucher ${row.voucher_no || "-"}`,left,pageH-18,{width:W,align:"center"});
+
     doc.end();
   } catch (err) {
     console.error("Payment PDF render failed:", err.stack || err.message || err);
