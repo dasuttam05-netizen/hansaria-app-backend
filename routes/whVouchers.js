@@ -6403,8 +6403,9 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
     const farmerId = String(req.query.farmer_id || "").trim();
     const warehouseId = String(req.query.warehouse_id || "").trim();
     const companyAccountId = String(req.query.company_account_id || "").trim();
+    const search = String(req.query.search || "").trim();
     const detailsOfDeduction = ["1", "true", "yes", "details"].includes(String(req.query.details_of_deduction || "").trim().toLowerCase());
-    const purchasePromise = getPurchaseReportRowsForUser(req.user, { farmerId, warehouseId, companyAccountId });
+    const purchasePromise = getPurchaseReportRowsForUser(req.user, { farmerId, warehouseId, companyAccountId, search });
 
     const filter = assignedWarehouseFilter(req.user, "p.warehouse_id");
     const paymentParams = [...filter.params];
@@ -6432,6 +6433,13 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
       if (farmerId && String(row.farmer_id || "") !== farmerId) return false;
       if (warehouseId && String(row.warehouse_id || "") !== warehouseId) return false;
       if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
+      if (search) {
+        const haystack = [
+          row.voucher_no, row.farmer_name, row.party_name, row.company_account_name,
+          row.warehouse_name, row.reference_id, row.description, row.amount, row.date,
+        ].map((value) => String(value ?? "").toLowerCase()).join(" ");
+        if (!haystack.includes(search.toLowerCase())) return false;
+      }
       return true;
     });
     const paymentIds = payments.map((row) => row.id);
