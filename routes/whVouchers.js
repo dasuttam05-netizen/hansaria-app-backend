@@ -2700,7 +2700,7 @@ async function getMongoPaymentRowsForUser(req) {
     });
   }
 
-  return rows.map((row) => {
+  const finalRows = rows.map((row) => {
     const adjustments =
       byPayment.get(String(row.id)) || [];
 
@@ -2742,6 +2742,12 @@ async function getMongoPaymentRowsForUser(req) {
           .join(", "),
     };
   });
+
+  const search = String(req.query.search || "").trim().toLowerCase();
+  if (!search) return finalRows;
+  return finalRows.filter((row) =>
+    JSON.stringify(row).toLowerCase().includes(search)
+  );
 }
 
 router.get("/next-voucher-no", (req, res) => {
@@ -4926,13 +4932,20 @@ async function getMongoReceiptRowsForUser(req) {
     });
   }
 
-  return rows.map((row) => ({
+  const search = String(req.query.search || "").trim().toLowerCase();
+  const finalRows = rows.map((row) => ({
     ...row,
     adjustments:
       byReceipt.get(
         String(row.id)
       ) || [],
   }));
+
+  // Receipt voucher search is server-side so it searches the complete list.
+  if (!search) return finalRows;
+  return finalRows.filter((row) =>
+    JSON.stringify(row).toLowerCase().includes(search)
+  );
 }
 
 router.get("/receipt", async (req, res) => {
@@ -5598,7 +5611,12 @@ router.get("/journal", async (req, res) => {
         };
       });
 
-    return res.json(rows);
+    const search = String(req.query.search || "").trim().toLowerCase();
+    const filteredRows = !search
+      ? rows
+      : rows.filter((row) => JSON.stringify(row).toLowerCase().includes(search));
+
+    return res.json(filteredRows);
   } catch (err) {
     console.error("Mongo journal list error:", err);
     return res.status(500).json({ error: err.message });
