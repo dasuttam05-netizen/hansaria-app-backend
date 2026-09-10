@@ -4232,8 +4232,15 @@ router.get("/payment/:id", async (req, res) => {
       // Some older payments were saved as "Against" with only reference_id
       // (the purchase voucher number) and without a PaymentAdjustment row.
       // Resolve that bill as a fallback so old vouchers also print full details.
-      const referenceVoucher = String(mongoRow.reference_id || "").trim();
-      if (referenceVoucher) or.push({ voucher_no: referenceVoucher });
+      const referenceVoucher = String(mongoRow.reference_id || mongoRow.reference || "").trim();
+      if (referenceVoucher) {
+        or.push({ voucher_no: referenceVoucher });
+        or.push({ bill_no: referenceVoucher });
+        // Older imported bills can contain leading/trailing spaces or casing differences.
+        const escapedReference = referenceVoucher.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        or.push({ voucher_no: { $regex: `^\\s*${escapedReference}\\s*$`, $options: "i" } });
+        or.push({ bill_no: { $regex: `^\\s*${escapedReference}\\s*$`, $options: "i" } });
+      }
 
       if (or.length) {
         const mongoRows = await PurchaseVoucher.find({ $or: or }).select(purchaseSelect).lean();
