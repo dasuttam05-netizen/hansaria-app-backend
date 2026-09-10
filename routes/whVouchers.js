@@ -110,6 +110,9 @@ function ensureTradingIndexes() {
     PurchaseVoucher.collection.createIndex({ warehouse_id: 1, company_account_id: 1, farmer_id: 1, date: -1, createdAt: -1 }, { name: "trading_purchase_filters_date" }),
     SaleVoucher.collection.createIndex({ date: -1, createdAt: -1, _id: -1 }, { name: "trading_sale_date_desc" }),
     SaleVoucher.collection.createIndex({ warehouse_id: 1, company_account_id: 1, farmer_id: 1, date: -1, createdAt: -1 }, { name: "trading_sale_filters_date" }),
+    PaymentVoucherNative?.collection?.createIndex?.({ warehouse_id: 1, farmer_id: 1, company_account_id: 1, date: -1 }, { name: "trading_payment_filters_date" }) || Promise.resolve(),
+    PaymentAdjustmentNative?.collection?.createIndex?.({ payment_id: 1, purchase_id: 1 }, { name: "trading_payment_adjustment_payment_purchase" }) || Promise.resolve(),
+    MongoPaymentAdjustment?.collection?.createIndex?.({ payment_id: 1, purchase_id: 1 }, { name: "trading_payment_adjustment_mongo_payment_purchase" }) || Promise.resolve(),
   ]).catch(() => {});
 }
 
@@ -2460,7 +2463,7 @@ function normalizeMongoMirrorVoucher(doc) {
       data?.id,
   };
 }
-async function getMongoPaymentRowsForUser(req) {
+async function getMongoPaymentRowsForUser(req, options = {}) {
   if (!mongoReady()) return [];
 
   const scopeIds = assignedWarehouseIdsForMongo(req.user);
@@ -2469,24 +2472,41 @@ async function getMongoPaymentRowsForUser(req) {
     req.user?.role === "admin" ||
     userHasPermission(req.user, "warehouses.manage");
 
+  const farmerId = String(options.farmerId || "").trim();
+  const warehouseId = String(options.warehouseId || "").trim();
+  const companyAccountId = String(options.companyAccountId || "").trim();
+  const paymentSearch = String(options.search || "").trim();
+  const makeFilter = (legacy = false) => {
+    const filter = {};
+    const field = (name) => legacy ? `data.${name}` : name;
+    if (warehouseId) filter[field("warehouse_id")] = warehouseId;
+    if (farmerId) filter[field("farmer_id")] = farmerId;
+    if (companyAccountId) filter[field("company_account_id")] = companyAccountId;
+    if (paymentSearch) {
+      const safe = paymentSearch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const rx = new RegExp(safe, "i");
+      const fields = legacy
+        ? ["data.voucher_no", "data.farmer_name", "data.party_name", "data.reference_id", "data.description", "data.warehouse_name", "data.company_account_name"]
+        : ["voucher_no", "farmer_name", "party_name", "reference_id", "description", "warehouse_name", "company_account_name"];
+      filter.$or = fields.map((field) => ({ [field]: rx }));
+    }
+    return filter;
+  };
+  const projection = {
+    id: 1, legacy_id: 1, _id: 1, data: 1, date: 1, voucher_no: 1, warehouse_id: 1, warehouse_name: 1,
+    farmer_id: 1, farmer_name: 1, party_name: 1, company_account_id: 1, company_account_name: 1, account_name: 1,
+    amount: 1, reference_type: 1, reference_id: 1, payment_mode: 1, description: 1
+  };
   const [legacyRows, nativeRows] = await Promise.all([
     mongoose.connection.db
       .collection("paymentvouchers")
-      .find({})
-      .sort({
-        "data.date": -1,
-        legacy_id: -1,
-        _id: -1,
-      })
+      .find(makeFilter(true), { projection })
+      .sort({ "data.date": -1, legacy_id: -1, _id: -1 })
       .toArray(),
     mongoose.connection.db
       .collection("paymentvouchers_native")
-      .find({})
-      .sort({
-        date: -1,
-        id: -1,
-        _id: -1,
-      })
+      .find(makeFilter(false), { projection })
+      .sort({ date: -1, id: -1, _id: -1 })
       .toArray()
       .catch(() => []),
   ]);
@@ -4207,7 +4227,7 @@ router.get("/payment/:id", async (req, res) => {
           { _id: { $in: purchaseIds.filter((value) => mongoose.Types.ObjectId.isValid(value)) } },
           { id: { $in: purchaseIds.map((value) => Number(value)).filter(Number.isFinite) } },
         ],
-      }).select("_id id voucher_no").lean();
+      }).select("_id id voucher_no date farmer_id farmer_name warehouse_id warehouse_name company_account_id company_account_name product_id product_name total_qty total_quantity net_weight quantity rate gross_amount amount claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable net_amount description bill_no lorry_no deduction_details").lean();
       (mongoRows || []).forEach((purchase) => {
         purchaseMap.set(String(purchase._id || purchase.id), purchase.voucher_no || "");
         if (purchase.id !== undefined && purchase.id !== null) {
@@ -4216,11 +4236,42 @@ router.get("/payment/:id", async (req, res) => {
       });
     }
 
-    const normalizedAdjustments = (adjustments || []).map((item) => ({
-      purchase_id: String(item.purchase_id || ""),
-      voucher_no: item.voucher_no || purchaseMap.get(String(item.purchase_id || "")) || "",
-      adjusted_amount: Number(item.adjusted_amount || 0),
-    }));
+    const normalizedAdjustments = (adjustments || []).map((item) => {
+      const purchase = purchaseMap.get(String(item.purchase_id || ""));
+      const adjustedAmount = Number(item.adjusted_amount || 0);
+      if (!purchase) {
+        return {
+          purchase_id: String(item.purchase_id || ""),
+          voucher_no: item.voucher_no || "",
+          adjusted_amount: adjustedAmount,
+          purchase_details: null,
+          balance_after_adjustment: null,
+        };
+      }
+      const grossAmount = purchaseGrossAmountFromRow(purchase);
+      const totalDeduction = purchaseDeductionTotalFromRow(purchase);
+      const roundOff = Number(purchase.round_off || 0) || 0;
+      const netPayable = purchaseNetPayableFromRow(purchase);
+      const previousAdjustments = (adjustments || [])
+        .filter((entry) => String(entry.purchase_id || "") === String(item.purchase_id || ""))
+        .reduce((sum, entry) => sum + Number(entry.adjusted_amount || 0), 0);
+      return {
+        purchase_id: String(item.purchase_id || ""),
+        voucher_no: item.voucher_no || purchase.voucher_no || purchaseMap.get(String(item.purchase_id || "")) || "",
+        adjusted_amount: adjustedAmount,
+        purchase_details: {
+          ...purchase,
+          gross_amount_calculated: grossAmount,
+          total_deduction_calculated: totalDeduction,
+          round_off: roundOff,
+          net_payable_calculated: netPayable,
+          deduction_details: Array.isArray(purchase.deduction_details) && purchase.deduction_details.length
+            ? purchase.deduction_details
+            : buildPurchaseDeductionDetails(purchase),
+        },
+        balance_after_adjustment: Number((netPayable - previousAdjustments).toFixed(2)),
+      };
+    });
 
     return res.json({
       ...mongoRow,
@@ -6427,7 +6478,7 @@ router.get("/report/purchase-party-ledger", async (req, res) => {
 
     const [purchases, allPayments] = await Promise.all([
       purchasePromise,
-      getMongoPaymentRowsForUser(req),
+      getMongoPaymentRowsForUser(req, { farmerId, warehouseId, companyAccountId, search }),
     ]);
     const payments = (allPayments || []).filter((row) => {
       if (farmerId && String(row.farmer_id || "") !== farmerId) return false;
