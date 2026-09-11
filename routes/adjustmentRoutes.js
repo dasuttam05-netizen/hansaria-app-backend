@@ -772,42 +772,6 @@ router.get(
       if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
-      } else if (locationId) {
-        // Palti Lorry rows are stored against warehouse_id. The Adjustment Entry
-        // uses Location, so resolve the selected Location to all its warehouses.
-        let warehouseRows = [];
-        try {
-          const rawLocationId = String(locationId).trim();
-          const locationFilter = mongoose.isValidObjectId(rawLocationId)
-            ? { location_id: new mongoose.Types.ObjectId(rawLocationId) }
-            : { location_id: rawLocationId };
-          warehouseRows = await MongoWarehouse.find(locationFilter)
-            .select({ _id: 1, legacy_id: 1, id: 1 })
-            .lean();
-        } catch (locationErr) {
-          console.error("[adjustment parties] location -> warehouse lookup failed:", locationErr);
-          warehouseRows = [];
-        }
-
-        const warehouseIds = Array.from(new Set(
-          (warehouseRows || [])
-            .flatMap((row) => [
-              row?.legacy_id != null ? String(row.legacy_id) : "",
-              row?.id != null ? String(row.id) : "",
-              row?._id != null ? String(row._id) : "",
-            ])
-            .map((id) => String(id || "").trim())
-            .filter(Boolean)
-        ));
-
-        if (warehouseIds.length) {
-          const warehouseConditions = warehouseIds
-            .map((id) => buildFlexibleFieldFilter("warehouse_id", id))
-            .filter(Boolean);
-          if (warehouseConditions.length) paltiAnd.push({ $or: warehouseConditions });
-        } else {
-          paltiAnd.push({ warehouse_id: { $in: [] } });
-        }
       }
 
       if (productId) {
