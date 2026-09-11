@@ -6,6 +6,7 @@ const {
   mongoose,
   isMongoMirrorReady,
   Warehouse,
+  Location,
   Employee,
   Product,
   Company,
@@ -46,6 +47,46 @@ function rawCollection() {
   return mongoose.connection.db.collection(
     "paltilorryentries"
   );
+}
+
+async function migrateLegacyPaltiLocations() {
+  const palti = rawCollection();
+  const legacyRows = await palti.find({
+    warehouse_id: { $exists: true, $ne: null },
+    $or: [
+      { location_id: { $exists: false } },
+      { location_id: null },
+      { location_id: "" },
+    ],
+  }).toArray();
+
+  if (!legacyRows.length) return;
+
+  const warehouses = await Warehouse.find({}).select({ _id: 1, id: 1, legacy_id: 1, location_id: 1 }).lean();
+  const map = new Map();
+  for (const warehouse of warehouses || []) {
+    const location = normalizeId(warehouse?.location_id);
+    if (!location) continue;
+    for (const alias of [warehouse?._id, warehouse?.id, warehouse?.legacy_id]) {
+      if (alias != null && normalizeId(alias)) map.set(normalizeId(alias), location);
+    }
+  }
+
+  const ops = [];
+  for (const row of legacyRows) {
+    const location = map.get(normalizeId(row?.warehouse_id));
+    if (!location) continue;
+    ops.push({
+      updateOne: {
+        filter: { _id: row._id },
+        update: { $set: { location_id: location, updated_at: new Date() }, $unset: { warehouse_id: "" } },
+      },
+    });
+  }
+  if (ops.length) {
+    await palti.bulkWrite(ops, { ordered: false });
+    console.log(`[palti migration] migrated ${ops.length} legacy rows to location_id`);
+  }
 }
 
 function normalizeId(value) {
@@ -305,6 +346,7 @@ async function decorateRows(
 
   const [
     warehouses,
+    locations,
     employees,
     products,
     companies,
@@ -312,6 +354,9 @@ async function decorateRows(
   ] =
     await Promise.all([
       Warehouse.find({})
+        .lean(),
+
+      Location.find({})
         .lean(),
 
       Employee.find({})
@@ -330,6 +375,11 @@ async function decorateRows(
   const warehouseMap =
     mapById(
       warehouses
+    );
+
+  const locationMap =
+    mapById(
+      locations
     );
 
   const employeeMap =
@@ -358,6 +408,13 @@ async function decorateRows(
         warehouseMap.get(
           normalizeId(
             row.warehouse_id
+          )
+        ) || {};
+
+      const location =
+        locationMap.get(
+          normalizeId(
+            row.location_id
           )
         ) || {};
 
@@ -417,9 +474,15 @@ async function decorateRows(
               )
             : null,
 
+        // Palti Lorry is Location based. Keep legacy warehouse_name only for old records.
         warehouse_name:
           row.warehouse_name ||
           warehouse.name ||
+          "",
+
+        location_name:
+          row.location_name ||
+          location.name ||
           "",
 
         employee_name:
@@ -481,6 +544,8 @@ router.get(
         return;
       }
 
+      await migrateLegacyPaltiLocations();
+
       const [
         posted,
         expenses,
@@ -523,6 +588,7 @@ router.get(
       const filteredPosted =
         posted.filter(
           (row) =>
+            !row.warehouse_id ||
             canSeeWarehouse(
               req.user,
               row.warehouse_id
@@ -532,6 +598,7 @@ router.get(
       const filteredExpenses =
         expenses.filter(
           (row) =>
+            !row.warehouse_id ||
             canSeeWarehouse(
               req.user,
               row.warehouse_id
