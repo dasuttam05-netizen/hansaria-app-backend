@@ -773,16 +773,14 @@ router.get(
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
       } else if (locationId) {
-        // Palti Lorry rows are stored against warehouse_id.
-        // Adjustment Entry selects Location, so resolve that location to all
-        // warehouses first and then filter Palti rows by those warehouse ids.
+        // Palti Lorry rows are stored against warehouse_id. The Adjustment Entry
+        // uses Location, so resolve the selected Location to all its warehouses.
         let warehouseRows = [];
         try {
           const rawLocationId = String(locationId).trim();
-          const locationFilter = mongoose.Types.ObjectId.isValid(rawLocationId)
+          const locationFilter = mongoose.isValidObjectId(rawLocationId)
             ? { location_id: new mongoose.Types.ObjectId(rawLocationId) }
             : { location_id: rawLocationId };
-
           warehouseRows = await MongoWarehouse.find(locationFilter)
             .select({ _id: 1, legacy_id: 1, id: 1 })
             .lean();
@@ -806,9 +804,7 @@ router.get(
           const warehouseConditions = warehouseIds
             .map((id) => buildFlexibleFieldFilter("warehouse_id", id))
             .filter(Boolean);
-          if (warehouseConditions.length) {
-            paltiAnd.push({ $or: warehouseConditions });
-          }
+          if (warehouseConditions.length) paltiAnd.push({ $or: warehouseConditions });
         } else {
           paltiAnd.push({ warehouse_id: { $in: [] } });
         }
