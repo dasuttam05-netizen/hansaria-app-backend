@@ -147,41 +147,22 @@ router.get("/palti-lorry-adjustment", authorizeReport("report.paltiLorryAdjustme
     }
 
     const db = mongoose.connection.db;
-    const adjustments = await db.collection("adjustments").find({
-      source_type: "palti_lorry",
-    }).sort({ created_at: 1, _id: 1 }).toArray();
+    const from = req.query.from_date ? new Date(`${req.query.from_date}T00:00:00`) : null;
+    const to = req.query.to_date ? new Date(`${req.query.to_date}T23:59:59.999`) : null;
+    const companyFilter = String(req.query.company_id || "").trim();
+    const warehouseFilter = String(req.query.warehouse_id || "").trim();
 
-    if (!adjustments.length) {
-      return res.json({
-        summary: {
-          total_palti_entries: 0,
-          total_palti_balance: 0,
-          total_adjusted_qty: 0,
-          total_available_balance: 0,
-          total_adjustment_rows: 0,
-          total_adjusted_dispatched: 0,
-        },
-        details: [],
-      });
-    }
+    // Load Palti entries themselves, not only adjustment rows. This report must
+    // still show Palti balance even when a Palti entry has not been adjusted yet.
+    const paltiRows = await db.collection("paltilorryentries").find({}).sort({ expense_date: 1, _id: 1 }).toArray();
+    const adjustments = await db.collection("adjustments")
+      .find({ source_type: "palti_lorry" })
+      .sort({ created_at: 1, _id: 1 })
+      .toArray();
 
-    const paltiIds = Array.from(new Set(
-      adjustments.map((row) => String(row?.palti_lorry_id ?? "").trim()).filter(Boolean)
-    ));
     const outwardIds = Array.from(new Set(
       adjustments.map((row) => String(row?.outward_id ?? "").trim()).filter(Boolean)
     ));
-
-    const paltiConditions = paltiIds.flatMap((value) => {
-      const conditions = [{ id: value }, { legacy_id: value }, { sl_no: value }];
-      if (mongoose.Types.ObjectId.isValid(value)) conditions.push({ _id: new mongoose.Types.ObjectId(value) });
-      const n = Number(value);
-      if (Number.isFinite(n)) {
-        conditions.push({ id: n }, { legacy_id: n }, { sl_no: n });
-      }
-      return conditions;
-    });
-
     const outwardConditions = outwardIds.flatMap((value) => {
       const conditions = [{ id: value }, { legacy_id: value }, { sl_no: value }];
       if (mongoose.Types.ObjectId.isValid(value)) conditions.push({ _id: new mongoose.Types.ObjectId(value) });
@@ -190,9 +171,8 @@ router.get("/palti-lorry-adjustment", authorizeReport("report.paltiLorryAdjustme
       return conditions;
     });
 
-    const [paltiRows, outwardRows, warehouses, products, companies, consignees] = await Promise.all([
-      db.collection("paltilorryentries").find(paltiConditions.length ? { $or: paltiConditions } : {}).toArray(),
-      Outward.find(outwardConditions.length ? { $or: outwardConditions } : {}).lean(),
+    const [outwardRows, warehouses, products, companies, consignees] = await Promise.all([
+      outwardConditions.length ? Outward.find({ $or: outwardConditions }).lean() : [],
       Warehouse.find({}).lean(),
       Product.find({}).lean(),
       Company.find({}).lean(),
@@ -206,48 +186,43 @@ router.get("/palti-lorry-adjustment", authorizeReport("report.paltiLorryAdjustme
     const companyMap = buildReportMasterMap(companies);
     const consigneeMap = buildReportMasterMap(consignees);
 
-    const from = req.query.from_date ? new Date(`${req.query.from_date}T00:00:00`) : null;
-    const to = req.query.to_date ? new Date(`${req.query.to_date}T23:59:59.999`) : null;
-    const companyFilter = String(req.query.company_id || "").trim();
-    const warehouseFilter = String(req.query.warehouse_id || "").trim();
-
-    const adjustedByPalti = new Map();
+    const adjustmentsByPalti = new Map();
     for (const row of adjustments) {
       const key = String(row?.palti_lorry_id ?? "").trim();
       if (!key) continue;
-      adjustedByPalti.set(key, (adjustedByPalti.get(key) || 0) + Number(row?.qty || 0));
+      if (!adjustmentsByPalti.has(key)) adjustmentsByPalti.set(key, []);
+      adjustmentsByPalti.get(key).push(row);
     }
 
-    const details = [];
-    for (const adjustment of adjustments) {
-      const paltiKey = String(adjustment?.palti_lorry_id ?? "").trim();
-      const palti = paltiMap.get(paltiKey);
-      if (!palti) continue;
+    const reportRows = [];
+    const includedPaltiKeys = new Set();
 
+    for (const palti of paltiRows) {
       const paltiDate = palti.expense_date || palti.date || null;
       const paltiDateObj = paltiDate ? new Date(paltiDate) : null;
       if (from && (!paltiDateObj || paltiDateObj < from)) continue;
       if (to && (!paltiDateObj || paltiDateObj > to)) continue;
 
-      const companyId = String(palti.company_id ?? adjustment.company_id ?? "").trim();
+      const companyId = String(palti.company_id ?? "").trim();
       const warehouseId = String(palti.warehouse_id ?? "").trim();
       if (companyFilter && !reportIdAliases({ id: companyId }).includes(companyFilter)) continue;
       if (warehouseFilter && !reportIdAliases({ id: warehouseId }).includes(warehouseFilter)) continue;
+
+      const paltiKey = String(palti.legacy_id ?? palti.id ?? palti.sl_no ?? palti._id ?? "").trim();
+      if (!paltiKey) continue;
+      includedPaltiKeys.add(paltiKey);
 
       const company = companyMap.get(companyId) || {};
       const warehouse = warehouseMap.get(warehouseId) || {};
       const product = productMap.get(String(palti.product_id ?? "").trim()) || {};
       const regFromConsignee = consigneeMap.get(String(palti.reg_from_consignee_id ?? "").trim()) || {};
       const regFromCompany = companyMap.get(String(palti.reg_from_company_id ?? "").trim()) || {};
-      const outward = outwardMap.get(String(adjustment.outward_id ?? "").trim()) || {};
-
-      const totalAdjusted = Number((adjustedByPalti.get(paltiKey) || 0).toFixed(4));
       const paltiBalance = Number(reportPaltiQty(palti).toFixed(4));
+      const paltiAdjustments = adjustmentsByPalti.get(paltiKey) || [];
+      const totalAdjusted = Number(paltiAdjustments.reduce((sum, row) => sum + Number(row?.qty || 0), 0).toFixed(4));
       const availableBalance = Number(Math.max(paltiBalance - totalAdjusted, 0).toFixed(4));
-      const adjustedQty = Number(Number(adjustment.qty || 0).toFixed(4));
 
-      details.push({
-        adjustment_id: adjustment?._id ? String(adjustment._id) : null,
+      const base = {
         palti_id: palti.legacy_id ?? palti.id ?? palti.sl_no ?? (palti._id ? String(palti._id) : null),
         palti_voucher_no: palti.voucher_no || null,
         palti_date: paltiDate,
@@ -262,28 +237,49 @@ router.get("/palti-lorry-adjustment", authorizeReport("report.paltiLorryAdjustme
         palti_balance: paltiBalance,
         total_adjusted_qty: totalAdjusted,
         available_balance: availableBalance,
-        outward_voucher_no: outward.outward_no || outward.outward_voucher_no || outward.voucher_no || outward.inv_no || "-",
-        outward_date: outward.date || null,
-        outward_party_name: outward.company_name || outward.buyer_name || outward.buyer || "-",
-        outward_lorry_no: outward.lorry_no || outward.reg_lorry_no || outward.new_lorry_no || "-",
-        adjusted_qty: adjustedQty,
-        adjusted_at: adjustment.created_at || adjustment.updated_at || null,
-      });
+      };
+
+      if (!paltiAdjustments.length) {
+        reportRows.push({
+          ...base,
+          outward_voucher_no: "-",
+          outward_date: null,
+          outward_party_name: "-",
+          outward_lorry_no: "-",
+          adjusted_qty: 0,
+          adjusted_at: null,
+        });
+        continue;
+      }
+
+      for (const adjustment of paltiAdjustments) {
+        const outward = outwardMap.get(String(adjustment.outward_id ?? "").trim()) || {};
+        reportRows.push({
+          ...base,
+          adjustment_id: adjustment?._id ? String(adjustment._id) : null,
+          outward_voucher_no: outward.outward_no || outward.outward_voucher_no || outward.voucher_no || outward.inv_no || "-",
+          outward_date: outward.date || null,
+          outward_party_name: outward.company_name || outward.buyer_name || outward.buyer || "-",
+          outward_lorry_no: outward.lorry_no || outward.reg_lorry_no || outward.new_lorry_no || "-",
+          adjusted_qty: Number(Number(adjustment.qty || 0).toFixed(4)),
+          adjusted_at: adjustment.created_at || adjustment.updated_at || null,
+        });
+      }
     }
 
     const uniquePalti = new Map();
-    for (const row of details) uniquePalti.set(String(row.palti_id), row);
+    for (const row of reportRows) uniquePalti.set(String(row.palti_id), row);
 
     const summary = {
       total_palti_entries: uniquePalti.size,
-      total_palti_balance: Number(details.reduce((sum, row) => sum + row.palti_balance, 0).toFixed(4)),
-      total_adjusted_qty: Number(details.reduce((sum, row) => sum + row.total_adjusted_qty, 0).toFixed(4)),
-      total_available_balance: Number(details.reduce((sum, row) => sum + row.available_balance, 0).toFixed(4)),
-      total_adjustment_rows: details.length,
-      total_adjusted_dispatched: Number(details.reduce((sum, row) => sum + row.adjusted_qty, 0).toFixed(4)),
+      total_palti_balance: Number([...uniquePalti.values()].reduce((sum, row) => sum + row.palti_balance, 0).toFixed(4)),
+      total_adjusted_qty: Number([...uniquePalti.values()].reduce((sum, row) => sum + row.total_adjusted_qty, 0).toFixed(4)),
+      total_available_balance: Number([...uniquePalti.values()].reduce((sum, row) => sum + row.available_balance, 0).toFixed(4)),
+      total_adjustment_rows: reportRows.filter((row) => Number(row.adjusted_qty || 0) > 0).length,
+      total_adjusted_dispatched: Number(reportRows.reduce((sum, row) => sum + Number(row.adjusted_qty || 0), 0).toFixed(4)),
     };
 
-    return res.json({ summary, details });
+    return res.json({ summary, details: reportRows });
   } catch (error) {
     console.error("[palti-lorry-adjustment report] error:", error);
     return res.status(500).json({ error: error.message });
