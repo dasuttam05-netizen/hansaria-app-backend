@@ -65,14 +65,6 @@ function getPaltiCollection() {
   );
 }
 
-function getExpenseCollection() {
-  // Use the native MongoDB collection for Expenses in adjustment flows.
-  // The Expense Mongoose schema stores some legacy IDs as Number, while newer
-  // records can contain Mongo/ObjectId-style string IDs. Native queries avoid
-  // Mongoose casting errors when filtering mixed legacy data.
-  return getDb().collection(MongoExpense.collection.name);
-}
-
 function normalizePaltiSource(value) {
   return String(value || "paltilorryentries").trim().toLowerCase() === "expenses"
     ? "expenses"
@@ -84,11 +76,27 @@ async function findPaltiSourceRow(id, source = "paltilorryentries") {
   const filter = buildFlexibleIdFilter(id);
   if (!filter) return null;
 
+  // Use native Mongo collection access here. The Expense Mongoose schema
+  // has numeric fields in some deployments, while the adjustment payload
+  // can contain Mongo ObjectId/string IDs. Native access avoids cast errors.
   if (normalizedSource === "expenses") {
-    return MongoExpense.findOne(filter).lean();
+    const expenseCollection = MongoExpense?.collection || getDb().collection("expenses");
+    return expenseCollection.findOne(filter);
   }
 
   return getPaltiCollection().findOne(filter);
+}
+
+async function findPaltiSourceRowWithFallback(id, source = "paltilorryentries") {
+  const preferred = normalizePaltiSource(source);
+  const first = await findPaltiSourceRow(id, preferred);
+  if (first) return { row: first, source: preferred };
+
+  const fallback = preferred === "expenses" ? "paltilorryentries" : "expenses";
+  const second = await findPaltiSourceRow(id, fallback);
+  if (second) return { row: second, source: fallback };
+
+  return { row: null, source: preferred };
 }
 
 function normalizeQty(value) {
@@ -173,96 +181,63 @@ FLEXIBLE LEGACY/MONGO ID FILTER
 function buildFlexibleIdFilter(
   value
 ) {
-  const raw =
-    String(
-      value ?? ""
-    ).trim();
-
-  if (!raw) {
-    return null;
-  }
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
 
   const conditions = [];
 
-  if (
-    mongoose.Types.ObjectId.isValid(
-      raw
-    )
-  ) {
-    conditions.push({
-      _id:
-        new mongoose.Types.ObjectId(
-          raw
-        ),
-    });
+  if (mongoose.Types.ObjectId.isValid(raw)) {
+    conditions.push({ _id: new mongoose.Types.ObjectId(raw) });
   }
 
-  const numeric =
-    Number(raw);
-
-  if (
-    Number.isFinite(
-      numeric
-    )
-  ) {
-    conditions.push({
-      legacy_id:
-        numeric,
-    });
-
-    conditions.push({
-      id:
-        numeric,
-    });
-
-    conditions.push({
-      sl_no:
-        numeric,
-    });
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric)) {
+    // Legacy data exists with both numeric and string ID fields.
+    conditions.push(
+      { legacy_id: numeric },
+      { legacy_id: raw },
+      { id: numeric },
+      { id: raw },
+      { sl_no: numeric },
+      { sl_no: raw },
+    );
   }
 
-  if (
-    conditions.length === 1
-  ) {
-    return conditions[0];
-  }
-
-  return {
-    $or:
-      conditions,
-  };
+  return conditions.length === 1 ? conditions[0] : { $or: conditions };
 }
 
 function buildFlexibleFieldFilter(field, value) {
   const raw = String(value ?? "").trim();
   if (!raw) return null;
 
-  const conditions = [{ [field]: raw }];
+  const candidates = [raw];
 
   if (mongoose.Types.ObjectId.isValid(raw)) {
-    conditions.push({
-      [field]: new mongoose.Types.ObjectId(raw),
-    });
+    candidates.push(new mongoose.Types.ObjectId(raw));
   }
 
   const numeric = Number(raw);
   if (Number.isFinite(numeric)) {
-    conditions.push({ [field]: numeric });
+    candidates.push(numeric);
   }
 
+  const unique = [];
   const seen = new Set();
-  const unique = conditions.filter((condition) => {
-    const value = condition[field];
-    const key = value && typeof value === "object" && value._bsontype === "ObjectID"
-      ? `oid:${String(value)}`
-      : `${typeof value}:${String(value)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 
-  if (unique.length === 1) return unique[0];
-  return { $or: unique };
+  for (const candidate of candidates) {
+    const key =
+      candidate instanceof mongoose.Types.ObjectId
+        ? `objectId:${candidate.toHexString()}`
+        : `${typeof candidate}:${String(candidate)}`;
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(candidate);
+  }
+
+  return unique.length === 1
+    ? { [field]: unique[0] }
+    : { [field]: { $in: unique } };
 }
 
 function buildMongoIdCandidates(
@@ -754,11 +729,13 @@ router.get(
        */
       const inwardAnd = [];
 
-      if (warehouseId) {
-        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
-        if (filter) inwardAnd.push(filter);
-      } else {
+      // LOCATION IS THE PRIMARY SCOPE when an outward has a location.
+      // Do not mix warehouse rows into a location-based adjustment.
+      if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) inwardAnd.push(filter);
+      } else if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) inwardAnd.push(filter);
       }
 
@@ -797,7 +774,8 @@ router.get(
 
       const paltiAnd = [];
 
-      // Palti Lorry is location-based. Prefer location_id; use warehouse_id only as legacy fallback.
+      // PALTI IS ALWAYS LOCATION-BASED for a location adjustment.
+      // Warehouse is only a fallback for old warehouse-based records.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) paltiAnd.push(filter);
@@ -837,6 +815,8 @@ router.get(
           ],
         },
       ];
+
+      // Expense-based Palti is also scoped by location first.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) expensePaltiAnd.push(filter);
@@ -849,10 +829,10 @@ router.get(
         if (filter) expensePaltiAnd.push(filter);
       }
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expensePaltiRows = await getExpenseCollection()
-        .find(expensePaltiFilter)
-        .project({ company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, location_id: 1, warehouse_id: 1, product_id: 1 })
-        .toArray();
+      const expenseCollection = MongoExpense?.collection || getDb().collection("expenses");
+      const expensePaltiRows = await expenseCollection.find(expensePaltiFilter, {
+        projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, location_id: 1, warehouse_id: 1, expense_date: 1, voucher_no: 1, reg_lorry_no: 1, new_lorry_no: 1, send_to_kind: 1, work_description: 1 },
+      }).toArray();
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -1116,7 +1096,8 @@ router.get(
         const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
         if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
         const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-        const expensePaltiRows = await getExpenseCollection().find(expensePaltiFilter).toArray();
+        const expenseCollection = MongoExpense?.collection || getDb().collection("expenses");
+        const expensePaltiRows = await expenseCollection.find(expensePaltiFilter).toArray();
 
         const combinedPaltiRows = [
           ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
@@ -1332,11 +1313,13 @@ router.get(
 
       const inwardAnd = [];
 
-      if (warehouseId) {
-        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
-        if (filter) inwardAnd.push(filter);
-      } else {
+      // LOCATION IS THE PRIMARY SCOPE when an outward has a location.
+      // Do not mix warehouse rows into a location-based adjustment.
+      if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) inwardAnd.push(filter);
+      } else if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) inwardAnd.push(filter);
       }
 
@@ -1896,20 +1879,21 @@ router.post(
             );
           }
 
-          const paltiSource = normalizePaltiSource(adj.palti_source);
-          const paltiFilter =
-            buildFlexibleIdFilter(
-              adj.palti_lorry_id
-            );
+          const requestedPaltiSource = normalizePaltiSource(adj.palti_source);
+          const lookup = await findPaltiSourceRowWithFallback(
+            adj.palti_lorry_id,
+            requestedPaltiSource
+          );
+          const paltiSource = lookup.source;
+          let paltiRow = lookup.row;
 
-          let paltiRow = null;
-          if (paltiSource === "expenses") {
-            paltiRow = await getExpenseCollection().findOne(paltiFilter);
-          } else {
+          // Re-read the selected source inside the transaction when possible.
+          if (paltiRow && paltiSource === "paltilorryentries") {
+            const paltiFilter = buildFlexibleIdFilter(adj.palti_lorry_id);
             paltiRow = await getPaltiCollection().findOne(
               paltiFilter,
               { session }
-            );
+            ) || paltiRow;
           }
 
           if (!paltiRow) {
