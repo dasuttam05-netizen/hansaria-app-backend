@@ -788,6 +788,36 @@ MONGODB DASHBOARD
 =====================================================
 */
 
+// Dashboard is expensive because it builds stock/rent summaries from several
+// collections. A short per-user cache prevents duplicate loads when the UI
+// remounts or multiple dashboard requests arrive close together.
+const dashboardResponseCache = new Map();
+const DASHBOARD_CACHE_TTL_MS = 20000;
+
+function getDashboardCacheKey(user) {
+  return String(user?.id || user?._id || user?.username || "anonymous");
+}
+
+function getCachedDashboardResponse(user) {
+  const key = getDashboardCacheKey(user);
+  const entry = dashboardResponseCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.time > DASHBOARD_CACHE_TTL_MS) {
+    dashboardResponseCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCachedDashboardResponse(user, data) {
+  const key = getDashboardCacheKey(user);
+  dashboardResponseCache.set(key, { time: Date.now(), data });
+  if (dashboardResponseCache.size > 200) {
+    const oldestKey = dashboardResponseCache.keys().next().value;
+    if (oldestKey) dashboardResponseCache.delete(oldestKey);
+  }
+}
+
 app.get(
   "/api/dashboard",
   authenticate,
@@ -795,6 +825,12 @@ app.get(
   async (req, res) => {
     try {
       const { user } = req;
+
+      const cachedDashboard = getCachedDashboardResponse(user);
+      if (cachedDashboard) {
+        res.set("Cache-Control", "private, max-age=20, stale-while-revalidate=20");
+        return res.json(cachedDashboard);
+      }
 
       if (
         mongoose.connection.readyState !== 1
@@ -2247,7 +2283,7 @@ app.get(
       ========================================
       */
 
-      return res.json({
+      const dashboardResponse = {
         ...listPayload,
 
         partyStock:
@@ -2267,7 +2303,11 @@ app.get(
           source:
             "mongodb",
         },
-      });
+      };
+
+      setCachedDashboardResponse(user, dashboardResponse);
+      res.set("Cache-Control", "private, max-age=20, stale-while-revalidate=20");
+      return res.json(dashboardResponse);
     } catch (error) {
       console.error(
         "Failed to load MongoDB dashboard payload:",
