@@ -772,6 +772,33 @@ router.get(
       if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
+      } else if (locationId) {
+        // Palti Lorry rows are stored against warehouse_id.
+        // When Adjustment Source uses Location, resolve that location
+        // to all its warehouses so Palti parties are included too.
+        const warehouseRows = await MongoWarehouse.find({
+          location_id: Number(locationId),
+        })
+          .select({ _id: 1, legacy_id: 1, id: 1 })
+          .lean();
+
+        const warehouseIds = warehouseRows.flatMap((row) => [
+          row?.legacy_id != null ? String(row.legacy_id) : null,
+          row?.id != null ? String(row.id) : null,
+          row?._id != null ? String(row._id) : null,
+        ]).filter(Boolean);
+
+        if (warehouseIds.length) {
+          const warehouseConditions = warehouseIds
+            .map((id) => buildFlexibleFieldFilter("warehouse_id", id))
+            .filter(Boolean);
+          if (warehouseConditions.length) {
+            paltiAnd.push({ $or: warehouseConditions });
+          }
+        } else {
+          // No warehouse belongs to this location, so no Palti party can match.
+          paltiAnd.push({ warehouse_id: { $in: [] } });
+        }
       }
 
       if (productId) {
@@ -934,16 +961,16 @@ router.get(
             ?.company_id
         );
 
-      const productId =
-        normalizeText(
-          req.query
-            ?.product_id
-        );
-
       const outwardDate =
         normalizeText(
           req.query
             ?.outward_date
+        );
+
+      const productId =
+        normalizeText(
+          req.query
+            ?.product_id
         );
 
       const sourceType =
@@ -961,7 +988,7 @@ router.get(
       ) {
         return res.status(400).json({
           error:
-            "warehouse_id or location_id, company_id and outward_date required",
+            "warehouse_id or location_id, company_id, product_id and outward_date required",
         });
       }
 
@@ -2118,36 +2145,11 @@ router.post(
           );
         }
 
-        const selectedCompany =
-          await MongoCompany.findOne(
-            buildFlexibleIdFilter(companyId)
-          )
-            .select({
-              _id: 1,
-              legacy_id: 1,
-              id: 1,
-            })
-            .lean();
-
-        const companyAliases = new Set(
-          [
-            companyId,
-            selectedCompany?._id
-              ? String(selectedCompany._id)
-              : null,
-            selectedCompany?.legacy_id != null
-              ? String(selectedCompany.legacy_id)
-              : null,
-            selectedCompany?.id != null
-              ? String(selectedCompany.id)
-              : null,
-          ].filter(Boolean)
-        );
-
         if (
-          !companyAliases.has(
-            String(inwardRow.company_id ?? "").trim()
-          )
+          String(
+            inwardRow.company_id
+          ) !==
+          companyId
         ) {
           throw makeAdjustmentError(
             `Company mismatch for inward_id ${adj.inward_id}`,
