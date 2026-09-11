@@ -772,35 +772,6 @@ router.get(
       if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
-      } else if (locationId) {
-        // Palti Lorry rows are stored against warehouse_id.
-        // Adjustment Source uses Location, so resolve the selected location
-        // to all warehouses belonging to that location first.
-        const warehouseRows = await MongoWarehouse.find({
-          location_id: Number(locationId),
-        })
-          .select({ _id: 1, legacy_id: 1, id: 1 })
-          .lean();
-
-        const warehouseIds = (warehouseRows || [])
-          .flatMap((row) => [
-            row?.legacy_id != null ? String(row.legacy_id) : null,
-            row?.id != null ? String(row.id) : null,
-            row?._id != null ? String(row._id) : null,
-          ])
-          .filter(Boolean);
-
-        if (warehouseIds.length) {
-          const warehouseConditions = warehouseIds
-            .map((id) => buildFlexibleFieldFilter("warehouse_id", id))
-            .filter(Boolean);
-          if (warehouseConditions.length) {
-            paltiAnd.push({ $or: warehouseConditions });
-          }
-        } else {
-          // No warehouse belongs to this location, therefore no Palti rows.
-          paltiAnd.push({ warehouse_id: { $in: [] } });
-        }
       }
 
       if (productId) {
@@ -1026,19 +997,18 @@ router.get(
               warehouseId
             );
         } else {
-          const warehouseRows =
-            await MongoWarehouse.find({
-              location_id:
-                Number(
-                  locationId
-                ),
-            })
-              .select({
-                _id: 1,
-                legacy_id: 1,
-                id: 1,
-              })
-              .lean();
+          // Location IDs may be Mongo ObjectIds, so use the existing flexible
+          // ID filter instead of Number(locationId), which becomes NaN.
+          const locationFilter = buildFlexibleIdFilter(locationId);
+          const warehouseRows = locationFilter
+            ? await MongoWarehouse.find(locationFilter)
+                .select({
+                  _id: 1,
+                  legacy_id: 1,
+                  id: 1,
+                })
+                .lean()
+            : [];
 
           const warehouseIds =
             warehouseRows.flatMap(
