@@ -10,6 +10,32 @@ const SECRET =
 
 const warnedFallbackUserIds = new Set();
 
+// Keep auth lookups fast without making permission/warehouse changes stale for long.
+const AUTH_USER_CACHE_TTL_MS = 15000;
+const authenticatedUserCache = new Map();
+
+function getCachedAuthenticatedUser(userId) {
+  const key = String(userId || "");
+  if (!key) return null;
+  const entry = authenticatedUserCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.time > AUTH_USER_CACHE_TTL_MS) {
+    authenticatedUserCache.delete(key);
+    return null;
+  }
+  return entry.user;
+}
+
+function setCachedAuthenticatedUser(userId, user) {
+  const key = String(userId || "");
+  if (!key) return;
+  authenticatedUserCache.set(key, { time: Date.now(), user });
+  if (authenticatedUserCache.size > 2000) {
+    const oldestKey = authenticatedUserCache.keys().next().value;
+    if (oldestKey) authenticatedUserCache.delete(oldestKey);
+  }
+}
+
 const REPORT_PERMISSION_KEYS = [
   "report.inward",
   "report.erp",
@@ -954,6 +980,12 @@ async function authenticate(
       return next();
     }
 
+    const cachedUser = getCachedAuthenticatedUser(decoded.id);
+    if (cachedUser) {
+      req.user = cachedUser;
+      return next();
+    }
+
     const user =
       await Employee.findOne({
         $or: [
@@ -979,6 +1011,7 @@ async function authenticate(
       await buildAuthenticatedUserPayload(
         user
       );
+    setCachedAuthenticatedUser(decoded.id, req.user);
 
     next();
 
