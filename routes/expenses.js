@@ -2155,8 +2155,9 @@ async function postExpenseToPaltiLorry(
       expense.expense_date ||
       null,
 
-    warehouse_id:
-      expense.warehouse_id ??
+    // Palti Lorry is location-based. Do not store warehouse_id.
+    location_id:
+      expense.location_id ??
       null,
 
     employee_id:
