@@ -9,6 +9,7 @@ const {
   Company: MongoCompany,
   CompanyAccount: MongoCompanyAccount,
   Warehouse: MongoWarehouse,
+  Expense: MongoExpense,
   isMongoMirrorReady,
 } = require("../db-mongodb");
 
@@ -62,6 +63,24 @@ function getPaltiCollection() {
   return getDb().collection(
     "paltilorryentries"
   );
+}
+
+function normalizePaltiSource(value) {
+  return String(value || "paltilorryentries").trim().toLowerCase() === "expenses"
+    ? "expenses"
+    : "paltilorryentries";
+}
+
+async function findPaltiSourceRow(id, source = "paltilorryentries") {
+  const normalizedSource = normalizePaltiSource(source);
+  const filter = buildFlexibleIdFilter(id);
+  if (!filter) return null;
+
+  if (normalizedSource === "expenses") {
+    return MongoExpense.findOne(filter).lean();
+  }
+
+  return getPaltiCollection().findOne(filter);
 }
 
 function normalizeQty(value) {
@@ -491,30 +510,31 @@ async function getAdjustedQtyForInward(
 async function getAdjustedQtyForPalti(
   paltiId,
   session = null,
-  excludeAdjustmentId = null
+  excludeAdjustmentId = null,
+  source = "paltilorryentries"
 ) {
   const collection =
     getAdjustmentCollection();
 
+  const normalizedSource = normalizePaltiSource(source);
   const filter = {
     palti_lorry_id:
       Number(
         paltiId
       ),
 
-    $or: [
-      {
-        source_type:
-          "palti_lorry",
-      },
+    source_type:
+      "palti_lorry",
 
-      {
-        source_type: {
-          $exists:
-            false,
-        },
-      },
-    ],
+    $or:
+      normalizedSource === "paltilorryentries"
+        ? [
+            { palti_source: "paltilorryentries" },
+            { palti_source: { $exists: false } },
+          ]
+        : [
+            { palti_source: "expenses" },
+          ],
   };
 
   if (
@@ -801,6 +821,30 @@ router.get(
           )
           .toArray();
 
+      const expensePaltiAnd = [
+        {
+          $or: [
+            { send_to_kind: "palti_lorry" },
+            { work_description: { $regex: /^palti lorry$/i } },
+          ],
+        },
+      ];
+      if (locationId) {
+        const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) expensePaltiAnd.push(filter);
+      } else if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+        if (filter) expensePaltiAnd.push(filter);
+      }
+      if (productId) {
+        const filter = buildFlexibleFieldFilter("product_id", productId);
+        if (filter) expensePaltiAnd.push(filter);
+      }
+      const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
+      const expensePaltiRows = await MongoExpense.find(expensePaltiFilter)
+        .select({ company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1 })
+        .lean();
+
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
           .map((row) => row?.company_id)
@@ -816,9 +860,18 @@ router.get(
           .filter(Boolean)
       ));
 
+      const expensePaltiCompanyIds = Array.from(new Set(
+        (expensePaltiRows || [])
+          .filter((row) => getPaltiQty(row) > 0)
+          .map((row) => row?.company_id)
+          .map((id) => String(id ?? "").trim())
+          .filter(Boolean)
+      ));
+
       const allCompanyIds = Array.from(new Set([
         ...inwardCompanyIds,
         ...paltiCompanyIds,
+        ...expensePaltiCompanyIds,
       ]));
 
       if (allCompanyIds.length === 0) {
@@ -862,6 +915,18 @@ router.get(
           id: company.legacy_id ?? company.id ?? String(company._id),
           name: company.name || "",
           source_type: "palti_lorry",
+          palti_source: "paltilorryentries",
+        });
+      }
+
+      for (const id of expensePaltiCompanyIds) {
+        const company = companyMap.get(id);
+        if (!company) continue;
+        result.push({
+          id: company.legacy_id ?? company.id ?? String(company._id),
+          name: company.name || "",
+          source_type: "palti_lorry",
+          palti_source: "expenses",
         });
       }
 
@@ -1022,12 +1087,39 @@ router.get(
             })
             .toArray();
 
+        const expensePaltiAnd = [
+          {
+            $or: [
+              { send_to_kind: "palti_lorry" },
+              { work_description: { $regex: /^palti lorry$/i } },
+            ],
+          },
+        ];
+        const expenseCompanyFilter = buildFlexibleFieldFilter("company_id", companyId);
+        if (expenseCompanyFilter) expensePaltiAnd.push(expenseCompanyFilter);
+        if (locationId) {
+          const filter = buildFlexibleFieldFilter("location_id", locationId);
+          if (filter) expensePaltiAnd.push(filter);
+        } else if (warehouseId) {
+          const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+          if (filter) expensePaltiAnd.push(filter);
+        }
+        const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
+        if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
+        const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
+        const expensePaltiRows = await MongoExpense.find(expensePaltiFilter).lean();
+
+        const combinedPaltiRows = [
+          ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
+          ...(expensePaltiRows || []).map((row) => ({ ...row, palti_source: "expenses" })),
+        ];
+
         const result =
           [];
 
         for (
           const row of
-            paltiRows
+            combinedPaltiRows
         ) {
           const paltiId =
             row.legacy_id ??
@@ -1043,7 +1135,10 @@ router.get(
 
           const alreadyAdjusted =
             await getAdjustedQtyForPalti(
-              paltiId
+              paltiId,
+              null,
+              null,
+              row.palti_source
             );
 
           const grossQty =
@@ -1176,6 +1271,9 @@ router.get(
 
             source_type:
               "palti_lorry",
+
+            palti_source:
+              row.palti_source || "paltilorryentries",
 
             outward_date:
               outwardDate,
@@ -1789,21 +1887,21 @@ router.post(
             );
           }
 
-          const paltiCollection =
-            getPaltiCollection();
-
+          const paltiSource = normalizePaltiSource(adj.palti_source);
           const paltiFilter =
             buildFlexibleIdFilter(
               adj.palti_lorry_id
             );
 
-          const paltiRow =
-            await paltiCollection.findOne(
+          let paltiRow = null;
+          if (paltiSource === "expenses") {
+            paltiRow = await MongoExpense.findOne(paltiFilter).lean();
+          } else {
+            paltiRow = await getPaltiCollection().findOne(
               paltiFilter,
-              {
-                session,
-              }
+              { session }
             );
+          }
 
           if (!paltiRow) {
             throw makeAdjustmentError(
@@ -1913,7 +2011,9 @@ router.post(
           const already =
             await getAdjustedQtyForPalti(
               paltiId,
-              session
+              session,
+              null,
+              paltiSource
             );
 
           const grossQty =
@@ -1996,6 +2096,9 @@ router.post(
 
               company_id:
                 companyId,
+
+              palti_source:
+                paltiSource,
 
               created_at:
                 new Date(),
@@ -2493,10 +2596,9 @@ router.get(
           null
         ) {
           palti =
-            await getPaltiCollection().findOne(
-              buildFlexibleIdFilter(
-                row.palti_lorry_id
-              )
+            await findPaltiSourceRow(
+              row.palti_lorry_id,
+              row.palti_source
             );
         }
 
@@ -2774,10 +2876,9 @@ async function updateAdjustment(
 
     if (isPalti) {
       sourceRow =
-        await getPaltiCollection().findOne(
-          buildFlexibleIdFilter(
-            row.palti_lorry_id
-          )
+        await findPaltiSourceRow(
+          row.palti_lorry_id,
+          row.palti_source
         );
 
       if (!sourceRow) {
@@ -2798,7 +2899,8 @@ async function updateAdjustment(
         await getAdjustedQtyForPalti(
           paltiId,
           null,
-          adjustmentObjectId
+          adjustmentObjectId,
+          row.palti_source
         );
 
       availableQty =
