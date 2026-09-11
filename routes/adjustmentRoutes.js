@@ -229,32 +229,34 @@ function buildFlexibleFieldFilter(field, value) {
   const raw = String(value ?? "").trim();
   if (!raw) return null;
 
-  const conditions = [{ [field]: raw }];
+  const candidates = [raw];
 
   if (mongoose.Types.ObjectId.isValid(raw)) {
-    conditions.push({
-      [field]: new mongoose.Types.ObjectId(raw),
-    });
+    candidates.push(new mongoose.Types.ObjectId(raw));
   }
 
   const numeric = Number(raw);
   if (Number.isFinite(numeric)) {
-    conditions.push({ [field]: numeric });
+    candidates.push(numeric);
   }
 
+  const unique = [];
   const seen = new Set();
-  const unique = conditions.filter((condition) => {
-    const value = condition[field];
-    const key = value && typeof value === "object" && value._bsontype === "ObjectID"
-      ? `oid:${String(value)}`
-      : `${typeof value}:${String(value)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 
-  if (unique.length === 1) return unique[0];
-  return { $or: unique };
+  for (const candidate of candidates) {
+    const key =
+      candidate instanceof mongoose.Types.ObjectId
+        ? `objectId:${candidate.toHexString()}`
+        : `${typeof candidate}:${String(candidate)}`;
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(candidate);
+  }
+
+  return unique.length === 1
+    ? { [field]: unique[0] }
+    : { [field]: { $in: unique } };
 }
 
 function buildMongoIdCandidates(
@@ -746,11 +748,13 @@ router.get(
        */
       const inwardAnd = [];
 
-      if (warehouseId) {
-        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
-        if (filter) inwardAnd.push(filter);
-      } else {
+      // LOCATION IS THE PRIMARY SCOPE when an outward has a location.
+      // Do not mix warehouse rows into a location-based adjustment.
+      if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) inwardAnd.push(filter);
+      } else if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) inwardAnd.push(filter);
       }
 
@@ -789,7 +793,8 @@ router.get(
 
       const paltiAnd = [];
 
-      // Palti Lorry is location-based. Prefer location_id; use warehouse_id only as legacy fallback.
+      // PALTI IS ALWAYS LOCATION-BASED for a location adjustment.
+      // Warehouse is only a fallback for old warehouse-based records.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) paltiAnd.push(filter);
@@ -829,6 +834,8 @@ router.get(
           ],
         },
       ];
+
+      // Expense-based Palti is also scoped by location first.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) expensePaltiAnd.push(filter);
@@ -1323,11 +1330,13 @@ router.get(
 
       const inwardAnd = [];
 
-      if (warehouseId) {
-        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
-        if (filter) inwardAnd.push(filter);
-      } else {
+      // LOCATION IS THE PRIMARY SCOPE when an outward has a location.
+      // Do not mix warehouse rows into a location-based adjustment.
+      if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) inwardAnd.push(filter);
+      } else if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) inwardAnd.push(filter);
       }
 
