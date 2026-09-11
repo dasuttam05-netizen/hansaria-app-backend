@@ -773,29 +773,48 @@ router.get(
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
       } else if (locationId) {
-        // Palti Lorry rows are stored against warehouse_id.
-        // Adjustment Source supplies a Location, so first resolve that
-        // location to all warehouses. Do NOT cast location_id to Number:
-        // in MongoDB it can be an ObjectId.
-        const locationFilter = buildFlexibleFieldFilter("location_id", locationId);
-        const locationWarehouses = locationFilter
-          ? await MongoWarehouse.find(locationFilter)
-              .select({ _id: 1, legacy_id: 1, id: 1 })
-              .lean()
-          : [];
+        // Palti Lorry records are stored by warehouse_id.
+        // The Adjustment page selects Location, so resolve that location
+        // to all warehouses first and then query Palti rows by those ids.
+        let warehouseRows = [];
+        try {
+          // location_id in Warehouse is a Mongo ObjectId in the current schema.
+          // Never use Number(locationId) here; that turns ObjectId strings into NaN.
+          const mongoose = require("mongoose");
+          const rawLocationId = String(locationId).trim();
+          const locationFilter = mongoose.isValidObjectId(rawLocationId)
+            ? { location_id: new mongoose.Types.ObjectId(rawLocationId) }
+            : { location_id: rawLocationId };
 
-        const warehouseConditions = [];
-        for (const row of locationWarehouses || []) {
-          for (const id of [row?.legacy_id, row?.id, row?._id]) {
-            const filter = buildFlexibleFieldFilter("warehouse_id", id);
-            if (filter) warehouseConditions.push(filter);
-          }
+          warehouseRows = await MongoWarehouse.find(locationFilter)
+            .select({ _id: 1, legacy_id: 1, id: 1 })
+            .lean();
+        } catch (locationErr) {
+          console.error("[adjustment parties] location -> warehouse lookup failed:", locationErr);
+          warehouseRows = [];
         }
 
-        if (warehouseConditions.length) {
-          paltiAnd.push({ $or: warehouseConditions });
+        const warehouseIds = Array.from(new Set(
+          (warehouseRows || [])
+            .flatMap((row) => [
+              row?.legacy_id != null ? String(row.legacy_id) : "",
+              row?.id != null ? String(row.id) : "",
+              row?._id != null ? String(row._id) : "",
+            ])
+            .map((id) => String(id || "").trim())
+            .filter(Boolean)
+        ));
+
+        if (warehouseIds.length) {
+          const warehouseConditions = warehouseIds
+            .map((id) => buildFlexibleFieldFilter("warehouse_id", id))
+            .filter(Boolean);
+          if (warehouseConditions.length) {
+            paltiAnd.push({ $or: warehouseConditions });
+          }
         } else {
-          // No warehouses in this location means no Palti parties.
+          // No warehouse belongs to this location, so do not return Palti rows
+          // from unrelated locations.
           paltiAnd.push({ warehouse_id: { $in: [] } });
         }
       }
@@ -1023,18 +1042,19 @@ router.get(
               warehouseId
             );
         } else {
-          // Location IDs may be Mongo ObjectIds, so use the existing flexible
-          // ID filter instead of Number(locationId), which becomes NaN.
-          const locationFilter = buildFlexibleIdFilter(locationId);
-          const warehouseRows = locationFilter
-            ? await MongoWarehouse.find(locationFilter)
-                .select({
-                  _id: 1,
-                  legacy_id: 1,
-                  id: 1,
-                })
-                .lean()
-            : [];
+          const warehouseRows =
+            await MongoWarehouse.find({
+              location_id:
+                Number(
+                  locationId
+                ),
+            })
+              .select({
+                _id: 1,
+                legacy_id: 1,
+                id: 1,
+              })
+              .lean();
 
           const warehouseIds =
             warehouseRows.flatMap(
