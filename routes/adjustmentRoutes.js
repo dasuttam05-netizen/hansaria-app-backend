@@ -9,7 +9,6 @@ const {
   Company: MongoCompany,
   CompanyAccount: MongoCompanyAccount,
   Warehouse: MongoWarehouse,
-  Location: MongoLocation,
   isMongoMirrorReady,
 } = require("../db-mongodb");
 
@@ -105,69 +104,6 @@ function getPaltiQty(row) {
   return normalizeQty(
     row?.new_weight
   );
-}
-
-
-async function migrateLegacyPaltiLocations() {
-  const paltiCollection = getPaltiCollection();
-  const legacyRows = await paltiCollection.find({
-    warehouse_id: { $exists: true, $ne: null },
-    $or: [
-      { location_id: { $exists: false } },
-      { location_id: null },
-      { location_id: "" },
-    ],
-  }).toArray();
-
-  if (!legacyRows.length) return;
-
-  const warehouseIds = Array.from(new Set(
-    legacyRows
-      .map((row) => String(row?.warehouse_id ?? "").trim())
-      .filter(Boolean)
-  ));
-
-  const warehouseConditions = warehouseIds
-    .map((id) => buildFlexibleIdFilter(id))
-    .filter(Boolean);
-
-  if (!warehouseConditions.length) return;
-
-  const warehouseRows = await MongoWarehouse.find({
-    $or: warehouseConditions,
-  }).select({ _id: 1, id: 1, legacy_id: 1, location_id: 1 }).lean();
-
-  const warehouseLocationMap = new Map();
-  for (const warehouse of warehouseRows || []) {
-    const location = String(warehouse?.location_id ?? "").trim();
-    if (!location) continue;
-    for (const alias of [warehouse?._id, warehouse?.id, warehouse?.legacy_id]) {
-      if (alias != null && String(alias).trim()) {
-        warehouseLocationMap.set(String(alias).trim(), location);
-      }
-    }
-  }
-
-  const ops = [];
-  for (const row of legacyRows) {
-    const warehouseId = String(row?.warehouse_id ?? "").trim();
-    const locationId = warehouseLocationMap.get(warehouseId);
-    if (!locationId) continue;
-    ops.push({
-      updateOne: {
-        filter: { _id: row._id },
-        update: {
-          $set: { location_id: locationId, updated_at: new Date() },
-          $unset: { warehouse_id: "" },
-        },
-      },
-    });
-  }
-
-  if (ops.length) {
-    await paltiCollection.bulkWrite(ops, { ordered: false });
-    console.log(`[palti migration] migrated ${ops.length} legacy Palti Lorry rows to location_id`);
-  }
 }
 
 function makeAdjustmentError(
@@ -755,8 +691,6 @@ router.get(
         return;
       }
 
-      await migrateLegacyPaltiLocations();
-
       const warehouseId =
         normalizeText(
           req.query
@@ -835,12 +769,13 @@ router.get(
 
       const paltiAnd = [];
 
-      // Palti Lorry is location-based. Never map Location -> Warehouse.
+      // Palti Lorry is location-based. Prefer location_id; use warehouse_id only as legacy fallback.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) paltiAnd.push(filter);
-      } else {
-        paltiAnd.push({ location_id: { $exists: false } });
+      } else if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+        if (filter) paltiAnd.push(filter);
       }
 
       if (productId) {
@@ -985,8 +920,6 @@ router.get(
         return;
       }
 
-      await migrateLegacyPaltiLocations();
-
       const warehouseId =
         normalizeText(
           req.query
@@ -1005,16 +938,16 @@ router.get(
             ?.company_id
         );
 
-      const productId =
-        normalizeText(
-          req.query
-            ?.product_id
-        );
-
       const outwardDate =
         normalizeText(
           req.query
             ?.outward_date
+        );
+
+      const productId =
+        normalizeText(
+          req.query
+            ?.product_id
         );
 
       const sourceType =
@@ -1032,7 +965,7 @@ router.get(
       ) {
         return res.status(400).json({
           error:
-            "warehouse_id or location_id, company_id and outward_date required",
+            "warehouse_id or location_id, company_id, product_id and outward_date required",
         });
       }
 
@@ -1053,36 +986,30 @@ router.get(
         const paltiCollection =
           getPaltiCollection();
 
-        const paltiFilter = {
-          company_id:
-            Number(
-              companyId
-            ),
-        };
+        const paltiAnd = [];
 
-        if (!locationId) {
-          return res.json([]);
-        }
+        const companyFilterForPalti =
+          buildFlexibleFieldFilter("company_id", companyId);
+        if (companyFilterForPalti) paltiAnd.push(companyFilterForPalti);
 
-        const locationFilter =
-          buildFlexibleFieldFilter(
-            "location_id",
-            locationId
-          );
-
-        if (locationFilter) {
-          Object.assign(paltiFilter, locationFilter);
+        if (locationId) {
+          const locationFilter =
+            buildFlexibleFieldFilter("location_id", locationId);
+          if (locationFilter) paltiAnd.push(locationFilter);
+        } else if (warehouseId) {
+          const warehouseFilter =
+            buildFlexibleFieldFilter("warehouse_id", warehouseId);
+          if (warehouseFilter) paltiAnd.push(warehouseFilter);
         }
 
         const productFilter =
-          buildFlexibleFieldFilter(
-            "product_id",
-            productId
-          );
+          buildFlexibleFieldFilter("product_id", productId);
+        if (productFilter) paltiAnd.push(productFilter);
 
-        if (productFilter) {
-          Object.assign(paltiFilter, productFilter);
-        }
+        const paltiFilter =
+          paltiAnd.length === 1
+            ? paltiAnd[0]
+            : { $and: paltiAnd };
 
         const paltiRows =
           await paltiCollection
@@ -1143,27 +1070,27 @@ router.get(
               outwardDate
             );
 
-          let locationName =
+          let warehouseName =
             "";
 
-          if (row.location_id != null) {
-            const locationFilter =
-              buildFlexibleIdFilter(
-                row.location_id
-              );
-
-            if (locationFilter) {
-              const location =
-                await MongoLocation.findOne(
-                  locationFilter
+          if (
+            row.warehouse_id !=
+            null
+          ) {
+            const warehouse =
+              await MongoWarehouse.findOne(
+                buildFlexibleIdFilter(
+                  row.warehouse_id
                 )
-                  .select({ name: 1 })
-                  .lean();
+              )
+                .select({
+                  name: 1,
+                })
+                .lean();
 
-              locationName =
-                location?.name ||
-                "";
-            }
+            warehouseName =
+              warehouse?.name ||
+              "";
           }
 
           let companyName =
@@ -1242,10 +1169,7 @@ router.get(
               ),
 
             warehouse_name:
-              "",
-
-            location_name:
-              locationName,
+              warehouseName,
 
             company_name:
               companyName,
@@ -1924,39 +1848,45 @@ router.post(
             );
           }
 
-          const outwardLocation =
+          const outwardWarehouse =
             String(
-              outward.location_id ||
+              outward.warehouse_id ||
                 ""
-            ).trim();
+            );
 
-          const rowLocation =
+          const rowWarehouse =
             String(
-              paltiRow.location_id ||
+              paltiRow.warehouse_id ||
                 ""
-            ).trim();
-
-          if (!outwardLocation) {
-            throw makeAdjustmentError(
-              "Outward does not have a location_id for Palti Lorry adjustment",
-              {
-                source_type: "palti_lorry",
-                palti_lorry_id: adj.palti_lorry_id,
-              }
             );
-          }
 
-          if (!rowLocation || rowLocation !== outwardLocation) {
-            throw makeAdjustmentError(
-              `Location mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
-              {
-                source_type: "palti_lorry",
-                palti_lorry_id: adj.palti_lorry_id,
-                outward_location_id: outwardLocation,
-                row_location_id: rowLocation,
-                qty: adjQty,
-              }
-            );
+          if (
+            outwardWarehouse
+          ) {
+            if (
+              rowWarehouse !==
+              outwardWarehouse
+            ) {
+              throw makeAdjustmentError(
+                `Warehouse mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
+                {
+                  source_type:
+                    adj.source_type,
+
+                  palti_lorry_id:
+                    adj.palti_lorry_id,
+
+                  outward_warehouse_id:
+                    outwardWarehouse,
+
+                  row_warehouse_id:
+                    rowWarehouse,
+
+                  qty:
+                    adjQty,
+                }
+              );
+            }
           }
 
           const paltiId =
@@ -2155,36 +2085,11 @@ router.post(
           );
         }
 
-        const selectedCompany =
-          await MongoCompany.findOne(
-            buildFlexibleIdFilter(companyId)
-          )
-            .select({
-              _id: 1,
-              legacy_id: 1,
-              id: 1,
-            })
-            .lean();
-
-        const companyAliases = new Set(
-          [
-            companyId,
-            selectedCompany?._id
-              ? String(selectedCompany._id)
-              : null,
-            selectedCompany?.legacy_id != null
-              ? String(selectedCompany.legacy_id)
-              : null,
-            selectedCompany?.id != null
-              ? String(selectedCompany.id)
-              : null,
-          ].filter(Boolean)
-        );
-
         if (
-          !companyAliases.has(
-            String(inwardRow.company_id ?? "").trim()
-          )
+          String(
+            inwardRow.company_id
+          ) !==
+          companyId
         ) {
           throw makeAdjustmentError(
             `Company mismatch for inward_id ${adj.inward_id}`,
