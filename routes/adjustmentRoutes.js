@@ -772,6 +772,45 @@ router.get(
       if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
+      } else if (locationId) {
+        // Palti Lorry rows are stored with warehouse_id (example: 5),
+        // while Adjustment Entry is selected by Location. Resolve the
+        // selected Location to every warehouse under it, then match
+        // Palti rows against all warehouse-id aliases.
+        let warehouseRows = [];
+        try {
+          const locationFilter = buildFlexibleFieldFilter("location_id", locationId);
+          warehouseRows = locationFilter
+            ? await MongoWarehouse.find(locationFilter)
+                .select({ _id: 1, legacy_id: 1, id: 1 })
+                .lean()
+            : [];
+        } catch (locationErr) {
+          console.error("[adjustment parties] location -> warehouse lookup failed:", locationErr);
+          warehouseRows = [];
+        }
+
+        const warehouseIds = Array.from(new Set(
+          (warehouseRows || [])
+            .flatMap((row) => [
+              row?.legacy_id != null ? String(row.legacy_id) : "",
+              row?.id != null ? String(row.id) : "",
+              row?._id != null ? String(row._id) : "",
+            ])
+            .map((id) => String(id || "").trim())
+            .filter(Boolean)
+        ));
+
+        if (warehouseIds.length) {
+          const warehouseConditions = warehouseIds
+            .map((id) => buildFlexibleFieldFilter("warehouse_id", id))
+            .filter(Boolean);
+          if (warehouseConditions.length) {
+            paltiAnd.push({ $or: warehouseConditions });
+          }
+        } else {
+          paltiAnd.push({ warehouse_id: { $in: [] } });
+        }
       }
 
       if (productId) {
