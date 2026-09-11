@@ -773,16 +773,13 @@ router.get(
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
       } else if (locationId) {
-        // Palti Lorry records are stored by warehouse_id.
-        // The Adjustment page selects Location, so resolve that location
-        // to all warehouses first and then query Palti rows by those ids.
+        // Palti Lorry rows are stored against warehouse_id.
+        // Adjustment Entry selects Location, so resolve that location to all
+        // warehouses first and then filter Palti rows by those warehouse ids.
         let warehouseRows = [];
         try {
-          // location_id in Warehouse is a Mongo ObjectId in the current schema.
-          // Never use Number(locationId) here; that turns ObjectId strings into NaN.
-          const mongoose = require("mongoose");
           const rawLocationId = String(locationId).trim();
-          const locationFilter = mongoose.isValidObjectId(rawLocationId)
+          const locationFilter = mongoose.Types.ObjectId.isValid(rawLocationId)
             ? { location_id: new mongoose.Types.ObjectId(rawLocationId) }
             : { location_id: rawLocationId };
 
@@ -813,8 +810,6 @@ router.get(
             paltiAnd.push({ $or: warehouseConditions });
           }
         } else {
-          // No warehouse belongs to this location, so do not return Palti rows
-          // from unrelated locations.
           paltiAnd.push({ warehouse_id: { $in: [] } });
         }
       }
