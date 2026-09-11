@@ -774,19 +774,21 @@ router.get(
         if (filter) paltiAnd.push(filter);
       } else if (locationId) {
         // Palti Lorry rows are stored against warehouse_id.
-        // When Adjustment Source uses Location, resolve that location
-        // to all its warehouses so Palti parties are included too.
+        // Adjustment Source uses Location, so resolve the selected location
+        // to all warehouses belonging to that location first.
         const warehouseRows = await MongoWarehouse.find({
           location_id: Number(locationId),
         })
           .select({ _id: 1, legacy_id: 1, id: 1 })
           .lean();
 
-        const warehouseIds = warehouseRows.flatMap((row) => [
-          row?.legacy_id != null ? String(row.legacy_id) : null,
-          row?.id != null ? String(row.id) : null,
-          row?._id != null ? String(row._id) : null,
-        ]).filter(Boolean);
+        const warehouseIds = (warehouseRows || [])
+          .flatMap((row) => [
+            row?.legacy_id != null ? String(row.legacy_id) : null,
+            row?.id != null ? String(row.id) : null,
+            row?._id != null ? String(row._id) : null,
+          ])
+          .filter(Boolean);
 
         if (warehouseIds.length) {
           const warehouseConditions = warehouseIds
@@ -796,7 +798,7 @@ router.get(
             paltiAnd.push({ $or: warehouseConditions });
           }
         } else {
-          // No warehouse belongs to this location, so no Palti party can match.
+          // No warehouse belongs to this location, therefore no Palti rows.
           paltiAnd.push({ warehouse_id: { $in: [] } });
         }
       }
