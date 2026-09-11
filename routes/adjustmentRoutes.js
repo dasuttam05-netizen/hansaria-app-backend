@@ -772,6 +772,32 @@ router.get(
       if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
+      } else if (locationId) {
+        // Palti Lorry rows are stored against warehouse_id.
+        // Adjustment Source supplies a Location, so first resolve that
+        // location to all warehouses. Do NOT cast location_id to Number:
+        // in MongoDB it can be an ObjectId.
+        const locationFilter = buildFlexibleFieldFilter("location_id", locationId);
+        const locationWarehouses = locationFilter
+          ? await MongoWarehouse.find(locationFilter)
+              .select({ _id: 1, legacy_id: 1, id: 1 })
+              .lean()
+          : [];
+
+        const warehouseConditions = [];
+        for (const row of locationWarehouses || []) {
+          for (const id of [row?.legacy_id, row?.id, row?._id]) {
+            const filter = buildFlexibleFieldFilter("warehouse_id", id);
+            if (filter) warehouseConditions.push(filter);
+          }
+        }
+
+        if (warehouseConditions.length) {
+          paltiAnd.push({ $or: warehouseConditions });
+        } else {
+          // No warehouses in this location means no Palti parties.
+          paltiAnd.push({ warehouse_id: { $in: [] } });
+        }
       }
 
       if (productId) {
