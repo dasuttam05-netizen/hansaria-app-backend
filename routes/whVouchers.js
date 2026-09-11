@@ -4481,7 +4481,10 @@ router.get("/payment/:id/pdf", async (req, res) => {
     infoCell(left, cw-2, "Farmer Name", farmer); infoCell(left+cw+1, cw-2, "Company / Account", account); infoCell(left+2*cw+4, cw-4, "Warehouse", warehouse); y += 27;
     infoCell(left, cw-2, "Payment Mode", row.payment_mode || row.reference_type || "Against"); infoCell(left+cw+1, cw-2, "Reference", reference || "-"); infoCell(left+2*cw+4, cw-4, "Narration", row.description || "-"); y += 27;
 
-    // Purchase + deductions in compact single-page blocks.
+    // Purchase details start on a fresh full A4 page so the bill/product section
+    // never gets pushed as a stray line onto page 2.
+    doc.addPage();
+    y = 40;
     section("PURCHASE DETAILS");
     if (billRows.length) {
       for (let idx = 0; idx < billRows.length; idx++) {
@@ -4558,7 +4561,13 @@ router.get("/payment/:id/pdf", async (req, res) => {
       y += 37;
     }
 
-    // Final summary, compact and single-page.
+    // Final payment summary gets its own clean section/page when the purchase
+    // details have filled the current page.
+    if (y > pageH - 170) {
+      doc.addPage();
+      y = 40;
+    }
+
     const remaining = Math.max(pageH - y - 62, 0);
     const summaryH = Math.min(58, Math.max(52, remaining));
     doc.roundedRect(left,y,W,summaryH,5).fillAndStroke(C.pale,"#78C8C0");
