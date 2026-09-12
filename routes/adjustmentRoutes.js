@@ -76,27 +76,11 @@ async function findPaltiSourceRow(id, source = "paltilorryentries") {
   const filter = buildFlexibleIdFilter(id);
   if (!filter) return null;
 
-  // Use native Mongo collection access here. The Expense Mongoose schema
-  // has numeric fields in some deployments, while the adjustment payload
-  // can contain Mongo ObjectId/string IDs. Native access avoids cast errors.
   if (normalizedSource === "expenses") {
-    const expenseCollection = MongoExpense?.collection || getDb().collection("expenses");
-    return expenseCollection.findOne(filter);
+    return MongoExpense.findOne(filter).lean();
   }
 
   return getPaltiCollection().findOne(filter);
-}
-
-async function findPaltiSourceRowWithFallback(id, source = "paltilorryentries") {
-  const preferred = normalizePaltiSource(source);
-  const first = await findPaltiSourceRow(id, preferred);
-  if (first) return { row: first, source: preferred };
-
-  const fallback = preferred === "expenses" ? "paltilorryentries" : "expenses";
-  const second = await findPaltiSourceRow(id, fallback);
-  if (second) return { row: second, source: fallback };
-
-  return { row: null, source: preferred };
 }
 
 function normalizeQty(value) {
@@ -181,29 +165,64 @@ FLEXIBLE LEGACY/MONGO ID FILTER
 function buildFlexibleIdFilter(
   value
 ) {
-  const raw = String(value ?? "").trim();
-  if (!raw) return null;
+  const raw =
+    String(
+      value ?? ""
+    ).trim();
+
+  if (!raw) {
+    return null;
+  }
 
   const conditions = [];
 
-  if (mongoose.Types.ObjectId.isValid(raw)) {
-    conditions.push({ _id: new mongoose.Types.ObjectId(raw) });
+  if (
+    mongoose.Types.ObjectId.isValid(
+      raw
+    )
+  ) {
+    conditions.push({
+      _id:
+        new mongoose.Types.ObjectId(
+          raw
+        ),
+    });
   }
 
-  const numeric = Number(raw);
-  if (Number.isFinite(numeric)) {
-    // Legacy data exists with both numeric and string ID fields.
-    conditions.push(
-      { legacy_id: numeric },
-      { legacy_id: raw },
-      { id: numeric },
-      { id: raw },
-      { sl_no: numeric },
-      { sl_no: raw },
-    );
+  const numeric =
+    Number(raw);
+
+  if (
+    Number.isFinite(
+      numeric
+    )
+  ) {
+    conditions.push({
+      legacy_id:
+        numeric,
+    });
+
+    conditions.push({
+      id:
+        numeric,
+    });
+
+    conditions.push({
+      sl_no:
+        numeric,
+    });
   }
 
-  return conditions.length === 1 ? conditions[0] : { $or: conditions };
+  if (
+    conditions.length === 1
+  ) {
+    return conditions[0];
+  }
+
+  return {
+    $or:
+      conditions,
+  };
 }
 
 function buildFlexibleFieldFilter(field, value) {
@@ -829,10 +848,9 @@ router.get(
         if (filter) expensePaltiAnd.push(filter);
       }
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expenseCollection = MongoExpense?.collection || getDb().collection("expenses");
-      const expensePaltiRows = await expenseCollection.find(expensePaltiFilter, {
-        projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, location_id: 1, warehouse_id: 1, expense_date: 1, voucher_no: 1, reg_lorry_no: 1, new_lorry_no: 1, send_to_kind: 1, work_description: 1 },
-      }).toArray();
+      const expensePaltiRows = await MongoExpense.find(expensePaltiFilter)
+        .select({ company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1 })
+        .lean();
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -1096,8 +1114,7 @@ router.get(
         const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
         if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
         const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-        const expenseCollection = MongoExpense?.collection || getDb().collection("expenses");
-        const expensePaltiRows = await expenseCollection.find(expensePaltiFilter).toArray();
+        const expensePaltiRows = await MongoExpense.find(expensePaltiFilter).lean();
 
         const combinedPaltiRows = [
           ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
@@ -1879,21 +1896,20 @@ router.post(
             );
           }
 
-          const requestedPaltiSource = normalizePaltiSource(adj.palti_source);
-          const lookup = await findPaltiSourceRowWithFallback(
-            adj.palti_lorry_id,
-            requestedPaltiSource
-          );
-          const paltiSource = lookup.source;
-          let paltiRow = lookup.row;
+          const paltiSource = normalizePaltiSource(adj.palti_source);
+          const paltiFilter =
+            buildFlexibleIdFilter(
+              adj.palti_lorry_id
+            );
 
-          // Re-read the selected source inside the transaction when possible.
-          if (paltiRow && paltiSource === "paltilorryentries") {
-            const paltiFilter = buildFlexibleIdFilter(adj.palti_lorry_id);
+          let paltiRow = null;
+          if (paltiSource === "expenses") {
+            paltiRow = await MongoExpense.findOne(paltiFilter).lean();
+          } else {
             paltiRow = await getPaltiCollection().findOne(
               paltiFilter,
               { session }
-            ) || paltiRow;
+            );
           }
 
           if (!paltiRow) {
@@ -2208,33 +2224,34 @@ router.post(
           );
         }
 
-        const outwardWarehouse =
-          String(
-            outward.warehouse_id ||
-              ""
-          );
+        // For a location-based outward, location is the authoritative scope.
+        // Do not reject a valid inward just because its warehouse_id is blank/different.
+        const outwardLocation = String(outward.location_id || "").trim();
+        const inwardLocation = String(inwardRow.location_id || "").trim();
+        const outwardWarehouse = String(outward.warehouse_id || "").trim();
+        const inwardWarehouse = String(inwardRow.warehouse_id || "").trim();
 
-        const inwardWarehouse =
-          String(
-            inwardRow.warehouse_id ||
-              ""
-          );
-
-        if (
-          outwardWarehouse
-        ) {
-          if (
-            outwardWarehouse !==
-            inwardWarehouse
-          ) {
+        if (outwardLocation) {
+          if (inwardLocation && inwardLocation !== outwardLocation) {
+            throw makeAdjustmentError(
+              `Location mismatch for inward_id ${adj.inward_id}`,
+              {
+                outward_location_id: outwardLocation,
+                row_location_id: inwardLocation,
+                inward_id: adj.inward_id,
+                qty: adjQty,
+              }
+            );
+          }
+        } else if (outwardWarehouse) {
+          if (outwardWarehouse !== inwardWarehouse) {
             throw makeAdjustmentError(
               `Warehouse mismatch for inward_id ${adj.inward_id}`,
               {
-                outward_warehouse_id:
-                  outwardWarehouse,
-
-                row_warehouse_id:
-                  inwardWarehouse,
+                outward_warehouse_id: outwardWarehouse,
+                row_warehouse_id: inwardWarehouse,
+                inward_id: adj.inward_id,
+                qty: adjQty,
               }
             );
           }
