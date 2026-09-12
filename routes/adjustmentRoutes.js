@@ -1894,20 +1894,52 @@ router.post(
             );
           }
 
-          const paltiSource = normalizePaltiSource(adj.palti_source);
-          const paltiFilter =
-            buildFlexibleIdFilter(
-              adj.palti_lorry_id
-            );
+          const requestedPaltiSource = normalizePaltiSource(adj.palti_source);
+          const paltiFilter = buildFlexibleIdFilter(adj.palti_lorry_id);
 
+          // The frontend can carry a stale/mismatched palti_source.
+          // Always try the requested source first, then the other Palti source.
+          // This makes legacy IDs such as 1 work whether the row is stored in
+          // paltilorryentries or expenses.
           let paltiRow = null;
-          if (paltiSource === "expenses") {
-            paltiRow = await getExpenseCollection().findOne(paltiFilter);
-          } else {
-            paltiRow = await getPaltiCollection().findOne(
-              paltiFilter,
-              { session }
-            );
+          let paltiSource = requestedPaltiSource;
+
+          if (paltiFilter) {
+            if (requestedPaltiSource === "expenses") {
+              paltiRow = await getExpenseCollection().findOne(paltiFilter);
+              if (!paltiRow) {
+                paltiRow = await getPaltiCollection().findOne(paltiFilter, { session });
+                if (paltiRow) paltiSource = "paltilorryentries";
+              }
+            } else {
+              paltiRow = await getPaltiCollection().findOne(paltiFilter, { session });
+              if (!paltiRow) {
+                paltiRow = await getExpenseCollection().findOne(paltiFilter);
+                if (paltiRow) paltiSource = "expenses";
+              }
+            }
+          }
+
+          // Last-resort lookup: some old records use expense_id / palti_lorry_id
+          // as their cross-reference rather than id/legacy_id/sl_no.
+          if (!paltiRow && paltiSource === "paltilorryentries") {
+            paltiRow = await getPaltiCollection().findOne({
+              $or: [
+                { expense_id: adj.palti_lorry_id },
+                { expense_id: String(adj.palti_lorry_id) },
+              ],
+            }, { session });
+          }
+
+          if (!paltiRow && paltiSource === "expenses") {
+            paltiRow = await getExpenseCollection().findOne({
+              $or: [
+                { palti_lorry_id: adj.palti_lorry_id },
+                { palti_lorry_id: String(adj.palti_lorry_id) },
+                { id: adj.palti_lorry_id },
+                { id: String(adj.palti_lorry_id) },
+              ],
+            });
           }
 
           if (!paltiRow) {
@@ -1994,12 +2026,12 @@ router.post(
             }
           }
 
-          const paltiId =
-            Number(
-              paltiRow.legacy_id ??
-                paltiRow.id ??
-                paltiRow.sl_no
-            );
+          const rawPaltiId =
+            paltiRow.legacy_id ??
+            paltiRow.id ??
+            paltiRow.sl_no ??
+            adj.palti_lorry_id;
+          const paltiId = Number(rawPaltiId);
 
           if (
             !Number.isFinite(
