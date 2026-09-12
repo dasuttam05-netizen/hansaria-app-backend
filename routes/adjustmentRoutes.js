@@ -1707,6 +1707,15 @@ router.post(
                     item?.palti_lorry_id ??
                     null,
 
+                  // A Palti adjustment can originate either from the
+                  // paltilorryentries collection or from an Expense posted
+                  // to Palti Lorry. Preserve this discriminator so the ID is
+                  // looked up in the same collection it was selected from.
+                  palti_source:
+                    normalizePaltiSource(
+                      item?.palti_source
+                    ),
+
                   source_type:
                     normalizeText(
                       item?.source_type ||
