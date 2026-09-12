@@ -65,6 +65,15 @@ function getPaltiCollection() {
   );
 }
 
+function getExpenseCollection() {
+  return getDb().collection("expenses");
+}
+
+function isNumericId(value) {
+  const raw = String(value ?? "").trim();
+  return raw !== "" && /^-?\d+(?:\.0+)?$/.test(raw);
+}
+
 function normalizePaltiSource(value) {
   return String(value || "paltilorryentries").trim().toLowerCase() === "expenses"
     ? "expenses"
@@ -77,7 +86,7 @@ async function findPaltiSourceRow(id, source = "paltilorryentries") {
   if (!filter) return null;
 
   if (normalizedSource === "expenses") {
-    return MongoExpense.findOne(filter).lean();
+    return getExpenseCollection().findOne(filter);
   }
 
   return getPaltiCollection().findOne(filter);
@@ -848,9 +857,18 @@ router.get(
         if (filter) expensePaltiAnd.push(filter);
       }
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expensePaltiRows = await MongoExpense.find(expensePaltiFilter)
-        .select({ company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1 })
-        .lean();
+      const expensePaltiQuery = { ...expensePaltiFilter };
+      // Expense.product_id and location_id are legacy numeric fields.
+      // Do not let a modern Mongo ObjectId string reach the Mongoose Number caster.
+      const expensePaltiRows = await getExpenseCollection().find(expensePaltiQuery, {
+        projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, location_id: 1, warehouse_id: 1, voucher_no: 1, reg_lorry_no: 1, new_lorry_no: 1, expense_date: 1, send_to_kind: 1, work_description: 1 }
+      }).toArray();
+      // When product_id is a modern ObjectId, Expense rows cannot be safely matched
+      // because the Expense schema stores product_id as a legacy Number.
+      // The location-based Palti source is paltilorryentries in this case.
+      const filteredExpensePaltiRows = isNumericId(productId)
+        ? expensePaltiRows.filter((row) => String(row.product_id ?? "") === String(Number(productId)))
+        : [];
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -868,7 +886,7 @@ router.get(
       ));
 
       const expensePaltiCompanyIds = Array.from(new Set(
-        (expensePaltiRows || [])
+        (filteredExpensePaltiRows || [])
           .filter((row) => getPaltiQty(row) > 0)
           .map((row) => row?.company_id)
           .map((id) => String(id ?? "").trim())
@@ -1114,7 +1132,10 @@ router.get(
         const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
         if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
         const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-        const expensePaltiRows = await MongoExpense.find(expensePaltiFilter).lean();
+        const expensePaltiRowsRaw = await getExpenseCollection().find(expensePaltiFilter).toArray();
+        const expensePaltiRows = isNumericId(productId)
+          ? expensePaltiRowsRaw.filter((row) => String(row.product_id ?? "") === String(Number(productId)))
+          : [];
 
         const combinedPaltiRows = [
           ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
@@ -1904,7 +1925,7 @@ router.post(
 
           let paltiRow = null;
           if (paltiSource === "expenses") {
-            paltiRow = await MongoExpense.findOne(paltiFilter).lean();
+            paltiRow = await getExpenseCollection().findOne(paltiFilter, { session });
           } else {
             paltiRow = await getPaltiCollection().findOne(
               paltiFilter,
