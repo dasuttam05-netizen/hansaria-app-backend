@@ -348,6 +348,24 @@ async function findMasterByIdOrLegacyOrName(
       if (byName) {
         return byName;
       }
+
+      // Spreadsheet exports frequently vary only in spacing (for example,
+      // "NOOR   MAHAMMAD" versus "NOOR MAHAMMAD"). Treat that as the same
+      // master name, while preserving an exact match for every actual word.
+      const nameParts = rawName.split(/\s+/).filter(Boolean);
+      if (nameParts.length > 1) {
+        const flexibleWhitespaceRegex = new RegExp(
+          `^${nameParts.map(escapeRegExp).join("\\s+")}$`,
+          "i"
+        );
+        const byFlexibleName = await Model.findOne({
+          name: flexibleWhitespaceRegex,
+        }).lean();
+
+        if (byFlexibleName) {
+          return byFlexibleName;
+        }
+      }
     } catch {}
   }
 
@@ -577,6 +595,7 @@ function normalizeOutwardImportRow(
     employee_name:
       row?.employee_name ??
       row?.EmployeeName ??
+      row?.["Employee Name"] ??
       row?.Employee ??
       "",
 
@@ -589,6 +608,7 @@ function normalizeOutwardImportRow(
     location_name:
       row?.location_name ??
       row?.LocationName ??
+      row?.["Location Name"] ??
       row?.Location ??
       "",
 
@@ -601,6 +621,7 @@ function normalizeOutwardImportRow(
     warehouse_name:
       row?.warehouse_name ??
       row?.WarehouseName ??
+      row?.["Warehouse Name"] ??
       row?.Warehouse ??
       "",
 
@@ -613,6 +634,7 @@ function normalizeOutwardImportRow(
     product_name:
       row?.product_name ??
       row?.ProductName ??
+      row?.["Product Name"] ??
       row?.Product ??
       "",
 
@@ -625,6 +647,7 @@ function normalizeOutwardImportRow(
     company_name:
       row?.company_name ??
       row?.CompanyName ??
+      row?.["Company Name"] ??
       row?.Company ??
       "",
 
@@ -637,12 +660,15 @@ function normalizeOutwardImportRow(
     company_account_name:
       row?.company_account_name ??
       row?.CompanyAccountName ??
+      row?.["Company Account Name"] ??
+      row?.["Company Account"] ??
       row?.CompanyAccount ??
       "",
 
     lorry_no:
       row?.lorry_no ??
       row?.LorryNo ??
+      row?.["Lorry No"] ??
       row?.Lorry ??
       "",
 
@@ -664,24 +690,28 @@ function normalizeOutwardImportRow(
     inv_no:
       row?.inv_no ??
       row?.InvNo ??
+      row?.["Invoice No"] ??
       row?.InvoiceNo ??
       "",
 
     buyer_name:
       row?.buyer_name ??
       row?.BuyerName ??
+      row?.["Buyer Name"] ??
       row?.Buyer ??
       "",
 
     consignee_name:
       row?.consignee_name ??
       row?.ConsigneeName ??
+      row?.["Consignee Name"] ??
       row?.Consignee ??
       "",
 
     self_loading:
       row?.self_loading ??
       row?.SelfLoading ??
+      row?.["Self Loading"] ??
       "No",
   };
 }
@@ -1536,6 +1566,14 @@ async function importOutwardRows(
           `Missing or unmatched required field(s): ${missing.join(
             ", "
           )}`,
+
+        // Return the interpreted row values so the upload screen can show
+        // exactly which Product/Company/Warehouse value could not be matched.
+        sample_row: {
+          product: row?.product_name || row?.product_id || "",
+          company: row?.company_name || row?.company_id || "",
+          warehouse: row?.warehouse_name || row?.warehouse_id || "",
+        },
       });
 
       continue;
