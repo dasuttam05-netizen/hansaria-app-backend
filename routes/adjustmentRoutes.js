@@ -10,6 +10,7 @@ const {
   CompanyAccount: MongoCompanyAccount,
   Warehouse: MongoWarehouse,
   Expense: MongoExpense,
+  Product: MongoProduct,
   isMongoMirrorReady,
 } = require("../db-mongodb");
 
@@ -65,6 +66,15 @@ function getPaltiCollection() {
   );
 }
 
+function getExpenseCollection() {
+  return getDb().collection("expenses");
+}
+
+function isNumericId(value) {
+  const raw = String(value ?? "").trim();
+  return raw !== "" && /^-?\d+(?:\.0+)?$/.test(raw);
+}
+
 function normalizePaltiSource(value) {
   return String(value || "paltilorryentries").trim().toLowerCase() === "expenses"
     ? "expenses"
@@ -77,7 +87,7 @@ async function findPaltiSourceRow(id, source = "paltilorryentries") {
   if (!filter) return null;
 
   if (normalizedSource === "expenses") {
-    return MongoExpense.findOne(filter).lean();
+    return getExpenseCollection().findOne(filter);
   }
 
   return getPaltiCollection().findOne(filter);
@@ -229,32 +239,34 @@ function buildFlexibleFieldFilter(field, value) {
   const raw = String(value ?? "").trim();
   if (!raw) return null;
 
-  const conditions = [{ [field]: raw }];
+  const candidates = [raw];
 
   if (mongoose.Types.ObjectId.isValid(raw)) {
-    conditions.push({
-      [field]: new mongoose.Types.ObjectId(raw),
-    });
+    candidates.push(new mongoose.Types.ObjectId(raw));
   }
 
   const numeric = Number(raw);
   if (Number.isFinite(numeric)) {
-    conditions.push({ [field]: numeric });
+    candidates.push(numeric);
   }
 
+  const unique = [];
   const seen = new Set();
-  const unique = conditions.filter((condition) => {
-    const value = condition[field];
-    const key = value && typeof value === "object" && value._bsontype === "ObjectID"
-      ? `oid:${String(value)}`
-      : `${typeof value}:${String(value)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 
-  if (unique.length === 1) return unique[0];
-  return { $or: unique };
+  for (const candidate of candidates) {
+    const key =
+      candidate instanceof mongoose.Types.ObjectId
+        ? `objectId:${candidate.toHexString()}`
+        : `${typeof candidate}:${String(candidate)}`;
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(candidate);
+  }
+
+  return unique.length === 1
+    ? { [field]: unique[0] }
+    : { [field]: { $in: unique } };
 }
 
 function buildMongoIdCandidates(
@@ -729,7 +741,18 @@ router.get(
             ?.product_id
         );
 
-      const sourceType = normalizeText(req.query?.source_type).toLowerCase();
+      let productName = "";
+      if (productId) {
+        try {
+          const productFilter = buildFlexibleIdFilter(productId);
+          if (productFilter) {
+            const productRow = await MongoProduct.findOne(productFilter).select({ name: 1 }).lean();
+            productName = normalizeText(productRow?.name);
+          }
+        } catch (_) {
+          productName = "";
+        }
+      }
 
       if (
         !warehouseId &&
@@ -748,8 +771,9 @@ router.get(
        */
       const inwardAnd = [];
 
-      // INWARD PARTY is strictly warehouse based.
-      if (warehouseId && sourceType !== "palti_lorry") {
+      // INWARD PARTY is always matched by WAREHOUSE.
+      // Location is intentionally ignored for inward-party discovery.
+      if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) inwardAnd.push(filter);
       }
@@ -772,11 +796,12 @@ router.get(
 
       const inwardFilter = inwardAnd.length === 1 ? inwardAnd[0] : { $and: inwardAnd };
 
-      const inwardRows = sourceType === "palti_lorry"
-        ? []
-        : await MongoInward.find(inwardFilter)
-            .select({ company_id: 1 })
-            .lean();
+      const inwardRows =
+        await MongoInward.find(inwardFilter)
+          .select({
+            company_id: 1,
+          })
+          .lean();
 
       /*
        * -------------------------
@@ -788,24 +813,32 @@ router.get(
 
       const paltiAnd = [];
 
-      // Palti Lorry is location-based. Prefer location_id; use warehouse_id only as legacy fallback.
-      // PALTI PARTY is strictly location based.
-      if (locationId && sourceType === "palti_lorry") {
+      // PALTI PARTY is always matched by LOCATION.
+      // Warehouse is intentionally ignored for Palti-party discovery.
+      if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) paltiAnd.push(filter);
       }
 
       if (productId) {
-        const filter = buildFlexibleFieldFilter("product_id", productId);
-        if (filter) paltiAnd.push(filter);
+        const productCandidates = [];
+        if (mongoose.Types.ObjectId.isValid(productId)) {
+          productCandidates.push({ product_id: new mongoose.Types.ObjectId(productId) });
+        }
+        productCandidates.push({ product_id: productId });
+        if (productName) {
+          productCandidates.push({ product_name: productName });
+        }
+        paltiAnd.push({ $or: productCandidates });
       }
 
       const paltiFilter = paltiAnd.length === 1 ? paltiAnd[0] : (paltiAnd.length ? { $and: paltiAnd } : {});
 
-      const paltiRows = sourceType === "inward"
-        ? []
-        : await paltiCollection
-            .find(paltiFilter, {
+      const paltiRows =
+        await paltiCollection
+          .find(
+            paltiFilter,
+            {
               projection: {
                 company_id: 1,
                 id: 1,
@@ -813,10 +846,35 @@ router.get(
                 balance: 1,
                 new_weight: 1,
               },
-            })
-            .toArray();
+            }
+          )
+          .toArray();
 
-      const expensePaltiRows = [];
+      const expensePaltiAnd = [
+        {
+          $or: [
+            { send_to_kind: "palti_lorry" },
+            { work_description: { $regex: /^palti lorry$/i } },
+          ],
+        },
+      ];
+
+      // Expense-based Palti is also always matched by LOCATION.
+      if (locationId) {
+        const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) expensePaltiAnd.push(filter);
+      }
+      const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
+      const expensePaltiRows = await getExpenseCollection().find(expensePaltiFilter, {
+        projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, product_name: 1, location_id: 1, warehouse_id: 1, voucher_no: 1, reg_lorry_no: 1, new_lorry_no: 1, expense_date: 1, send_to_kind: 1, work_description: 1 }
+      }).toArray();
+      const filteredExpensePaltiRows = (expensePaltiRows || []).filter((row) => {
+        if (!productId) return true;
+        const rowProductId = String(row.product_id ?? "").trim();
+        if (isNumericId(productId) && rowProductId === String(Number(productId))) return true;
+        if (productName && normalizeText(row.product_name).toLowerCase() === productName.toLowerCase()) return true;
+        return false;
+      });
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -834,7 +892,7 @@ router.get(
       ));
 
       const expensePaltiCompanyIds = Array.from(new Set(
-        (expensePaltiRows || [])
+        (filteredExpensePaltiRows || [])
           .filter((row) => getPaltiQty(row) > 0)
           .map((row) => row?.company_id)
           .map((id) => String(id ?? "").trim())
@@ -1080,7 +1138,10 @@ router.get(
         const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
         if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
         const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-        const expensePaltiRows = await MongoExpense.find(expensePaltiFilter).lean();
+        const expensePaltiRowsRaw = await getExpenseCollection().find(expensePaltiFilter).toArray();
+        const expensePaltiRows = isNumericId(productId)
+          ? expensePaltiRowsRaw.filter((row) => String(row.product_id ?? "") === String(Number(productId)))
+          : [];
 
         const combinedPaltiRows = [
           ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
@@ -1296,11 +1357,10 @@ router.get(
 
       const inwardAnd = [];
 
+      // INWARD PARTY is always matched by WAREHOUSE.
+      // Location is intentionally ignored for inward-party discovery.
       if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
-        if (filter) inwardAnd.push(filter);
-      } else {
-        const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) inwardAnd.push(filter);
       }
 
@@ -1868,7 +1928,7 @@ router.post(
 
           let paltiRow = null;
           if (paltiSource === "expenses") {
-            paltiRow = await MongoExpense.findOne(paltiFilter).lean();
+            paltiRow = await getExpenseCollection().findOne(paltiFilter, { session });
           } else {
             paltiRow = await getPaltiCollection().findOne(
               paltiFilter,
@@ -2188,33 +2248,34 @@ router.post(
           );
         }
 
-        const outwardWarehouse =
-          String(
-            outward.warehouse_id ||
-              ""
-          );
+        // For a location-based outward, location is the authoritative scope.
+        // Do not reject a valid inward just because its warehouse_id is blank/different.
+        const outwardLocation = String(outward.location_id || "").trim();
+        const inwardLocation = String(inwardRow.location_id || "").trim();
+        const outwardWarehouse = String(outward.warehouse_id || "").trim();
+        const inwardWarehouse = String(inwardRow.warehouse_id || "").trim();
 
-        const inwardWarehouse =
-          String(
-            inwardRow.warehouse_id ||
-              ""
-          );
-
-        if (
-          outwardWarehouse
-        ) {
-          if (
-            outwardWarehouse !==
-            inwardWarehouse
-          ) {
+        if (outwardLocation) {
+          if (inwardLocation && inwardLocation !== outwardLocation) {
+            throw makeAdjustmentError(
+              `Location mismatch for inward_id ${adj.inward_id}`,
+              {
+                outward_location_id: outwardLocation,
+                row_location_id: inwardLocation,
+                inward_id: adj.inward_id,
+                qty: adjQty,
+              }
+            );
+          }
+        } else if (outwardWarehouse) {
+          if (outwardWarehouse !== inwardWarehouse) {
             throw makeAdjustmentError(
               `Warehouse mismatch for inward_id ${adj.inward_id}`,
               {
-                outward_warehouse_id:
-                  outwardWarehouse,
-
-                row_warehouse_id:
-                  inwardWarehouse,
+                outward_warehouse_id: outwardWarehouse,
+                row_warehouse_id: inwardWarehouse,
+                inward_id: adj.inward_id,
+                qty: adjQty,
               }
             );
           }
