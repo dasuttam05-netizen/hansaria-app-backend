@@ -10,6 +10,7 @@ const {
   CompanyAccount: MongoCompanyAccount,
   Warehouse: MongoWarehouse,
   Expense: MongoExpense,
+  Product: MongoProduct,
   isMongoMirrorReady,
 } = require("../db-mongodb");
 
@@ -740,6 +741,19 @@ router.get(
             ?.product_id
         );
 
+      let productName = "";
+      if (productId) {
+        try {
+          const productFilter = buildFlexibleIdFilter(productId);
+          if (productFilter) {
+            const productRow = await MongoProduct.findOne(productFilter).select({ name: 1 }).lean();
+            productName = normalizeText(productRow?.name);
+          }
+        } catch (_) {
+          productName = "";
+        }
+      }
+
       if (
         !warehouseId &&
         !locationId
@@ -813,8 +827,15 @@ router.get(
       }
 
       if (productId) {
-        const filter = buildFlexibleFieldFilter("product_id", productId);
-        if (filter) paltiAnd.push(filter);
+        const productCandidates = [];
+        if (mongoose.Types.ObjectId.isValid(productId)) {
+          productCandidates.push({ product_id: new mongoose.Types.ObjectId(productId) });
+        }
+        productCandidates.push({ product_id: productId });
+        if (productName) {
+          productCandidates.push({ product_name: productName });
+        }
+        paltiAnd.push({ $or: productCandidates });
       }
 
       const paltiFilter = paltiAnd.length === 1 ? paltiAnd[0] : (paltiAnd.length ? { $and: paltiAnd } : {});
@@ -852,23 +873,17 @@ router.get(
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) expensePaltiAnd.push(filter);
       }
-      if (productId) {
-        const filter = buildFlexibleFieldFilter("product_id", productId);
-        if (filter) expensePaltiAnd.push(filter);
-      }
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expensePaltiQuery = { ...expensePaltiFilter };
-      // Expense.product_id and location_id are legacy numeric fields.
-      // Do not let a modern Mongo ObjectId string reach the Mongoose Number caster.
-      const expensePaltiRows = await getExpenseCollection().find(expensePaltiQuery, {
-        projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, location_id: 1, warehouse_id: 1, voucher_no: 1, reg_lorry_no: 1, new_lorry_no: 1, expense_date: 1, send_to_kind: 1, work_description: 1 }
+      const expensePaltiRows = await getExpenseCollection().find(expensePaltiFilter, {
+        projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, product_name: 1, location_id: 1, warehouse_id: 1, voucher_no: 1, reg_lorry_no: 1, new_lorry_no: 1, expense_date: 1, send_to_kind: 1, work_description: 1 }
       }).toArray();
-      // When product_id is a modern ObjectId, Expense rows cannot be safely matched
-      // because the Expense schema stores product_id as a legacy Number.
-      // The location-based Palti source is paltilorryentries in this case.
-      const filteredExpensePaltiRows = isNumericId(productId)
-        ? expensePaltiRows.filter((row) => String(row.product_id ?? "") === String(Number(productId)))
-        : [];
+      const filteredExpensePaltiRows = (expensePaltiRows || []).filter((row) => {
+        if (!productId) return true;
+        const rowProductId = String(row.product_id ?? "").trim();
+        if (isNumericId(productId) && rowProductId === String(Number(productId))) return true;
+        if (productName && normalizeText(row.product_name).toLowerCase() === productName.toLowerCase()) return true;
+        return false;
+      });
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
