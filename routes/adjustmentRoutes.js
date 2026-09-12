@@ -65,6 +65,10 @@ function getPaltiCollection() {
   );
 }
 
+function getExpenseCollection() {
+  return getDb().collection("expenses");
+}
+
 function normalizePaltiSource(value) {
   return String(value || "paltilorryentries").trim().toLowerCase() === "expenses"
     ? "expenses"
@@ -77,7 +81,7 @@ async function findPaltiSourceRow(id, source = "paltilorryentries") {
   if (!filter) return null;
 
   if (normalizedSource === "expenses") {
-    return MongoExpense.findOne(filter).lean();
+    return getExpenseCollection().findOne(filter);
   }
 
   return getPaltiCollection().findOne(filter);
@@ -748,9 +752,12 @@ router.get(
        */
       const inwardAnd = [];
 
-      // INWARD PARTY IS ALWAYS MATCHED BY WAREHOUSE.
-      // Location must not filter inward parties.
-      if (warehouseId) {
+      // LOCATION IS THE PRIMARY SCOPE when an outward has a location.
+      // Do not mix warehouse rows into a location-based adjustment.
+      if (locationId) {
+        const filter = buildFlexibleFieldFilter("location_id", locationId);
+        if (filter) inwardAnd.push(filter);
+      } else if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) inwardAnd.push(filter);
       }
@@ -790,16 +797,20 @@ router.get(
 
       const paltiAnd = [];
 
-      // PALTI PARTY IS ALWAYS MATCHED BY LOCATION.
-      // Warehouse must not filter Palti parties.
+      // PALTI IS ALWAYS LOCATION-BASED for a location adjustment.
+      // Warehouse is only a fallback for old warehouse-based records.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) paltiAnd.push(filter);
+      } else if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+        if (filter) paltiAnd.push(filter);
       }
 
-      // IMPORTANT: Palti party discovery is LOCATION-BASED only.
-      // Do not filter the party list by product_id here; product matching
-      // is applied when the selected Palti party's stock/report is loaded.
+      if (productId) {
+        const filter = buildFlexibleFieldFilter("product_id", productId);
+        if (filter) paltiAnd.push(filter);
+      }
 
       const paltiFilter = paltiAnd.length === 1 ? paltiAnd[0] : (paltiAnd.length ? { $and: paltiAnd } : {});
 
@@ -828,18 +839,22 @@ router.get(
         },
       ];
 
-      // Expense-based Palti is always matched by LOCATION.
+      // Expense-based Palti is also scoped by location first.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
         if (filter) expensePaltiAnd.push(filter);
+      } else if (warehouseId) {
+        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+        if (filter) expensePaltiAnd.push(filter);
       }
-      // Do not apply product_id to Palti party discovery. See note above.
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expensePaltiRows = await MongoExpense.collection
-        .find(expensePaltiFilter, {
-          projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, location_id: 1, warehouse_id: 1, product_id: 1 },
-        })
-        .toArray();
+      const expensePaltiRows = await getExpenseCollection().find(expensePaltiFilter, { projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, product_name: 1, location_id: 1, warehouse_id: 1, send_to_kind: 1, work_description: 1 } }).toArray();
+      const filteredExpensePaltiRows = !productId ? expensePaltiRows : expensePaltiRows.filter((row) => {
+        const want = String(productId).trim();
+        const rowPid = String(row?.product_id ?? "").trim();
+        if (rowPid === want) return true;
+        return false;
+      });
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -1057,6 +1072,10 @@ router.get(
           const locationFilter =
             buildFlexibleFieldFilter("location_id", locationId);
           if (locationFilter) paltiAnd.push(locationFilter);
+        } else if (warehouseId) {
+          const warehouseFilter =
+            buildFlexibleFieldFilter("warehouse_id", warehouseId);
+          if (warehouseFilter) paltiAnd.push(warehouseFilter);
         }
 
         const productFilter =
@@ -1092,17 +1111,17 @@ router.get(
         if (locationId) {
           const filter = buildFlexibleFieldFilter("location_id", locationId);
           if (filter) expensePaltiAnd.push(filter);
+        } else if (warehouseId) {
+          const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
+          if (filter) expensePaltiAnd.push(filter);
         }
-        const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
-        if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
         const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-        const expensePaltiRows = await MongoExpense.collection
-          .find(expensePaltiFilter)
-          .toArray();
+        const expensePaltiRows = await getExpenseCollection().find(expensePaltiFilter).toArray();
+        const filteredExpensePaltiRows = !productId ? expensePaltiRows : expensePaltiRows.filter((row) => String(row?.product_id ?? "").trim() === String(productId).trim());
 
         const combinedPaltiRows = [
           ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
-          ...(expensePaltiRows || []).map((row) => ({ ...row, palti_source: "expenses" })),
+          ...(filteredExpensePaltiRows || []).map((row) => ({ ...row, palti_source: "expenses" })),
         ];
 
         const result =
@@ -1888,7 +1907,7 @@ router.post(
 
           let paltiRow = null;
           if (paltiSource === "expenses") {
-            paltiRow = await MongoExpense.findOne(paltiFilter).lean();
+            paltiRow = await getExpenseCollection().findOne(paltiFilter);
           } else {
             paltiRow = await getPaltiCollection().findOne(
               paltiFilter,
