@@ -77,7 +77,7 @@ async function findPaltiSourceRow(id, source = "paltilorryentries") {
   if (!filter) return null;
 
   if (normalizedSource === "expenses") {
-    return MongoExpense.findOne(filter).lean();
+    return MongoExpense.collection.findOne(filter);
   }
 
   return getPaltiCollection().findOne(filter);
@@ -848,9 +848,9 @@ router.get(
         if (filter) expensePaltiAnd.push(filter);
       }
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expensePaltiRows = await MongoExpense.find(expensePaltiFilter)
-        .select({ company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1 })
-        .lean();
+      const expensePaltiRows = await MongoExpense.collection.find(expensePaltiFilter, {
+        projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, location_id: 1, warehouse_id: 1, send_to_kind: 1, work_description: 1, voucher_no: 1, lorry_no: 1 },
+      }).toArray();
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -1114,7 +1114,7 @@ router.get(
         const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
         if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
         const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-        const expensePaltiRows = await MongoExpense.find(expensePaltiFilter).lean();
+        const expensePaltiRows = await MongoExpense.collection.find(expensePaltiFilter).toArray();
 
         const combinedPaltiRows = [
           ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
@@ -1904,7 +1904,7 @@ router.post(
 
           let paltiRow = null;
           if (paltiSource === "expenses") {
-            paltiRow = await MongoExpense.findOne(paltiFilter).lean();
+            paltiRow = await MongoExpense.collection.findOne(paltiFilter, { session });
           } else {
             paltiRow = await getPaltiCollection().findOne(
               paltiFilter,
@@ -1928,17 +1928,29 @@ router.post(
             );
           }
 
-          const actualPaltiCompanyId = String(
-            paltiRow.company_id ?? ""
-          ).trim();
-
-          if (!actualPaltiCompanyId) {
+          if (
+            String(
+              paltiRow.company_id
+            ) !==
+            companyId
+          ) {
             throw makeAdjustmentError(
-              `Palti Lorry ${adj.palti_lorry_id} has no company_id`,
+              `Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
               {
-                source_type: "palti_lorry",
-                palti_lorry_id: adj.palti_lorry_id,
-                qty: adjQty,
+                source_type:
+                  adj.source_type,
+
+                palti_lorry_id:
+                  adj.palti_lorry_id,
+
+                company_id:
+                  companyId,
+
+                row_company_id:
+                  paltiRow.company_id,
+
+                qty:
+                  adjQty,
               }
             );
           }
@@ -2092,7 +2104,7 @@ router.post(
                 adjQty,
 
               company_id:
-                actualPaltiCompanyId,
+                companyId,
 
               palti_source:
                 paltiSource,
@@ -2185,17 +2197,29 @@ router.post(
           );
         }
 
-        const actualInwardCompanyId = String(
-          inwardRow.company_id ?? ""
-        ).trim();
-
-        if (!actualInwardCompanyId) {
+        if (
+          String(
+            inwardRow.company_id
+          ) !==
+          companyId
+        ) {
           throw makeAdjustmentError(
-            `Inward ${adj.inward_id} has no company_id`,
+            `Company mismatch for inward_id ${adj.inward_id}`,
             {
-              source_type: "inward",
-              inward_id: adj.inward_id,
-              qty: adjQty,
+              source_type:
+                "inward",
+
+              inward_id:
+                adj.inward_id,
+
+              company_id:
+                companyId,
+
+              row_company_id:
+                inwardRow.company_id,
+
+              qty:
+                adjQty,
             }
           );
         }
@@ -2387,7 +2411,7 @@ router.post(
               adjQty,
 
             company_id:
-              actualInwardCompanyId,
+              companyId,
 
             created_at:
               new Date(),
