@@ -748,12 +748,9 @@ router.get(
        */
       const inwardAnd = [];
 
-      // LOCATION IS THE PRIMARY SCOPE when an outward has a location.
-      // Do not mix warehouse rows into a location-based adjustment.
-      if (locationId) {
-        const filter = buildFlexibleFieldFilter("location_id", locationId);
-        if (filter) inwardAnd.push(filter);
-      } else if (warehouseId) {
+      // INWARD PARTY IS ALWAYS MATCHED BY WAREHOUSE.
+      // Location must not filter inward parties.
+      if (warehouseId) {
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) inwardAnd.push(filter);
       }
@@ -793,13 +790,10 @@ router.get(
 
       const paltiAnd = [];
 
-      // PALTI IS ALWAYS LOCATION-BASED for a location adjustment.
-      // Warehouse is only a fallback for old warehouse-based records.
+      // PALTI PARTY IS ALWAYS MATCHED BY LOCATION.
+      // Warehouse must not filter Palti parties.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
-        if (filter) paltiAnd.push(filter);
-      } else if (warehouseId) {
-        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) paltiAnd.push(filter);
       }
 
@@ -834,19 +828,18 @@ router.get(
         },
       ];
 
-      // Expense-based Palti is also scoped by location first.
+      // Expense-based Palti is always matched by LOCATION.
       if (locationId) {
         const filter = buildFlexibleFieldFilter("location_id", locationId);
-        if (filter) expensePaltiAnd.push(filter);
-      } else if (warehouseId) {
-        const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) expensePaltiAnd.push(filter);
       }
       // Do not apply product_id to Palti party discovery. See note above.
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expensePaltiRows = await MongoExpense.find(expensePaltiFilter)
-        .select({ company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1 })
-        .lean();
+      const expensePaltiRows = await MongoExpense.collection
+        .find(expensePaltiFilter, {
+          projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, location_id: 1, warehouse_id: 1, product_id: 1 },
+        })
+        .toArray();
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -1064,10 +1057,6 @@ router.get(
           const locationFilter =
             buildFlexibleFieldFilter("location_id", locationId);
           if (locationFilter) paltiAnd.push(locationFilter);
-        } else if (warehouseId) {
-          const warehouseFilter =
-            buildFlexibleFieldFilter("warehouse_id", warehouseId);
-          if (warehouseFilter) paltiAnd.push(warehouseFilter);
         }
 
         const productFilter =
@@ -1103,14 +1092,13 @@ router.get(
         if (locationId) {
           const filter = buildFlexibleFieldFilter("location_id", locationId);
           if (filter) expensePaltiAnd.push(filter);
-        } else if (warehouseId) {
-          const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
-          if (filter) expensePaltiAnd.push(filter);
         }
         const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
         if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
         const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-        const expensePaltiRows = await MongoExpense.find(expensePaltiFilter).lean();
+        const expensePaltiRows = await MongoExpense.collection
+          .find(expensePaltiFilter)
+          .toArray();
 
         const combinedPaltiRows = [
           ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
