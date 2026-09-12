@@ -259,6 +259,33 @@ function buildFlexibleFieldFilter(field, value) {
     : { [field]: { $in: unique } };
 }
 
+async function matchesCompanyId(rowCompanyId, requestedCompanyId, session = null) {
+  const rowId = String(rowCompanyId ?? "").trim();
+  const requestedId = String(requestedCompanyId ?? "").trim();
+
+  if (!rowId || !requestedId) return false;
+  if (rowId === requestedId) return true;
+
+  // The UI uses a company's legacy numeric ID, while older inward/palti rows
+  // may store the Mongo ObjectId. Resolve the requested ID through the company
+  // master record and accept any of its supported identifiers.
+  const companyFilter = buildFlexibleIdFilter(requestedId);
+  if (!companyFilter) return false;
+
+  let query = MongoCompany.findOne(companyFilter)
+    .select({ _id: 1, legacy_id: 1, id: 1, sl_no: 1 })
+    .lean();
+
+  if (session) query = query.session(session);
+
+  const company = await query;
+  if (!company) return false;
+
+  return [company._id, company.legacy_id, company.id, company.sl_no]
+    .filter((value) => value !== null && value !== undefined && value !== "")
+    .some((value) => String(value) === rowId);
+}
+
 function buildMongoIdCandidates(
   value
 ) {
@@ -1938,10 +1965,11 @@ router.post(
           }
 
           if (
-            String(
-              paltiRow.company_id
-            ) !==
-            companyId
+            !(await matchesCompanyId(
+              paltiRow.company_id,
+              companyId,
+              session
+            ))
           ) {
             throw makeAdjustmentError(
               `Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
@@ -2207,10 +2235,11 @@ router.post(
         }
 
         if (
-          String(
-            inwardRow.company_id
-          ) !==
-          companyId
+          !(await matchesCompanyId(
+            inwardRow.company_id,
+            companyId,
+            session
+          ))
         ) {
           throw makeAdjustmentError(
             `Company mismatch for inward_id ${adj.inward_id}`,
