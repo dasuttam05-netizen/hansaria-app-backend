@@ -65,10 +65,6 @@ function getPaltiCollection() {
   );
 }
 
-function getExpenseCollection() {
-  return getDb().collection("expenses");
-}
-
 function normalizePaltiSource(value) {
   return String(value || "paltilorryentries").trim().toLowerCase() === "expenses"
     ? "expenses"
@@ -81,7 +77,7 @@ async function findPaltiSourceRow(id, source = "paltilorryentries") {
   if (!filter) return null;
 
   if (normalizedSource === "expenses") {
-    return getExpenseCollection().findOne(filter);
+    return MongoExpense.findOne(filter).lean();
   }
 
   return getPaltiCollection().findOne(filter);
@@ -201,15 +197,20 @@ function buildFlexibleIdFilter(
       numeric
     )
   ) {
-    // Legacy IDs may be stored as either Number or String.
-    const numericString = String(numeric);
+    conditions.push({
+      legacy_id:
+        numeric,
+    });
 
-    conditions.push({ legacy_id: numeric });
-    conditions.push({ legacy_id: numericString });
-    conditions.push({ id: numeric });
-    conditions.push({ id: numericString });
-    conditions.push({ sl_no: numeric });
-    conditions.push({ sl_no: numericString });
+    conditions.push({
+      id:
+        numeric,
+    });
+
+    conditions.push({
+      sl_no:
+        numeric,
+    });
   }
 
   if (
@@ -842,14 +843,14 @@ router.get(
         const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
         if (filter) expensePaltiAnd.push(filter);
       }
+      if (productId) {
+        const filter = buildFlexibleFieldFilter("product_id", productId);
+        if (filter) expensePaltiAnd.push(filter);
+      }
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expensePaltiRows = await getExpenseCollection().find(expensePaltiFilter, { projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, product_name: 1, location_id: 1, warehouse_id: 1, send_to_kind: 1, work_description: 1 } }).toArray();
-      const filteredExpensePaltiRows = !productId ? expensePaltiRows : expensePaltiRows.filter((row) => {
-        const want = String(productId).trim();
-        const rowPid = String(row?.product_id ?? "").trim();
-        if (rowPid === want) return true;
-        return false;
-      });
+      const expensePaltiRows = await MongoExpense.find(expensePaltiFilter)
+        .select({ company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1 })
+        .lean();
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -1110,13 +1111,14 @@ router.get(
           const filter = buildFlexibleFieldFilter("warehouse_id", warehouseId);
           if (filter) expensePaltiAnd.push(filter);
         }
+        const expenseProductFilter = buildFlexibleFieldFilter("product_id", productId);
+        if (expenseProductFilter) expensePaltiAnd.push(expenseProductFilter);
         const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-        const expensePaltiRows = await getExpenseCollection().find(expensePaltiFilter).toArray();
-        const filteredExpensePaltiRows = !productId ? expensePaltiRows : expensePaltiRows.filter((row) => String(row?.product_id ?? "").trim() === String(productId).trim());
+        const expensePaltiRows = await MongoExpense.find(expensePaltiFilter).lean();
 
         const combinedPaltiRows = [
           ...(paltiRows || []).map((row) => ({ ...row, palti_source: "paltilorryentries" })),
-          ...(filteredExpensePaltiRows || []).map((row) => ({ ...row, palti_source: "expenses" })),
+          ...(expensePaltiRows || []).map((row) => ({ ...row, palti_source: "expenses" })),
         ];
 
         const result =
@@ -1894,52 +1896,20 @@ router.post(
             );
           }
 
-          const requestedPaltiSource = normalizePaltiSource(adj.palti_source);
-          const paltiFilter = buildFlexibleIdFilter(adj.palti_lorry_id);
+          const paltiSource = normalizePaltiSource(adj.palti_source);
+          const paltiFilter =
+            buildFlexibleIdFilter(
+              adj.palti_lorry_id
+            );
 
-          // The frontend can carry a stale/mismatched palti_source.
-          // Always try the requested source first, then the other Palti source.
-          // This makes legacy IDs such as 1 work whether the row is stored in
-          // paltilorryentries or expenses.
           let paltiRow = null;
-          let paltiSource = requestedPaltiSource;
-
-          if (paltiFilter) {
-            if (requestedPaltiSource === "expenses") {
-              paltiRow = await getExpenseCollection().findOne(paltiFilter);
-              if (!paltiRow) {
-                paltiRow = await getPaltiCollection().findOne(paltiFilter, { session });
-                if (paltiRow) paltiSource = "paltilorryentries";
-              }
-            } else {
-              paltiRow = await getPaltiCollection().findOne(paltiFilter, { session });
-              if (!paltiRow) {
-                paltiRow = await getExpenseCollection().findOne(paltiFilter);
-                if (paltiRow) paltiSource = "expenses";
-              }
-            }
-          }
-
-          // Last-resort lookup: some old records use expense_id / palti_lorry_id
-          // as their cross-reference rather than id/legacy_id/sl_no.
-          if (!paltiRow && paltiSource === "paltilorryentries") {
-            paltiRow = await getPaltiCollection().findOne({
-              $or: [
-                { expense_id: adj.palti_lorry_id },
-                { expense_id: String(adj.palti_lorry_id) },
-              ],
-            }, { session });
-          }
-
-          if (!paltiRow && paltiSource === "expenses") {
-            paltiRow = await getExpenseCollection().findOne({
-              $or: [
-                { palti_lorry_id: adj.palti_lorry_id },
-                { palti_lorry_id: String(adj.palti_lorry_id) },
-                { id: adj.palti_lorry_id },
-                { id: String(adj.palti_lorry_id) },
-              ],
-            });
+          if (paltiSource === "expenses") {
+            paltiRow = await MongoExpense.findOne(paltiFilter).lean();
+          } else {
+            paltiRow = await getPaltiCollection().findOne(
+              paltiFilter,
+              { session }
+            );
           }
 
           if (!paltiRow) {
@@ -1958,29 +1928,17 @@ router.post(
             );
           }
 
-          if (
-            String(
-              paltiRow.company_id
-            ) !==
-            companyId
-          ) {
+          const actualPaltiCompanyId = String(
+            paltiRow.company_id ?? ""
+          ).trim();
+
+          if (!actualPaltiCompanyId) {
             throw makeAdjustmentError(
-              `Company mismatch for palti_lorry_id ${adj.palti_lorry_id}`,
+              `Palti Lorry ${adj.palti_lorry_id} has no company_id`,
               {
-                source_type:
-                  adj.source_type,
-
-                palti_lorry_id:
-                  adj.palti_lorry_id,
-
-                company_id:
-                  companyId,
-
-                row_company_id:
-                  paltiRow.company_id,
-
-                qty:
-                  adjQty,
+                source_type: "palti_lorry",
+                palti_lorry_id: adj.palti_lorry_id,
+                qty: adjQty,
               }
             );
           }
@@ -2026,12 +1984,12 @@ router.post(
             }
           }
 
-          const rawPaltiId =
-            paltiRow.legacy_id ??
-            paltiRow.id ??
-            paltiRow.sl_no ??
-            adj.palti_lorry_id;
-          const paltiId = Number(rawPaltiId);
+          const paltiId =
+            Number(
+              paltiRow.legacy_id ??
+                paltiRow.id ??
+                paltiRow.sl_no
+            );
 
           if (
             !Number.isFinite(
@@ -2134,7 +2092,7 @@ router.post(
                 adjQty,
 
               company_id:
-                companyId,
+                actualPaltiCompanyId,
 
               palti_source:
                 paltiSource,
@@ -2227,29 +2185,17 @@ router.post(
           );
         }
 
-        if (
-          String(
-            inwardRow.company_id
-          ) !==
-          companyId
-        ) {
+        const actualInwardCompanyId = String(
+          inwardRow.company_id ?? ""
+        ).trim();
+
+        if (!actualInwardCompanyId) {
           throw makeAdjustmentError(
-            `Company mismatch for inward_id ${adj.inward_id}`,
+            `Inward ${adj.inward_id} has no company_id`,
             {
-              source_type:
-                "inward",
-
-              inward_id:
-                adj.inward_id,
-
-              company_id:
-                companyId,
-
-              row_company_id:
-                inwardRow.company_id,
-
-              qty:
-                adjQty,
+              source_type: "inward",
+              inward_id: adj.inward_id,
+              qty: adjQty,
             }
           );
         }
@@ -2441,7 +2387,7 @@ router.post(
               adjQty,
 
             company_id:
-              companyId,
+              actualInwardCompanyId,
 
             created_at:
               new Date(),
