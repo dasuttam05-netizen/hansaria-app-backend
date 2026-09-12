@@ -201,20 +201,15 @@ function buildFlexibleIdFilter(
       numeric
     )
   ) {
-    conditions.push({
-      legacy_id:
-        numeric,
-    });
+    // Legacy IDs may be stored as either Number or String.
+    const numericString = String(numeric);
 
-    conditions.push({
-      id:
-        numeric,
-    });
-
-    conditions.push({
-      sl_no:
-        numeric,
-    });
+    conditions.push({ legacy_id: numeric });
+    conditions.push({ legacy_id: numericString });
+    conditions.push({ id: numeric });
+    conditions.push({ id: numericString });
+    conditions.push({ sl_no: numeric });
+    conditions.push({ sl_no: numericString });
   }
 
   if (
