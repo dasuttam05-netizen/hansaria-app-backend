@@ -538,6 +538,19 @@ const saleVoucherSchema =
 
           farmer_id: String,
 
+          farmer_name: String,
+
+          date: String,
+
+          lorry_no: String,
+
+          weight: {
+            type: Number,
+            default: 0,
+          },
+
+          consignee_name: String,
+
           quantity: {
             type: Number,
             default: 0,
