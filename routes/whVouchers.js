@@ -578,13 +578,18 @@ function buildSalePayload(body, voucherNo) {
   const purchaseLinks = Array.isArray(body.against_purchase_links)
     ? body.against_purchase_links
         .map((item) => {
-          const quantity = Number(item.quantity || item.adjusted_qty || 0);
+          const quantity = Number(item.quantity || item.adjusted_qty || item.weight || 0);
           const rate = Number(item.rate || 0);
           const amount = Number(item.amount || quantity * rate || 0);
           return {
             purchase_id: item.purchase_id ? String(item.purchase_id) : "",
             voucher_no: item.voucher_no || item.purchase_voucher_no || "",
             farmer_id: item.farmer_id ? String(item.farmer_id) : "",
+            farmer_name: item.farmer_name ? String(item.farmer_name) : "",
+            date: item.date ? String(item.date) : "",
+            lorry_no: item.lorry_no ? String(item.lorry_no) : "",
+            weight: Number.isFinite(Number(item.weight)) ? Number(item.weight) : quantity,
+            consignee_name: item.consignee_name ? String(item.consignee_name) : "",
             quantity: Number.isFinite(quantity) ? quantity : 0,
             rate: Number.isFinite(rate) ? rate : 0,
             amount: Number.isFinite(amount) ? amount : 0,
@@ -607,7 +612,7 @@ function buildSalePayload(body, voucherNo) {
     po_no: body.po_no || "",
     direct_purchase_rate: Number(body.direct_purchase_rate) || 0,
     direct_purchase_amount: Number(body.direct_purchase_amount) || 0,
-    against_purchase_enabled: Boolean(body.against_purchase_enabled && purchaseLinks.length),
+    against_purchase_enabled: Boolean((body.sale_type === "direct" || body.against_purchase_enabled) && purchaseLinks.length),
     against_purchase_farmer_id: body.against_purchase_farmer_id ? String(body.against_purchase_farmer_id) : "",
     against_purchase_links: purchaseLinks,
     lorry_no: body.lorry_no || body.reference_id || "",
@@ -721,6 +726,11 @@ async function createDirectSalePurchaseVoucher(salePayload) {
     purchase_id: String(doc._id),
     voucher_no: doc.voucher_no,
     farmer_id: farmerId,
+    farmer_name: String(doc.farmer_name || ""),
+    date: String(doc.date || salePayload.date || ""),
+    lorry_no: String(salePayload.lorry_no || ""),
+    weight: qty,
+    consignee_name: String(salePayload.consignee_name || ""),
     quantity: qty,
     rate: Number(salePayload.direct_purchase_rate || 0),
     amount,
