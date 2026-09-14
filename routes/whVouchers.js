@@ -736,6 +736,14 @@ async function createDirectSalePurchaseVoucher(salePayload) {
   const purchaseVoucherNo = await nextMongoVoucherNo("purchase");
   const qty = Number(salePayload.unloading_qty || salePayload.quantity || 0);
   const amount = Number((qty * Number(salePayload.direct_purchase_rate || 0)).toFixed(2));
+  let farmerName = "";
+  if (mongoose.Types.ObjectId.isValid(farmerId)) {
+    const farmer = await Farmer.findById(farmerId).select("name").lean();
+    farmerName = String(farmer?.name || "").trim();
+  } else if (Number.isFinite(Number(farmerId))) {
+    const farmer = await Farmer.findOne({ $or: [{ id: Number(farmerId) }, { legacy_id: Number(farmerId) }] }).select("name").lean();
+    farmerName = String(farmer?.name || "").trim();
+  }
   const doc = await PurchaseVoucher.create({
     voucher_no: purchaseVoucherNo,
     date: salePayload.date,
@@ -759,7 +767,7 @@ async function createDirectSalePurchaseVoucher(salePayload) {
     purchase_id: String(doc._id),
     voucher_no: doc.voucher_no,
     farmer_id: farmerId,
-    farmer_name: String(doc.farmer_name || ""),
+    farmer_name: farmerName,
     date: String(doc.date || salePayload.date || ""),
     lorry_no: String(salePayload.lorry_no || ""),
     weight: qty,
