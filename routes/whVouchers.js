@@ -256,6 +256,8 @@ function parseVoucherListOptions(req) {
   const buyerId = String(req.query.buyer_id || "").trim();
   const companyAccountId = String(req.query.company_account_id || "").trim();
   const productId = String(req.query.product_id || "").trim();
+  const untaggedDirectPurchase = String(req.query.untagged_direct_purchase || "") === "1";
+  const excludeSaleId = String(req.query.exclude_sale_id || "").trim();
   const fromDate = toDateOnly(req.query.from_date);
   const toDate = toDateOnly(req.query.to_date);
   return {
@@ -270,6 +272,8 @@ function parseVoucherListOptions(req) {
     buyerId,
     companyAccountId,
     productId,
+    untaggedDirectPurchase,
+    excludeSaleId,
     fromDate,
     toDate,
   };
@@ -403,6 +407,26 @@ async function getPurchaseVoucherPage(req) {
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "purchase");
   await addPurchaseSearchFilter(filter, options.search);
+  // A direct-loading purchase can be linked to only one sale voucher. The
+  // tagging popup requests this mode so saved tags do not appear again.
+  if (options.untaggedDirectPurchase) {
+    const saleFilter = {
+      ...mongoSaleScope(req.user),
+      "against_purchase_links.purchase_id": { $exists: true, $ne: "" },
+    };
+    if (options.excludeSaleId && mongoose.Types.ObjectId.isValid(options.excludeSaleId)) {
+      saleFilter._id = { $ne: options.excludeSaleId };
+    }
+    const taggedSales = await SaleVoucher.find(saleFilter)
+      .select("against_purchase_links.purchase_id")
+      .lean();
+    const taggedPurchaseIds = [...new Set(
+      taggedSales.flatMap((sale) => (Array.isArray(sale.against_purchase_links) ? sale.against_purchase_links : []))
+        .map((link) => String(link?.purchase_id || "").trim())
+        .filter(Boolean)
+    )];
+    if (taggedPurchaseIds.length) filter._id = { ...(filter._id || {}), $nin: taggedPurchaseIds };
+  }
   const [total, docs] = await Promise.all([
     PurchaseVoucher.countDocuments(filter),
     PurchaseVoucher.find(filter)
