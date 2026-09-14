@@ -361,6 +361,8 @@ const purchaseVoucherSchema =
 
       farmer_id: String,
 
+      consignee_id: String,
+
       company_account_id: String,
 
       product_id: String,
