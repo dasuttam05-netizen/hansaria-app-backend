@@ -3911,6 +3911,7 @@ router.post("/sale", (req, res) => {
   if (!req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
   if (isDirectSale && !req.body?.location_id) return res.status(400).json({ error: "Location is required for direct sale" });
   if (isDirectSale && !(req.body?.farmer_id || req.body?.against_purchase_farmer_id)) return res.status(400).json({ error: "Farmer is required for direct sale" });
+  if (isDirectSale && !req.body?.consignee_id) return res.status(400).json({ error: "Consignee is required for direct sale" });
   if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
   if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
   if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
@@ -3959,6 +3960,7 @@ router.put("/sale/:id", async (req, res) => {
   const isDirectSale = req.body?.sale_type === "direct";
   if (!req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
   if (isDirectSale && !req.body?.location_id) return res.status(400).json({ error: "Location is required for direct sale" });
+  if (isDirectSale && !req.body?.consignee_id) return res.status(400).json({ error: "Consignee is required for direct sale" });
   if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
 
   if (mongoReady() && mongoose.Types.ObjectId.isValid(id)) {
