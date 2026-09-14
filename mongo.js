@@ -351,6 +351,14 @@ const purchaseVoucherSchema =
 
       warehouse_id: String,
 
+      // Set for the purchase voucher generated automatically from a direct
+      // loading sale. This keeps direct-loading tags separate from normal
+      // warehouse purchase vouchers.
+      is_direct_loading: {
+        type: Boolean,
+        default: false,
+      },
+
       farmer_id: String,
 
       company_account_id: String,
