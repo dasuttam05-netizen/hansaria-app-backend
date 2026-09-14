@@ -7474,7 +7474,7 @@ router.get("/sale/:id/summary", async (req, res) => {
     if (!row) return res.status(404).json({ error: "Not found" });
     if (!(await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id))) return;
 
-    const purchaseLinks = Array.isArray(row.against_purchase_links)
+    const rawPurchaseLinks = Array.isArray(row.against_purchase_links)
       ? row.against_purchase_links
       : (() => {
           try {
@@ -7483,6 +7483,12 @@ router.get("/sale/:id/summary", async (req, res) => {
             return [];
           }
         })();
+    const purchaseLinks = rawPurchaseLinks.map((item) => ({
+      ...item,
+      purchase_id: item?.purchase_id ? String(item.purchase_id) : "",
+      consignee_id: item?.consignee_id ? String(item.consignee_id) : String(row.consignee_id || ""),
+      consignee_name: item?.consignee_name || row.consignee_name || "",
+    }));
     const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
     const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
     const resolvedTransportRow = await getTransportBiltiMatch({
