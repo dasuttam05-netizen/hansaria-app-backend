@@ -536,6 +536,7 @@ function buildPurchasePayload(body, voucherNo) {
     date: body.date,
     warehouse_id: body.warehouse_id ? String(body.warehouse_id) : "",
     farmer_id: body.farmer_id ? String(body.farmer_id) : "",
+    consignee_id: body.consignee_id ? String(body.consignee_id) : "",
     company_account_id: body.company_account_id ? String(body.company_account_id) : "",
     product_id: body.product_id ? String(body.product_id) : "",
     employee_id: body.employee_id ? String(body.employee_id) : "",
@@ -744,12 +745,24 @@ async function createDirectSalePurchaseVoucher(salePayload) {
     const farmer = await Farmer.findOne({ $or: [{ id: Number(farmerId) }, { legacy_id: Number(farmerId) }] }).select("name").lean();
     farmerName = String(farmer?.name || "").trim();
   }
+  const consigneeId = String(salePayload.consignee_id || "").trim();
+  let consigneeName = "";
+  if (consigneeId) {
+    const consigneeFilters = [];
+    if (mongoose.Types.ObjectId.isValid(consigneeId)) consigneeFilters.push({ _id: consigneeId });
+    if (Number.isFinite(Number(consigneeId))) consigneeFilters.push({ legacy_id: Number(consigneeId) });
+    if (consigneeFilters.length) {
+      const [consignee] = await findDedicatedPartyDocs("consignee", { $or: consigneeFilters });
+      consigneeName = String(consignee?.name || "").trim();
+    }
+  }
   const doc = await PurchaseVoucher.create({
     voucher_no: purchaseVoucherNo,
     date: salePayload.date,
     warehouse_id: salePayload.warehouse_id || "",
     is_direct_loading: true,
     farmer_id: farmerId,
+    consignee_id: salePayload.consignee_id || "",
     company_account_id: salePayload.company_account_id || "",
     product_id: salePayload.product_id || "",
     employee_id: salePayload.employee_id || "",
@@ -771,7 +784,7 @@ async function createDirectSalePurchaseVoucher(salePayload) {
     date: String(doc.date || salePayload.date || ""),
     lorry_no: String(salePayload.lorry_no || ""),
     weight: qty,
-    consignee_name: String(salePayload.consignee_name || ""),
+    consignee_name: consigneeName || String(salePayload.consignee_name || ""),
     quantity: qty,
     rate: Number(salePayload.direct_purchase_rate || 0),
     amount,
@@ -1076,12 +1089,18 @@ async function decoratePurchaseRows(rows) {
   const farmerIds = [...new Set(rows.map((r) => r.farmer_id).filter(mongoose.Types.ObjectId.isValid))];
   const productIds = [...new Set(rows.map((r) => r.product_id).filter(mongoose.Types.ObjectId.isValid))];
   const accountIds = [...new Set(rows.map((r) => r.company_account_id).filter(mongoose.Types.ObjectId.isValid))];
+  const consigneeIds = [...new Set(rows.map((r) => String(r.consignee_id || "")).filter(Boolean))];
+  const consigneeFilters = [
+    ...consigneeIds.filter(mongoose.Types.ObjectId.isValid).map((id) => ({ _id: id })),
+    ...consigneeIds.map(Number).filter(Number.isFinite).map((id) => ({ legacy_id: id })),
+  ];
 
-  const [warehouses, farmers, products, accounts] = await Promise.all([
+  const [warehouses, farmers, products, accounts, consignees] = await Promise.all([
     warehouseIds.length ? Warehouse.find({ _id: { $in: warehouseIds } }).lean() : [],
     farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).lean() : [],
     productIds.length ? Product.find({ _id: { $in: productIds } }).lean() : [],
     accountIds.length ? CompanyAccount.find({ _id: { $in: accountIds } }).lean() : [],
+    consigneeFilters.length ? findDedicatedPartyDocs("consignee", { $or: consigneeFilters }) : [],
   ]);
 
   const byId = (items) => new Map(items.map((item) => [String(item._id), item]));
@@ -1089,6 +1108,11 @@ async function decoratePurchaseRows(rows) {
   const farmerMap = byId(farmers);
   const productMap = byId(products);
   const accountMap = byId(accounts);
+  const consigneeMap = new Map();
+  consignees.forEach((consignee) => {
+    if (consignee?._id) consigneeMap.set(String(consignee._id), consignee);
+    if (consignee?.legacy_id !== undefined && consignee?.legacy_id !== null) consigneeMap.set(String(consignee.legacy_id), consignee);
+  });
 
   return rows.map((row) => {
     const plain = row.toObject ? row.toObject() : row;
@@ -1096,6 +1120,7 @@ async function decoratePurchaseRows(rows) {
     const farmer = farmerMap.get(String(plain.farmer_id));
     const product = productMap.get(String(plain.product_id));
     const account = accountMap.get(String(plain.company_account_id));
+    const consignee = consigneeMap.get(String(plain.consignee_id || ""));
     return {
       ...plain,
       id: String(plain._id),
@@ -1117,6 +1142,7 @@ async function decoratePurchaseRows(rows) {
       farmer_pincode: farmer?.pincode || plain.farmer_pincode,
       farmer_gst: farmer?.gst_no || farmer?.gst || plain.farmer_gst,
       farmer_pan: farmer?.pan_no || farmer?.pan || plain.farmer_pan,
+      consignee_name: consignee?.name || plain.consignee_name || "",
       product_name: product?.name || plain.product_name,
       company_account_name: account?.account_name || plain.company_account_name,
       company_account_address: account?.address || plain.company_account_address,
