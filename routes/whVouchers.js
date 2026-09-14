@@ -627,6 +627,25 @@ function buildSalePayload(body, voucherNo) {
             quantity: Number.isFinite(quantity) ? quantity : 0,
             rate: Number.isFinite(rate) ? rate : 0,
             amount: Number.isFinite(amount) ? amount : 0,
+            purchase_total_qty: Number(item.purchase_total_qty || item.total_qty || quantity) || quantity,
+            claim_amount: Number(item.claim_amount ?? item.bags_claim ?? 0) || 0,
+            bags_claim: Number(item.bags_claim ?? item.claim_amount ?? 0) || 0,
+            shortage_amount: Number(item.shortage_amount ?? 0) || 0,
+            shortage_qty: Number(item.shortage_qty ?? 0) || 0,
+            moisture: Number(item.moisture ?? 0) || 0,
+            dunki: Number(item.dunki ?? 0) || 0,
+            fungus: Number(item.fungus ?? 0) || 0,
+            discolour: Number(item.discolour ?? 0) || 0,
+            less_bags_weight: Number(item.less_bags_weight ?? 0) || 0,
+            others: Number(item.others ?? item.other_deduction ?? 0) || 0,
+            other_deduction: Number(item.other_deduction ?? item.others ?? 0) || 0,
+            labour: Number(item.labour ?? 0) || 0,
+            transport_charge: Number(item.transport_charge ?? 0) || 0,
+            cd_amount: Number(item.cd_amount ?? 0) || 0,
+            adjustment_amount: Number(item.adjustment_amount ?? 0) || 0,
+            tds_amount: Number(item.tds_amount ?? 0) || 0,
+            round_off: Number(item.round_off ?? 0) || 0,
+            total_deduction: Number(item.total_deduction ?? item.total_deduct_amount ?? 0) || 0,
           };
         })
         .filter((item) => item.purchase_id && item.quantity > 0)
@@ -7496,12 +7515,14 @@ router.get("/sale/:id/summary", async (req, res) => {
       lorryNo: row.lorry_no || "",
     });
     const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.transport_charge || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
-    const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+    const directPurchaseAmount = Number(row.direct_purchase_amount || hydratedPurchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
     const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
+    const purchaseDeductionTotal = hydratedPurchaseLinks.reduce((sum, item) => sum + Number(item.total_deduction || 0), 0);
+    const netPurchaseAmount = Math.max(directPurchaseAmount - purchaseDeductionTotal, 0);
 
     res.json({
       sale: row,
-      purchase_links: purchaseLinks,
+      purchase_links: hydratedPurchaseLinks,
       payment_details: paymentDetails,
       journal_details: journalDetails,
       transport_charge: Number(resolvedTransportRow?.transport_amount || resolvedTransportRow?.payable_amount || resolvedTransportRow?.net_amount || resolvedTransportRow?.gross_freight || 0),
@@ -7523,7 +7544,9 @@ router.get("/sale/:id/summary", async (req, res) => {
         net_payable: netAmount,
         net_receivable: Number(row.net_receivable_amount || netAmount),
         direct_purchase_amount: directPurchaseAmount,
-        profit_loss: netAmount - directPurchaseAmount,
+        purchase_deduction_total: purchaseDeductionTotal,
+        net_purchase_amount: netPurchaseAmount,
+        profit_loss: netAmount - netPurchaseAmount,
       },
     });
   } catch (err) {
