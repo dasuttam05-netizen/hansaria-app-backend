@@ -4100,6 +4100,11 @@ router.put("/sale/:id", async (req, res) => {
       net_receivable_amount: netAmount,
       net_amount_payable: netAmount,
       outstanding: netAmount,
+      ...(Array.isArray(req.body.against_purchase_links) ? {
+        against_purchase_enabled: req.body.against_purchase_links.length ? 1 : 0,
+        against_purchase_farmer_id: req.body.against_purchase_farmer_id ?? mongoSale.against_purchase_farmer_id ?? "",
+        against_purchase_links: JSON.stringify(req.body.against_purchase_links),
+      } : {}),
       updated_at: new Date(),
     };
 
@@ -7474,7 +7479,7 @@ router.get("/sale/:id/summary", async (req, res) => {
     if (!row) return res.status(404).json({ error: "Not found" });
     if (!(await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id))) return;
 
-    const rawPurchaseLinks = Array.isArray(row.against_purchase_links)
+    const purchaseLinks = Array.isArray(row.against_purchase_links)
       ? row.against_purchase_links
       : (() => {
           try {
@@ -7483,12 +7488,6 @@ router.get("/sale/:id/summary", async (req, res) => {
             return [];
           }
         })();
-    const purchaseLinks = rawPurchaseLinks.map((item) => ({
-      ...item,
-      purchase_id: item?.purchase_id ? String(item.purchase_id) : "",
-      consignee_id: item?.consignee_id ? String(item.consignee_id) : String(row.consignee_id || ""),
-      consignee_name: item?.consignee_name || row.consignee_name || "",
-    }));
     const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
     const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
     const resolvedTransportRow = await getTransportBiltiMatch({
