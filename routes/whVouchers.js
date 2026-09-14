@@ -7416,11 +7416,6 @@ router.get("/sale/:id/pdf", async (req, res) => {
             return [];
           }
         })();
-    const directFarmerId = String(row.farmer_id || row.against_purchase_farmer_id || '').trim();
-    if (directFarmerId && !row.farmer_name && mongoose.Types.ObjectId.isValid(directFarmerId)) {
-      const farmerDoc = await Farmer.findById(directFarmerId).select('name').lean().catch(() => null);
-      if (farmerDoc?.name) row.farmer_name = farmerDoc.name;
-    }
     const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.transport_charge || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
     const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
     const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
@@ -7512,57 +7507,6 @@ router.get("/sale/:id/summary", async (req, res) => {
             return [];
           }
         })();
-
-    // Hydrate tagged purchase rows for the farmer-wise Sale Summary.
-    let hydratedPurchaseLinks = purchaseLinks;
-    if (mongoReady() && purchaseLinks.length) {
-      const ids = purchaseLinks
-        .map((item) => String(item?.purchase_id || item?.id || item?._id || '').trim())
-        .filter((id) => mongoose.Types.ObjectId.isValid(id));
-      const purchaseDocs = ids.length ? await PurchaseVoucher.find({ _id: { $in: ids } }).lean() : [];
-      const purchaseMap = new Map(purchaseDocs.map((doc) => [String(doc._id), doc]));
-      const farmerIds = Array.from(new Set(
-        purchaseLinks
-          .map((item) => String(item?.farmer_id || purchaseMap.get(String(item?.purchase_id || item?.id || item?._id || ''))?.farmer_id || '').trim())
-          .filter(Boolean)
-      ));
-      const farmerObjectIds = farmerIds.filter((fid) => mongoose.Types.ObjectId.isValid(fid));
-      const farmers = farmerObjectIds.length ? await Farmer.find({ _id: { $in: farmerObjectIds } }).select('name').lean() : [];
-      const farmerMap = new Map(farmers.map((farmer) => [String(farmer._id), farmer.name]));
-
-      hydratedPurchaseLinks = purchaseLinks.map((item) => {
-        const purchaseId = String(item?.purchase_id || item?.id || item?._id || '').trim();
-        const doc = purchaseMap.get(purchaseId) || {};
-        const farmerId = String(item?.farmer_id || doc.farmer_id || '').trim();
-        const claim = Number(item?.claim_amount ?? item?.bags_claim ?? doc.claim_amount ?? doc.bags_claim ?? 0) || 0;
-        const shortage = Number(item?.shortage_amount ?? doc.shortage_amount ?? 0) || 0;
-        const freight = Number(item?.transport_charge ?? doc.transport_charge ?? 0) || 0;
-        const others = Number(item?.other_deduction ?? item?.others ?? doc.other_deduction ?? doc.others ?? 0) || 0;
-        const labour = Number(item?.labour ?? doc.labour ?? 0) || 0;
-        const cd = Number(item?.cd_amount ?? doc.cd_amount ?? 0) || 0;
-        const adjustment = Number(item?.adjustment_amount ?? doc.adjustment_amount ?? 0) || 0;
-        const tds = Number(item?.tds_amount ?? doc.tds_amount ?? 0) || 0;
-        const totalDeduction = Number(item?.total_deduction ?? doc.total_deduction ?? (claim + freight + others + labour + cd + adjustment + tds));
-        return {
-          ...item,
-          farmer_id: farmerId,
-          farmer_name: item?.farmer_name || farmerMap.get(farmerId) || '',
-          quantity: Number(item?.quantity ?? doc.total_qty ?? doc.quantity ?? 0) || 0,
-          rate: Number(item?.rate ?? doc.rate ?? 0) || 0,
-          amount: Number(item?.amount ?? doc.amount ?? 0) || 0,
-          shortage_amount: shortage,
-          claim_amount: claim,
-          transport_charge: freight,
-          other_deduction: others,
-          labour,
-          cd_amount: cd,
-          adjustment_amount: adjustment,
-          tds_amount: tds,
-          total_deduction: totalDeduction,
-        };
-      });
-    }
-
     const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
     const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
     const resolvedTransportRow = await getTransportBiltiMatch({
@@ -7602,10 +7546,6 @@ router.get("/sale/:id/summary", async (req, res) => {
         direct_purchase_amount: directPurchaseAmount,
         purchase_deduction_total: purchaseDeductionTotal,
         net_purchase_amount: netPurchaseAmount,
-        round_off: Number(row.round_off || 0),
-        direct_purchase_qty: Number(row.unloading_qty || row.quantity || 0),
-        direct_purchase_rate: Number(row.direct_purchase_rate || 0),
-        purchase_deduction_total: purchaseDeductionTotal,
         profit_loss: netAmount - netPurchaseAmount,
       },
     });
