@@ -426,6 +426,15 @@ async function getPurchaseVoucherPage(req) {
         .filter(Boolean)
     )];
     if (taggedPurchaseIds.length) filter._id = { ...(filter._id || {}), $nin: taggedPurchaseIds };
+    // Legacy auto entries have the same description but no marker. Keep them
+    // available during the migration; normal warehouse purchases never pass.
+    filter.$and = [
+      ...(filter.$and || []),
+      { $or: [
+        { is_direct_loading: true },
+        { description: /^Auto direct sale purchase against/i },
+      ] },
+    ];
   }
   const [total, docs] = await Promise.all([
     PurchaseVoucher.countDocuments(filter),
@@ -709,7 +718,6 @@ function buildSalePayload(body, voucherNo) {
   payload.fifo_amount = grossAmount;
   payload.fifo_rate = qtyForFifo > 0 ? grossAmount / qtyForFifo : 0;
   if (payload.sale_type === "direct") {
-    payload.warehouse_id = "";
     payload.direct_purchase_amount = Number((qtyForFifo * payload.direct_purchase_rate).toFixed(2));
   }
 
@@ -731,7 +739,8 @@ async function createDirectSalePurchaseVoucher(salePayload) {
   const doc = await PurchaseVoucher.create({
     voucher_no: purchaseVoucherNo,
     date: salePayload.date,
-    warehouse_id: "",
+    warehouse_id: salePayload.warehouse_id || "",
+    is_direct_loading: true,
     farmer_id: farmerId,
     company_account_id: salePayload.company_account_id || "",
     product_id: salePayload.product_id || "",
@@ -3886,7 +3895,7 @@ router.post("/sale", (req, res) => {
           if (saleQty > availableQty + 0.0001) {
             return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
           }
-        } else if (req.body?.create_against_purchase === true) {
+        } else if (isDirectSale) {
           const directPurchase = await createDirectSalePurchaseVoucher(payload);
           payload.against_purchase_enabled = Boolean(directPurchase);
           payload.against_purchase_farmer_id = directPurchase?.farmer_id || payload.against_purchase_farmer_id || "";
