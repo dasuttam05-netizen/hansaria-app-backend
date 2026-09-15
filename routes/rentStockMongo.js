@@ -173,11 +173,11 @@ async function buildInwardRows(filters = {}) {
   const productId = String(filters.product_id || '');
   const employeeId = String(filters.employee_id || '');
   const query = {};
-  if (companyIds.size) query.company_id = { $in: Array.from(companyIds) };
-  if (warehouseIds.size) query.warehouse_id = { $in: Array.from(warehouseIds) };
-  if (locationIds.size) query.location_id = { $in: Array.from(locationIds) };
-  if (productId) query.product_id = productId;
-  if (employeeId) query.employee_id = employeeId;
+  if (companyIds.size) query.company_id = flexibleRefs(['company_id'], Array.from(companyIds));
+  if (warehouseIds.size) query.warehouse_id = flexibleRefs(['warehouse_id'], Array.from(warehouseIds));
+  if (locationIds.size) query.location_id = flexibleRefs(['location_id'], Array.from(locationIds));
+  if (productId) query.product_id = flexibleRefs(['product_id'], [productId]);
+  if (employeeId) query.employee_id = flexibleRefs(['employee_id'], [employeeId]);
 
   // Keep date filtering in JS because this legacy collection contains mixed date types.
   // The projection and other DB-side filters avoid shipping unnecessary document fields.
@@ -429,7 +429,14 @@ router.get('/warehouse-rent-month-end', async (req,res,next)=>{
   if(!mongoReady()) return next();
   try{
     const month=String(req.query.month||new Date().toISOString().slice(0,7));
-    const details=await buildRentDetails({monthList:[month],filters:{company_id:req.query.company_id,warehouse_id:req.query.warehouse_id}});
+    const details=await buildRentDetails({
+      monthList:[month],
+      filters:{
+        company_id:req.query.company_id,
+        warehouse_id:req.query.warehouse_id,
+        location_id:req.query.location_id || req.query.location_ids,
+      },
+    });
     const map=new Map(); details.forEach(r=>{const k=`${r.month}__${r.party_name}__${r.warehouse_name}`; if(!map.has(k)) map.set(k,{month:r.month,month_label:r.month_label,month_end_date:r.month_end_date,party_name:r.party_name,warehouse_name:r.warehouse_name,total_weight:0,total_rent:0,total_entries:0}); const s=map.get(k); s.total_weight+=num(r.original_weight); s.total_rent+=num(r.rent_amount); s.total_entries+=1;});
     const summary=Array.from(map.values()).map(r=>({...r,total_weight:Number(r.total_weight.toFixed(4)),total_rent:Number(r.total_rent.toFixed(2))}));
     res.json({month,month_label:monthLabel(month),month_end_date:monthEnd(month),summary,details});
