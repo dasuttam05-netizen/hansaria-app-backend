@@ -825,11 +825,8 @@ DISPLAY DECORATION
 async function decorateOutwardDocs(
   docs
 ) {
-  const result = [];
-
-  for (
-    const doc of docs || []
-  ) {
+  const result = await Promise.all(
+    (docs || []).map(async (doc) => {
     const masters =
       await resolveOutwardMasters({
         employee_id:
@@ -880,7 +877,7 @@ async function decorateOutwardDocs(
       doc?.inv_no ||
       "";
 
-    result.push({
+    return {
       ...doc,
 
       mongo_id:
@@ -985,8 +982,9 @@ async function decorateOutwardDocs(
         safeNumber(
           doc?.amount
         ),
-    });
-  }
+    };
+    })
+  );
 
   return result;
 }
