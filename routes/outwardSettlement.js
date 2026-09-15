@@ -2295,13 +2295,13 @@ router.get(
           })
           .lean();
 
-      const result =
-        [];
+      const result = [];
+      const batchSize = 8;
 
-      for (
-        const outward of
-          outwardRows
-      ) {
+      for (let batchStart = 0; batchStart < outwardRows.length; batchStart += batchSize) {
+        const batch = outwardRows.slice(batchStart, batchStart + batchSize);
+        const batchRows = await Promise.all(
+          batch.map(async (outward) => {
         const outwardId =
           Number(
             outward.legacy_id ??
@@ -2314,7 +2314,7 @@ router.get(
             outwardId
           )
         ) {
-          continue;
+          return null;
         }
 
         const settlement =
@@ -2325,7 +2325,7 @@ router.get(
         if (
           !settlement
         ) {
-          continue;
+          return null;
         }
 
         const meta =
@@ -2728,7 +2728,7 @@ router.get(
             outward.product
           );
 
-        result.push({
+        return {
           ...outward,
 
           id:
@@ -2833,7 +2833,10 @@ router.get(
 
           adjustment_details:
             mappedAdjustmentDetails,
-        });
+        };
+          })
+        );
+        result.push(...batchRows.filter(Boolean));
       }
 
       return res.json(
