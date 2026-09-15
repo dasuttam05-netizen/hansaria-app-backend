@@ -45,10 +45,43 @@ async function loadInwards(query) {
   return Inward.find(filter).sort({ date: 1, _id: 1 }).lean();
 }
 
+function grossQty(row) { return Number(row?.weight ?? row?.quantity ?? 0) || 0; }
+function shortageQty(row) { return Number(calculateShortageQty(grossQty(row), 1, row?.shortage_percent)) || 0; }
 function availableQty(row) {
-  const gross = Number(row.weight || row.quantity || 0);
-  const shortage = calculateShortageQty(gross, 1, row.shortage_percent);
-  return gross - shortage - Number(row.adjusted_qty || 0);
+  const shortage = shortageQty(row);
+  if (row?.remaining_qty !== undefined && row?.remaining_qty !== null && row?.remaining_qty !== '') return Math.max(Number(row.remaining_qty) - shortage, 0);
+  return Math.max(grossQty(row) - shortage - Number(row?.adjusted_qty || 0), 0);
+}
+function idAliases(row) { return [row?._id,row?.legacy_id,row?.id,row?.sl_no].filter(v => v !== undefined && v !== null && String(v).trim()).map(String); }
+function buildAliasMap(rows) { const map=new Map(); for(const row of rows||[]) for(const id of idAliases(row)) map.set(id,row); return map; }
+
+async function buildPartyStockRows(query) {
+  const inwards = await loadInwards(query);
+  if (!inwards.length) return [];
+  const db = mongoose.connection.db;
+  const [adjustments,outwards,warehouses,products,companies] = await Promise.all([
+    db.collection('adjustments').find({}).toArray(), Outward.find({}).lean(), Warehouse.find({}).lean(), Product.find({}).lean(), Company.find({}).lean()
+  ]);
+  const outwardMap=buildAliasMap(outwards), warehouseMap=buildAliasMap(warehouses), productMap=buildAliasMap(products), companyMap=buildAliasMap(companies);
+  const adjustedByInward=new Map(), outwardDatesByInward=new Map();
+  for(const adj of adjustments||[]){
+    if(String(adj?.source_type||'inward').toLowerCase() !== 'inward') continue;
+    const key=String(adj?.inward_id??'').trim(); if(!key) continue;
+    const qty=Number(adj?.qty??adj?.quantity??0)||0; adjustedByInward.set(key,(adjustedByInward.get(key)||0)+qty);
+    const outward=outwardMap.get(String(adj?.outward_id??'').trim()); const od=outward?.date||outward?.outward_date||null;
+    if(od){ const arr=outwardDatesByInward.get(key)||[]; arr.push(od); outwardDatesByInward.set(key,arr); }
+  }
+  return inwards.map(row=>{
+    const aliases=idAliases(row); let adjusted=0; for(const key of aliases){ if(adjustedByInward.has(key)){adjusted=Number(adjustedByInward.get(key)||0); break;} }
+    const gross=grossQty(row), shortage=shortageQty(row), netOpening=Math.max(gross-shortage,0);
+    const remainingRaw=Number(row?.remaining_qty);
+    const available=Number.isFinite(remainingRaw) ? Math.max(remainingRaw-shortage,0) : Math.max(netOpening-adjusted,0);
+    const warehouse=warehouseMap.get(String(row?.warehouse_id??''))||{}, product=productMap.get(String(row?.product_id??''))||{}, company=companyMap.get(String(row?.company_id??''))||{};
+    const dates=aliases.flatMap(k=>outwardDatesByInward.get(k)||[]).filter(Boolean).sort((a,b)=>new Date(a)-new Date(b));
+    const inwardDate=row?.date||row?.inward_date||null, outwardDate=dates.at(-1)||row?.outward_date||null;
+    const daysDiff=outwardDate&&inwardDate?Math.max(0,Math.floor((new Date(outwardDate)-new Date(inwardDate))/86400000)):0;
+    return {...row, id:row?._id?String(row._id):(row?.legacy_id??row?.sl_no??row?.id), company_name:row?.company_name||company?.name||row?.company||'', company_address:row?.company_address||company?.address||company?.company_address||'', account_name:row?.company_account_name||row?.company_account||row?.account_name||'', lorry_no:row?.lorry_no||'', employee_name:row?.employee_name||'', warehouse_name:row?.warehouse_name||warehouse?.name||row?.warehouse||'', warehouse_address:row?.warehouse_address||warehouse?.address||warehouse?.warehouse_address||'', location_name:row?.location_name||row?.location||'', product_name:row?.product_name||product?.name||row?.product||'', inward_date:inwardDate, outward_date:outwardDate, days_diff:daysDiff, gross_qty:+gross.toFixed(4), shortage_qty:+shortage.toFixed(4), net_opening_qty:+netOpening.toFixed(4), already_adjusted_qty:+adjusted.toFixed(4), available_balance_qty:+available.toFixed(4)};
+  });
 }
 
 function summaryBy(rows, keyFn, create) {
@@ -80,14 +113,12 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), async (req, r
 
 router.get("/party-stock", authorizeReport("report.partyStock"), async (req, res) => {
   try {
-    const rows = (await loadInwards(req.query)).map((row) => ({ ...row, available_balance_qty: availableQty(row) }));
-    const summary = summaryBy(rows, (row) => `${row.company_name || row.company || "Unknown"}::${row.warehouse_name || row.warehouse_id || "Unknown"}`, (row) => ({
-      party_name: row.company_name || row.company || "Unknown Party",
-      warehouse_name: row.warehouse_name || "Unknown",
-      available_balance_qty: Number(row.available_balance_qty || 0),
+    const rows = await buildPartyStockRows(req.query);
+    const summary = summaryBy(rows, row => `${row.company_name || "Unknown"}::${row.warehouse_name || row.warehouse_id || "Unknown"}`, row => ({
+      party_name: row.company_name || "Unknown Party", company_address: row.company_address || "", warehouse_name: row.warehouse_name || "Unknown", gross_qty: Number(row.gross_qty||0), shortage_qty: Number(row.shortage_qty||0), net_opening_qty: Number(row.net_opening_qty||0), already_adjusted_qty: Number(row.already_adjusted_qty||0), available_balance_qty: Number(row.available_balance_qty||0),
     }));
     return res.json({ summary, details: rows });
-  } catch (error) { return res.status(500).json({ error: error.message }); }
+  } catch (error) { console.error("Party stock report failed:", error); return res.status(500).json({ error: error.message }); }
 });
 
 router.get("/warehouse-stock", authorizeReport("report.partyStock"), async (req, res) => {
