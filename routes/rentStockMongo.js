@@ -173,9 +173,9 @@ async function buildInwardRows(filters = {}) {
   const productId = String(filters.product_id || '');
   const employeeId = String(filters.employee_id || '');
   const query = {};
-  if (companyIds.size) query.company_id = flexibleRefs(['company_id'], Array.from(companyIds));
-  if (warehouseIds.size) query.warehouse_id = flexibleRefs(['warehouse_id'], Array.from(warehouseIds));
-  if (locationIds.size) query.location_id = flexibleRefs(['location_id'], Array.from(locationIds));
+  // Keep product/employee filtering in Mongo. Party/warehouse/location are
+  // matched after master-name resolution because legacy inward rows can store
+  // either IDs, legacy IDs, or names in these fields.
   if (productId) query.product_id = flexibleRefs(['product_id'], [productId]);
   if (employeeId) query.employee_id = flexibleRefs(['employee_id'], [employeeId]);
 
@@ -195,6 +195,23 @@ async function buildInwardRows(filters = {}) {
     return true;
   });
   const maps = await masterMapsForRows(filtered);
+  const matchesSelected = (row, selectedIds, master, idFields, nameFields) => {
+    if (!selectedIds.size) return true;
+    const values = [];
+    for (const key of idFields) if (row?.[key] !== undefined && row?.[key] !== null && row?.[key] !== '') values.push(String(row[key]).trim());
+    for (const key of nameFields) if (row?.[key]) values.push(String(row[key]).trim().toLowerCase());
+    if (master) {
+      for (const key of ['_id','id','legacy_id']) {
+        if (master?.[key] !== undefined && master?.[key] !== null && master?.[key] !== '') values.push(String(master[key]).trim());
+      }
+      for (const key of ['name','account_name']) if (master?.[key]) values.push(String(master[key]).trim().toLowerCase());
+    }
+    for (const selected of selectedIds) {
+      const s = String(selected).trim();
+      if (values.includes(s) || values.includes(s.toLowerCase())) return true;
+    }
+    return false;
+  };
   return filtered.map(r => {
     const c = findMaster(maps.companies, r.company_id, r.company_name || r.company);
     const a = findMaster(maps.accounts, r.company_account_id, r.company_account_name || r.company_account || r.account_name);
@@ -218,8 +235,11 @@ async function buildInwardRows(filters = {}) {
       date: inwardDate,
       inward_date: inwardDate,
       outward_date: dateOnly(r.outward_date),
+      __selectedCompany: matchesSelected(r, companyIds, c, ['company_id','companyId'], ['company_name','company']),
+      __selectedWarehouse: matchesSelected(r, warehouseIds, w, ['warehouse_id','warehouseId'], ['warehouse_name','warehouse']),
+      __selectedLocation: matchesSelected(r, locationIds, l, ['location_id','locationId'], ['location_name','location']),
     };
-  });
+  }).filter(r => r.__selectedCompany && r.__selectedWarehouse && r.__selectedLocation).map(({__selectedCompany,__selectedWarehouse,__selectedLocation,...row}) => row);
 }
 
 async function adjustmentMap(inwardIds = null) {
@@ -414,11 +434,12 @@ async function handleRentLedger(req,res,next) {
   if (!mongoReady()) return next();
   try {
     const page=Math.max(parseInt(req.query.page,10)||1,1); const pageSize=Math.min(Math.max(parseInt(req.query.page_size,10)||100,1),500); const usePaging=req.query.page!==undefined||req.query.page_size!==undefined;
-    // For date-range ledgers, expand every month between range endpoints.
-    let allMonths=[]; const from=req.query.from_date?String(req.query.from_date).slice(0,7):''; const to=req.query.to_date?String(req.query.to_date).slice(0,7):'';
-    if(from&&to){ let cur=from; for(let i=0;i<24&&cur<=to;i++,cur=addMonths(cur,1)) allMonths.push(cur); }
-    if(!allMonths.length) allMonths=[new Date().toISOString().slice(0,7)];
-    const full=await buildRentDetails({monthList:allMonths,filters:req.query}); const total=full.length; const data=usePaging?full.slice((page-1)*pageSize,page*pageSize):full;
+    // Ledger is an as-of report: calculate rent for the month containing the
+    // selected end date. Expanding every month here double-counted the same
+    // stock and made the ledger total differ from the Month End Report.
+    const to=req.query.to_date?dateOnly(req.query.to_date):new Date().toISOString().slice(0,10);
+    const reportMonth=to ? to.slice(0,7) : new Date().toISOString().slice(0,7);
+    const full=await buildRentDetails({monthList:[reportMonth],filters:req.query}); const total=full.length; const data=usePaging?full.slice((page-1)*pageSize,page*pageSize):full;
     res.json(usePaging?{data,pagination:{page,pageSize,totalCount:total,totalPages:Math.max(1,Math.ceil(total/pageSize)),hasMore:page*pageSize<total}}:data);
   } catch(e){ console.error('Mongo warehouse rent ledger failed:',e); return next(); }
 }
