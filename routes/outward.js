@@ -1146,36 +1146,14 @@ async function getAvailableWarehouseStock({
     !product_id
   ) {
     return {
-      currentStock:
-        0,
-
-      reservedStock:
-        0,
-
-      availableStock:
-        0,
+      currentStock: 0,
+      reservedStock: 0,
+      availableStock: 0,
     };
   }
 
-  const normalizedWarehouse =
-    normalizeId(
-      warehouse_id
-    );
-
-  const normalizedProduct =
-    normalizeId(
-      product_id
-    );
-
-  const warehouseCandidates =
-    mixedIdCandidates(
-      warehouse_id
-    );
-
-  const productCandidates =
-    mixedIdCandidates(
-      product_id
-    );
+  const warehouseCandidates = mixedIdCandidates(warehouse_id);
+  const productCandidates = mixedIdCandidates(product_id);
 
   if (
     warehouseCandidates.length === 0 ||
@@ -1189,172 +1167,59 @@ async function getAvailableWarehouseStock({
   }
 
   /*
-   * Current stock = remaining_qty from Inward.
-   * Match ObjectId/string/legacy numeric representations.
+   * IMPORTANT STOCK RULE:
+   * Outward entry is only an outward entry/reservation.
+   * It must NOT be subtracted from warehouse available stock.
+   * Actual warehouse stock is represented by Inward.remaining_qty.
+   *
+   * Example:
+   * Inward 100 | Outward 60 | Adjustment 50
+   * Current 100 | Outward Entry 60 | Available 50
+   * Pending adjustment = 10
+   *
+   * Keep the rest of the outward logic unchanged.
    */
-  const inwardRows =
-    await MongoInward.find({
-      warehouse_id: {
-        $in: warehouseCandidates,
-      },
-
-      product_id: {
-        $in: productCandidates,
-      },
+  const inwardRows = await MongoInward.find({
+    warehouse_id: {
+      $in: warehouseCandidates,
+    },
+    product_id: {
+      $in: productCandidates,
+    },
+  })
+    .select({
+      remaining_qty: 1,
+      weight: 1,
+      quantity: 1,
+      date: 1,
+      legacy_id: 1,
     })
-      .select({
-        remaining_qty:
-          1,
+    .lean();
 
-        weight:
-          1,
-
-        quantity:
-          1,
-
-        date:
-          1,
-
-        legacy_id:
-          1,
-      })
-      .lean();
-
-  // Gross inward quantity is the stock that originally entered the warehouse.
-  // Remaining quantity is the physical balance after adjustments.
   let currentStock = 0;
-  let physicalAvailableStock = 0;
+  let availableStock = 0;
 
   for (const row of inwardRows) {
     const grossQty = safeNumber(
       row?.weight ?? row?.quantity
     );
-    const remainingQty =
-      row?.remaining_qty !== undefined && row?.remaining_qty !== null
-        ? safeNumber(row.remaining_qty)
-        : grossQty;
+
+    const remainingQty = safeNumber(
+      row?.remaining_qty ??
+        row?.weight ??
+        row?.quantity
+    );
 
     currentStock += grossQty;
-    physicalAvailableStock += Math.max(remainingQty, 0);
-  }
-
-  /*
-   * Pending / partial reserved stock.
-   */
-  const outwardFilter = {
-    warehouse_id: {
-      $in: warehouseCandidates,
-    },
-
-    product_id: {
-      $in: productCandidates,
-    },
-
-    status: {
-      $in: [
-        "Pending",
-        "Partial",
-      ],
-    },
-  };
-
-  if (
-    outwardId
-  ) {
-    const existing =
-      await findMongoOutward(
-        outwardId
-      );
-
-    if (
-      existing?._id
-    ) {
-      outwardFilter._id = {
-        $ne:
-          existing._id,
-      };
-    }
-  }
-
-  const pendingOutwards =
-    await MongoOutward.find(
-      outwardFilter
-    )
-      .select({
-        _id:
-          1,
-
-        legacy_id:
-          1,
-
-        quantity:
-          1,
-
-        weight:
-          1,
-      })
-      .lean();
-
-  let reservedStock =
-    0;
-
-  for (
-    const row of
-      pendingOutwards
-  ) {
-    const outwardIdValue =
-      row?.legacy_id ??
-      row?._id;
-
-    const adjustedQty =
-      await getAdjustedQtyForOutward(
-        outwardIdValue
-      );
-
-    const quantity =
-      safeNumber(
-        row?.quantity ??
-          row?.weight
-      );
-
-    reservedStock +=
-      Math.max(
-        quantity -
-          adjustedQty,
-        0
-      );
-  }
-
-  // IMPORTANT:
-  // `availableStock` is the actual warehouse balance after adjustment.
-  // Pending outward entries are shown separately as `reservedStock`; they do
-  // not reduce the displayed physical balance a second time.
-  let adjustedQtyForCurrentOutward = 0;
-  let pendingAdjustmentQtyForCurrentOutward = 0;
-
-  if (outwardId) {
-    const currentOutward = await findMongoOutward(outwardId);
-    if (currentOutward) {
-      const currentOutwardQty = safeNumber(
-        currentOutward.quantity ?? currentOutward.weight
-      );
-      adjustedQtyForCurrentOutward = await getAdjustedQtyForOutward(
-        currentOutward.legacy_id ?? currentOutward.sl_no ?? currentOutward._id
-      );
-      pendingAdjustmentQtyForCurrentOutward = Math.max(
-        currentOutwardQty - adjustedQtyForCurrentOutward,
-        0
-      );
-    }
+    availableStock += Math.max(remainingQty, 0);
   }
 
   return {
     currentStock,
-    reservedStock,
-    availableStock: Math.max(physicalAvailableStock, 0),
-    physicalAvailableStock: Math.max(physicalAvailableStock, 0),
-    adjustedQtyForCurrentOutward: Math.max(adjustedQtyForCurrentOutward, 0),
-    pendingAdjustmentQtyForCurrentOutward: Math.max(pendingAdjustmentQtyForCurrentOutward, 0),
+    // Kept for compatibility with the existing API/UI.
+    // Outward entries are NOT deducted here.
+    reservedStock: 0,
+    availableStock: Math.max(availableStock, 0),
   };
 }
 
@@ -1374,14 +1239,8 @@ async function validateOutwardStock({
   const requestedQty =
     safeNumber(qty);
 
-  const validationAvailableStock = Math.max(
-    safeNumber(stock.physicalAvailableStock ?? stock.availableStock) -
-      safeNumber(stock.reservedStock),
-    0
-  );
-
   if (
-    validationAvailableStock <
+    stock.availableStock <
     requestedQty
   ) {
     return {
@@ -1389,7 +1248,7 @@ async function validateOutwardStock({
         false,
 
       error:
-        `Not enough stock in this warehouse. Available stock is ${validationAvailableStock.toFixed(
+        `Not enough stock in this warehouse. Available stock is ${stock.availableStock.toFixed(
           2
         )}.`,
 
