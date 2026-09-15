@@ -2078,290 +2078,55 @@ FIFO COMPLETE
 router.put(
   "/complete/:id",
   async (req, res) => {
-    if (
-      !userHasPermission(
-        req.user,
-        "outward.edit"
-      )
-    ) {
-      return res
-        .status(403)
-        .json({
-          error:
-            "You do not have permission to complete outward entries",
-        });
+    if (!userHasPermission(req.user, "outward.edit")) {
+      return res.status(403).json({
+        error: "You do not have permission to complete outward entries",
+      });
     }
 
-    if (!ensureMongo(res)) {
-      return;
-    }
+    if (!ensureMongo(res)) return;
 
-    const outward =
-      await findMongoOutward(
-        req.params.id
-      );
-
+    const outward = await findMongoOutward(req.params.id);
     if (!outward) {
-      return res
-        .status(404)
-        .json({
-          error:
-            "Outward not found",
-        });
+      return res.status(404).json({ error: "Outward entry not found" });
     }
 
-    if (
-      !canAccessOutwardRow(
-        req.user,
-        outward
-      )
-    ) {
-      return res
-        .status(403)
-        .json({
-          error:
-            "You can only update entries for your assigned warehouse",
-        });
-    }
+    // IMPORTANT:
+    // Completing an outward must NOT consume Inward.remaining_qty again.
+    // Actual warehouse stock is consumed only by the Adjustment transaction.
+    // The old FIFO code here was reducing remaining_qty and creating another
+    // adjustment row, which could make the same lorry appear to reduce stock
+    // twice when a manual/partial adjustment was subsequently saved.
+    const requestedQty = safeNumber(outward.quantity ?? outward.weight);
+    const adjustedQty = await getAdjustedQtyForOutward(
+      outward.legacy_id ?? outward.sl_no ?? outward._id
+    );
+    const remainingQty = Math.max(requestedQty - adjustedQty, 0);
 
-    const requestedQty =
-      safeNumber(
-        outward?.quantity ??
-          outward?.weight
-      );
-
-    const currentAdjustedQty =
-      await getAdjustedQtyForOutward(
-        outward?.legacy_id ??
-          outward?._id
-      );
-
-    let remaining =
-      Math.max(
-        requestedQty -
-          currentAdjustedQty,
-        0
-      );
-
-    if (
-      remaining <= 0
-    ) {
-      await MongoOutward.updateOne(
-        {
-          _id:
-            outward._id,
-        },
-        {
-          $set: {
-            status:
-              "Completed",
-
-            updated_at:
-              new Date(),
-          },
-        }
-      );
-
-      return res.json({
-        message:
-          "FIFO Adjustment Done",
-
-        remaining_qty:
-          0,
-
-        status:
-          "Completed",
-
-        source:
-          "mongodb",
+    if (remainingQty > 0.0001) {
+      return res.status(400).json({
+        error: `Outward is not fully adjusted. Remaining qty ${remainingQty.toFixed(4)}. Complete it only after full adjustment.`,
+        requested_qty: Number(requestedQty.toFixed(4)),
+        adjusted_qty: Number(adjustedQty.toFixed(4)),
+        remaining_qty: Number(remainingQty.toFixed(4)),
       });
     }
-
-    const warehouseId =
-      normalizeId(
-        outward.warehouse_id
-      );
-
-    const productId =
-      normalizeId(
-        outward.product_id
-      );
-
-    if (
-      !warehouseId ||
-      !productId
-    ) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "Warehouse or product is missing from outward entry",
-        });
-    }
-
-    /*
-     * FIFO:
-     * Oldest inward first.
-     */
-    const inwardFilter = {
-      warehouse_id:
-        warehouseId,
-
-      product_id:
-        productId,
-    };
-
-    const inwardRows =
-      await MongoInward.find(
-        inwardFilter
-      )
-        .sort({
-          date:
-            1,
-
-          sl_no:
-            1,
-
-          legacy_id:
-            1,
-
-          _id:
-            1,
-        })
-        .lean();
-
-    for (
-      const inward of
-        inwardRows
-    ) {
-      if (
-        remaining <= 0
-      ) {
-        break;
-      }
-
-      const available =
-        safeNumber(
-          inward?.remaining_qty ??
-            inward?.weight ??
-            inward?.quantity
-        );
-
-      if (
-        available <= 0
-      ) {
-        continue;
-      }
-
-      const useQty =
-        Math.min(
-          available,
-          remaining
-        );
-
-      const inwardQuery =
-        inward?._id
-          ? {
-              _id:
-                inward._id,
-            }
-          : {
-              legacy_id:
-                inward.legacy_id,
-            };
-
-      /*
-       * Atomic-ish conditional update:
-       * only consume if remaining_qty is still enough.
-       */
-      const updateResult =
-        await MongoInward.updateOne(
-          inwardQuery,
-          {
-            $set: {
-              updated_at:
-                new Date(),
-            },
-
-            $inc: {
-              remaining_qty:
-                -useQty,
-            },
-          }
-        );
-
-      if (
-        !updateResult?.matchedCount
-      ) {
-        continue;
-      }
-
-    const adjustmentOutwardId =
-  outward?.legacy_id ??
-  outward?.sl_no ??
-  String(
-    outward?._id
-  );
-
-const adjustmentInwardId =
-  inward?.legacy_id ??
-  inward?.sl_no ??
-  String(
-    inward?._id
-  );
-
-      await createAdjustmentMirrorRow({
-        outward_id:
-          adjustmentOutwardId,
-
-        inward_id:
-          adjustmentInwardId,
-
-        qty:
-          useQty,
-
-        created_at:
-          new Date(),
-
-        date:
-          new Date(),
-      });
-
-      remaining -=
-        useQty;
-    }
-
-    const status =
-      remaining > 0
-        ? "Partial"
-        : "Completed";
 
     await MongoOutward.updateOne(
-      {
-        _id:
-          outward._id,
-      },
+      { _id: outward._id },
       {
         $set: {
-          status,
-
-          updated_at:
-            new Date(),
+          status: "Completed",
+          updated_at: new Date(),
         },
       }
     );
 
     return res.json({
-      message:
-        "FIFO Adjustment Done",
-
-      remaining_qty:
-        remaining,
-
-      status,
-
-      source:
-        "mongodb",
+      message: "Outward marked Completed",
+      remaining_qty: 0,
+      status: "Completed",
+      source: "mongodb",
     });
   }
 );
