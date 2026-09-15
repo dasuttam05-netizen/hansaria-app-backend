@@ -1220,19 +1220,22 @@ async function getAvailableWarehouseStock({
       })
       .lean();
 
-  let currentStock =
-    0;
+  // Gross inward quantity is the stock that originally entered the warehouse.
+  // Remaining quantity is the physical balance after adjustments.
+  let currentStock = 0;
+  let physicalAvailableStock = 0;
 
-  for (
-    const row of
-      inwardRows
-  ) {
-    currentStock +=
-      safeNumber(
-        row?.remaining_qty ??
-          row?.weight ??
-          row?.quantity
-      );
+  for (const row of inwardRows) {
+    const grossQty = safeNumber(
+      row?.weight ?? row?.quantity
+    );
+    const remainingQty =
+      row?.remaining_qty !== undefined && row?.remaining_qty !== null
+        ? safeNumber(row.remaining_qty)
+        : grossQty;
+
+    currentStock += grossQty;
+    physicalAvailableStock += Math.max(remainingQty, 0);
   }
 
   /*
@@ -1322,17 +1325,36 @@ async function getAvailableWarehouseStock({
       );
   }
 
+  // IMPORTANT:
+  // `availableStock` is the actual warehouse balance after adjustment.
+  // Pending outward entries are shown separately as `reservedStock`; they do
+  // not reduce the displayed physical balance a second time.
+  let adjustedQtyForCurrentOutward = 0;
+  let pendingAdjustmentQtyForCurrentOutward = 0;
+
+  if (outwardId) {
+    const currentOutward = await findMongoOutward(outwardId);
+    if (currentOutward) {
+      const currentOutwardQty = safeNumber(
+        currentOutward.quantity ?? currentOutward.weight
+      );
+      adjustedQtyForCurrentOutward = await getAdjustedQtyForOutward(
+        currentOutward.legacy_id ?? currentOutward.sl_no ?? currentOutward._id
+      );
+      pendingAdjustmentQtyForCurrentOutward = Math.max(
+        currentOutwardQty - adjustedQtyForCurrentOutward,
+        0
+      );
+    }
+  }
+
   return {
     currentStock,
-
     reservedStock,
-
-    availableStock:
-      Math.max(
-        currentStock -
-          reservedStock,
-        0
-      ),
+    availableStock: Math.max(physicalAvailableStock, 0),
+    physicalAvailableStock: Math.max(physicalAvailableStock, 0),
+    adjustedQtyForCurrentOutward: Math.max(adjustedQtyForCurrentOutward, 0),
+    pendingAdjustmentQtyForCurrentOutward: Math.max(pendingAdjustmentQtyForCurrentOutward, 0),
   };
 }
 
@@ -1352,8 +1374,14 @@ async function validateOutwardStock({
   const requestedQty =
     safeNumber(qty);
 
+  const validationAvailableStock = Math.max(
+    safeNumber(stock.physicalAvailableStock ?? stock.availableStock) -
+      safeNumber(stock.reservedStock),
+    0
+  );
+
   if (
-    stock.availableStock <
+    validationAvailableStock <
     requestedQty
   ) {
     return {
@@ -1361,7 +1389,7 @@ async function validateOutwardStock({
         false,
 
       error:
-        `Not enough stock in this warehouse. Available stock is ${stock.availableStock.toFixed(
+        `Not enough stock in this warehouse. Available stock is ${validationAvailableStock.toFixed(
           2
         )}.`,
 
@@ -2078,55 +2106,290 @@ FIFO COMPLETE
 router.put(
   "/complete/:id",
   async (req, res) => {
-    if (!userHasPermission(req.user, "outward.edit")) {
-      return res.status(403).json({
-        error: "You do not have permission to complete outward entries",
-      });
+    if (
+      !userHasPermission(
+        req.user,
+        "outward.edit"
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You do not have permission to complete outward entries",
+        });
     }
 
-    if (!ensureMongo(res)) return;
+    if (!ensureMongo(res)) {
+      return;
+    }
 
-    const outward = await findMongoOutward(req.params.id);
+    const outward =
+      await findMongoOutward(
+        req.params.id
+      );
+
     if (!outward) {
-      return res.status(404).json({ error: "Outward entry not found" });
+      return res
+        .status(404)
+        .json({
+          error:
+            "Outward not found",
+        });
     }
 
-    // IMPORTANT:
-    // Completing an outward must NOT consume Inward.remaining_qty again.
-    // Actual warehouse stock is consumed only by the Adjustment transaction.
-    // The old FIFO code here was reducing remaining_qty and creating another
-    // adjustment row, which could make the same lorry appear to reduce stock
-    // twice when a manual/partial adjustment was subsequently saved.
-    const requestedQty = safeNumber(outward.quantity ?? outward.weight);
-    const adjustedQty = await getAdjustedQtyForOutward(
-      outward.legacy_id ?? outward.sl_no ?? outward._id
-    );
-    const remainingQty = Math.max(requestedQty - adjustedQty, 0);
+    if (
+      !canAccessOutwardRow(
+        req.user,
+        outward
+      )
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "You can only update entries for your assigned warehouse",
+        });
+    }
 
-    if (remainingQty > 0.0001) {
-      return res.status(400).json({
-        error: `Outward is not fully adjusted. Remaining qty ${remainingQty.toFixed(4)}. Complete it only after full adjustment.`,
-        requested_qty: Number(requestedQty.toFixed(4)),
-        adjusted_qty: Number(adjustedQty.toFixed(4)),
-        remaining_qty: Number(remainingQty.toFixed(4)),
+    const requestedQty =
+      safeNumber(
+        outward?.quantity ??
+          outward?.weight
+      );
+
+    const currentAdjustedQty =
+      await getAdjustedQtyForOutward(
+        outward?.legacy_id ??
+          outward?._id
+      );
+
+    let remaining =
+      Math.max(
+        requestedQty -
+          currentAdjustedQty,
+        0
+      );
+
+    if (
+      remaining <= 0
+    ) {
+      await MongoOutward.updateOne(
+        {
+          _id:
+            outward._id,
+        },
+        {
+          $set: {
+            status:
+              "Completed",
+
+            updated_at:
+              new Date(),
+          },
+        }
+      );
+
+      return res.json({
+        message:
+          "FIFO Adjustment Done",
+
+        remaining_qty:
+          0,
+
+        status:
+          "Completed",
+
+        source:
+          "mongodb",
       });
     }
+
+    const warehouseId =
+      normalizeId(
+        outward.warehouse_id
+      );
+
+    const productId =
+      normalizeId(
+        outward.product_id
+      );
+
+    if (
+      !warehouseId ||
+      !productId
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Warehouse or product is missing from outward entry",
+        });
+    }
+
+    /*
+     * FIFO:
+     * Oldest inward first.
+     */
+    const inwardFilter = {
+      warehouse_id:
+        warehouseId,
+
+      product_id:
+        productId,
+    };
+
+    const inwardRows =
+      await MongoInward.find(
+        inwardFilter
+      )
+        .sort({
+          date:
+            1,
+
+          sl_no:
+            1,
+
+          legacy_id:
+            1,
+
+          _id:
+            1,
+        })
+        .lean();
+
+    for (
+      const inward of
+        inwardRows
+    ) {
+      if (
+        remaining <= 0
+      ) {
+        break;
+      }
+
+      const available =
+        safeNumber(
+          inward?.remaining_qty ??
+            inward?.weight ??
+            inward?.quantity
+        );
+
+      if (
+        available <= 0
+      ) {
+        continue;
+      }
+
+      const useQty =
+        Math.min(
+          available,
+          remaining
+        );
+
+      const inwardQuery =
+        inward?._id
+          ? {
+              _id:
+                inward._id,
+            }
+          : {
+              legacy_id:
+                inward.legacy_id,
+            };
+
+      /*
+       * Atomic-ish conditional update:
+       * only consume if remaining_qty is still enough.
+       */
+      const updateResult =
+        await MongoInward.updateOne(
+          inwardQuery,
+          {
+            $set: {
+              updated_at:
+                new Date(),
+            },
+
+            $inc: {
+              remaining_qty:
+                -useQty,
+            },
+          }
+        );
+
+      if (
+        !updateResult?.matchedCount
+      ) {
+        continue;
+      }
+
+    const adjustmentOutwardId =
+  outward?.legacy_id ??
+  outward?.sl_no ??
+  String(
+    outward?._id
+  );
+
+const adjustmentInwardId =
+  inward?.legacy_id ??
+  inward?.sl_no ??
+  String(
+    inward?._id
+  );
+
+      await createAdjustmentMirrorRow({
+        outward_id:
+          adjustmentOutwardId,
+
+        inward_id:
+          adjustmentInwardId,
+
+        qty:
+          useQty,
+
+        created_at:
+          new Date(),
+
+        date:
+          new Date(),
+      });
+
+      remaining -=
+        useQty;
+    }
+
+    const status =
+      remaining > 0
+        ? "Partial"
+        : "Completed";
 
     await MongoOutward.updateOne(
-      { _id: outward._id },
+      {
+        _id:
+          outward._id,
+      },
       {
         $set: {
-          status: "Completed",
-          updated_at: new Date(),
+          status,
+
+          updated_at:
+            new Date(),
         },
       }
     );
 
     return res.json({
-      message: "Outward marked Completed",
-      remaining_qty: 0,
-      status: "Completed",
-      source: "mongodb",
+      message:
+        "FIFO Adjustment Done",
+
+      remaining_qty:
+        remaining,
+
+      status,
+
+      source:
+        "mongodb",
     });
   }
 );
