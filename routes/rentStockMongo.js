@@ -429,14 +429,7 @@ router.get('/warehouse-rent-month-end', async (req,res,next)=>{
   if(!mongoReady()) return next();
   try{
     const month=String(req.query.month||new Date().toISOString().slice(0,7));
-    const details=await buildRentDetails({
-      monthList:[month],
-      filters:{
-        company_id:req.query.company_id,
-        warehouse_id:req.query.warehouse_id,
-        location_id:req.query.location_id || req.query.location_ids,
-      },
-    });
+    const details=await buildRentDetails({monthList:[month],filters:req.query});
     const map=new Map(); details.forEach(r=>{const k=`${r.month}__${r.party_name}__${r.warehouse_name}`; if(!map.has(k)) map.set(k,{month:r.month,month_label:r.month_label,month_end_date:r.month_end_date,party_name:r.party_name,warehouse_name:r.warehouse_name,total_weight:0,total_rent:0,total_entries:0}); const s=map.get(k); s.total_weight+=num(r.original_weight); s.total_rent+=num(r.rent_amount); s.total_entries+=1;});
     const summary=Array.from(map.values()).map(r=>({...r,total_weight:Number(r.total_weight.toFixed(4)),total_rent:Number(r.total_rent.toFixed(2))}));
     res.json({month,month_label:monthLabel(month),month_end_date:monthEnd(month),summary,details});
