@@ -9,6 +9,7 @@ const {
   Company,
   CompanyAccount,
   Product,
+  ConsigneeName,
   Inward,
   Outward,
 } = require("../db-mongodb");
@@ -174,13 +175,14 @@ router.get("/masters", async (req, res) => {
       ? {}
       : { _id: { $in: allowedLocationIds(req.user).filter((id) => mongoose.isValidObjectId(id)) } };
 
-    const [locations, warehouses, companies, accounts, products, employees] = await Promise.all([
+    const [locations, warehouses, companies, accounts, products, employees, consignees] = await Promise.all([
       Location.find(locationQuery, { name: 1, address: 1 }).sort({ name: 1 }).lean(),
       Warehouse.find(warehouseQuery, { name: 1, location_id: 1 }).sort({ name: 1 }).lean(),
       Company.find({}, { name: 1 }).sort({ name: 1 }).lean(),
       CompanyAccount.find({}, { account_name: 1, company_id: 1 }).sort({ account_name: 1 }).lean(),
       Product.find({}, { name: 1 }).sort({ name: 1 }).lean(),
       manager ? Employee.find({}, { name: 1, employee_id: 1, role: 1, location_id: 1, location_ids: 1, assigned_warehouse_ids: 1 }).sort({ name: 1 }).lean() : Employee.find({ _id: objectIdOrValue(currentUserId(req.user)) }, { name: 1, employee_id: 1 }).lean(),
+      ConsigneeName.find({}, { name: 1 }).sort({ name: 1 }).lean(),
     ]);
 
     res.json({
@@ -190,6 +192,7 @@ router.get("/masters", async (req, res) => {
       accounts: accounts.map((x) => ({ ...x, id: String(x._id), company_id: idOf(x.company_id) })),
       products: products.map((x) => ({ ...x, id: String(x._id) })),
       employees: employees.map((x) => ({ ...x, id: String(x._id), employee_id: x.employee_id || "" })),
+      consignees: consignees.map((x) => ({ id: String(x._id), name: x.name || "" })),
     });
   } catch (err) {
     console.error("[daily-rejections:masters]", err);
@@ -283,25 +286,23 @@ router.post("/", async (req, res) => {
     const rejectionQty = Math.max(originalQty - actualUnloadingQty, 0);
     const actionType = text(body.action_type).toUpperCase();
     const reason = text(body.reason).toUpperCase();
+    const consigneeId = text(body.consignee_id);
     const consignee = text(body.consignee);
 
-    if (!warehouseId || !locationId || !text(body.product_id) || !actionType || !WORK_DESCRIPTIONS.has(actionType) || !reason || !REASONS.has(reason) || !Number.isFinite(originalQty) || !Number.isFinite(actualUnloadingQty) || actualUnloadingQty < 0 || rejectionQty <= 0) {
-      return res.status(400).json({ error: "Warehouse, Location, Product, Work Description, Reason, Original Qty and Actual Unloading Qty are required; rejection must be positive" });
+    if (!locationId || !text(body.product_id) || !reason || !REASONS.has(reason) || !Number.isFinite(originalQty) || !Number.isFinite(actualUnloadingQty) || originalQty <= 0 || actualUnloadingQty < 0 || rejectionQty <= 0) {
+      return res.status(400).json({ error: "Location, Product, Consignee, Reason, Original Qty and Actual Unloading Qty are required; rejection must be positive" });
     }
     if (actualUnloadingQty > originalQty) {
       return res.status(400).json({ error: "Actual unloading quantity cannot exceed original quantity" });
     }
-    if (!canAccessWarehouse(req.user, warehouseId) && !isManager(req.user)) {
-      return res.status(403).json({ error: "You do not have access to this warehouse" });
-    }
-
-    const [location, warehouse, employee, company, account, product, inward, outward] = await Promise.all([
+    const [location, warehouse, employee, company, account, product, consigneeMaster, inward, outward] = await Promise.all([
       Location.findById(objectIdOrValue(locationId), { name: 1 }).lean().catch(() => null),
       Warehouse.findById(objectIdOrValue(warehouseId), { name: 1, location_id: 1 }).lean().catch(() => null),
       Employee.findOne({ $or: [{ _id: objectIdOrValue(employeeId) }, { employee_id: employeeId }] }, { name: 1 }).lean().catch(() => null),
       text(body.company_id) ? Company.findById(objectIdOrValue(body.company_id), { name: 1 }).lean().catch(() => null) : null,
       text(body.company_account_id) ? CompanyAccount.findById(objectIdOrValue(body.company_account_id), { account_name: 1 }).lean().catch(() => null) : null,
       Product.findById(objectIdOrValue(body.product_id), { name: 1 }).lean().catch(() => null),
+      consigneeId ? ConsigneeName.findById(objectIdOrValue(consigneeId), { name: 1 }).lean().catch(() => null) : null,
       text(body.inward_id) ? Inward.findById(objectIdOrValue(body.inward_id)).lean().catch(() => null) : null,
       text(body.outward_id) ? Outward.findById(objectIdOrValue(body.outward_id)).lean().catch(() => null) : null,
     ]);
@@ -314,7 +315,7 @@ router.post("/", async (req, res) => {
       employee_name: employee?.name || text(body.employee_name),
       location_id: locationId,
       location_name: location?.name || text(body.location_name),
-      warehouse_id: warehouseId,
+      warehouse_id: warehouseId || null,
       warehouse_name: warehouse?.name || text(body.warehouse_name),
       company_id: text(body.company_id) || null,
       company_name: company?.name || text(body.company_name),
@@ -327,13 +328,14 @@ router.post("/", async (req, res) => {
       outward_id: text(body.outward_id) || null,
       outward_voucher: text(body.outward_voucher || outward?.voucher_no || outward?.outward_no),
       lorry_no: text(body.lorry_no || outward?.lorry_no || inward?.lorry_no),
-      consignee,
+      consignee_id: consigneeId || null,
+      consignee: consigneeMaster?.name || consignee,
       original_qty: originalQty || num(inward?.weight || inward?.quantity || outward?.weight || outward?.quantity),
       actual_unloading_qty: actualUnloadingQty,
       rejection_qty: rejectionQty,
       reason,
       remarks: text(body.remarks),
-      action_type: actionType,
+      action_type: actionType && WORK_DESCRIPTIONS.has(actionType) ? actionType : "",
       assigned_to: null,
       assigned_to_name: "",
       assigned_by: null,
@@ -365,7 +367,9 @@ router.patch("/:id/assign", async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid rejection id" });
 
     const assignedTo = text(req.body?.assigned_to);
-    if (!assignedTo) return res.status(400).json({ error: "Employee is required" });
+    const actionType = text(req.body?.action_type).toUpperCase();
+    if (!assignedTo || !actionType) return res.status(400).json({ error: "Employee and Work Description are required" });
+    if (!WORK_DESCRIPTIONS.has(actionType)) return res.status(400).json({ error: "Invalid Work Description" });
 
     const employee = await Employee.findById(objectIdOrValue(assignedTo), { name: 1 }).lean();
     if (!employee) return res.status(404).json({ error: "Assigned employee not found" });
@@ -380,7 +384,7 @@ router.patch("/:id/assign", async (req, res) => {
 
     await collection.updateOne(
       { _id: existing._id },
-      { $set: { assigned_to: String(employee._id), assigned_to_name: employee.name || "", assigned_by: currentUserId(req.user), assigned_at: now, status: "ASSIGNED", updated_at: now, history } }
+      { $set: { assigned_to: String(employee._id), assigned_to_name: employee.name || "", action_type: actionType, assigned_by: currentUserId(req.user), assigned_at: now, status: "ASSIGNED", updated_at: now, history } }
     );
     res.json({ ok: true });
   } catch (err) {
@@ -399,7 +403,7 @@ router.post("/:id/start", async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
     const uid = currentUserId(req.user);
     if (!isManager(req.user) && String(existing.assigned_to || "") !== uid && String(existing.employee_id || "") !== uid) return res.status(403).json({ error: "This rejection is not assigned to you" });
-    if (!["ASSIGNED", "PENDING"].includes(normalizeStatus(existing.status))) return res.status(400).json({ error: "Only Pending or Assigned rejection can be started" });
+    if (normalizeStatus(existing.status) !== "ASSIGNED") return res.status(400).json({ error: "Only Assigned rejection can be started" });
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({ action: "STARTED", by: uid, by_name: req.user?.name || req.user?.username || "", at: now, status: "RUNNING" });
