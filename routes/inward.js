@@ -530,6 +530,23 @@ async function resolveInwardMasters(
     ),
   ]);
 
+  // Import files often contain product names with harmless leading/trailing
+  // spaces (for example, "Maize "). Match those against the master product
+  // without changing the stored product name or any other import logic.
+  let resolvedProduct = product;
+  if (!resolvedProduct && stringValue(row?.product_name)) {
+    const productName = stringValue(row.product_name);
+    const escaped = escapeRegExp(productName);
+    try {
+      resolvedProduct = await Product.findOne({
+        $or: [
+          { name: new RegExp(`^\\s*${escaped}\\s*$`, "i") },
+          { product_name: new RegExp(`^\\s*${escaped}\\s*$`, "i") },
+        ],
+      }).lean();
+    } catch {}
+  }
+
   /*
    * Company account
    */
@@ -594,7 +611,7 @@ async function resolveInwardMasters(
     employee,
     location,
     warehouse,
-    product,
+    product: resolvedProduct,
     company,
     companyAccount,
   };
