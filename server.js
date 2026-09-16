@@ -415,6 +415,9 @@ const cashEntriesRoutes =
 const mongoHealthRoutes =
   require("./routes/mongoHealth");
 
+const dailyRejectionRoutes =
+  require("./routes/dailyRejections");
+
 const {
   normalizeDashboardList,
   normalizeDashboardSummary,
@@ -2438,6 +2441,13 @@ app.use(
   cashEntriesRoutes
 );
 
+
+app.use(
+  "/api/daily-rejections",
+  authenticate,
+  dailyRejectionRoutes
+);
+
 app.use(
   "/api/mongo-health",
   mongoHealthRoutes
@@ -2553,3 +2563,4 @@ function startServer(port) {
 }
 
 startServer(PORT);
+
