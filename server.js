@@ -1881,10 +1881,11 @@ app.get(
           outwardDateMap[
             outwardId
           ] =
-            firstNonEmptyDate(
-              row?.date,
-              row?.outward_date
-            );
+            row?.date
+              ? firstNonEmptyDate(
+                  row.date
+                )
+              : null;
         }
       );
 
@@ -2010,9 +2011,9 @@ app.get(
             (adj) => {
               const adjustmentDate =
                 firstNonEmptyDate(
-                  adj?.outward_date,
-                  adj?.buyer_unloading_date,
                   adj?.transport_dispatch_date,
+                  adj?.buyer_unloading_date,
+                  adj?.outward_date,
                   adj?.created_at
                 );
 
@@ -2552,4 +2553,3 @@ function startServer(port) {
 }
 
 startServer(PORT);
-
