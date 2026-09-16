@@ -40,6 +40,9 @@ function num(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+const WORK_DESCRIPTIONS = new Set(["PALTI", "WAREHOUSE UNLOAD", "LOCAL SALE", "PARTY ACCOUNT", "OTHERS"]);
+const REASONS = new Set(["HIGH FUNGUS", "HIGH MOISTURE", "DISCOLOUR", "DAMAGE", "LIVE INSECT", "WATER DAMAGE", "OTHERS"]);
+
 function normalizeStatus(value) {
   const raw = text(value).toUpperCase();
   if (["PENDING", "ASSIGNED", "RUNNING", "COMPLETE"].includes(raw)) return raw;
@@ -232,6 +235,7 @@ router.get("/", async (req, res) => {
     const locationId = text(req.query.location_id);
     const warehouseId = text(req.query.warehouse_id);
     const companyId = text(req.query.company_id);
+    const actionType = text(req.query.action_type).toUpperCase();
 
     if (status !== "PENDING" && status !== "ASSIGNED" && status !== "RUNNING" && status !== "COMPLETE") {
       delete query.status;
@@ -247,6 +251,7 @@ router.get("/", async (req, res) => {
     if (locationId) query.location_id = locationId;
     if (warehouseId) query.warehouse_id = warehouseId;
     if (companyId) query.company_id = companyId;
+    if (actionType && WORK_DESCRIPTIONS.has(actionType)) query.action_type = actionType;
 
     if (!isManager(req.user)) {
       query.$or = [{ employee_id: currentUserId(req.user) }, { assigned_to: currentUserId(req.user) }];
@@ -273,10 +278,18 @@ router.post("/", async (req, res) => {
     const warehouseId = text(body.warehouse_id);
     const locationId = text(body.location_id || req.user?.location_id);
     const employeeId = text(body.employee_id || currentUserId(req.user));
-    const rejectionQty = num(body.rejection_qty);
+    const originalQty = num(body.original_qty);
+    const actualUnloadingQty = num(body.actual_unloading_qty);
+    const rejectionQty = Math.max(originalQty - actualUnloadingQty, 0);
+    const actionType = text(body.action_type).toUpperCase();
+    const reason = text(body.reason).toUpperCase();
+    const consignee = text(body.consignee);
 
-    if (!warehouseId || !locationId || !text(body.product_id) || rejectionQty <= 0) {
-      return res.status(400).json({ error: "Warehouse, Location, Product and positive Rejection Qty are required" });
+    if (!warehouseId || !locationId || !text(body.product_id) || !actionType || !WORK_DESCRIPTIONS.has(actionType) || !reason || !REASONS.has(reason) || !Number.isFinite(originalQty) || !Number.isFinite(actualUnloadingQty) || actualUnloadingQty < 0 || rejectionQty <= 0) {
+      return res.status(400).json({ error: "Warehouse, Location, Product, Work Description, Reason, Original Qty and Actual Unloading Qty are required; rejection must be positive" });
+    }
+    if (actualUnloadingQty > originalQty) {
+      return res.status(400).json({ error: "Actual unloading quantity cannot exceed original quantity" });
     }
     if (!canAccessWarehouse(req.user, warehouseId) && !isManager(req.user)) {
       return res.status(403).json({ error: "You do not have access to this warehouse" });
@@ -314,11 +327,13 @@ router.post("/", async (req, res) => {
       outward_id: text(body.outward_id) || null,
       outward_voucher: text(body.outward_voucher || outward?.voucher_no || outward?.outward_no),
       lorry_no: text(body.lorry_no || outward?.lorry_no || inward?.lorry_no),
-      original_qty: num(body.original_qty || inward?.weight || inward?.quantity || outward?.weight || outward?.quantity),
+      consignee,
+      original_qty: originalQty || num(inward?.weight || inward?.quantity || outward?.weight || outward?.quantity),
+      actual_unloading_qty: actualUnloadingQty,
       rejection_qty: rejectionQty,
-      reason: text(body.reason),
+      reason,
       remarks: text(body.remarks),
-      action_type: "",
+      action_type: actionType,
       assigned_to: null,
       assigned_to_name: "",
       assigned_by: null,
