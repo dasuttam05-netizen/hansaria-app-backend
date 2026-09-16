@@ -618,6 +618,7 @@ async function getAdjustmentDetails(outward, outwardId) {
       id: 1,
       inward_id: 1,
       palti_lorry_id: 1,
+      palti_source: 1,
       source_type: 1,
       qty: 1,
       settlement_weight: 1,
@@ -650,15 +651,41 @@ async function getAdjustmentDetails(outward, outwardId) {
     paltiConditions.push({ sl_no: { $in: paltiNumericIds } });
   }
 
-  const paltiRows = paltiConditions.length
-    ? await paltiCollection()
-        .find({ $or: paltiConditions })
-        .project({ _id: 1, id: 1, legacy_id: 1, sl_no: 1, voucher_no: 1, new_lorry_no: 1, reg_lorry_no: 1, expense_date: 1, company_id: 1, company_account_id: 1, warehouse_id: 1, location_id: 1, product_id: 1 })
-        .toArray()
-    : [];
+  const paltiProjection = {
+    _id: 1,
+    id: 1,
+    legacy_id: 1,
+    sl_no: 1,
+    voucher_no: 1,
+    new_lorry_no: 1,
+    reg_lorry_no: 1,
+    expense_date: 1,
+    date: 1,
+    company_id: 1,
+    company_account_id: 1,
+    company_name: 1,
+    company_account_name: 1,
+    warehouse_id: 1,
+    location_id: 1,
+    product_id: 1,
+    product_name: 1,
+  };
+
+  const [paltiRows, expensePaltiRows] = paltiConditions.length
+    ? await Promise.all([
+        paltiCollection()
+          .find({ $or: paltiConditions })
+          .project(paltiProjection)
+          .toArray(),
+        expenseCollection()
+          .find({ $or: paltiConditions })
+          .project(paltiProjection)
+          .toArray(),
+      ])
+    : [[], []];
 
   const actualPaltiMap = new Map();
-  for (const row of paltiRows || []) {
+  for (const row of [...(paltiRows || []), ...(expensePaltiRows || [])]) {
     for (const key of [row?._id, row?.legacy_id, row?.id, row?.sl_no]) {
       if (key !== null && key !== undefined && key !== "") {
         actualPaltiMap.set(String(key), row);
@@ -703,13 +730,36 @@ async function getAdjustmentDetails(outward, outwardId) {
       adjustment_company_rate: num(row.company_rate ?? row.adjustment_company_rate),
       whatsapp_sent_at: row.whatsapp_sent_at || null,
       inward_voucher_no: inward?.voucher_no ?? palti?.voucher_no ?? null,
-      lorry_no: inward?.lorry_no || palti?.new_lorry_no || palti?.reg_lorry_no || null,
-      inward_date: inward?.date ?? palti?.expense_date ?? null,
-      company_name: company?.name || "",
-      company_account_name: account?.account_name || "",
-      warehouse_name: warehouse?.name || "",
-      location_name: location?.name || "",
-      product_name: product?.name || "",
+      lorry_no:
+        inward?.lorry_no ||
+        palti?.new_lorry_no ||
+        palti?.reg_lorry_no ||
+        palti?.display_lorry_no ||
+        null,
+      inward_date: inward?.date ?? palti?.expense_date ?? palti?.date ?? null,
+      company_name:
+        company?.name ||
+        palti?.company_name ||
+        palti?.companyName ||
+        null ||
+        "",
+      company_account_name:
+        account?.account_name ||
+        palti?.company_account_name ||
+        palti?.account_name ||
+        "",
+      warehouse_name:
+        warehouse?.name ||
+        palti?.warehouse_name ||
+        "",
+      location_name:
+        location?.name ||
+        palti?.location_name ||
+        "",
+      product_name:
+        product?.name ||
+        palti?.product_name ||
+        "",
     };
   });
 }
