@@ -1226,8 +1226,19 @@ router.get(
 
           getCollection("transportbilti")
             .findOne(
-              { outward_id: numericOutwardId },
-              { projection: { net_amount: 1, payable_amount: 1 } }
+              {
+                outward_id: {
+                  $in: Array.from(
+                    new Set(
+                      [
+                        numericOutwardId,
+                        String(numericOutwardId),
+                      ].filter(Boolean)
+                    )
+                  ),
+                },
+              },
+              { projection: { net_amount: 1, payable_amount: 1, outward_id: 1 } }
             )
             .catch(() => null),
         ]);
@@ -2295,13 +2306,13 @@ router.get(
           })
           .lean();
 
-      const result = [];
-      const batchSize = 8;
+      const result =
+        [];
 
-      for (let batchStart = 0; batchStart < outwardRows.length; batchStart += batchSize) {
-        const batch = outwardRows.slice(batchStart, batchStart + batchSize);
-        const batchRows = await Promise.all(
-          batch.map(async (outward) => {
+      for (
+        const outward of
+          outwardRows
+      ) {
         const outwardId =
           Number(
             outward.legacy_id ??
@@ -2314,7 +2325,7 @@ router.get(
             outwardId
           )
         ) {
-          return null;
+          continue;
         }
 
         const settlement =
@@ -2325,7 +2336,7 @@ router.get(
         if (
           !settlement
         ) {
-          return null;
+          continue;
         }
 
         const meta =
@@ -2728,7 +2739,7 @@ router.get(
             outward.product
           );
 
-        return {
+        result.push({
           ...outward,
 
           id:
@@ -2833,10 +2844,7 @@ router.get(
 
           adjustment_details:
             mappedAdjustmentDetails,
-        };
-          })
-        );
-        result.push(...batchRows.filter(Boolean));
+        });
       }
 
       return res.json(
