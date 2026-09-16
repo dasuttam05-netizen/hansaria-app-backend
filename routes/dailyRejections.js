@@ -29,6 +29,7 @@ const ASSIGN = "dailyRejection.assign";
 const START = "dailyRejection.start";
 const COMPLETE = "dailyRejection.complete";
 const REPORT = "dailyRejection.report";
+const EDIT = "dailyRejection.edit";
 
 const MANAGER_ROLES = new Set(["admin", "bm", "ho"]);
 
@@ -139,7 +140,7 @@ async function hydrateRows(rows) {
 
   const [companies, accounts, products, warehouses, locations, employees] = await Promise.all([
     Company.find(companyIds.length ? { _id: { $in: companyIds } } : { _id: { $in: [] } }, { name: 1 }).lean(),
-    CompanyAccount.find(accountIds.length ? { _id: { $in: accountIds } } : { _id: { $in: [] } }, { account_name: 1 }).lean(),
+    CompanyAccount.find(accountIds.length ? { _id: { $in: accountIds } } : { _id: { $in: [] } }, { account_name: 1, name: 1, company_id: 1, company_name: 1 }).lean(),
     Product.find(productIds.length ? { _id: { $in: productIds } } : { _id: { $in: [] } }, { name: 1 }).lean(),
     Warehouse.find(warehouseIds.length ? { _id: { $in: warehouseIds } } : { _id: { $in: [] } }, { name: 1 }).lean(),
     Location.find(locationIds.length ? { _id: { $in: locationIds } } : { _id: { $in: [] } }, { name: 1 }).lean(),
@@ -182,17 +183,17 @@ router.get("/masters", async (req, res) => {
       CompanyAccount.find({}, { account_name: 1, company_id: 1 }).sort({ account_name: 1 }).lean(),
       Product.find({}, { name: 1 }).sort({ name: 1 }).lean(),
       manager ? Employee.find({}, { name: 1, employee_id: 1, role: 1, location_id: 1, location_ids: 1, assigned_warehouse_ids: 1 }).sort({ name: 1 }).lean() : Employee.find({ _id: objectIdOrValue(currentUserId(req.user)) }, { name: 1, employee_id: 1 }).lean(),
-      ConsigneeName.find({}, { name: 1 }).sort({ name: 1 }).lean(),
+      ConsigneeName.find({}, { name: 1, consignee_name: 1, buyer_name: 1 }).sort({ name: 1, consignee_name: 1 }).lean().catch(() => []),
     ]);
 
     res.json({
       locations: locations.map((x) => ({ ...x, id: String(x._id) })),
       warehouses: warehouses.map((x) => ({ ...x, id: String(x._id) })),
       companies: companies.map((x) => ({ ...x, id: String(x._id) })),
-      accounts: accounts.map((x) => ({ ...x, id: String(x._id), company_id: idOf(x.company_id) })),
+      accounts: accounts.map((x) => ({ ...x, id: String(x._id), company_id: idOf(x.company_id), company_name: x.company_name || x.company?.name || "", account_name: x.account_name || x.name || "" })),
       products: products.map((x) => ({ ...x, id: String(x._id) })),
       employees: employees.map((x) => ({ ...x, id: String(x._id), employee_id: x.employee_id || "" })),
-      consignees: consignees.map((x) => ({ id: String(x._id), name: x.name || "" })),
+      consignees: consignees.map((x) => ({ ...x, id: String(x._id), name: x.name || x.consignee_name || x.buyer_name || "" })),
     });
   } catch (err) {
     console.error("[daily-rejections:masters]", err);
@@ -269,6 +270,31 @@ router.get("/", async (req, res) => {
   }
 });
 
+router.get("/report", async (req, res) => {
+  try {
+    if (!userHasPermission(req.user, REPORT) && !isAdminUser(req.user)) {
+      return res.status(403).json({ error: "Permission denied" });
+    }
+    if (!requireMongo(res)) return;
+    const from = text(req.query.from);
+    const to = text(req.query.to);
+    const actionType = text(req.query.action_type).toUpperCase();
+    const query = {};
+    if (from || to) {
+      query.entry_date = {};
+      if (from) query.entry_date.$gte = new Date(`${from}T00:00:00`);
+      if (to) query.entry_date.$lte = new Date(`${to}T23:59:59.999`);
+    }
+    if (actionType && actionType !== "ALL") query.action_type = actionType;
+    if (!isManager(req.user)) query.$or = [{ employee_id: currentUserId(req.user) }, { assigned_to: currentUserId(req.user) }];
+    const rows = await mongoose.connection.db.collection("daily_rejections").find(query).sort({ entry_date: -1, created_at: -1 }).limit(5000).toArray();
+    res.json({ rows: await hydrateRows(rows), count: rows.length });
+  } catch (err) {
+    console.error("[daily-rejections:report]", err);
+    res.status(500).json({ error: err.message || "Failed to load Daily Rejection report" });
+  }
+});
+
 router.post("/", async (req, res) => {
   try {
     if (!assertPermission(req.user, CREATE, res)) return;
@@ -278,33 +304,28 @@ router.post("/", async (req, res) => {
     const entryDate = body.entry_date ? new Date(body.entry_date) : new Date();
     if (Number.isNaN(entryDate.getTime())) return res.status(400).json({ error: "Invalid entry date" });
 
-    const warehouseId = text(body.warehouse_id);
     const locationId = text(body.location_id || req.user?.location_id);
     const employeeId = text(body.employee_id || currentUserId(req.user));
     const originalQty = num(body.original_qty);
     const actualUnloadingQty = num(body.actual_unloading_qty);
     const rejectionQty = Math.max(originalQty - actualUnloadingQty, 0);
-    const actionType = text(body.action_type).toUpperCase();
     const reason = text(body.reason).toUpperCase();
     const consigneeId = text(body.consignee_id);
-    const consignee = text(body.consignee);
+    const consignee = text(body.consignee || body.consignee_name);
 
-    if (!locationId || !text(body.product_id) || !reason || !REASONS.has(reason) || !Number.isFinite(originalQty) || !Number.isFinite(actualUnloadingQty) || originalQty <= 0 || actualUnloadingQty < 0 || rejectionQty <= 0) {
+    if (!locationId || !text(body.product_id) || !consigneeId || !reason || !REASONS.has(reason) || !Number.isFinite(originalQty) || !Number.isFinite(actualUnloadingQty) || actualUnloadingQty < 0 || rejectionQty <= 0) {
       return res.status(400).json({ error: "Location, Product, Consignee, Reason, Original Qty and Actual Unloading Qty are required; rejection must be positive" });
     }
     if (actualUnloadingQty > originalQty) {
       return res.status(400).json({ error: "Actual unloading quantity cannot exceed original quantity" });
     }
-    const [location, warehouse, employee, company, account, product, consigneeMaster, inward, outward] = await Promise.all([
+    const [location, employee, company, account, product, consigneeDoc] = await Promise.all([
       Location.findById(objectIdOrValue(locationId), { name: 1 }).lean().catch(() => null),
-      Warehouse.findById(objectIdOrValue(warehouseId), { name: 1, location_id: 1 }).lean().catch(() => null),
       Employee.findOne({ $or: [{ _id: objectIdOrValue(employeeId) }, { employee_id: employeeId }] }, { name: 1 }).lean().catch(() => null),
       text(body.company_id) ? Company.findById(objectIdOrValue(body.company_id), { name: 1 }).lean().catch(() => null) : null,
       text(body.company_account_id) ? CompanyAccount.findById(objectIdOrValue(body.company_account_id), { account_name: 1 }).lean().catch(() => null) : null,
       Product.findById(objectIdOrValue(body.product_id), { name: 1 }).lean().catch(() => null),
-      consigneeId ? ConsigneeName.findById(objectIdOrValue(consigneeId), { name: 1 }).lean().catch(() => null) : null,
-      text(body.inward_id) ? Inward.findById(objectIdOrValue(body.inward_id)).lean().catch(() => null) : null,
-      text(body.outward_id) ? Outward.findById(objectIdOrValue(body.outward_id)).lean().catch(() => null) : null,
+      ConsigneeName.findById(objectIdOrValue(consigneeId), { name: 1, consignee_name: 1, buyer_name: 1 }).lean().catch(() => null),
     ]);
 
     const rejectionNo = await generateRejectionNo(entryDate);
@@ -315,27 +336,21 @@ router.post("/", async (req, res) => {
       employee_name: employee?.name || text(body.employee_name),
       location_id: locationId,
       location_name: location?.name || text(body.location_name),
-      warehouse_id: warehouseId || null,
-      warehouse_name: warehouse?.name || text(body.warehouse_name),
       company_id: text(body.company_id) || null,
       company_name: company?.name || text(body.company_name),
       company_account_id: text(body.company_account_id) || null,
       company_account_name: account?.account_name || text(body.company_account_name),
       product_id: text(body.product_id),
       product_name: product?.name || text(body.product_name),
-      inward_id: text(body.inward_id) || null,
-      inward_voucher: text(body.inward_voucher || inward?.voucher_no || inward?.inward_no),
-      outward_id: text(body.outward_id) || null,
-      outward_voucher: text(body.outward_voucher || outward?.voucher_no || outward?.outward_no),
-      lorry_no: text(body.lorry_no || outward?.lorry_no || inward?.lorry_no),
-      consignee_id: consigneeId || null,
-      consignee: consigneeMaster?.name || consignee,
-      original_qty: originalQty || num(inward?.weight || inward?.quantity || outward?.weight || outward?.quantity),
+      consignee_id: consigneeId,
+      consignee: consigneeDoc?.name || consigneeDoc?.consignee_name || consigneeDoc?.buyer_name || consignee,
+      consignee_name: consigneeDoc?.name || consigneeDoc?.consignee_name || consigneeDoc?.buyer_name || consignee,
+      original_qty: originalQty,
       actual_unloading_qty: actualUnloadingQty,
       rejection_qty: rejectionQty,
       reason,
       remarks: text(body.remarks),
-      action_type: actionType && WORK_DESCRIPTIONS.has(actionType) ? actionType : "",
+      action_type: "",
       assigned_to: null,
       assigned_to_name: "",
       assigned_by: null,
@@ -360,6 +375,72 @@ router.post("/", async (req, res) => {
   }
 });
 
+router.put("/:id", async (req, res) => {
+  try {
+    if (!userHasPermission(req.user, EDIT) && !isAdminUser(req.user)) {
+      return res.status(403).json({ error: "Permission denied" });
+    }
+    if (!requireMongo(res)) return;
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid rejection id" });
+
+    const collection = mongoose.connection.db.collection("daily_rejections");
+    const existing = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
+    if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
+    if (normalizeStatus(existing.status) === "COMPLETE") return res.status(400).json({ error: "Completed rejection cannot be edited" });
+
+    const body = req.body || {};
+    const entryDate = body.entry_date ? new Date(body.entry_date) : existing.entry_date;
+    const originalQty = num(body.original_qty);
+    const actualUnloadingQty = num(body.actual_unloading_qty);
+    const rejectionQty = Math.max(originalQty - actualUnloadingQty, 0);
+    const reason = text(body.reason).toUpperCase();
+    const consigneeId = text(body.consignee_id);
+    if (Number.isNaN(entryDate?.getTime?.()) || !text(body.location_id) || !text(body.product_id) || !consigneeId || !REASONS.has(reason) || originalQty <= 0 || actualUnloadingQty < 0 || actualUnloadingQty > originalQty || rejectionQty <= 0) {
+      return res.status(400).json({ error: "Location, Product, Consignee, Reason and valid quantities are required" });
+    }
+
+    const [location, company, account, product, consigneeDoc] = await Promise.all([
+      Location.findById(objectIdOrValue(body.location_id), { name: 1 }).lean().catch(() => null),
+      text(body.company_id) ? Company.findById(objectIdOrValue(body.company_id), { name: 1 }).lean().catch(() => null) : null,
+      text(body.company_account_id) ? CompanyAccount.findById(objectIdOrValue(body.company_account_id), { account_name: 1, name: 1 }).lean().catch(() => null) : null,
+      Product.findById(objectIdOrValue(body.product_id), { name: 1 }).lean().catch(() => null),
+      ConsigneeName.findById(objectIdOrValue(consigneeId), { name: 1, consignee_name: 1, buyer_name: 1 }).lean().catch(() => null),
+    ]);
+
+    const history = Array.isArray(existing.history) ? existing.history : [];
+    history.push({ action: "EDITED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: new Date(), status: normalizeStatus(existing.status) });
+
+    await collection.updateOne(
+      { _id: existing._id },
+      { $set: {
+        entry_date: entryDate,
+        location_id: text(body.location_id),
+        location_name: location?.name || text(body.location_name),
+        company_id: text(body.company_id) || null,
+        company_name: company?.name || text(body.company_name),
+        company_account_id: text(body.company_account_id) || null,
+        company_account_name: account?.account_name || account?.name || text(body.company_account_name),
+        product_id: text(body.product_id),
+        product_name: product?.name || text(body.product_name),
+        consignee_id: consigneeId,
+        consignee: consigneeDoc?.name || consigneeDoc?.consignee_name || consigneeDoc?.buyer_name || text(body.consignee_name),
+        consignee_name: consigneeDoc?.name || consigneeDoc?.consignee_name || consigneeDoc?.buyer_name || text(body.consignee_name),
+        original_qty: originalQty,
+        actual_unloading_qty: actualUnloadingQty,
+        rejection_qty: rejectionQty,
+        reason,
+        remarks: text(body.remarks),
+        updated_at: new Date(),
+        history,
+      } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[daily-rejections:edit]", err);
+    res.status(500).json({ error: err.message || "Failed to edit Daily Rejection" });
+  }
+});
+
 router.patch("/:id/assign", async (req, res) => {
   try {
     if (!assertPermission(req.user, ASSIGN, res)) return;
@@ -368,8 +449,8 @@ router.patch("/:id/assign", async (req, res) => {
 
     const assignedTo = text(req.body?.assigned_to);
     const actionType = text(req.body?.action_type).toUpperCase();
-    if (!assignedTo || !actionType) return res.status(400).json({ error: "Employee and Work Description are required" });
-    if (!WORK_DESCRIPTIONS.has(actionType)) return res.status(400).json({ error: "Invalid Work Description" });
+    if (!assignedTo) return res.status(400).json({ error: "Employee is required" });
+    if (!actionType || !WORK_DESCRIPTIONS.has(actionType)) return res.status(400).json({ error: "Work Description is required" });
 
     const employee = await Employee.findById(objectIdOrValue(assignedTo), { name: 1 }).lean();
     if (!employee) return res.status(404).json({ error: "Assigned employee not found" });
@@ -380,11 +461,11 @@ router.patch("/:id/assign", async (req, res) => {
 
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
-    history.push({ action: "ASSIGNED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: now, status: "ASSIGNED", assigned_to: String(employee._id) });
+    history.push({ action: "ASSIGNED_AND_STARTED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: now, status: "RUNNING", assigned_to: String(employee._id), action_type: actionType });
 
     await collection.updateOne(
       { _id: existing._id },
-      { $set: { assigned_to: String(employee._id), assigned_to_name: employee.name || "", action_type: actionType, assigned_by: currentUserId(req.user), assigned_at: now, status: "ASSIGNED", updated_at: now, history } }
+      { $set: { assigned_to: String(employee._id), assigned_to_name: employee.name || "", assigned_by: currentUserId(req.user), assigned_at: now, action_type: actionType, status: "RUNNING", started_at: now, started_by: currentUserId(req.user), updated_at: now, history } }
     );
     res.json({ ok: true });
   } catch (err) {
@@ -402,8 +483,8 @@ router.post("/:id/start", async (req, res) => {
     const existing = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
     const uid = currentUserId(req.user);
-    if (!isManager(req.user) && String(existing.assigned_to || "") !== uid && String(existing.employee_id || "") !== uid) return res.status(403).json({ error: "This rejection is not assigned to you" });
-    if (normalizeStatus(existing.status) !== "ASSIGNED") return res.status(400).json({ error: "Only Assigned rejection can be started" });
+    if (String(existing.assigned_to || "") !== uid) return res.status(403).json({ error: "Only the assigned employee can complete this work" });
+    if (!["ASSIGNED", "PENDING"].includes(normalizeStatus(existing.status))) return res.status(400).json({ error: "Only Pending or Assigned rejection can be started" });
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({ action: "STARTED", by: uid, by_name: req.user?.name || req.user?.username || "", at: now, status: "RUNNING" });
@@ -417,14 +498,14 @@ router.post("/:id/start", async (req, res) => {
 
 router.post("/:id/complete", async (req, res) => {
   try {
-    if (!assertPermission(req.user, COMPLETE, res)) return;
     if (!requireMongo(res)) return;
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid rejection id" });
     const collection = mongoose.connection.db.collection("daily_rejections");
     const existing = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
     const uid = currentUserId(req.user);
-    if (!isManager(req.user) && String(existing.assigned_to || "") !== uid && String(existing.employee_id || "") !== uid) return res.status(403).json({ error: "This rejection is not assigned to you" });
+    const isAssignedEmployee = String(existing.assigned_to || "") === uid;
+    if (!isAssignedEmployee && !userHasPermission(req.user, COMPLETE)) return res.status(403).json({ error: "Only the assigned employee or authorised user can complete this work" });
     if (normalizeStatus(existing.status) !== "RUNNING") return res.status(400).json({ error: "Only Running rejection can be completed" });
 
     const now = new Date();
