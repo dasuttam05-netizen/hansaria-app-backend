@@ -283,7 +283,9 @@ async function buildRentDetails({ monthList, filters }) {
       for (const a of adjustments) {
         const out = outById.get(String(a.outward_id || ''));
         const buyer = buyerByOutward.get(String(a.outward_id || ''));
-        const adjustmentDate = dateOnly(buyer?.unloading_date) || dateOnly(out?.date) || dateOnly(a.created_at);
+        // Dispatch date in the rent report must use the actual Outward entry date.
+        // Do not use Buyer Adjustment unloading date as the dispatch date.
+        const adjustmentDate = dateOnly(out?.date) || dateOnly(out?.outward_date) || dateOnly(buyer?.unloading_date) || dateOnly(a.created_at);
         if (!adjustmentDate || adjustmentDate > monthEndDate) continue;
         const qty=num(a.qty), aSlab=monthSlab(row.date, adjustmentDate);
         adjustedQty += qty; adjustedRentAmount += qty*rentRate*aSlab.monthsDiff;
@@ -292,13 +294,17 @@ async function buildRentDetails({ monthList, filters }) {
       const shortageQty = calculateShortageQty(num(row.weight), slab.monthsDiff, row.shortage_percent);
       const balanceQty = num(row.weight)-shortageQty-adjustedQty;
       const balanceRentAmount = Math.max(balanceQty,0)*rentRate*slab.monthsDiff;
+      // When an outward entry exists, the report's Dispatch Date and Days must be
+      // based on that outward entry date instead of month-end/unloading date.
+      const reportReferenceDate = lastDispatchDate || monthEndDate;
+      const reportDaysDiff = monthSlab(row.date, reportReferenceDate).daysDiff;
       detailed.push({
         id:row.id, month, month_label:monthLabel(month), month_end_date:monthEndDate,
-        inward_date:row.date, reference_date: num(row.weight)-adjustedQty>0 ? monthEndDate : (lastDispatchDate || monthEndDate),
+        inward_date:row.date, reference_date:reportReferenceDate,
         dispatch_date:lastDispatchDate || null, party_name:row.company_name || row.account_name || 'Unknown',
         warehouse_name:row.warehouse_name || 'Unknown', voucher_no:row.voucher_no || '', lorry_no:row.lorry_no || '',
         original_weight:Number(num(row.weight).toFixed(4)), adjusted_qty:Number(adjustedQty.toFixed(4)), shortage_qty:Number(shortageQty.toFixed(4)),
-        balance_qty:Number(Math.max(balanceQty,0).toFixed(4)), days_diff:slab.daysDiff, month_slab:slab.monthsDiff, rent_rate:rentRate,
+        balance_qty:Number(Math.max(balanceQty,0).toFixed(4)), days_diff:reportDaysDiff, month_slab:slab.monthsDiff, rent_rate:rentRate,
         adjusted_rent_amount:Number(adjustedRentAmount.toFixed(2)), balance_rent_amount:Number(balanceRentAmount.toFixed(2)),
         rent_amount:Number((adjustedRentAmount+balanceRentAmount).toFixed(2)),
       });
