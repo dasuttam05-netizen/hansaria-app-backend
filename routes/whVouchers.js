@@ -7507,6 +7507,52 @@ router.get("/sale/:id/summary", async (req, res) => {
             return [];
           }
         })();
+    // Hydrate linked purchase bills from MongoDB so the Sale Summary report
+    // always has the actual purchase data/deductions saved against the bill.
+    const hydratedPurchaseLinks = await Promise.all(
+      purchaseLinks.map(async (link) => {
+        const purchaseId = link?.purchase_id || link?.id || link?._id;
+        if (!purchaseId || !mongoose.Types.ObjectId.isValid(String(purchaseId))) return link;
+        try {
+          const purchase = await PurchaseVoucher.findById(purchaseId).lean();
+          if (!purchase) return link;
+          return {
+            ...link,
+            purchase_id: String(purchase._id),
+            voucher_no: purchase.voucher_no || link.voucher_no || "",
+            date: purchase.date || link.date || "",
+            farmer_id: purchase.farmer_id || link.farmer_id || "",
+            farmer_name: link.farmer_name || purchase.farmer_name || "",
+            quantity: Number(purchase.total_qty || purchase.net_weight || purchase.quantity || link.quantity || 0),
+            weight: Number(purchase.total_qty || purchase.net_weight || purchase.quantity || link.weight || 0),
+            rate: Number(purchase.rate || link.rate || 0),
+            amount: Number(purchase.amount || link.amount || 0),
+            claim_amount: Number(purchase.claim_amount || purchase.bags_claim || link.claim_amount || 0),
+            labour: Number(purchase.labour || link.labour || 0),
+            transport_charge: Number(purchase.transport_charge || link.transport_charge || 0),
+            cd_amount: Number(purchase.cd_amount || link.cd_amount || 0),
+            tds_amount: Number(purchase.tds_amount || link.tds_amount || 0),
+            other_deduction: Number(purchase.other_deduction || link.other_deduction || 0),
+            adjustment_amount: Number(purchase.adjustment_amount || link.adjustment_amount || 0),
+            round_off: Number(purchase.round_off || link.round_off || 0),
+            total_deduction: Number(
+              purchase.total_deduction ||
+              link.total_deduction ||
+              Number(purchase.claim_amount || 0) +
+              Number(purchase.labour || 0) +
+              Number(purchase.transport_charge || 0) +
+              Number(purchase.cd_amount || 0) +
+              Number(purchase.tds_amount || 0) +
+              Number(purchase.other_deduction || 0) +
+              Number(purchase.adjustment_amount || 0)
+            ),
+            net_amount_payable: Number(purchase.net_amount_payable || link.net_amount_payable || 0),
+          };
+        } catch {
+          return link;
+        }
+      })
+    );
     const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
     const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
     const resolvedTransportRow = await getTransportBiltiMatch({
