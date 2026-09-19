@@ -4075,6 +4075,7 @@ router.put("/sale/:id", async (req, res) => {
   if (deductionOnly) {
     const adjustmentValue = Number(req.body.adjustment_amount) || 0;
     const tdsValue = Number(req.body.tds_amount) || 0;
+    const transportChargeValue = Number(req.body.transport_charge) || 0;
     const roundOffValue = Number(req.body.round_off) || 0;
     if (!mongoReady()) {
       return res.status(503).json({ error: "MongoDB is not connected. Sale vouchers are MongoDB-primary." });
@@ -4097,7 +4098,7 @@ router.put("/sale/:id", async (req, res) => {
     const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : mongoSale.cd_percent) || 0;
     const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : mongoSale.cd_amount) || 0;
     const totalDeductionValue = Number(req.body.total_deduction) || 0;
-    const netAmount = grossAmount - claimValue - otherDeductionValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+    const netAmount = grossAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
     const updateDoc = {
       unloading_date: req.body.unloading_date !== undefined ? req.body.unloading_date : mongoSale.unloading_date,
       shortage_quantity: shortageQty,
@@ -4110,11 +4111,13 @@ router.put("/sale/:id", async (req, res) => {
       total_deduction: totalDeductionValue,
       claim_amount: claimValue,
       other_deduction: otherDeductionValue,
+      transport_charge: transportChargeValue,
       cd_percent: cdPercentValue,
       cd_amount: cdAmountValue,
       adjustment_amount: adjustmentValue,
       tds_amount: tdsValue,
       round_off: roundOffValue,
+      total_deduct_amount: totalDeductionValue,
       net_amount: netAmount,
       net_receivable_amount: netAmount,
       net_amount_payable: netAmount,
