@@ -1189,11 +1189,13 @@ async function decorateSaleRows(rows) {
   const accountIds = [...new Set(plainRows.map((r) => String(r?.company_account_id || "")).filter(Boolean))];
   const buyerIds = [...new Set(plainRows.map((r) => String(r?.buyer_id || r?.company_id || "")).filter(Boolean))];
   const consigneeIds = [...new Set(plainRows.map((r) => String(r?.consignee_id || "")).filter(Boolean))];
+  const farmerIds = [...new Set(plainRows.map((r) => String(r?.farmer_id || r?.against_purchase_farmer_id || "")).filter(Boolean))];
 
   const safeObjectIds = (ids) => ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
   const mongoWarehouseIds = safeObjectIds(warehouseIds);
   const mongoProductIds = safeObjectIds(productIds);
   const mongoAccountIds = safeObjectIds(accountIds);
+  const mongoFarmerIds = safeObjectIds(farmerIds);
 
   const legacyIds = (ids) => ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0);
   const buyerLegacyIds = legacyIds(buyerIds);
@@ -1221,6 +1223,7 @@ async function decorateSaleRows(rows) {
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
+    mongoFarmerIds.length ? Farmer.find({ _id: { $in: mongoFarmerIds } }).lean() : Promise.resolve([]),
     buyerQuery ? findDedicatedPartyDocs("buyer", buyerQuery) : Promise.resolve([]),
     consigneeQuery ? findDedicatedPartyDocs("consignee", consigneeQuery) : Promise.resolve([]),
   ]);
@@ -1242,14 +1245,17 @@ async function decorateSaleRows(rows) {
   const mongoWarehouseMap = byMongoId(valueAt(0));
   const mongoProductMap = byMongoId(valueAt(1));
   const mongoAccountMap = byMongoId(valueAt(2));
-  const buyerMap = byLegacyOrMongoId(valueAt(3));
-  const consigneeMap = byLegacyOrMongoId(valueAt(4));
+  const farmerMap = byLegacyOrMongoId(valueAt(3));
+  const buyerMap = byLegacyOrMongoId(valueAt(4));
+  const consigneeMap = byLegacyOrMongoId(valueAt(5));
 
   return plainRows.map((plain) => {
     const buyerId = String(plain?.buyer_id || plain?.company_id || "");
+    const farmerId = String(plain?.farmer_id || plain?.against_purchase_farmer_id || "");
     const warehouse = mongoWarehouseMap.get(String(plain?.warehouse_id || ""));
     const product = mongoProductMap.get(String(plain?.product_id || ""));
     const account = mongoAccountMap.get(String(plain?.company_account_id || ""));
+    const farmer = farmerMap.get(farmerId) || {};
     const buyer = buyerMap.get(buyerId) || {};
     const consignee = consigneeMap.get(String(plain?.consignee_id || ""));
     const totalQuantity = Number(plain?.quantity ?? plain?.total_quantity ?? Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0));
@@ -1259,6 +1265,7 @@ async function decorateSaleRows(rows) {
       id: String(plain?._id || plain?.id || ""),
       _id: String(plain?._id || plain?.id || ""),
       buyer_id: buyerId,
+      farmer_name: farmer?.name || farmer?.farmer_name || plain?.farmer_name || "-",
       warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
       product_name: product?.name || plain?.product_name || "-",
       company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
@@ -6565,8 +6572,7 @@ router.get("/report/filter-options", async (req, res) => {
   const type = String(req.query.type || "purchase").trim().toLowerCase();
   if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Trading report filters" });
 
-  const isProfitLoss = type === "profit-loss";
-  const isSale = type === "sale" || type === "sale-party-ledger" || type === "sale-followup" || type === "sale-journey" || isProfitLoss;
+  const isSale = type === "sale" || type === "sale-party-ledger" || type === "sale-followup" || type === "sale-journey";
   const isPurchase = type === "purchase" || type === "purchase-party-ledger" || type === "fifo-stock";
   if (!isSale && !isPurchase) return res.status(400).json({ error: "Unsupported report type" });
 
@@ -6592,8 +6598,6 @@ router.get("/report/filter-options", async (req, res) => {
     let warehouseIds = [];
     let farmerIds = [];
     let buyerIds = [];
-    let employeeIds = [];
-    let locationIds = [];
 
     if (isPurchase) {
       [accountIds, warehouseIds, farmerIds] = await Promise.all([
@@ -6612,17 +6616,6 @@ router.get("/report/filter-options", async (req, res) => {
       ]);
     }
 
-    if (isProfitLoss) {
-      const profitScope = { ...mongoSaleScope(req.user) };
-      if (accountId) profitScope.company_account_id = accountId;
-      if (warehouseId) profitScope.warehouse_id = warehouseId;
-      if (farmerId) profitScope.farmer_id = farmerId;
-      [employeeIds, locationIds] = await Promise.all([
-        SaleVoucher.distinct("employee_id", profitScope),
-        SaleVoucher.distinct("location_id", profitScope),
-      ]);
-    }
-
     const clean = (values) => [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))];
     const validIds = (values) => clean(values).filter((value) => mongoose.Types.ObjectId.isValid(value));
 
@@ -6630,8 +6623,6 @@ router.get("/report/filter-options", async (req, res) => {
     const cleanWarehouseIds = validIds(warehouseIds);
     const cleanFarmerIds = validIds(farmerIds);
     const cleanBuyerIds = validIds(buyerIds);
-    const cleanEmployeeIds = validIds(employeeIds);
-    const cleanLocationIds = validIds(locationIds);
     const cleanBuyerLegacyIds = clean(buyerIds).map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0);
     const buyerFilterQuery = cleanBuyerIds.length || cleanBuyerLegacyIds.length ? {
       $or: [
@@ -6642,13 +6633,11 @@ router.get("/report/filter-options", async (req, res) => {
 
     // Return labels together with IDs so Reports do not need to load the
     // entire nine-table master bundle just to populate filter dropdowns.
-    const [accountDocs, warehouseDocs, farmerDocs, buyerDocs, employeeDocs, locationDocs] = await Promise.all([
+    const [accountDocs, warehouseDocs, farmerDocs, buyerDocs] = await Promise.all([
       cleanAccountIds.length ? CompanyAccount.find({ _id: { $in: cleanAccountIds } }).select("_id account_name name").lean() : [],
       cleanWarehouseIds.length ? Warehouse.find({ _id: { $in: cleanWarehouseIds } }).select("_id name").lean() : [],
       cleanFarmerIds.length ? Farmer.find({ _id: { $in: cleanFarmerIds } }).select("_id name").lean() : [],
       buyerFilterQuery ? findDedicatedPartyDocs("buyer", buyerFilterQuery, "_id legacy_id name") : [],
-      cleanEmployeeIds.length ? Employee.find({ _id: { $in: cleanEmployeeIds } }).select("_id name").lean() : [],
-      cleanLocationIds.length ? Location.find({ _id: { $in: cleanLocationIds } }).select("_id name").lean() : [],
     ]);
 
     const cleanNamed = (docs, type) => {
@@ -6673,10 +6662,6 @@ router.get("/report/filter-options", async (req, res) => {
       warehouses: cleanNamed(warehouseDocs),
       farmers: cleanNamed(farmerDocs),
       buyers: cleanNamed(buyerDocs, "buyer"),
-      employee_ids: clean(employeeIds),
-      location_ids: clean(locationIds),
-      employees: cleanNamed(employeeDocs),
-      locations: cleanNamed(locationDocs),
     };
     tradingFilterCache.set(cacheKey, { time: Date.now(), data });
     res.set("Cache-Control", "private, max-age=900, stale-while-revalidate=120");
@@ -6822,260 +6807,120 @@ router.get("/report/purchase-summary", async (req, res) => {
   return res.status(503).json({ error: "MongoDB is required for purchase summary" });
 });
 
-function parseProfitLossFilters(req) {
-  return {
-    fromDate: toDateOnly(req.query.from_date),
-    toDate: toDateOnly(req.query.to_date),
-    warehouseId: String(req.query.warehouse_id || "").trim(),
-    farmerId: String(req.query.farmer_id || "").trim(),
-    employeeId: String(req.query.employee_id || "").trim(),
-    locationId: String(req.query.location_id || "").trim(),
-    buyerId: String(req.query.buyer_id || "").trim(),
-    search: String(req.query.search || "").trim(),
-  };
-}
-
-async function getDetailedProfitLossRows(req, filters = parseProfitLossFilters(req)) {
-  const mongoFilter = { ...mongoSaleScope(req.user) };
-  if (filters.warehouseId) mongoFilter.warehouse_id = filters.warehouseId;
-  if (filters.farmerId) mongoFilter.farmer_id = filters.farmerId;
-  if (filters.employeeId) mongoFilter.employee_id = filters.employeeId;
-  if (filters.locationId) mongoFilter.location_id = filters.locationId;
-  if (filters.buyerId) {
-    mongoFilter.$or = [
-      { buyer_id: filters.buyerId },
-      { company_id: filters.buyerId },
-    ];
-  }
-  if (filters.fromDate || filters.toDate) {
-    mongoFilter.date = {};
-    if (filters.fromDate) mongoFilter.date.$gte = filters.fromDate;
-    if (filters.toDate) mongoFilter.date.$lte = filters.toDate;
-  }
-  if (filters.search) {
-    const safe = filters.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const rx = new RegExp(safe, "i");
-    mongoFilter.$and = [
-      ...(mongoFilter.$and || []),
-      { $or: [
-        { voucher_no: rx }, { bill_no: rx }, { farmer_name: rx },
-        { buyer_name: rx }, { company_name: rx }, { consignee_name: rx },
-        { lorry_no: rx }, { warehouse_name: rx }, { description: rx },
-      ] },
-    ];
-  }
-
-  const sales = await SaleVoucher.find(mongoFilter)
-    .sort({ date: -1, createdAt: -1, _id: -1 })
-    .lean();
-
-  let rows = await decorateSaleRows(sales || []);
-
-  // Hydrate Farmer / Employee / Location labels in one batch.
-  const farmerIds = [...new Set(rows.map((r) => String(r.farmer_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-  const employeeIds = [...new Set(rows.map((r) => String(r.employee_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-  const locationIds = [...new Set(rows.map((r) => String(r.location_id || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))];
-  const [farmerDocs, employeeDocs, locationDocs] = await Promise.all([
-    farmerIds.length ? Farmer.find({ _id: { $in: farmerIds } }).select("_id name").lean() : [],
-    employeeIds.length ? Employee.find({ _id: { $in: employeeIds } }).select("_id name").lean() : [],
-    locationIds.length ? Location.find({ _id: { $in: locationIds } }).select("_id name").lean() : [],
-  ]);
-  const farmerMap = new Map((farmerDocs || []).map((r) => [String(r._id), r.name]));
-  const employeeMap = new Map((employeeDocs || []).map((r) => [String(r._id), r.name]));
-  const locationMap = new Map((locationDocs || []).map((r) => [String(r._id), r.name]));
-
-  // Hydrate linked purchase vouchers in one batch so the report uses the
-  // exact same purchase-deduction logic as Sale Summary.
-  const allPurchaseIds = [...new Set(rows.flatMap((row) => {
-    const links = Array.isArray(row.against_purchase_links)
-      ? row.against_purchase_links
-      : (() => { try { return row.against_purchase_links ? JSON.parse(row.against_purchase_links) : []; } catch { return []; } })();
-    return links.map((item) => String(item?.purchase_id || item?.id || item?._id || "")).filter(Boolean);
-  }))];
-  const validPurchaseIds = allPurchaseIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
-  const purchaseDocs = validPurchaseIds.length
-    ? await PurchaseVoucher.find({ _id: { $in: validPurchaseIds } }).lean()
-    : [];
-  const purchaseMap = new Map((purchaseDocs || []).map((doc) => [String(doc._id), doc]));
-
-  rows = rows.map((row) => {
-    const links = Array.isArray(row.against_purchase_links)
-      ? row.against_purchase_links
-      : (() => { try { return row.against_purchase_links ? JSON.parse(row.against_purchase_links) : []; } catch { return []; } })();
-
-    const netSaleAmount = Number(
-      row.net_receivable_amount ??
-      row.net_amount_payable ??
-      row.outstanding ??
-      row.amount ??
-      0
-    );
-    const rawPurchaseAmount = Number(
-      row.direct_purchase_amount ||
-      links.reduce((sum, item) => sum + Number(item?.amount || 0), 0)
-    );
-    const purchaseDeductionTotal = links.reduce((sum, item) => {
-      const purchase = purchaseMap.get(String(item?.purchase_id || item?.id || item?._id || ""));
-      if (!purchase) return sum;
-      return sum + purchaseDeductionTotalFromRow(purchase);
-    }, 0);
-    const netPurchaseAmount = Math.max(rawPurchaseAmount - purchaseDeductionTotal, 0);
-    // This matches Warehouse Trading -> Sale Summary -> Profit/Loss.
-    const profitLoss = Number((netSaleAmount - netPurchaseAmount).toFixed(2));
-    const qty = Number(row.quantity || row.unloading_qty || row.total_quantity || 0);
-
-    return {
-      ...row,
-      report_date: row.date || row.unloading_date || "",
-      sale_invoice_no: row.voucher_no || row.bill_no || "-",
-      farmer_name: row.farmer_name || farmerMap.get(String(row.farmer_id || "")) || "-",
-      buyer_name: row.buyer_name || row.company_name || "-",
-      consignee_name: row.consignee_name || "-",
-      lorry_no: row.lorry_no || row.reference_id || "-",
-      quantity: Number(qty.toFixed(4)),
-      net_sale_amount: Number(netSaleAmount.toFixed(2)),
-      purchase_amount: Number(rawPurchaseAmount.toFixed(2)),
-      purchase_deduction_total: Number(purchaseDeductionTotal.toFixed(2)),
-      net_purchase_amount: Number(netPurchaseAmount.toFixed(2)),
-      profit_loss: profitLoss,
-      profit_loss_type: profitLoss >= 0 ? "Profit" : "Loss",
-      warehouse_name: row.warehouse_name || "-",
-      employee_name: row.employee_name || employeeMap.get(String(row.employee_id || "")) || "-",
-      location_name: row.location_name || locationMap.get(String(row.location_id || "")) || "-",
-    };
-  });
-
-  return rows;
-}
-
-function profitLossExportRows(rows) {
-  return (rows || []).map((row) => ({
-    "Date": row.report_date || row.date || "",
-    "Sale Invoice No": row.sale_invoice_no || row.voucher_no || "",
-    "Farmer Name": row.farmer_name || "",
-    "Buyer Name": row.buyer_name || "",
-    "Consignee Name": row.consignee_name || "",
-    "Lorry No": row.lorry_no || "",
-    "Quantity": Number(row.quantity || 0),
-    "Net Sale Amount": Number(row.net_sale_amount || 0),
-    "Purchase Amount": Number(row.purchase_amount || 0),
-    "Profit / Loss": Number(row.profit_loss || 0),
-    "Warehouse": row.warehouse_name || "",
-    "Location": row.location_name || "",
-    "Employee": row.employee_name || "",
-  }));
-}
-
 router.get("/report/profit-loss", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.profitLoss")) {
     return res.status(403).json({ error: "Permission denied" });
   }
+
   try {
-    const filters = parseProfitLossFilters(req);
-    const rows = await getDetailedProfitLossRows(req, filters);
+    const mode = String(req.query.mode || "direct").trim().toLowerCase() === "warehouse" ? "warehouse" : "direct";
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
-    const usePaging = req.query.page !== undefined || req.query.page_size !== undefined;
-    const data = usePaging ? rows.slice((page - 1) * pageSize, page * pageSize) : rows;
-    return res.json(usePaging ? {
-      data,
+    const fromDate = String(req.query.from_date || "").trim();
+    const toDate = String(req.query.to_date || "").trim();
+    const locationId = String(req.query.location_id || "").trim();
+    const employeeId = String(req.query.employee_id || "").trim();
+    const farmerId = String(req.query.farmer_id || "").trim();
+    const search = String(req.query.search || "").trim();
+
+    if (mode === "warehouse") {
+      const [purchases, sales] = await Promise.all([
+        getPurchaseReportRowsForUser(req.user),
+        getSaleReportRowsForUser(req.user),
+      ]);
+      const rows = new Map();
+      const ensure = (row) => {
+        const key = String(row.warehouse_id || "");
+        if (!rows.has(key)) {
+          rows.set(key, {
+            id: row.warehouse_id,
+            warehouse_id: row.warehouse_id,
+            warehouse_name: row.warehouse_name || "",
+            sale_amount: 0,
+            purchase_amount: 0,
+            profit_loss: 0,
+          });
+        }
+        const item = rows.get(key);
+        item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
+        return item;
+      };
+      purchases.forEach((row) => {
+        const item = ensure(row);
+        item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+      });
+      sales.forEach((row) => {
+        const item = ensure(row);
+        item.sale_amount += Number(row.amount || row.total_amount || 0);
+      });
+      return res.json(Array.from(rows.values()).map((row) => ({
+        ...row,
+        sale_amount: Number(row.sale_amount.toFixed(2)),
+        purchase_amount: Number(row.purchase_amount.toFixed(2)),
+        profit_loss: Number((row.sale_amount - row.purchase_amount).toFixed(2)),
+      })));
+    }
+
+    if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for direct profit/loss report" });
+
+    const filter = { ...mongoSaleScope(req.user), sale_type: "direct" };
+    if (farmerId) filter.farmer_id = farmerId;
+    if (locationId) filter.location_id = locationId;
+    if (employeeId) filter.employee_id = employeeId;
+    if (fromDate || toDate) {
+      filter.date = {};
+      if (fromDate) filter.date.$gte = fromDate;
+      if (toDate) filter.date.$lte = toDate;
+    }
+    if (search) {
+      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const rx = new RegExp(safe, "i");
+      filter.$and = [{ $or: [
+        { voucher_no: rx }, { bill_no: rx }, { farmer_name: rx }, { buyer_name: rx },
+        { company_name: rx }, { consignee_name: rx }, { lorry_no: rx }, { warehouse_name: rx },
+      ] }];
+    }
+
+    const total = await SaleVoucher.countDocuments(filter);
+    const rows = await SaleVoucher.find(filter)
+      .sort({ date: -1, createdAt: -1, _id: -1 })
+      .skip((page - 1) * pageSize)
+      .limit(pageSize)
+      .lean();
+    const decorated = await decorateSaleRows(rows);
+    const reportRows = decorated.map((row) => {
+      const grossAmount = Number(row.amount || row.total_amount || 0);
+      const netPayable = Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || grossAmount || 0);
+      const linkedPurchaseAmount = Array.isArray(row.against_purchase_links)
+        ? row.against_purchase_links.reduce((sum, item) => sum + Number(item?.amount || 0), 0)
+        : 0;
+      const purchaseAmount = Number(row.direct_purchase_amount || linkedPurchaseAmount || (Number(row.direct_purchase_rate || 0) * Number(row.quantity || row.total_quantity || 0)) || 0);
+      return {
+        ...row,
+        date: row.date || "",
+        farmer_name: row.farmer_name || row.against_purchase_farmer_name || "-",
+        buyer_name: row.buyer_name || row.company_name || row.party_name || "-",
+        consignee_name: row.consignee_name || "-",
+        lorry_no: row.lorry_no || "-",
+        quantity: Number(row.quantity || row.total_quantity || row.unloading_qty || 0),
+        sale_amount: Number(netPayable.toFixed(2)),
+        purchase_amount: Number(purchaseAmount.toFixed(2)),
+        profit_loss: Number((netPayable - purchaseAmount).toFixed(2)),
+      };
+    });
+
+    return res.json({
+      data: reportRows,
       pagination: {
         page,
         pageSize,
-        total: rows.length,
-        totalPages: Math.max(1, Math.ceil(rows.length / pageSize)),
-        hasMore: page * pageSize < rows.length,
+        total,
+        hasMore: page * pageSize < total,
       },
-    } : data);
+    });
   } catch (err) {
     console.error("Profit/Loss report failed:", err);
-    return res.status(500).json({ error: err.message || "Failed to load Profit/Loss report" });
-  }
-});
-
-router.get("/report/profit-loss/export/xlsx", async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.report.profitLoss")) {
-    return res.status(403).json({ error: "Permission denied" });
-  }
-  try {
-    const rows = await getDetailedProfitLossRows(req);
-    const exportRows = profitLossExportRows(rows);
-    const ws = XLSX.utils.json_to_sheet(exportRows);
-    ws["!cols"] = [
-      { wch: 13 }, { wch: 20 }, { wch: 22 }, { wch: 22 }, { wch: 22 },
-      { wch: 15 }, { wch: 14 }, { wch: 17 }, { wch: 17 }, { wch: 17 },
-      { wch: 24 }, { wch: 22 }, { wch: 22 },
-    ];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Profit Loss");
-    const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="warehouse_profit_loss_report.xlsx"');
-    return res.send(buffer);
-  } catch (err) {
-    return res.status(500).json({ error: err.message || "Failed to export Profit/Loss Excel" });
-  }
-});
-
-router.get("/report/profit-loss/export/pdf", async (req, res) => {
-  if (!userHasPermission(req.user, "warehouse.trading.report.profitLoss")) {
-    return res.status(403).json({ error: "Permission denied" });
-  }
-  try {
-    const rows = await getDetailedProfitLossRows(req);
-    const doc = new PDFDocument({ size: "A4", layout: "landscape", margin: 24 });
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", 'attachment; filename="warehouse_profit_loss_report.pdf"');
-    doc.pipe(res);
-
-    const pageW = doc.page.width;
-    const margin = 24;
-    const colX = [margin, 72, 158, 235, 312, 389, 454, 510, 580, 650, 725, 820, 895];
-    const headers = ["Date", "Sale Inv No", "Farmer", "Buyer", "Consignee", "Lorry", "Qty", "Sale Amt", "Buy Amt", "Profit/Loss", "Warehouse", "Location", "Employee"];
-    doc.font("Helvetica-Bold").fontSize(13).text("WAREHOUSE PROFIT / LOSS REPORT", margin, 20);
-    doc.font("Helvetica").fontSize(7).text(`Generated: ${fmtDate(new Date())}`, margin, 38);
-
-    let y = 55;
-    const rowH = 17;
-    const drawHeader = () => {
-      doc.rect(margin, y, pageW - margin * 2, 18).fill("#0f766e");
-      doc.fillColor("#fff").font("Helvetica-Bold").fontSize(6.2);
-      headers.forEach((h, i) => doc.text(h, colX[i] + 2, y + 6, { width: (colX[i + 1] || pageW - margin) - colX[i] - 4, align: "left" }));
-      y += 18;
-    };
-    drawHeader();
-
-    rows.forEach((row) => {
-      if (y > doc.page.height - 35) {
-        doc.addPage();
-        y = 24;
-        drawHeader();
-      }
-      const vals = [
-        fmtDate(row.report_date), row.sale_invoice_no, row.farmer_name, row.buyer_name,
-        row.consignee_name, row.lorry_no, Number(row.quantity || 0).toFixed(4),
-        fmtNum(row.net_sale_amount), fmtNum(row.purchase_amount), fmtNum(row.profit_loss),
-        row.warehouse_name, row.location_name, row.employee_name,
-      ];
-      doc.fillColor("#111827").font("Helvetica").fontSize(5.8);
-      vals.forEach((v, i) => {
-        doc.text(String(v || "-"), colX[i] + 2, y + 5, {
-          width: (colX[i + 1] || pageW - margin) - colX[i] - 4,
-          height: 12,
-          ellipsis: true,
-        });
-      });
-      doc.moveTo(margin, y + rowH).lineTo(pageW - margin, y + rowH).stroke("#d1d5db");
-      y += rowH;
-    });
-
-    const totalProfit = rows.reduce((sum, row) => sum + Number(row.profit_loss || 0), 0);
-    if (y > doc.page.height - 28) { doc.addPage(); y = 24; }
-    doc.roundedRect(margin, y + 4, pageW - margin * 2, 25, 4).fill("#eef9f7");
-    doc.fillColor("#064f4a").font("Helvetica-Bold").fontSize(9).text(`Total Profit / Loss: Rs. ${fmtNum(totalProfit)}`, margin + 10, y + 13);
-    doc.end();
-  } catch (err) {
-    return res.status(500).json({ error: err.message || "Failed to export Profit/Loss PDF" });
+    res.status(500).json({ error: err.message });
   }
 });
 
