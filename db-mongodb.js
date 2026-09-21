@@ -411,6 +411,10 @@ const companyAccountSchema =
 
     pan_no: String,
 
+    gst_no: String,
+
+    pin_no: String,
+
     mobile: String,
 
     shortage_percent: {
