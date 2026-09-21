@@ -264,6 +264,56 @@ router.get("/", async (req, res) => {
 
 /*
 ====================================================
+LOOKUP BY GST / PIN
+====================================================
+*/
+
+router.get("/lookup", async (req, res) => {
+  try {
+    if (!canReadCompanyAccounts(req.user)) {
+      return res.status(403).json({
+        error: "You do not have permission to view company accounts",
+      });
+    }
+
+    if (!requireMongo(req, res)) return;
+
+    const gstNo = String(req.query.gst_no || "").trim();
+    const pinNo = String(req.query.pin_no || "").trim();
+
+    if (!gstNo && !pinNo) {
+      return res.status(400).json({
+        error: "GST No or PIN No is required",
+      });
+    }
+
+    const escapeRegex = (value) =>
+      value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    const query = gstNo
+      ? { gst_no: { $regex: `^${escapeRegex(gstNo)}$`, $options: "i" } }
+      : { pin_no: { $regex: `^${escapeRegex(pinNo)}$`, $options: "i" } };
+
+    const account = await CompanyAccount.findOne(query).lean();
+
+    if (!account) {
+      return res.json({ account: null });
+    }
+
+    return res.json({
+      account: {
+        ...account,
+        id: account._id ? String(account._id) : account.id,
+      },
+    });
+  } catch (err) {
+    console.error("Error looking up company account:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/*
+====================================================
 CREATE
 ====================================================
 */
