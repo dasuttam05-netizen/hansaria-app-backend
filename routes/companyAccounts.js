@@ -292,6 +292,8 @@ router.post("/", async (req, res) => {
       company_id,
       company_name,
       pan_no,
+      gst_no,
+      pin_no,
       mobile,
       shortage_percent,
     } = req.body;
@@ -363,6 +365,12 @@ router.post("/", async (req, res) => {
           String(
             pan_no
           ).trim(),
+
+        gst_no:
+          String(gst_no || "").trim(),
+
+        pin_no:
+          String(pin_no || "").trim(),
 
         mobile:
           String(
@@ -490,6 +498,16 @@ async function importCompanyAccountsRows(
           row.pan_no || ""
         ).trim();
 
+      const gstNo =
+        String(
+          row.gst_no || row.gstNo || row.GST || ""
+        ).trim();
+
+      const pinNo =
+        String(
+          row.pin_no || row.pinNo || row.PIN || row.pincode || ""
+        ).trim();
+
       const mobile =
         String(
           row.mobile || ""
@@ -588,6 +606,12 @@ async function importCompanyAccountsRows(
 
           pan_no:
             panNo,
+
+          gst_no:
+            gstNo || null,
+
+          pin_no:
+            pinNo || null,
 
           mobile:
             mobile,
@@ -791,6 +815,21 @@ router.post(
           row.PanNo ??
           "",
 
+        gst_no:
+          row.gst_no ??
+          row.GST ??
+          row.GSTNo ??
+          row["GST No"] ??
+          "",
+
+        pin_no:
+          row.pin_no ??
+          row.PIN ??
+          row.PINNo ??
+          row["PIN No"] ??
+          row.pincode ??
+          "",
+
         mobile:
           row.mobile ??
           row.Mobile ??
@@ -810,6 +849,48 @@ router.post(
     );
   }
 );
+
+/*
+====================================================
+IMPORT TEMPLATE XLSX
+====================================================
+*/
+
+router.get("/import-template", async (req, res) => {
+  try {
+    if (!isAdminUser(req.user)) {
+      return res.status(403).json({ error: "Only admin can download company account import template" });
+    }
+
+    const rows = [{
+      company_name: "ABC COMPANY",
+      account_name: "Main A/C",
+      address: "Head Office Address",
+      gst_no: "22AAAAA0000A1Z5",
+      pan_no: "ABCDE1234F",
+      pin_no: "700001",
+      mobile: "9876543210",
+      shortage_percent: ""
+    }];
+
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(rows, {
+      header: [
+        "company_name", "account_name", "address", "gst_no",
+        "pan_no", "pin_no", "mobile", "shortage_percent"
+      ]
+    });
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Company Accounts");
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=company_accounts_import_format.xlsx");
+    return res.send(buffer);
+  } catch (err) {
+    console.error("Company account template failed:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 /*
 ====================================================
@@ -843,6 +924,8 @@ router.put(
         company_id,
         company_name,
         pan_no,
+        gst_no,
+        pin_no,
         mobile,
         shortage_percent,
       } = req.body;
@@ -935,6 +1018,12 @@ router.put(
                 String(
                   pan_no
                 ).trim(),
+
+              gst_no:
+                String(gst_no || "").trim(),
+
+              pin_no:
+                String(pin_no || "").trim(),
 
               mobile:
                 String(
