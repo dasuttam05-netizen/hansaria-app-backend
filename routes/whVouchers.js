@@ -6821,6 +6821,9 @@ router.get("/report/profit-loss", async (req, res) => {
     const locationId = String(req.query.location_id || "").trim();
     const employeeId = String(req.query.employee_id || "").trim();
     const farmerId = String(req.query.farmer_id || "").trim();
+    const warehouseId = String(req.query.warehouse_id || "").trim();
+    const buyerId = String(req.query.buyer_id || "").trim();
+    const consigneeId = String(req.query.consignee_id || "").trim();
     const search = String(req.query.search || "").trim();
 
     if (mode === "warehouse") {
@@ -6867,6 +6870,9 @@ router.get("/report/profit-loss", async (req, res) => {
     if (farmerId) filter.farmer_id = farmerId;
     if (locationId) filter.location_id = locationId;
     if (employeeId) filter.employee_id = employeeId;
+    if (warehouseId) filter.warehouse_id = warehouseId;
+    if (buyerId) filter.buyer_id = buyerId;
+    if (consigneeId) filter.consignee_id = consigneeId;
     if (fromDate || toDate) {
       filter.date = {};
       if (fromDate) filter.date.$gte = fromDate;
