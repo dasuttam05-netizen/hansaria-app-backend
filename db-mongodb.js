@@ -1881,6 +1881,8 @@ const stockJournalSchema = new mongoose.Schema(
     outward_voucher_no: String,
     inward_id: mongoose.Schema.Types.Mixed,
     inward_voucher_no: String,
+    destination_inward_id: mongoose.Schema.Types.ObjectId,
+    destination_voucher_no: String,
 
     warehouse_id: mongoose.Schema.Types.Mixed,
     warehouse_name: String,
