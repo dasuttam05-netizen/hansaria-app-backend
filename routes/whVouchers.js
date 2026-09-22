@@ -972,8 +972,11 @@ async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deduc
   const rows = [
     { key: "shortage", label: "Shortage", amount: Number(shortageAmount || 0) },
     { key: "claim", label: "Claim", amount: Number(deductionAmount || 0) },
+    { key: "other_deduction", label: "Other Deduction", amount: Number(body?.other_deduction || 0) },
     { key: "cash_discount", label: "Cash Discount", amount: Number(cdAmount || 0) },
     { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
+    { key: "adjustment", label: "Adjustment", amount: Number(body?.adjustment_amount || 0) },
+    { key: "transport", label: "Transport Charge", amount: Number(body?.transport_charge || 0) },
   ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
 
   const created = [];
@@ -4009,12 +4012,12 @@ router.put("/sale/:id", async (req, res) => {
           const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
           const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
 
-          const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : shortageAmount;
+          const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : 0;
           const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
           const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
           const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
 
-          const netAmount = grossAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+          const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
 
           existing.unloading_date = req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date;
           existing.due_date = dueFields.due_date || existing.due_date || "";
@@ -4027,7 +4030,7 @@ router.put("/sale/:id", async (req, res) => {
           existing.fungus = Number(req.body.fungus !== undefined ? req.body.fungus : existing.fungus) || 0;
           existing.discolour = Number(req.body.discolour !== undefined ? req.body.discolour : existing.discolour) || 0;
           existing.others = Number(req.body.others !== undefined ? req.body.others : existing.others) || 0;
-          const calculatedTotalDeduction = claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue;
+          const calculatedTotalDeduction = shortageAmount + claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue;
           existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : calculatedTotalDeduction) || calculatedTotalDeduction;
           existing.transport_charge = transportChargeValue;
           existing.claim_amount = claimValue;
@@ -4100,12 +4103,12 @@ router.put("/sale/:id", async (req, res) => {
     const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : mongoSale.unloading_qty || req.body.quantity || mongoSale.quantity) || 0;
     const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
     const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
-    const claimValue = req.body.claim_amount !== undefined ? Number(req.body.claim_amount) || 0 : shortageAmount;
+    const claimValue = req.body.claim_amount !== undefined ? Number(req.body.claim_amount) || 0 : 0;
     const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : mongoSale.other_deduction) || 0;
     const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : mongoSale.cd_percent) || 0;
     const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : mongoSale.cd_amount) || 0;
-    const totalDeductionValue = Number(req.body.total_deduction) || 0;
-    const netAmount = grossAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+    const totalDeductionValue = Number(req.body.total_deduction) || Number((shortageAmount + claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue).toFixed(2));
+    const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
     const updateDoc = {
       unloading_date: req.body.unloading_date !== undefined ? req.body.unloading_date : mongoSale.unloading_date,
       shortage_quantity: shortageQty,
@@ -6821,9 +6824,6 @@ router.get("/report/profit-loss", async (req, res) => {
     const locationId = String(req.query.location_id || "").trim();
     const employeeId = String(req.query.employee_id || "").trim();
     const farmerId = String(req.query.farmer_id || "").trim();
-    const warehouseId = String(req.query.warehouse_id || "").trim();
-    const buyerId = String(req.query.buyer_id || "").trim();
-    const consigneeId = String(req.query.consignee_id || "").trim();
     const search = String(req.query.search || "").trim();
 
     if (mode === "warehouse") {
@@ -6870,9 +6870,6 @@ router.get("/report/profit-loss", async (req, res) => {
     if (farmerId) filter.farmer_id = farmerId;
     if (locationId) filter.location_id = locationId;
     if (employeeId) filter.employee_id = employeeId;
-    if (warehouseId) filter.warehouse_id = warehouseId;
-    if (buyerId) filter.buyer_id = buyerId;
-    if (consigneeId) filter.consignee_id = consigneeId;
     if (fromDate || toDate) {
       filter.date = {};
       if (fromDate) filter.date.$gte = fromDate;
@@ -7172,12 +7169,12 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       const details = bySale.get(saleId) || [];
       const grossSale = Number(row.amount || row.total_amount || 0);
 
-      // claim_amount is the effective shortage/claim deduction used by the
-      // sale net calculation. shortage_amount is kept as supporting detail,
-      // so it is never subtracted twice.
+      // Shortage and Claim are separate deductions. Shortage is calculated
+      // from dispatch/unloading and Claim is an independent manual amount.
       const claim = Number(row.claim_amount || 0);
       const shortageQty = Number(row.shortage_quantity || 0);
-      const shortageAmount = Number(row.shortage_amount || 0);
+      const saleRate = Number(row.rate || 0);
+      const shortageAmount = Number((Number(row.shortage_amount || 0) || shortageQty * saleRate).toFixed(2));
       const otherDeduction = Number(row.other_deduction || 0);
       const cdAmount = Number(row.cd_amount || 0);
       const freight = Number(row.transport_charge || 0);
@@ -7185,15 +7182,9 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       const tds = Number(row.tds_amount || 0);
       const roundOff = Number(row.round_off || 0);
 
-      // Keep the existing accounting amount unchanged. Claim/shortage are
-      // displayed as one effective deduction so the same amount is never
-      // credited twice when shortage_amount is the supporting claim value.
-      const claimLabel = claim > 0
-        ? (shortageAmount > 0 && Math.abs(claim - shortageAmount) < 0.000001 ? "Shortage" : "Claim")
-        : (shortageAmount > 0 ? "Shortage" : "Claim");
-
       const deductionParts = [
-        ...(claim > 0 || shortageAmount > 0 ? [{ key: claimLabel.toLowerCase(), label: claimLabel, amount: claim > 0 ? claim : shortageAmount }] : []),
+        ...(shortageAmount > 0 ? [{ key: "shortage", label: "Shortage", amount: shortageAmount }] : []),
+        ...(claim > 0 ? [{ key: "claim", label: "Claim", amount: claim }] : []),
         { key: "other", label: "Other", amount: otherDeduction },
         { key: "cd", label: "CD", amount: cdAmount },
         { key: "freight", label: "Freight", amount: freight },
