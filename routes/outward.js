@@ -3351,26 +3351,241 @@ router.get("/journal-source-accounts", async (req, res) => {
   }
 });
 
+async function createManualJournalEntry({
+  date,
+  employee_id,
+  location_id,
+  warehouse_id,
+  product_id,
+  from_account_id,
+  to_account_id,
+  quantity,
+  rate,
+  lorry_no,
+  narration,
+  session,
+  journalNo,
+}) {
+  const qtyRequested = safeNumber(quantity);
+  const toCandidates = mixedIdCandidates(to_account_id);
+  const fromCandidates = mixedIdCandidates(from_account_id);
+  const warehouseCandidates = mixedIdCandidates(warehouse_id);
+  const productCandidates = mixedIdCandidates(product_id);
+
+  const toAccount = await MongoCompanyAccount.findOne({ _id: { $in: toCandidates } }).session(session).lean();
+  if (!toAccount) throw new Error("TO Party Account not found");
+  const toCompany = toAccount.company_id
+    ? await MongoCompany.findById(toAccount.company_id).session(session).lean()
+    : null;
+
+  const sourceRows = await MongoInward.find({
+    warehouse_id: { $in: warehouseCandidates },
+    product_id: { $in: productCandidates },
+    company_account_id: { $in: fromCandidates },
+    remaining_qty: { $gt: 0 },
+  })
+    .sort({ date: 1, sl_no: 1, legacy_id: 1, _id: 1 })
+    .session(session)
+    .lean();
+
+  const totalSourceQty = sourceRows.reduce((sum, row) => sum + safeNumber(row.remaining_qty), 0);
+  if (totalSourceQty + 0.000001 < qtyRequested) {
+    throw new Error(`Not enough stock for FROM Party. Available stock is ${totalSourceQty.toFixed(2)}.`);
+  }
+
+  let remaining = qtyRequested;
+  let createdQty = 0;
+  let allocationCount = 0;
+  const journalDate = date ? new Date(date) : new Date();
+  const transferRateInput = safeNumber(rate);
+
+  for (const source of sourceRows) {
+    if (remaining <= 0) break;
+    const sourceRemaining = safeNumber(source.remaining_qty);
+    const useQty = Math.min(remaining, sourceRemaining);
+    if (useQty <= 0) continue;
+
+    const sourceId = source._id;
+    const updated = await MongoInward.findOneAndUpdate(
+      { _id: sourceId, remaining_qty: { $gte: useQty } },
+      {
+        $inc: { remaining_qty: -useQty, journal_adjusted_qty: useQty },
+        $set: { outward_date: journalDate, updated_at: new Date() },
+      },
+      { new: true, session }
+    ).lean();
+    if (!updated) throw new Error("Stock changed while saving the journal entry. Please try again.");
+
+    const sourceRate = safeNumber(source.rate);
+    const transferRate = transferRateInput > 0 ? transferRateInput : sourceRate;
+    const amount = useQty * transferRate;
+    const sourceIdText = normalizeId(source._id);
+    const destinationVoucher = `${journalNo}-${allocationCount + 1}`;
+
+    const destinationDocs = await MongoInward.create([{
+      voucher_no: destinationVoucher,
+      inward_no: destinationVoucher,
+      date: journalDate,
+      employee_id: employee_id || null,
+      location_id: location_id || source.location_id || null,
+      warehouse_id,
+      product_id,
+      company_id: toAccount.company_id ?? null,
+      company_account_id: toAccount._id,
+      employee_name: "",
+      location_name: source.location_name || "",
+      warehouse_name: source.warehouse_name || "",
+      product_name: source.product_name || "",
+      company_name: toCompany?.name || "",
+      company_account_name: toAccount.account_name || "",
+      lorry_no: safeText(lorry_no) || source.lorry_no || "",
+      quantity: useQty,
+      weight: useQty,
+      remaining_qty: useQty,
+      rate: transferRate,
+      amount,
+      shortage_percent: 0,
+      narration: `Journal Transfer ${journalNo}${narration ? ` | ${safeText(narration)}` : ""}`,
+      created_at: new Date(),
+      updated_at: new Date(),
+    }], { session });
+    const destination = destinationDocs[0];
+
+    await MongoStockJournal.create([{
+      journal_no: journalNo,
+      movement_type: "MANUAL_PARTY_STOCK_TRANSFER",
+      date: journalDate,
+      outward_id: journalNo,
+      outward_voucher_no: journalNo,
+      inward_id: sourceIdText,
+      inward_voucher_no: source.voucher_no || source.inward_no || "",
+      destination_inward_id: destination._id,
+      destination_voucher_no: destinationVoucher,
+      warehouse_id,
+      warehouse_name: source.warehouse_name || "",
+      location_id: location_id || source.location_id || null,
+      location_name: source.location_name || "",
+      product_id,
+      product_name: source.product_name || "",
+      from_party_id: source.company_account_id,
+      from_party_name: source.company_account_name || "",
+      to_party_id: toAccount._id,
+      to_party_name: toAccount.account_name || "",
+      qty: useQty,
+      cost_rate: sourceRate,
+      cost_amount: useQty * sourceRate,
+      sale_rate: transferRate,
+      sale_amount: amount,
+      profit_loss: amount - (useQty * sourceRate),
+      lorry_no: safeText(lorry_no) || source.lorry_no || "",
+      employee_id: employee_id || null,
+      employee_name: "",
+      company_id: toAccount.company_id ?? null,
+      company_name: toCompany?.name || "",
+      buyer_name: "",
+      consignee_name: "",
+      created_at: new Date(),
+      updated_at: new Date(),
+    }], { session });
+
+    createdQty += useQty;
+    allocationCount += 1;
+    remaining -= useQty;
+  }
+
+  return { quantity: Number(createdQty.toFixed(4)), allocations: allocationCount, journal_no: journalNo };
+}
+
+async function reverseManualJournalEntry(journalNo, session) {
+  const rows = await MongoStockJournal.find({
+    journal_no: journalNo,
+    movement_type: "MANUAL_PARTY_STOCK_TRANSFER",
+  }).sort({ created_at: 1, _id: 1 }).session(session).lean();
+  if (!rows.length) throw new Error("Journal Entry not found");
+
+  const legacyPrefix = String(journalNo).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const legacyDestinations = await MongoInward.find({
+    voucher_no: { $regex: `^${legacyPrefix}-` },
+  }).sort({ created_at: 1, _id: 1 }).session(session).lean();
+  let legacyDestinationIndex = 0;
+
+  for (const row of rows) {
+    let destination = null;
+    if (row.destination_inward_id) {
+      destination = await MongoInward.findById(row.destination_inward_id).session(session).lean();
+    } else if (row.destination_voucher_no) {
+      destination = await MongoInward.findOne({ voucher_no: row.destination_voucher_no }).session(session).lean();
+    } else {
+      destination = legacyDestinations[legacyDestinationIndex] || null;
+      legacyDestinationIndex += 1;
+    }
+
+    if (!destination) {
+      throw new Error(`Journal ${journalNo} cannot be edited/deleted because its transferred stock record was not found.`);
+    }
+    if (Math.abs(safeNumber(destination.remaining_qty) - safeNumber(row.qty)) > 0.000001) {
+      throw new Error(`Journal ${journalNo} cannot be edited/deleted because transferred stock has already been used in another transaction.`);
+    }
+
+    const sourceId = row.inward_id;
+    if (sourceId) {
+      await MongoInward.updateOne(
+        { _id: sourceId },
+        {
+          $inc: {
+            remaining_qty: safeNumber(row.qty),
+            journal_adjusted_qty: -safeNumber(row.qty),
+          },
+          $set: { updated_at: new Date() },
+        },
+        { session }
+      );
+    }
+
+    if (destination) {
+      await MongoInward.deleteOne({ _id: destination._id }, { session });
+    }
+  }
+
+  await MongoStockJournal.deleteMany({
+    journal_no: journalNo,
+    movement_type: "MANUAL_PARTY_STOCK_TRANSFER",
+  }, { session });
+
+  // Rebuild the journal date on source rows from any remaining manual journal.
+  const affectedSourceIds = [...new Set(rows.map((r) => normalizeId(r.inward_id)).filter(Boolean))];
+  for (const sourceId of affectedSourceIds) {
+    const remainingManual = await MongoStockJournal.find({
+      inward_id: sourceId,
+      movement_type: "MANUAL_PARTY_STOCK_TRANSFER",
+    }).sort({ date: -1, created_at: -1 }).session(session).lean();
+    const totalAdjusted = remainingManual.reduce((sum, r) => sum + safeNumber(r.qty), 0);
+    const source = await MongoInward.findById(sourceId).session(session).lean();
+    if (source) {
+      await MongoInward.updateOne(
+        { _id: sourceId },
+        {
+          $set: {
+            journal_adjusted_qty: totalAdjusted,
+            outward_date: remainingManual.length ? remainingManual[0].date : null,
+            updated_at: new Date(),
+          },
+        },
+        { session }
+      );
+    }
+  }
+
+  return rows;
+}
+
 router.post("/journal-entry", async (req, res) => {
   if (!userHasPermission(req.user, "outward.create")) {
     return res.status(403).json({ error: "You do not have permission to create journal entries" });
   }
   if (!ensureMongo(res)) return;
 
-  const {
-    date,
-    employee_id,
-    location_id,
-    warehouse_id,
-    product_id,
-    from_account_id,
-    to_account_id,
-    quantity,
-    rate,
-    lorry_no,
-    narration,
-  } = req.body || {};
-
+  const { date, employee_id, location_id, warehouse_id, product_id, from_account_id, to_account_id, quantity, rate, lorry_no, narration } = req.body || {};
   const qtyRequested = safeNumber(quantity);
   if (!warehouse_id || !product_id || !from_account_id || !to_account_id || qtyRequested <= 0) {
     return res.status(400).json({ error: "Warehouse, product, FROM party, TO party and quantity are required" });
@@ -3378,166 +3593,125 @@ router.post("/journal-entry", async (req, res) => {
   if (normalizeId(from_account_id) === normalizeId(to_account_id)) {
     return res.status(400).json({ error: "FROM Party and TO Party must be different" });
   }
-  if (!canAccessWarehouse(req.user, warehouse_id)) {
-    return res.status(403).json({ error: "You can only create entries for your assigned warehouse" });
-  }
+  if (!canAccessWarehouse(req.user, warehouse_id)) return res.status(403).json({ error: "You can only create entries for your assigned warehouse" });
 
   const session = await mongoose.startSession();
   const journalNo = `JE-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-  let createdQty = 0;
-  let allocationCount = 0;
-
   try {
+    let result;
     await session.withTransaction(async () => {
-      const toCandidates = mixedIdCandidates(to_account_id);
-      const fromCandidates = mixedIdCandidates(from_account_id);
-      const warehouseCandidates = mixedIdCandidates(warehouse_id);
-      const productCandidates = mixedIdCandidates(product_id);
-
-      const toAccount = await MongoCompanyAccount.findOne({ _id: { $in: toCandidates } }).session(session).lean();
-      if (!toAccount) {
-        throw new Error("TO Party Account not found");
-      }
-      const toCompany = toAccount.company_id
-        ? await MongoCompany.findById(toAccount.company_id).session(session).lean()
-        : null;
-
-      const sourceRows = await MongoInward.find({
-        warehouse_id: { $in: warehouseCandidates },
-        product_id: { $in: productCandidates },
-        company_account_id: { $in: fromCandidates },
-        remaining_qty: { $gt: 0 },
-      })
-        .sort({ date: 1, sl_no: 1, legacy_id: 1, _id: 1 })
-        .session(session)
-        .lean();
-
-      const totalSourceQty = sourceRows.reduce((sum, row) => sum + safeNumber(row.remaining_qty), 0);
-      if (totalSourceQty + 0.000001 < qtyRequested) {
-        throw new Error(`Not enough stock for FROM Party. Available stock is ${totalSourceQty.toFixed(2)}.`);
-      }
-
-      let remaining = qtyRequested;
-      const transferRateInput = safeNumber(rate);
-
-      for (const source of sourceRows) {
-        if (remaining <= 0) break;
-        const sourceRemaining = safeNumber(source.remaining_qty);
-        const useQty = Math.min(remaining, sourceRemaining);
-        if (useQty <= 0) continue;
-
-        const sourceId = source._id;
-        const journalDate = date ? new Date(date) : new Date();
-        const updated = await MongoInward.findOneAndUpdate(
-          {
-            _id: sourceId,
-            remaining_qty: { $gte: useQty },
-          },
-          {
-            $inc: {
-              remaining_qty: -useQty,
-              journal_adjusted_qty: useQty,
-            },
-            $set: {
-              outward_date: journalDate,
-              updated_at: new Date(),
-            },
-          },
-          { new: true, session }
-        ).lean();
-
-        if (!updated) {
-          throw new Error("Stock changed while saving the journal entry. Please try again.");
-        }
-
-        const sourceRate = safeNumber(source.rate);
-        const transferRate = transferRateInput > 0 ? transferRateInput : sourceRate;
-        const amount = useQty * transferRate;
-        const sourceIdText = normalizeId(source._id);
-        const destinationVoucher = `${journalNo}-${allocationCount + 1}`;
-
-        await MongoInward.create([{
-          voucher_no: destinationVoucher,
-          inward_no: destinationVoucher,
-          date: journalDate,
-          employee_id: employee_id || null,
-          location_id: location_id || source.location_id || null,
-          warehouse_id: warehouse_id,
-          product_id: product_id,
-          company_id: toAccount.company_id ?? null,
-          company_account_id: toAccount._id,
-          employee_name: "",
-          location_name: source.location_name || "",
-          warehouse_name: source.warehouse_name || "",
-          product_name: source.product_name || "",
-          company_name: toCompany?.name || "",
-          company_account_name: toAccount.account_name || "",
-          lorry_no: safeText(lorry_no) || source.lorry_no || "",
-          quantity: useQty,
-          weight: useQty,
-          remaining_qty: useQty,
-          rate: transferRate,
-          amount,
-          shortage_percent: 0,
-          narration: `Journal Transfer ${journalNo}${narration ? ` | ${safeText(narration)}` : ""}`,
-          created_at: new Date(),
-          updated_at: new Date(),
-        }], { session });
-
-        await MongoStockJournal.create([{
-          journal_no: journalNo,
-          movement_type: "MANUAL_PARTY_STOCK_TRANSFER",
-          date: journalDate,
-          outward_id: journalNo,
-          outward_voucher_no: journalNo,
-          inward_id: sourceIdText,
-          inward_voucher_no: source.voucher_no || source.inward_no || "",
-          warehouse_id,
-          warehouse_name: source.warehouse_name || "",
-          location_id: location_id || source.location_id || null,
-          location_name: source.location_name || "",
-          product_id,
-          product_name: source.product_name || "",
-          from_party_id: source.company_account_id,
-          from_party_name: source.company_account_name || "",
-          to_party_id: toAccount._id,
-          to_party_name: toAccount.account_name || "",
-          qty: useQty,
-          cost_rate: sourceRate,
-          cost_amount: useQty * sourceRate,
-          sale_rate: transferRate,
-          sale_amount: amount,
-          profit_loss: amount - (useQty * sourceRate),
-          lorry_no: safeText(lorry_no) || source.lorry_no || "",
-          employee_id: employee_id || null,
-          employee_name: "",
-          company_id: toAccount.company_id ?? null,
-          company_name: toCompany?.name || "",
-          buyer_name: "",
-          consignee_name: "",
-          created_at: new Date(),
-          updated_at: new Date(),
-        }], { session });
-
-        createdQty += useQty;
-        allocationCount += 1;
-        remaining -= useQty;
-      }
+      result = await createManualJournalEntry({ date, employee_id, location_id, warehouse_id, product_id, from_account_id, to_account_id, quantity, rate, lorry_no, narration, session, journalNo });
     });
-
-    return res.status(201).json({
-      success: true,
-      journal_no: journalNo,
-      quantity: Number(createdQty.toFixed(4)),
-      allocations: allocationCount,
-      message: "Journal Entry saved and stock transferred from FROM party to TO party",
-    });
+    return res.status(201).json({ success: true, ...result, message: "Journal Entry saved and stock transferred FROM party TO party" });
   } catch (error) {
     console.error("Manual party stock journal failed:", error);
     return res.status(400).json({ error: error.message || "Failed to save journal entry" });
-  } finally {
-    await session.endSession();
+  } finally { await session.endSession(); }
+});
+
+router.get("/journal-history", async (req, res) => {
+  if (!userHasPermission(req.user, "outward.view") && !userHasPermission(req.user, "report.partyStock")) {
+    return res.status(403).json({ error: "You do not have permission to view journal history" });
   }
+  if (!ensureMongo(res)) return;
+  try {
+    const query = { movement_type: "MANUAL_PARTY_STOCK_TRANSFER" };
+    if (req.query.warehouse_id) query.warehouse_id = req.query.warehouse_id;
+    if (req.query.product_id) query.product_id = req.query.product_id;
+    const docs = await MongoStockJournal.find(query).sort({ date: -1, created_at: -1, _id: -1 }).limit(5000).lean();
+    const grouped = new Map();
+    const fromAccountIds = [...new Set(docs.map((row) => normalizeId(row.from_party_id)).filter(Boolean))];
+    const accountCandidates = fromAccountIds.flatMap((id) => mixedIdCandidates(id));
+    const fromAccounts = accountCandidates.length
+      ? await MongoCompanyAccount.find({ _id: { $in: accountCandidates } }).lean()
+      : [];
+    const fromAccountMap = new Map(fromAccounts.map((account) => [normalizeId(account._id), account]));
+    const companyIds = [...new Set(fromAccounts.map((account) => normalizeId(account.company_id)).filter(Boolean))];
+    const companyCandidates = companyIds.flatMap((id) => mixedIdCandidates(id));
+    const fromCompanies = companyCandidates.length
+      ? await MongoCompany.find({ _id: { $in: companyCandidates } }).lean()
+      : [];
+    const fromCompanyMap = new Map(fromCompanies.map((company) => [normalizeId(company._id), company]));
+
+    for (const row of docs) {
+      if (!canAccessWarehouse(req.user, row.warehouse_id)) continue;
+      const key = row.journal_no;
+      if (!key) continue;
+      const existing = grouped.get(key);
+      if (existing) {
+        existing.qty += safeNumber(row.qty);
+        existing.allocations += 1;
+      } else {
+        const fromAccount = fromAccountMap.get(normalizeId(row.from_party_id));
+        const fromCompany = fromAccount ? fromCompanyMap.get(normalizeId(fromAccount.company_id)) : null;
+        grouped.set(key, {
+          journal_no: row.journal_no,
+          date: row.date,
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name || "",
+          product_id: row.product_id,
+          product_name: row.product_name || "",
+          from_company_id: fromAccount?.company_id ?? null,
+          from_company_name: fromCompany?.name || "",
+          from_account_id: row.from_party_id,
+          from_account_name: row.from_party_name || fromAccount?.account_name || "",
+          to_company_id: row.company_id ?? null,
+          to_company_name: row.company_name || "",
+          to_account_id: row.to_party_id,
+          to_account_name: row.to_party_name || "",
+          qty: safeNumber(row.qty),
+          rate: safeNumber(row.sale_rate),
+          lorry_no: row.lorry_no || "",
+          employee_id: row.employee_id || null,
+          location_id: row.location_id || null,
+          allocations: 1,
+        });
+      }
+    }
+    return res.json({ rows: Array.from(grouped.values()), total: grouped.size });
+  } catch (error) {
+    console.error("Journal history failed:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+router.put("/journal-entry/:journalNo", async (req, res) => {
+  if (!userHasPermission(req.user, "outward.create")) return res.status(403).json({ error: "You do not have permission to edit journal entries" });
+  if (!ensureMongo(res)) return;
+  const { journalNo } = req.params;
+  const { date, employee_id, location_id, warehouse_id, product_id, from_account_id, to_account_id, quantity, rate, lorry_no, narration } = req.body || {};
+  if (!journalNo || !warehouse_id || !product_id || !from_account_id || !to_account_id || safeNumber(quantity) <= 0) {
+    return res.status(400).json({ error: "Journal No, warehouse, product, FROM party, TO party and quantity are required" });
+  }
+  if (normalizeId(from_account_id) === normalizeId(to_account_id)) return res.status(400).json({ error: "FROM Party and TO Party must be different" });
+  if (!canAccessWarehouse(req.user, warehouse_id)) return res.status(403).json({ error: "You can only edit entries for your assigned warehouse" });
+
+  const session = await mongoose.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      await reverseManualJournalEntry(journalNo, session);
+      result = await createManualJournalEntry({ date, employee_id, location_id, warehouse_id, product_id, from_account_id, to_account_id, quantity, rate, lorry_no, narration, session, journalNo });
+    });
+    return res.json({ success: true, ...result, journal_no: journalNo, message: "Journal Entry updated and stock recalculated" });
+  } catch (error) {
+    console.error("Journal edit failed:", error);
+    return res.status(400).json({ error: error.message || "Failed to edit journal entry" });
+  } finally { await session.endSession(); }
+});
+
+router.delete("/journal-entry/:journalNo", async (req, res) => {
+  if (!userHasPermission(req.user, "outward.create")) return res.status(403).json({ error: "You do not have permission to delete journal entries" });
+  if (!ensureMongo(res)) return;
+  const { journalNo } = req.params;
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => { await reverseManualJournalEntry(journalNo, session); });
+    return res.json({ success: true, journal_no: journalNo, message: "Journal Entry deleted and stock restored" });
+  } catch (error) {
+    console.error("Journal delete failed:", error);
+    return res.status(400).json({ error: error.message || "Failed to delete journal entry" });
+  } finally { await session.endSession(); }
 });
 
 /*
