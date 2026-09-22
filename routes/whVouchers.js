@@ -1189,13 +1189,11 @@ async function decorateSaleRows(rows) {
   const accountIds = [...new Set(plainRows.map((r) => String(r?.company_account_id || "")).filter(Boolean))];
   const buyerIds = [...new Set(plainRows.map((r) => String(r?.buyer_id || r?.company_id || "")).filter(Boolean))];
   const consigneeIds = [...new Set(plainRows.map((r) => String(r?.consignee_id || "")).filter(Boolean))];
-  const farmerIds = [...new Set(plainRows.map((r) => String(r?.farmer_id || r?.against_purchase_farmer_id || "")).filter(Boolean))];
 
   const safeObjectIds = (ids) => ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
   const mongoWarehouseIds = safeObjectIds(warehouseIds);
   const mongoProductIds = safeObjectIds(productIds);
   const mongoAccountIds = safeObjectIds(accountIds);
-  const mongoFarmerIds = safeObjectIds(farmerIds);
 
   const legacyIds = (ids) => ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0);
   const buyerLegacyIds = legacyIds(buyerIds);
@@ -1223,7 +1221,6 @@ async function decorateSaleRows(rows) {
     mongoWarehouseIds.length ? Warehouse.find({ _id: { $in: mongoWarehouseIds } }).lean() : Promise.resolve([]),
     mongoProductIds.length ? Product.find({ _id: { $in: mongoProductIds } }).lean() : Promise.resolve([]),
     mongoAccountIds.length ? CompanyAccount.find({ _id: { $in: mongoAccountIds } }).lean() : Promise.resolve([]),
-    mongoFarmerIds.length ? Farmer.find({ _id: { $in: mongoFarmerIds } }).lean() : Promise.resolve([]),
     buyerQuery ? findDedicatedPartyDocs("buyer", buyerQuery) : Promise.resolve([]),
     consigneeQuery ? findDedicatedPartyDocs("consignee", consigneeQuery) : Promise.resolve([]),
   ]);
@@ -1245,17 +1242,14 @@ async function decorateSaleRows(rows) {
   const mongoWarehouseMap = byMongoId(valueAt(0));
   const mongoProductMap = byMongoId(valueAt(1));
   const mongoAccountMap = byMongoId(valueAt(2));
-  const farmerMap = byLegacyOrMongoId(valueAt(3));
-  const buyerMap = byLegacyOrMongoId(valueAt(4));
-  const consigneeMap = byLegacyOrMongoId(valueAt(5));
+  const buyerMap = byLegacyOrMongoId(valueAt(3));
+  const consigneeMap = byLegacyOrMongoId(valueAt(4));
 
   return plainRows.map((plain) => {
     const buyerId = String(plain?.buyer_id || plain?.company_id || "");
-    const farmerId = String(plain?.farmer_id || plain?.against_purchase_farmer_id || "");
     const warehouse = mongoWarehouseMap.get(String(plain?.warehouse_id || ""));
     const product = mongoProductMap.get(String(plain?.product_id || ""));
     const account = mongoAccountMap.get(String(plain?.company_account_id || ""));
-    const farmer = farmerMap.get(farmerId) || {};
     const buyer = buyerMap.get(buyerId) || {};
     const consignee = consigneeMap.get(String(plain?.consignee_id || ""));
     const totalQuantity = Number(plain?.quantity ?? plain?.total_quantity ?? Math.max(Number(plain?.gross_weight || 0) - Number(plain?.tare_weight || 0), 0));
@@ -1265,7 +1259,6 @@ async function decorateSaleRows(rows) {
       id: String(plain?._id || plain?.id || ""),
       _id: String(plain?._id || plain?.id || ""),
       buyer_id: buyerId,
-      farmer_name: farmer?.name || farmer?.farmer_name || plain?.farmer_name || "-",
       warehouse_name: warehouse?.name || plain?.warehouse_name || "-",
       product_name: product?.name || plain?.product_name || "-",
       company_account_name: account?.account_name || account?.name || plain?.company_account_name || "-",
@@ -4009,12 +4002,12 @@ router.put("/sale/:id", async (req, res) => {
           const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
           const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
 
-          const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : shortageAmount;
+          const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : 0;
           const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
           const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
           const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
 
-          const netAmount = grossAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+          const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
 
           existing.unloading_date = req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date;
           existing.due_date = dueFields.due_date || existing.due_date || "";
@@ -4027,7 +4020,7 @@ router.put("/sale/:id", async (req, res) => {
           existing.fungus = Number(req.body.fungus !== undefined ? req.body.fungus : existing.fungus) || 0;
           existing.discolour = Number(req.body.discolour !== undefined ? req.body.discolour : existing.discolour) || 0;
           existing.others = Number(req.body.others !== undefined ? req.body.others : existing.others) || 0;
-          const calculatedTotalDeduction = claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue;
+          const calculatedTotalDeduction = shortageAmount + claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue;
           existing.total_deduction = Number(req.body.total_deduction !== undefined ? req.body.total_deduction : calculatedTotalDeduction) || calculatedTotalDeduction;
           existing.transport_charge = transportChargeValue;
           existing.claim_amount = claimValue;
@@ -4100,12 +4093,12 @@ router.put("/sale/:id", async (req, res) => {
     const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : mongoSale.unloading_qty || req.body.quantity || mongoSale.quantity) || 0;
     const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
     const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
-    const claimValue = req.body.claim_amount !== undefined ? Number(req.body.claim_amount) || 0 : shortageAmount;
+    const claimValue = req.body.claim_amount !== undefined ? Number(req.body.claim_amount) || 0 : 0;
     const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : mongoSale.other_deduction) || 0;
     const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : mongoSale.cd_percent) || 0;
     const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : mongoSale.cd_amount) || 0;
     const totalDeductionValue = Number(req.body.total_deduction) || 0;
-    const netAmount = grossAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+    const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
     const updateDoc = {
       unloading_date: req.body.unloading_date !== undefined ? req.body.unloading_date : mongoSale.unloading_date,
       shortage_quantity: shortageQty,
@@ -4115,7 +4108,7 @@ router.put("/sale/:id", async (req, res) => {
       fungus: Number(req.body.fungus) || 0,
       discolour: Number(req.body.discolour) || 0,
       others: Number(req.body.others) || 0,
-      total_deduction: totalDeductionValue,
+      total_deduction: (Number(req.body.total_deduction) || (shortageAmount + claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue)),
       claim_amount: claimValue,
       other_deduction: otherDeductionValue,
       transport_charge: transportChargeValue,
@@ -6813,113 +6806,46 @@ router.get("/report/profit-loss", async (req, res) => {
   }
 
   try {
-    const mode = String(req.query.mode || "direct").trim().toLowerCase() === "warehouse" ? "warehouse" : "direct";
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
-    const fromDate = String(req.query.from_date || "").trim();
-    const toDate = String(req.query.to_date || "").trim();
-    const locationId = String(req.query.location_id || "").trim();
-    const employeeId = String(req.query.employee_id || "").trim();
-    const farmerId = String(req.query.farmer_id || "").trim();
-    const search = String(req.query.search || "").trim();
+    const [purchases, sales] = await Promise.all([
+      getPurchaseReportRowsForUser(req.user),
+      getSaleReportRowsForUser(req.user),
+    ]);
+    const rows = new Map();
+    const ensure = (row) => {
+      const key = String(row.warehouse_id || "");
+      if (!rows.has(key)) {
+        rows.set(key, {
+          id: row.warehouse_id,
+          warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_name || "",
+          sale_amount: 0,
+          purchase_amount: 0,
+          profit_loss: 0,
+        });
+      }
+      const item = rows.get(key);
+      item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
+      return item;
+    };
 
-    if (mode === "warehouse") {
-      const [purchases, sales] = await Promise.all([
-        getPurchaseReportRowsForUser(req.user),
-        getSaleReportRowsForUser(req.user),
-      ]);
-      const rows = new Map();
-      const ensure = (row) => {
-        const key = String(row.warehouse_id || "");
-        if (!rows.has(key)) {
-          rows.set(key, {
-            id: row.warehouse_id,
-            warehouse_id: row.warehouse_id,
-            warehouse_name: row.warehouse_name || "",
-            sale_amount: 0,
-            purchase_amount: 0,
-            profit_loss: 0,
-          });
-        }
-        const item = rows.get(key);
-        item.warehouse_name = item.warehouse_name || row.warehouse_name || "";
-        return item;
-      };
-      purchases.forEach((row) => {
-        const item = ensure(row);
-        item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
-      });
-      sales.forEach((row) => {
-        const item = ensure(row);
-        item.sale_amount += Number(row.amount || row.total_amount || 0);
-      });
-      return res.json(Array.from(rows.values()).map((row) => ({
+    purchases.forEach((row) => {
+      const item = ensure(row);
+      item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+    });
+    sales.forEach((row) => {
+      const item = ensure(row);
+      item.sale_amount += Number(row.amount || row.total_amount || 0);
+    });
+
+    res.json(
+      Array.from(rows.values()).map((row) => ({
         ...row,
         sale_amount: Number(row.sale_amount.toFixed(2)),
         purchase_amount: Number(row.purchase_amount.toFixed(2)),
         profit_loss: Number((row.sale_amount - row.purchase_amount).toFixed(2)),
-      })));
-    }
-
-    if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for direct profit/loss report" });
-
-    const filter = { ...mongoSaleScope(req.user), sale_type: "direct" };
-    if (farmerId) filter.farmer_id = farmerId;
-    if (locationId) filter.location_id = locationId;
-    if (employeeId) filter.employee_id = employeeId;
-    if (fromDate || toDate) {
-      filter.date = {};
-      if (fromDate) filter.date.$gte = fromDate;
-      if (toDate) filter.date.$lte = toDate;
-    }
-    if (search) {
-      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const rx = new RegExp(safe, "i");
-      filter.$and = [{ $or: [
-        { voucher_no: rx }, { bill_no: rx }, { farmer_name: rx }, { buyer_name: rx },
-        { company_name: rx }, { consignee_name: rx }, { lorry_no: rx }, { warehouse_name: rx },
-      ] }];
-    }
-
-    const total = await SaleVoucher.countDocuments(filter);
-    const rows = await SaleVoucher.find(filter)
-      .sort({ date: -1, createdAt: -1, _id: -1 })
-      .skip((page - 1) * pageSize)
-      .limit(pageSize)
-      .lean();
-    const decorated = await decorateSaleRows(rows);
-    const reportRows = decorated.map((row) => {
-      const grossAmount = Number(row.amount || row.total_amount || 0);
-      const netPayable = Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || grossAmount || 0);
-      const linkedPurchaseAmount = Array.isArray(row.against_purchase_links)
-        ? row.against_purchase_links.reduce((sum, item) => sum + Number(item?.amount || 0), 0)
-        : 0;
-      const purchaseAmount = Number(row.direct_purchase_amount || linkedPurchaseAmount || (Number(row.direct_purchase_rate || 0) * Number(row.quantity || row.total_quantity || 0)) || 0);
-      return {
-        ...row,
-        date: row.date || "",
-        farmer_name: row.farmer_name || row.against_purchase_farmer_name || "-",
-        buyer_name: row.buyer_name || row.company_name || row.party_name || "-",
-        consignee_name: row.consignee_name || "-",
-        lorry_no: row.lorry_no || "-",
-        quantity: Number(row.quantity || row.total_quantity || row.unloading_qty || 0),
-        sale_amount: Number(netPayable.toFixed(2)),
-        purchase_amount: Number(purchaseAmount.toFixed(2)),
-        profit_loss: Number((netPayable - purchaseAmount).toFixed(2)),
-      };
-    });
-
-    return res.json({
-      data: reportRows,
-      pagination: {
-        page,
-        pageSize,
-        total,
-        hasMore: page * pageSize < total,
-      },
-    });
+      }))
+    );
   } catch (err) {
-    console.error("Profit/Loss report failed:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -7166,9 +7092,7 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       const details = bySale.get(saleId) || [];
       const grossSale = Number(row.amount || row.total_amount || 0);
 
-      // claim_amount is the effective shortage/claim deduction used by the
-      // sale net calculation. shortage_amount is kept as supporting detail,
-      // so it is never subtracted twice.
+      // Shortage and Claim are separate Sale deductions.
       const claim = Number(row.claim_amount || 0);
       const shortageQty = Number(row.shortage_quantity || 0);
       const shortageAmount = Number(row.shortage_amount || 0);
@@ -7179,15 +7103,9 @@ router.get("/report/sale-party-ledger", async (req, res) => {
       const tds = Number(row.tds_amount || 0);
       const roundOff = Number(row.round_off || 0);
 
-      // Keep the existing accounting amount unchanged. Claim/shortage are
-      // displayed as one effective deduction so the same amount is never
-      // credited twice when shortage_amount is the supporting claim value.
-      const claimLabel = claim > 0
-        ? (shortageAmount > 0 && Math.abs(claim - shortageAmount) < 0.000001 ? "Shortage" : "Claim")
-        : (shortageAmount > 0 ? "Shortage" : "Claim");
-
       const deductionParts = [
-        ...(claim > 0 || shortageAmount > 0 ? [{ key: claimLabel.toLowerCase(), label: claimLabel, amount: claim > 0 ? claim : shortageAmount }] : []),
+        ...(shortageAmount > 0 ? [{ key: "shortage", label: "Shortage", amount: shortageAmount }] : []),
+        ...(claim > 0 ? [{ key: "claim", label: "Claim", amount: claim }] : []),
         { key: "other", label: "Other", amount: otherDeduction },
         { key: "cd", label: "CD", amount: cdAmount },
         { key: "freight", label: "Freight", amount: freight },
