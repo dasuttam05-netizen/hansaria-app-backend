@@ -411,10 +411,6 @@ const companyAccountSchema =
 
     pan_no: String,
 
-    gst_no: String,
-
-    pin_no: String,
-
     mobile: String,
 
     shortage_percent: {
@@ -1859,6 +1855,63 @@ const journalVoucherSchema =
 
 /*
 ====================================================
+STOCK JOURNAL / PARTY STOCK MOVEMENT
+====================================================
+
+Additive ledger only. Existing Inward/Outward/FIFO logic is not changed.
+Each completed FIFO allocation creates a journal row describing the actual
+inward lot consumed and the party/account movement associated with the
+outward voucher.
+*/
+const stockJournalSchema = new mongoose.Schema(
+  {
+    journal_no: { type: String, index: true },
+    movement_type: { type: String, default: "PARTY_STOCK_TRANSFER", index: true },
+    date: Date,
+
+    outward_id: mongoose.Schema.Types.Mixed,
+    outward_voucher_no: String,
+    inward_id: mongoose.Schema.Types.Mixed,
+    inward_voucher_no: String,
+
+    warehouse_id: mongoose.Schema.Types.Mixed,
+    warehouse_name: String,
+    location_id: mongoose.Schema.Types.Mixed,
+    location_name: String,
+    product_id: mongoose.Schema.Types.Mixed,
+    product_name: String,
+
+    from_party_id: mongoose.Schema.Types.Mixed,
+    from_party_name: String,
+    to_party_id: mongoose.Schema.Types.Mixed,
+    to_party_name: String,
+
+    qty: Number,
+    cost_rate: Number,
+    cost_amount: Number,
+    sale_rate: Number,
+    sale_amount: Number,
+    profit_loss: Number,
+
+    lorry_no: String,
+    employee_id: mongoose.Schema.Types.Mixed,
+    employee_name: String,
+    company_id: mongoose.Schema.Types.Mixed,
+    company_name: String,
+    buyer_name: String,
+    consignee_name: String,
+
+    created_at: { type: Date, default: Date.now },
+    updated_at: { type: Date, default: Date.now },
+  },
+  { collection: "stock_journals" }
+);
+
+stockJournalSchema.index({ date: -1, warehouse_id: 1, product_id: 1 });
+stockJournalSchema.index({ outward_id: 1, inward_id: 1, movement_type: 1 }, { unique: true, sparse: true });
+
+/*
+====================================================
 EXPORTS
 ====================================================
 */
@@ -1954,6 +2007,13 @@ module.exports = {
     mongoose.model(
       "Outward",
       outwardSchema
+    ),
+
+  StockJournal:
+    mongoose.models.StockJournal ||
+    mongoose.model(
+      "StockJournal",
+      stockJournalSchema
     ),
 
   Adjustment:
