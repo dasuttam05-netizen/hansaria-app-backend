@@ -764,6 +764,14 @@ const inwardSchema =
 
     remaining_qty: Number,
 
+    // Party Stock Report support for Journal Entry stock transfers.
+    // Journal transfer behaves like an outward/adjustment against this inward lot.
+    outward_date: Date,
+    journal_adjusted_qty: {
+      type: Number,
+      default: 0,
+    },
+
     rate: Number,
 
     amount: Number,
@@ -771,9 +779,6 @@ const inwardSchema =
     shortage_percent: Number,
 
     narration: String,
-    stock_movement_type: String,
-    journal_no: String,
-    journal_source_inward_id: mongoose.Schema.Types.Mixed,
 
     created_at: {
       type: Date,
@@ -1886,12 +1891,8 @@ const stockJournalSchema = new mongoose.Schema(
 
     from_party_id: mongoose.Schema.Types.Mixed,
     from_party_name: String,
-    from_company_id: mongoose.Schema.Types.Mixed,
-    from_company_name: String,
     to_party_id: mongoose.Schema.Types.Mixed,
     to_party_name: String,
-    to_company_id: mongoose.Schema.Types.Mixed,
-    to_company_name: String,
 
     qty: Number,
     cost_rate: Number,
