@@ -22,6 +22,7 @@ const {
   CompanyAccount: MongoCompanyAccount,
   Inward: MongoInward,
   Outward: MongoOutward,
+  StockJournal: MongoStockJournal,
   MirrorRow,
   isMongoMirrorReady,
 } = require("../db-mongodb");
@@ -1956,6 +1957,88 @@ router.get(
 
 /*
 ====================================================
+STOCK JOURNAL HELPER
+====================================================
+
+This is an additive journal only. It does NOT change the existing FIFO,
+remaining_qty, validation, or outward status logic.
+*/
+async function createStockJournalForAllocation({ outward, inward, qty }) {
+  const quantity = safeNumber(qty);
+  if (!outward || !inward || quantity <= 0) return null;
+
+  const costRate = safeNumber(inward?.rate);
+  const saleRate = safeNumber(outward?.rate);
+  const costAmount = quantity * costRate;
+  const saleAmount = quantity * saleRate;
+  const profitLoss = saleAmount - costAmount;
+
+  const outwardId = outward?.legacy_id ?? outward?.sl_no ?? String(outward?._id);
+  const inwardId = inward?.legacy_id ?? inward?.sl_no ?? String(inward?._id);
+
+  const fromPartyId = inward?.company_account_id ?? null;
+  const fromPartyName =
+    safeText(inward?.company_account_name) ||
+    safeText(inward?.company_name) ||
+    safeText(inward?.party_name) ||
+    "";
+  const toPartyId = outward?.buyer_id ?? null;
+  const toPartyName = safeText(outward?.buyer_name) || safeText(outward?.buyer) || "";
+
+  try {
+    return await MongoStockJournal.findOneAndUpdate(
+      {
+        outward_id: outwardId,
+        inward_id: inwardId,
+        movement_type: "PARTY_STOCK_TRANSFER",
+      },
+      {
+        $setOnInsert: {
+          journal_no: `SJ-${outwardId}-${inwardId}`,
+          movement_type: "PARTY_STOCK_TRANSFER",
+          date: outward?.date || new Date(),
+          outward_id: outwardId,
+          outward_voucher_no: outward?.voucher_no || outward?.outward_no || "",
+          inward_id: inwardId,
+          inward_voucher_no: inward?.inward_no || inward?.voucher_no || "",
+          warehouse_id: outward?.warehouse_id ?? inward?.warehouse_id ?? null,
+          warehouse_name: outward?.warehouse_name || inward?.warehouse_name || "",
+          location_id: outward?.location_id ?? inward?.location_id ?? null,
+          location_name: outward?.location_name || inward?.location_name || "",
+          product_id: outward?.product_id ?? inward?.product_id ?? null,
+          product_name: outward?.product_name || inward?.product_name || outward?.product || inward?.product || "",
+          from_party_id: fromPartyId,
+          from_party_name: fromPartyName,
+          to_party_id: toPartyId,
+          to_party_name: toPartyName,
+          qty: quantity,
+          cost_rate: costRate,
+          cost_amount: costAmount,
+          sale_rate: saleRate,
+          sale_amount: saleAmount,
+          profit_loss: profitLoss,
+          lorry_no: safeText(outward?.lorry_no) || "",
+          employee_id: outward?.employee_id ?? null,
+          employee_name: outward?.employee_name || "",
+          company_id: outward?.company_id ?? null,
+          company_name: outward?.company_name || "",
+          buyer_name: outward?.buyer_name || "",
+          consignee_name: outward?.consignee_name || "",
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      },
+      { upsert: true, new: true }
+    ).lean();
+  } catch (error) {
+    // A journal failure must never change the existing stock/FIFO outcome.
+    console.error("Stock journal create failed:", error);
+    return null;
+  }
+}
+
+/*
+====================================================
 FIFO COMPLETE
 ====================================================
 */
@@ -2210,6 +2293,13 @@ const adjustmentInwardId =
 
         date:
           new Date(),
+      });
+
+      // Additive journal only. Existing FIFO/stock logic remains unchanged.
+      await createStockJournalForAllocation({
+        outward,
+        inward,
+        qty: useQty,
       });
 
       remaining -=
@@ -3190,5 +3280,45 @@ router.delete(
     }
   }
 );
+
+/*
+====================================================
+STOCK JOURNAL REPORT
+====================================================
+*/
+router.get("/stock-journal", async (req, res) => {
+  if (!userHasPermission(req.user, "outward.view") && !userHasPermission(req.user, "report.partyStock")) {
+    return res.status(403).json({ error: "You do not have permission to view stock journal" });
+  }
+
+  if (!ensureMongo(res)) return;
+
+  try {
+    const query = {};
+    if (req.query.from_date || req.query.to_date) {
+      query.date = {};
+      if (req.query.from_date) query.date.$gte = new Date(`${req.query.from_date}T00:00:00.000Z`);
+      if (req.query.to_date) query.date.$lte = new Date(`${req.query.to_date}T23:59:59.999Z`);
+    }
+    if (req.query.warehouse_id) query.warehouse_id = req.query.warehouse_id;
+    if (req.query.location_id) query.location_id = req.query.location_id;
+    if (req.query.product_id) query.product_id = req.query.product_id;
+    if (req.query.employee_id) query.employee_id = req.query.employee_id;
+    if (req.query.from_party_id) query.from_party_id = req.query.from_party_id;
+    if (req.query.to_party_id) query.to_party_id = req.query.to_party_id;
+
+    const docs = await MongoStockJournal.find(query).sort({ date: -1, created_at: -1, _id: -1 }).limit(5000).lean();
+    const filtered = docs.filter((row) => !row.warehouse_id || canAccessWarehouse(req.user, row.warehouse_id));
+
+    return res.json({
+      rows: filtered,
+      total: filtered.length,
+      source: "mongodb",
+    });
+  } catch (error) {
+    console.error("Stock journal report failed:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
 
 module.exports = router;
