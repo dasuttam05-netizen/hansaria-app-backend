@@ -483,11 +483,17 @@ async function getAdjustedQtyForInward(
   const collection =
     getAdjustmentCollection();
 
+  const inwardIdFilter = buildFlexibleFieldFilter(
+    "inward_id",
+    inwardId
+  );
+
+  if (!inwardIdFilter) {
+    return 0;
+  }
+
   const filter = {
-    inward_id:
-      Number(
-        inwardId
-      ),
+    ...inwardIdFilter,
   };
 
   if (
@@ -2213,20 +2219,19 @@ router.post(
           );
         }
 
-        const inwardNumericId =
-          Number(
-            inwardRow.legacy_id ??
-              inwardRow.id ??
-              inwardRow.sl_no
-          );
+        const inwardReferenceId =
+          inwardRow.legacy_id ??
+          inwardRow.id ??
+          inwardRow.sl_no ??
+          (inwardRow._id ? String(inwardRow._id) : null);
 
         if (
-          !Number.isFinite(
-            inwardNumericId
-          )
+          inwardReferenceId === null ||
+          inwardReferenceId === undefined ||
+          String(inwardReferenceId).trim() === ""
         ) {
           throw makeAdjustmentError(
-            "Inward does not have a valid legacy ID",
+            "Inward does not have a valid ID",
             {
               inward_id:
                 adj.inward_id,
@@ -2313,7 +2318,7 @@ router.post(
 
         const alreadyAdjustedForThisInward =
           await getAdjustedQtyForInward(
-            inwardNumericId,
+            inwardReferenceId,
             session
           );
 
@@ -2437,7 +2442,7 @@ router.post(
               outwardNumericId,
 
             inward_id:
-              inwardNumericId,
+              inwardReferenceId,
 
             palti_lorry_id:
               null,
