@@ -7256,6 +7256,33 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         });
       });
 
+      // Additional Amount is NOT a deduction. It increases the party receivable,
+      // so it is posted as a separate Debit against the same sale bill.
+      const additionalAmount = Number(row.additional_amount || 0);
+      if (Number.isFinite(additionalAmount) && additionalAmount > 0.000001) {
+        ledgerRows.push({
+          ...row,
+          id: `${saleId}-additional-amount`,
+          _id: `${saleId}-additional-amount`,
+          date: row.unloading_date || row.date,
+          voucher_no: row.voucher_no,
+          voucher_type: "Sale - Add Amount",
+          particulars: `Add Amount against ${row.voucher_no || "Sale"}`,
+          adjustment_details: "",
+          receipt_details: [],
+          sale_id: saleId,
+          sale_amount: 0,
+          receipt_amount: 0,
+          journal_amount: Number(additionalAmount.toFixed(2)),
+          bill_balance: Number((netReceivable - receiptAmount).toFixed(2)),
+          debit: Number(additionalAmount.toFixed(2)),
+          credit: 0,
+          party_id: String(row.buyer_id || row.company_id || ""),
+          party_name: row.buyer_name || row.company_name || "-",
+          ledger_component: "additional_amount",
+        });
+      }
+
       if (Math.abs(roundOff) > 0.000001) {
         ledgerRows.push({
           ...row,
