@@ -414,11 +414,6 @@ ADJUSTMENT QUERIES
 ====================================================
 */
 
-function getLogicalAdjustmentId(row) {
-  if (!row) return null;
-  return row.legacy_id ?? row.id ?? row.sl_no ?? (row._id ? String(row._id) : null);
-}
-
 async function getAdjustedQtyForOutward(
   outwardId,
   session = null,
@@ -427,14 +422,11 @@ async function getAdjustedQtyForOutward(
   const collection =
     getAdjustmentCollection();
 
-  const outwardIdFilter = buildFlexibleFieldFilter(
-    "outward_id",
-    outwardId
-  );
-
-  const filter = outwardIdFilter || {
+  const filter = {
     outward_id:
-      "__invalid_outward_id__",
+      Number(
+        outwardId
+      ),
   };
 
   if (
@@ -491,14 +483,11 @@ async function getAdjustedQtyForInward(
   const collection =
     getAdjustmentCollection();
 
-  const inwardIdFilter = buildFlexibleFieldFilter(
-    "inward_id",
-    inwardId
-  );
-
-  const filter = inwardIdFilter || {
+  const filter = {
     inward_id:
-      "__invalid_inward_id__",
+      Number(
+        inwardId
+      ),
   };
 
   if (
@@ -557,15 +546,11 @@ async function getAdjustedQtyForPalti(
     getAdjustmentCollection();
 
   const normalizedSource = normalizePaltiSource(source);
-  const paltiIdFilter = buildFlexibleFieldFilter(
-    "palti_lorry_id",
-    paltiId
-  );
-
   const filter = {
-    ...(paltiIdFilter || {
-      palti_lorry_id: "__invalid_palti_id__",
-    }),
+    palti_lorry_id:
+      Number(
+        paltiId
+      ),
 
     source_type:
       "palti_lorry",
@@ -1742,14 +1727,12 @@ router.post(
               .map(
                 (item) => ({
                   inward_id:
-                    normalizeId(
-                      item?.inward_id
-                    ),
+                    item?.inward_id ??
+                    null,
 
                   palti_lorry_id:
-                    normalizeId(
-                      item?.palti_lorry_id
-                    ),
+                    item?.palti_lorry_id ??
+                    null,
 
                   // A Palti adjustment can originate either from the
                   // paltilorryentries collection or from an Expense posted
@@ -1767,9 +1750,8 @@ router.post(
                     ).toLowerCase(),
 
                   company_id:
-                    normalizeId(
-                      item?.company_id
-                    ),
+                    item?.company_id ??
+                    null,
 
                   qty:
                     Number(
@@ -1819,17 +1801,21 @@ router.post(
         });
       }
 
-      const outwardAdjustmentId =
-        getLogicalAdjustmentId(
-          outward
+      const outwardNumericId =
+        Number(
+          outward.legacy_id ??
+            outward.id ??
+            outward.sl_no
         );
 
       if (
-        !outwardAdjustmentId
+        !Number.isFinite(
+          outwardNumericId
+        )
       ) {
         return res.status(400).json({
           error:
-            "Outward does not have a valid ID",
+            "Outward does not have a valid legacy ID",
         });
       }
 
@@ -1848,7 +1834,7 @@ router.post(
 
       const alreadyAdjusted =
         await getAdjustedQtyForOutward(
-          outwardAdjustmentId
+          outwardNumericId
         );
 
       const remainingToAdjust =
@@ -2047,14 +2033,20 @@ router.post(
             }
           }
 
-          const paltiAdjustmentId =
-            getLogicalAdjustmentId(
-              paltiRow
+          const paltiId =
+            Number(
+              paltiRow.legacy_id ??
+                paltiRow.id ??
+                paltiRow.sl_no
             );
 
-          if (!paltiAdjustmentId) {
+          if (
+            !Number.isFinite(
+              paltiId
+            )
+          ) {
             throw makeAdjustmentError(
-              "Palti Lorry does not have a valid ID",
+              "Palti Lorry does not have a valid legacy ID",
               {
                 palti_lorry_id:
                   adj.palti_lorry_id,
@@ -2064,7 +2056,7 @@ router.post(
 
           const already =
             await getAdjustedQtyForPalti(
-              paltiAdjustmentId,
+              paltiId,
               session,
               null,
               paltiSource
@@ -2134,13 +2126,13 @@ router.post(
           await getAdjustmentCollection().insertOne(
             {
               outward_id:
-                outwardAdjustmentId,
+                outwardNumericId,
 
               inward_id:
                 null,
 
               palti_lorry_id:
-                paltiAdjustmentId,
+                paltiId,
 
               source_type:
                 "palti_lorry",
@@ -2221,14 +2213,20 @@ router.post(
           );
         }
 
-        const inwardAdjustmentId =
-          getLogicalAdjustmentId(
-            inwardRow
+        const inwardNumericId =
+          Number(
+            inwardRow.legacy_id ??
+              inwardRow.id ??
+              inwardRow.sl_no
           );
 
-        if (!inwardAdjustmentId) {
+        if (
+          !Number.isFinite(
+            inwardNumericId
+          )
+        ) {
           throw makeAdjustmentError(
-            "Inward does not have a valid ID",
+            "Inward does not have a valid legacy ID",
             {
               inward_id:
                 adj.inward_id,
@@ -2315,7 +2313,7 @@ router.post(
 
         const alreadyAdjustedForThisInward =
           await getAdjustedQtyForInward(
-            inwardAdjustmentId,
+            inwardNumericId,
             session
           );
 
@@ -2586,22 +2584,45 @@ router.get(
         });
       }
 
-      const outwardAdjustmentId =
-        getLogicalAdjustmentId(
-          outward
+      const outwardNumericId =
+        Number(
+          outward.legacy_id ??
+            outward.id ??
+            outward.sl_no
         );
-
-      const outwardIdFilter = buildFlexibleFieldFilter(
-        "outward_id",
-        outwardAdjustmentId
-      );
 
       const collection =
         getAdjustmentCollection();
 
+      // Adjustment rows created by older/newer flows may store the outward
+      // reference as a numeric legacy id, string id, or Mongo _id string.
+      // Query all supported representations so the log never fails or
+      // appears empty just because the ID type differs.
+      const outwardIdCandidates = [
+        outward.legacy_id,
+        outward.id,
+        outward.sl_no,
+        outward?._id ? String(outward._id) : null,
+      ].filter((value) => value !== null && value !== undefined && String(value).trim() !== "");
+
+      const uniqueOutwardIds = [];
+      const seenOutwardIds = new Set();
+      for (const value of outwardIdCandidates) {
+        const key = `${typeof value}:${String(value)}`;
+        if (!seenOutwardIds.has(key)) {
+          seenOutwardIds.add(key);
+          uniqueOutwardIds.push(value);
+        }
+      }
+
       const rows =
         await collection
-          .find(outwardIdFilter || { outward_id: "__invalid_outward_id__" })
+          .find({
+            outward_id:
+              uniqueOutwardIds.length > 1
+                ? { $in: uniqueOutwardIds }
+                : uniqueOutwardIds[0],
+          })
           .sort({
             created_at:
               1,
@@ -2615,83 +2636,84 @@ router.get(
         const row of
           rows
       ) {
-        let inward =
-          null;
+        try {
+          let inward =
+            null;
 
-        let palti =
-          null;
+          let palti =
+            null;
 
-        let company =
-          null;
+          let company =
+            null;
 
-        let warehouse =
-          null;
+          let warehouse =
+            null;
 
-        if (
-          row.inward_id !=
-          null
-        ) {
-          inward =
-            await MongoInward.findOne(
-              buildFlexibleIdFilter(
-                row.inward_id
-              )
-            )
-              .lean();
-        }
-
-        if (
-          row.palti_lorry_id !=
-          null
-        ) {
-          palti =
-            await findPaltiSourceRow(
-              row.palti_lorry_id,
-              row.palti_source
-            );
-        }
-
-        const companyId =
-          inward?.company_id ??
-          palti?.company_id;
-
-        if (
-          companyId !=
+          if (
+            row.inward_id !=
             null
-        ) {
-          company =
-            await MongoCompany.findOne(
-              buildFlexibleIdFilter(
-                companyId
+          ) {
+            inward =
+              await MongoInward.findOne(
+                buildFlexibleIdFilter(
+                  row.inward_id
+                )
               )
-            )
-              .select({
-                name: 1,
-              })
-              .lean();
-        }
+                .lean();
+          }
 
-        const warehouseId =
-          inward?.warehouse_id ??
-          palti?.warehouse_id;
-
-        if (
-          warehouseId !=
+          if (
+            row.palti_lorry_id !=
             null
-        ) {
-          warehouse =
-            await MongoWarehouse.findOne(
-              buildFlexibleIdFilter(
-                warehouseId
-              )
-            )
-              .select({
-                name: 1,
-              })
-              .lean();
-        }
+          ) {
+            palti =
+              await findPaltiSourceRow(
+                row.palti_lorry_id,
+                row.palti_source
+              );
+          }
 
-        result.push({
+          const companyId =
+            inward?.company_id ??
+            palti?.company_id;
+
+          if (
+            companyId !=
+              null
+          ) {
+            company =
+              await MongoCompany.findOne(
+                buildFlexibleIdFilter(
+                  companyId
+                )
+              )
+                .select({
+                  name: 1,
+                })
+                .lean();
+          }
+
+          const warehouseId =
+            inward?.warehouse_id ??
+            palti?.warehouse_id;
+
+          if (
+            warehouseId !=
+              null
+          ) {
+            warehouse =
+              await MongoWarehouse.findOne(
+                buildFlexibleIdFilter(
+                  warehouseId
+                )
+              )
+                .select({
+                  name: 1,
+                })
+                .lean();
+          }
+
+          result.push({
           id:
             row._id
               ? String(
@@ -2757,6 +2779,27 @@ router.get(
             row.updated_at ||
             null,
         });
+        } catch (rowError) {
+          // One malformed historical adjustment row must not break the entire
+          // adjustment log endpoint. Return the raw adjustment identifiers and
+          // quantity so the UI can still display the log entry.
+          console.error("[adjustment log] row enrichment failed:", rowError);
+          result.push({
+            id: row._id ? String(row._id) : null,
+            qty: normalizeQty(row.qty),
+            inward_voucher: row.inward_id ?? row.palti_lorry_id ?? null,
+            lorry_no: "-",
+            inward_date: null,
+            company_name: "",
+            warehouse_name: "",
+            source_type: row.source_type || "inward",
+            outward_id: Number.isFinite(outwardNumericId) ? outwardNumericId : (outward?._id ? String(outward._id) : null),
+            inward_id: row.inward_id ?? null,
+            palti_lorry_id: row.palti_lorry_id ?? null,
+            created_at: row.created_at || null,
+            updated_at: row.updated_at || null,
+          });
+        }
       }
 
       return res.json(
