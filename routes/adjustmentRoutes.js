@@ -414,6 +414,11 @@ ADJUSTMENT QUERIES
 ====================================================
 */
 
+function getLogicalAdjustmentId(row) {
+  if (!row) return null;
+  return row.legacy_id ?? row.id ?? row.sl_no ?? (row._id ? String(row._id) : null);
+}
+
 async function getAdjustedQtyForOutward(
   outwardId,
   session = null,
@@ -422,11 +427,14 @@ async function getAdjustedQtyForOutward(
   const collection =
     getAdjustmentCollection();
 
-  const filter = {
+  const outwardIdFilter = buildFlexibleFieldFilter(
+    "outward_id",
+    outwardId
+  );
+
+  const filter = outwardIdFilter || {
     outward_id:
-      Number(
-        outwardId
-      ),
+      "__invalid_outward_id__",
   };
 
   if (
@@ -488,12 +496,9 @@ async function getAdjustedQtyForInward(
     inwardId
   );
 
-  if (!inwardIdFilter) {
-    return 0;
-  }
-
-  const filter = {
-    ...inwardIdFilter,
+  const filter = inwardIdFilter || {
+    inward_id:
+      "__invalid_inward_id__",
   };
 
   if (
@@ -552,11 +557,15 @@ async function getAdjustedQtyForPalti(
     getAdjustmentCollection();
 
   const normalizedSource = normalizePaltiSource(source);
+  const paltiIdFilter = buildFlexibleFieldFilter(
+    "palti_lorry_id",
+    paltiId
+  );
+
   const filter = {
-    palti_lorry_id:
-      Number(
-        paltiId
-      ),
+    ...(paltiIdFilter || {
+      palti_lorry_id: "__invalid_palti_id__",
+    }),
 
     source_type:
       "palti_lorry",
@@ -1733,12 +1742,14 @@ router.post(
               .map(
                 (item) => ({
                   inward_id:
-                    item?.inward_id ??
-                    null,
+                    normalizeId(
+                      item?.inward_id
+                    ),
 
                   palti_lorry_id:
-                    item?.palti_lorry_id ??
-                    null,
+                    normalizeId(
+                      item?.palti_lorry_id
+                    ),
 
                   // A Palti adjustment can originate either from the
                   // paltilorryentries collection or from an Expense posted
@@ -1756,8 +1767,9 @@ router.post(
                     ).toLowerCase(),
 
                   company_id:
-                    item?.company_id ??
-                    null,
+                    normalizeId(
+                      item?.company_id
+                    ),
 
                   qty:
                     Number(
@@ -1807,21 +1819,17 @@ router.post(
         });
       }
 
-      const outwardNumericId =
-        Number(
-          outward.legacy_id ??
-            outward.id ??
-            outward.sl_no
+      const outwardAdjustmentId =
+        getLogicalAdjustmentId(
+          outward
         );
 
       if (
-        !Number.isFinite(
-          outwardNumericId
-        )
+        !outwardAdjustmentId
       ) {
         return res.status(400).json({
           error:
-            "Outward does not have a valid legacy ID",
+            "Outward does not have a valid ID",
         });
       }
 
@@ -1840,7 +1848,7 @@ router.post(
 
       const alreadyAdjusted =
         await getAdjustedQtyForOutward(
-          outwardNumericId
+          outwardAdjustmentId
         );
 
       const remainingToAdjust =
@@ -2039,20 +2047,14 @@ router.post(
             }
           }
 
-          const paltiId =
-            Number(
-              paltiRow.legacy_id ??
-                paltiRow.id ??
-                paltiRow.sl_no
+          const paltiAdjustmentId =
+            getLogicalAdjustmentId(
+              paltiRow
             );
 
-          if (
-            !Number.isFinite(
-              paltiId
-            )
-          ) {
+          if (!paltiAdjustmentId) {
             throw makeAdjustmentError(
-              "Palti Lorry does not have a valid legacy ID",
+              "Palti Lorry does not have a valid ID",
               {
                 palti_lorry_id:
                   adj.palti_lorry_id,
@@ -2062,7 +2064,7 @@ router.post(
 
           const already =
             await getAdjustedQtyForPalti(
-              paltiId,
+              paltiAdjustmentId,
               session,
               null,
               paltiSource
@@ -2132,13 +2134,13 @@ router.post(
           await getAdjustmentCollection().insertOne(
             {
               outward_id:
-                outwardNumericId,
+                outwardAdjustmentId,
 
               inward_id:
                 null,
 
               palti_lorry_id:
-                paltiId,
+                paltiAdjustmentId,
 
               source_type:
                 "palti_lorry",
@@ -2219,17 +2221,12 @@ router.post(
           );
         }
 
-        const inwardReferenceId =
-          inwardRow.legacy_id ??
-          inwardRow.id ??
-          inwardRow.sl_no ??
-          (inwardRow._id ? String(inwardRow._id) : null);
+        const inwardAdjustmentId =
+          getLogicalAdjustmentId(
+            inwardRow
+          );
 
-        if (
-          inwardReferenceId === null ||
-          inwardReferenceId === undefined ||
-          String(inwardReferenceId).trim() === ""
-        ) {
+        if (!inwardAdjustmentId) {
           throw makeAdjustmentError(
             "Inward does not have a valid ID",
             {
@@ -2318,7 +2315,7 @@ router.post(
 
         const alreadyAdjustedForThisInward =
           await getAdjustedQtyForInward(
-            inwardReferenceId,
+            inwardAdjustmentId,
             session
           );
 
@@ -2442,7 +2439,7 @@ router.post(
               outwardNumericId,
 
             inward_id:
-              inwardReferenceId,
+              inwardNumericId,
 
             palti_lorry_id:
               null,
@@ -2589,22 +2586,22 @@ router.get(
         });
       }
 
-      const outwardNumericId =
-        Number(
-          outward.legacy_id ??
-            outward.id ??
-            outward.sl_no
+      const outwardAdjustmentId =
+        getLogicalAdjustmentId(
+          outward
         );
+
+      const outwardIdFilter = buildFlexibleFieldFilter(
+        "outward_id",
+        outwardAdjustmentId
+      );
 
       const collection =
         getAdjustmentCollection();
 
       const rows =
         await collection
-          .find({
-            outward_id:
-              outwardNumericId,
-          })
+          .find(outwardIdFilter || { outward_id: "__invalid_outward_id__" })
           .sort({
             created_at:
               1,
