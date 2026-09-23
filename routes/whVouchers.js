@@ -3987,10 +3987,16 @@ router.put("/sale/:id", async (req, res) => {
   const id = req.params.id;
   const deductionOnly = Boolean(req.body?.deduction_only);
   const isDirectSale = req.body?.sale_type === "direct";
-  if (!req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
-  if (isDirectSale && !req.body?.location_id) return res.status(400).json({ error: "Location is required for direct sale" });
-  if (isDirectSale && !req.body?.consignee_id) return res.status(400).json({ error: "Consignee is required for direct sale" });
-  if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
+  // F2 Sale Voucher Pass updates deductions on an existing voucher.
+  // Do not require the full sale-entry fields again; the existing voucher
+  // already has warehouse/location/consignee. Normal sale edits keep the
+  // existing validations unchanged.
+  if (!deductionOnly) {
+    if (!req.body?.warehouse_id) return res.status(400).json({ error: "Warehouse is required for sale voucher" });
+    if (isDirectSale && !req.body?.location_id) return res.status(400).json({ error: "Location is required for direct sale" });
+    if (isDirectSale && !req.body?.consignee_id) return res.status(400).json({ error: "Consignee is required for direct sale" });
+    if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
+  }
 
   if (mongoReady() && mongoose.Types.ObjectId.isValid(id)) {
     return (async () => {
