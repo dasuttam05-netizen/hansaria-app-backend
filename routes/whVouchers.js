@@ -949,7 +949,7 @@ function createVoucherNoPromise(type, voucherNo = "") {
   });
 }
 
-async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deductionAmount, cdAmount, tdsAmount }) {
+async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deductionAmount, cdAmount, tdsAmount, additionalAmount = 0 }) {
   const saleVoucherNo = String(sale?.voucher_no || body?.voucher_no || "").trim();
   if (!saleVoucherNo) return [];
 
@@ -977,6 +977,7 @@ async function recreateSaleDeductionJournals({ sale, body, shortageAmount, deduc
     { key: "tds", label: "TDS", amount: Number(tdsAmount || 0) },
     { key: "adjustment", label: "Adjustment", amount: Number(body?.adjustment_amount || 0) },
     { key: "transport", label: "Transport Charge", amount: Number(body?.transport_charge || 0) },
+    { key: "additional_amount", label: "Additional Amount", amount: Number(additionalAmount || body?.additional_amount || 0) },
   ].filter((row) => Number.isFinite(row.amount) && row.amount > 0);
 
   const created = [];
@@ -4010,6 +4011,7 @@ router.put("/sale/:id", async (req, res) => {
           const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
           const roundOffValue = Number(req.body.round_off !== undefined ? req.body.round_off : existing.round_off) || 0;
           const transportChargeValue = Number(req.body.transport_charge !== undefined ? req.body.transport_charge : existing.transport_charge) || 0;
+          const additionalAmountValue = Number(req.body.additional_amount !== undefined ? req.body.additional_amount : existing.additional_amount) || 0;
           const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
           const saleQty = Number(existing.quantity || 0);
           const grossAmount = Number(existing.amount || 0);
@@ -4023,7 +4025,7 @@ router.put("/sale/:id", async (req, res) => {
           const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
           const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
 
-          const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+          const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + additionalAmountValue + roundOffValue;
 
           existing.unloading_date = req.body.unloading_date !== undefined ? req.body.unloading_date : existing.unloading_date;
           existing.due_date = dueFields.due_date || existing.due_date || "";
@@ -4045,12 +4047,15 @@ router.put("/sale/:id", async (req, res) => {
           existing.cd_amount = cdAmountValue;
           existing.adjustment_amount = adjustmentValue;
           existing.tds_amount = tdsValue;
+          existing.additional_amount = additionalAmountValue;
           existing.round_off = roundOffValue;
           existing.net_amount = netAmount;
           existing.net_receivable_amount = netAmount;
           existing.net_amount_payable = netAmount;
           existing.outstanding = netAmount;
           const saved = await existing.save();
+          // Persist Add Amount even when the deployed SaleVoucher schema predates this field.
+          await SaleVoucher.collection.updateOne({ _id: existing._id }, { $set: { additional_amount: additionalAmountValue } });
           const journals = await recreateSaleDeductionJournals({
             sale: saved,
             body: req.body,
@@ -4058,6 +4063,7 @@ router.put("/sale/:id", async (req, res) => {
             deductionAmount: otherDeductionValue + adjustmentValue,
             cdAmount: cdAmountValue,
             tdsAmount: tdsValue,
+            additionalAmount: additionalAmountValue,
           });
           return res.json({ id: String(saved._id), updated: 1, voucher_no: saved.voucher_no, deduction_only: true, saved_to: "mongodb", shortage_qty: existing.shortage_quantity, shortage_amount: shortageAmount, journals });
         }
