@@ -414,6 +414,42 @@ ADJUSTMENT QUERIES
 ====================================================
 */
 
+function storedIdCandidates(value) {
+  if (value === null || value === undefined || value === "") {
+    return [];
+  }
+
+  const candidates = [];
+  const text = String(value).trim();
+
+  if (text) {
+    candidates.push(text);
+  }
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    candidates.push(numeric);
+  }
+
+  return [...new Set(candidates.map((item) =>
+    typeof item === "string" ? item : item
+  ))];
+}
+
+function buildStoredIdFilter(field, value) {
+  const candidates = storedIdCandidates(value);
+
+  if (candidates.length === 0) {
+    return { [field]: null };
+  }
+
+  if (candidates.length === 1) {
+    return { [field]: candidates[0] };
+  }
+
+  return { [field]: { $in: candidates } };
+}
+
 async function getAdjustedQtyForOutward(
   outwardId,
   session = null,
@@ -422,12 +458,11 @@ async function getAdjustedQtyForOutward(
   const collection =
     getAdjustmentCollection();
 
-  const filter = {
-    outward_id:
-      Number(
-        outwardId
-      ),
-  };
+  const filter =
+    buildStoredIdFilter(
+      "outward_id",
+      outwardId
+    );
 
   if (
     excludeAdjustmentId
@@ -483,12 +518,11 @@ async function getAdjustedQtyForInward(
   const collection =
     getAdjustmentCollection();
 
-  const filter = {
-    inward_id:
-      Number(
-        inwardId
-      ),
-  };
+  const filter =
+    buildStoredIdFilter(
+      "inward_id",
+      inwardId
+    );
 
   if (
     excludeAdjustmentId
@@ -1808,14 +1842,20 @@ router.post(
             outward.sl_no
         );
 
-      if (
-        !Number.isFinite(
-          outwardNumericId
-        )
-      ) {
+      // Normal outward rows use their legacy/sl number.
+      // Journal-created outward references may only have Mongo _id, so keep
+      // the Mongo id as the adjustment reference instead of rejecting the save.
+      const outwardAdjustmentId =
+        Number.isFinite(outwardNumericId)
+          ? outwardNumericId
+          : outward?._id
+            ? String(outward._id)
+            : null;
+
+      if (!outwardAdjustmentId) {
         return res.status(400).json({
           error:
-            "Outward does not have a valid legacy ID",
+            "Outward id could not be resolved",
         });
       }
 
@@ -1834,7 +1874,7 @@ router.post(
 
       const alreadyAdjusted =
         await getAdjustedQtyForOutward(
-          outwardNumericId
+          outwardAdjustmentId
         );
 
       const remainingToAdjust =
@@ -2220,13 +2260,19 @@ router.post(
               inwardRow.sl_no
           );
 
-        if (
-          !Number.isFinite(
-            inwardNumericId
-          )
-        ) {
+        // Journal Entry destination inward rows are created with a Mongo _id
+        // and may not have legacy_id/sl_no. Use that _id for adjustment storage
+        // so Journal-created stock can be adjusted normally.
+        const inwardAdjustmentId =
+          Number.isFinite(inwardNumericId)
+            ? inwardNumericId
+            : inwardRow?._id
+              ? String(inwardRow._id)
+              : null;
+
+        if (!inwardAdjustmentId) {
           throw makeAdjustmentError(
-            "Inward does not have a valid legacy ID",
+            "Inward id could not be resolved",
             {
               inward_id:
                 adj.inward_id,
@@ -2313,7 +2359,7 @@ router.post(
 
         const alreadyAdjustedForThisInward =
           await getAdjustedQtyForInward(
-            inwardNumericId,
+            inwardAdjustmentId,
             session
           );
 
@@ -2437,7 +2483,7 @@ router.post(
               outwardNumericId,
 
             inward_id:
-              inwardNumericId,
+              inwardAdjustmentId,
 
             palti_lorry_id:
               null,
@@ -2544,11 +2590,7 @@ GET ADJUSTMENT LOG
 router.get(
   "/:id",
   async (req, res) => {
-    if (
-      !canViewAdjustment(
-        req.user
-      )
-    ) {
+    if (!canViewAdjustment(req.user)) {
       return res.status(403).json({
         error:
           "You do not have permission to view adjustments",
@@ -2556,14 +2598,10 @@ router.get(
     }
 
     try {
-      if (!requireMongo(res)) {
-        return;
-      }
+      if (!requireMongo(res)) return;
 
       const outwardFilter =
-        buildFlexibleIdFilter(
-          req.params.id
-        );
+        buildFlexibleIdFilter(req.params.id);
 
       if (!outwardFilter) {
         return res.status(400).json({
@@ -2591,220 +2629,160 @@ router.get(
             outward.sl_no
         );
 
+      const outwardAdjustmentId =
+        Number.isFinite(outwardNumericId)
+          ? outwardNumericId
+          : outward?._id
+            ? String(outward._id)
+            : String(req.params.id);
+
       const collection =
         getAdjustmentCollection();
 
-      // Adjustment rows created by older/newer flows may store the outward
-      // reference as a numeric legacy id, string id, or Mongo _id string.
-      // Query all supported representations so the log never fails or
-      // appears empty just because the ID type differs.
-      const outwardIdCandidates = [
-        outward.legacy_id,
-        outward.id,
-        outward.sl_no,
-        outward?._id ? String(outward._id) : null,
-      ].filter((value) => value !== null && value !== undefined && String(value).trim() !== "");
-
-      const uniqueOutwardIds = [];
-      const seenOutwardIds = new Set();
-      for (const value of outwardIdCandidates) {
-        const key = `${typeof value}:${String(value)}`;
-        if (!seenOutwardIds.has(key)) {
-          seenOutwardIds.add(key);
-          uniqueOutwardIds.push(value);
-        }
-      }
-
       const rows =
         await collection
-          .find({
-            outward_id:
-              uniqueOutwardIds.length > 1
-                ? { $in: uniqueOutwardIds }
-                : uniqueOutwardIds[0],
-          })
+          .find(
+            buildStoredIdFilter(
+              "outward_id",
+              outwardAdjustmentId
+            )
+          )
           .sort({
             created_at:
               1,
           })
           .toArray();
 
-      const result =
-        [];
+      const result = [];
 
-      for (
-        const row of
-          rows
-      ) {
+      for (const row of rows) {
         try {
-          let inward =
-            null;
+          let inward = null;
+          let palti = null;
+          let company = null;
+          let warehouse = null;
 
-          let palti =
-            null;
-
-          let company =
-            null;
-
-          let warehouse =
-            null;
-
-          if (
-            row.inward_id !=
-            null
-          ) {
-            inward =
-              await MongoInward.findOne(
-                buildFlexibleIdFilter(
-                  row.inward_id
-                )
-              )
-                .lean();
+          if (row.inward_id != null) {
+            inward = await MongoInward.findOne(
+              buildFlexibleIdFilter(row.inward_id)
+            ).lean();
           }
 
-          if (
-            row.palti_lorry_id !=
-            null
-          ) {
-            palti =
-              await findPaltiSourceRow(
-                row.palti_lorry_id,
-                row.palti_source
-              );
+          if (row.palti_lorry_id != null) {
+            palti = await findPaltiSourceRow(
+              row.palti_lorry_id,
+              row.palti_source
+            );
           }
 
           const companyId =
             inward?.company_id ??
             palti?.company_id;
 
-          if (
-            companyId !=
-              null
-          ) {
-            company =
-              await MongoCompany.findOne(
-                buildFlexibleIdFilter(
-                  companyId
-                )
-              )
-                .select({
-                  name: 1,
-                })
-                .lean();
+          if (companyId != null) {
+            company = await MongoCompany.findOne(
+              buildFlexibleIdFilter(companyId)
+            )
+              .select({ name: 1 })
+              .lean();
           }
 
           const warehouseId =
             inward?.warehouse_id ??
             palti?.warehouse_id;
 
-          if (
-            warehouseId !=
-              null
-          ) {
-            warehouse =
-              await MongoWarehouse.findOne(
-                buildFlexibleIdFilter(
-                  warehouseId
-                )
-              )
-                .select({
-                  name: 1,
-                })
-                .lean();
+          if (warehouseId != null) {
+            warehouse = await MongoWarehouse.findOne(
+              buildFlexibleIdFilter(warehouseId)
+            )
+              .select({ name: 1 })
+              .lean();
           }
 
           result.push({
-          id:
-            row._id
-              ? String(
-                  row._id
-                )
-              : null,
-
-          qty:
-            normalizeQty(
-              row.qty
-            ),
-
-          inward_voucher:
-            inward?.voucher_no ??
-            palti?.voucher_no ??
-            null,
-
-          lorry_no:
-            normalizeText(
-              inward?.lorry_no
-            ) ||
-            normalizeText(
-              palti?.reg_lorry_no
-            ) ||
-            normalizeText(
-              palti?.new_lorry_no
-            ) ||
-            "-",
-
-          inward_date:
-            inward?.date ??
-            palti?.expense_date ??
-            null,
-
-          company_name:
-            company?.name ||
-            "",
-
-          warehouse_name:
-            warehouse?.name ||
-            "",
-
-          source_type:
-            row.source_type ||
-            "inward",
-
-          outward_id:
-            outwardNumericId,
-
-          inward_id:
-            row.inward_id ??
-            null,
-
-          palti_lorry_id:
-            row.palti_lorry_id ??
-            null,
-
-          created_at:
-            row.created_at ||
-            null,
-
-          updated_at:
-            row.updated_at ||
-            null,
-        });
+            id: row._id ? String(row._id) : null,
+            qty: normalizeQty(row.qty),
+            inward_voucher:
+              inward?.voucher_no ??
+              palti?.voucher_no ??
+              null,
+            lorry_no:
+              normalizeText(inward?.lorry_no) ||
+              normalizeText(palti?.reg_lorry_no) ||
+              normalizeText(palti?.new_lorry_no) ||
+              "-",
+            inward_date:
+              inward?.date ??
+              palti?.expense_date ??
+              null,
+            company_name:
+              company?.name ||
+              inward?.company_name ||
+              palti?.company_name ||
+              "-",
+            warehouse_name:
+              warehouse?.name ||
+              inward?.warehouse_name ||
+              palti?.warehouse_name ||
+              "-",
+            company_id:
+              companyId ??
+              null,
+            source_type:
+              row.source_type ||
+              "inward",
+            inward_id:
+              row.inward_id ??
+              null,
+            palti_lorry_id:
+              row.palti_lorry_id ??
+              null,
+            palti_source:
+              row.palti_source ||
+              null,
+            outward_id:
+              row.outward_id ??
+              outwardAdjustmentId,
+            created_at:
+              row.created_at ||
+              null,
+            updated_at:
+              row.updated_at ||
+              null,
+          });
         } catch (rowError) {
-          // One malformed historical adjustment row must not break the entire
-          // adjustment log endpoint. Return the raw adjustment identifiers and
-          // quantity so the UI can still display the log entry.
-          console.error("[adjustment log] row enrichment failed:", rowError);
+          console.error(
+            "[adjustment log] row enrichment error:",
+            rowError
+          );
+
+          // One broken historical row must not make the entire adjustment log
+          // return HTTP 500. Keep the saved adjustment visible with its basic data.
           result.push({
             id: row._id ? String(row._id) : null,
             qty: normalizeQty(row.qty),
-            inward_voucher: row.inward_id ?? row.palti_lorry_id ?? null,
+            inward_voucher:
+              row.inward_voucher ??
+              row.inward_id ??
+              row.palti_lorry_id ??
+              null,
             lorry_no: "-",
             inward_date: null,
-            company_name: "",
-            warehouse_name: "",
+            company_name: "-",
+            warehouse_name: "-",
+            company_id: row.company_id ?? null,
             source_type: row.source_type || "inward",
-            outward_id: Number.isFinite(outwardNumericId) ? outwardNumericId : (outward?._id ? String(outward._id) : null),
             inward_id: row.inward_id ?? null,
             palti_lorry_id: row.palti_lorry_id ?? null,
+            palti_source: row.palti_source || null,
+            outward_id: row.outward_id ?? outwardAdjustmentId,
             created_at: row.created_at || null,
             updated_at: row.updated_at || null,
           });
         }
       }
 
-      return res.json(
-        result
-      );
+      return res.json(result);
     } catch (err) {
       console.error(
         "[adjustment log] error:",
@@ -2813,7 +2791,8 @@ router.get(
 
       return res.status(500).json({
         error:
-          err.message,
+          err?.message ||
+          "Failed to load adjustment log",
       });
     }
   }
