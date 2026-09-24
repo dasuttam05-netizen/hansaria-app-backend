@@ -1205,8 +1205,8 @@ async function getAvailableWarehouseStock({
   // Do not use Inward.remaining_qty here because that can already include
   // adjustments and would make the Outward Entry stock disagree with the
   // Stock Report.
-  const adjustmentRows = MirrorRow && typeof MirrorRow.find === "function"
-    ? await MirrorRow.find({ table: "adjustment" }).select({ row_id: 1, data: 1 }).lean()
+  const adjustmentRows = mongoose?.connection?.db
+    ? await mongoose.connection.db.collection("adjustments").find({}).toArray()
     : [];
   const adjustedByInward = new Map();
 
