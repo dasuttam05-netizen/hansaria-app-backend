@@ -1192,8 +1192,34 @@ async function getAvailableWarehouseStock({
       quantity: 1,
       date: 1,
       legacy_id: 1,
+      shortage_percent: 1,
+      id: 1,
+      sl_no: 1,
     })
     .lean();
+
+  // Match the Stock Report formula used on Dashboard / Party Stock:
+  // Available = Inward (Gross) - Shortage - Already Adjusted.
+  // Do not use Inward.remaining_qty here because that can already include
+  // adjustments and would make the Outward Entry stock disagree with the
+  // Stock Report.
+  const adjustmentRows = MirrorRow && typeof MirrorRow.find === "function"
+    ? await MirrorRow.find({ table: "adjustment" }).select({ row_id: 1, data: 1 }).lean()
+    : [];
+  const adjustedByInward = new Map();
+
+  for (const mirrorRow of adjustmentRows || []) {
+    const data = mirrorRow?.data || {};
+    if (String(data?.source_type || "inward").trim().toLowerCase() !== "inward") continue;
+    const inwardId = String(data?.inward_id ?? "").trim();
+    if (!inwardId) continue;
+    const qty = safeNumber(data?.qty ?? data?.quantity);
+    if (!qty) continue;
+    adjustedByInward.set(
+      inwardId,
+      (adjustedByInward.get(inwardId) || 0) + qty
+    );
+  }
 
   let currentStock = 0;
   let availableStock = 0;
@@ -1203,14 +1229,39 @@ async function getAvailableWarehouseStock({
       row?.weight ?? row?.quantity
     );
 
-    const remainingQty = safeNumber(
-      row?.remaining_qty ??
-        row?.weight ??
-        row?.quantity
+    const shortageQty = Math.max(
+      0,
+      safeNumber(
+        calculateShortageQty(
+          grossQty,
+          1,
+          row?.shortage_percent
+        )
+      )
     );
 
+    const inwardAliases = [
+      row?._id,
+      row?.legacy_id,
+      row?.id,
+      row?.sl_no,
+    ]
+      .filter((value) => value !== undefined && value !== null && String(value).trim() !== "")
+      .map(String);
+
+    let adjustedQty = 0;
+    for (const alias of inwardAliases) {
+      if (adjustedByInward.has(alias)) {
+        adjustedQty = safeNumber(adjustedByInward.get(alias));
+        break;
+      }
+    }
+
     currentStock += grossQty;
-    availableStock += Math.max(remainingQty, 0);
+    availableStock += Math.max(
+      grossQty - shortageQty - adjustedQty,
+      0
+    );
   }
 
   return {
