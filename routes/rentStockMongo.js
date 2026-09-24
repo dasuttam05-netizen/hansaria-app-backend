@@ -357,7 +357,13 @@ router.get('/party-stock', async (req,res,next) => {
         const candidate=dateOnly(a.outward_date) || dateOnly(a.date) || dateOnly(buyer?.outward_date) || dateOnly(buyer?.unloading_date) || dateOnly(buyer?.date) || dateOnly(out?.outward_date) || dateOnly(out?.unloading_date) || dateOnly(out?.date) || dateOnly(a.created_at) || dateOnly(a.createdAt);
         if (candidate && (!latestOutwardDate || candidate > latestOutwardDate)) latestOutwardDate=candidate;
       });
-      const avail=availableQty(r.weight,r.date,adjusted,r.shortage_percent,refDate);
+      // Party Stock / Full Details shortage and balance must use the same
+      // Inward -> Outward reference date when an outward adjustment exists.
+      // Falling back to today's date here was making a 67-day inward look like
+      // a 4-slab row when the actual outward was 67 days after inward.
+      const stockReferenceDate = latestOutwardDate || refDate;
+      const stockSlab = monthSlab(r.date, stockReferenceDate);
+      const avail=availableQty(r.weight,r.date,adjusted,r.shortage_percent,stockReferenceDate);
       const shortageQty=Math.max(0,num(r.weight)-avail-adjusted);
       const detail={
         ...r,
@@ -366,6 +372,8 @@ router.get('/party-stock', async (req,res,next) => {
         net_opening_qty:Number((num(r.weight)-shortageQty).toFixed(4)),
         already_adjusted_qty:Number(adjusted.toFixed(4)),
         available_balance_qty:Number(avail.toFixed(4)),
+        days_diff:stockSlab.daysDiff,
+        month_slab:stockSlab.monthsDiff,
         date:r.date,
         inward_date:r.inward_date || r.date || '',
         outward_date:latestOutwardDate || '',
