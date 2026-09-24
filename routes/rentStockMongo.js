@@ -296,7 +296,7 @@ async function buildRentDetails({ monthList, filters }) {
       const balanceRentAmount = Math.max(balanceQty,0)*rentRate*slab.monthsDiff;
       // Godown rent is calculated on the original Inward quantity.
       // Keep all existing shortage, adjustment, dispatch-date and slab logic unchanged.
-      const inwardRentAmount = Math.max(num(row.weight),0)*rentRate*slab.monthsDiff;
+      const inwardRentAmount = Math.max(num(row.weight),0)*rentRate*reportSlab.monthsDiff;
       // When an outward entry exists, the report's Dispatch Date, Days and Month Slab
       // must all be based on the actual outward entry date.
       const reportReferenceDate = lastDispatchDate || monthEndDate;
