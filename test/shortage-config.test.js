@@ -14,9 +14,17 @@ test('automatic shortage scales by month slab', () => {
   assert.equal(calculateShortageQty(100, 3), 6);
 });
 
-test('manual company shortage percentage overrides the default automatic rate', () => {
+test('manual shortage percentage scales by month slab', () => {
+  // 0.75% per slab: 2 slabs -> 1.50% on 100 qty = 1.50 qty
   const qty = calculateShortageQty(100, 2, 0.75);
-  assert.equal(qty, 0.75);
+  assert.equal(qty, 1.5);
+});
+
+test('manual 1 percent becomes 1%, 2%, 3%, 4% by slab', () => {
+  assert.equal(calculateShortageQty(10, 1, 1), 0.1);
+  assert.equal(calculateShortageQty(10, 2, 1), 0.2);
+  assert.equal(calculateShortageQty(10, 3, 1), 0.3);
+  assert.equal(calculateShortageQty(10, 4, 1), 0.4);
 });
 
 test('resolveShortageRate returns null when manual percentage is not supplied', () => {
