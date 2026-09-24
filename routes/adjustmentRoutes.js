@@ -450,6 +450,25 @@ function buildStoredIdFilter(field, value) {
   return { [field]: { $in: candidates } };
 }
 
+// Journal Entry-created inward rows intentionally use a Mongo ObjectId
+// instead of the normal numeric legacy inward id. Keep their adjustment
+// availability tied to the actual remaining_qty on that transferred lot.
+function isJournalTransferInward(row) {
+  const voucher = String(
+    row?.voucher_no ??
+      row?.inward_no ??
+      ""
+  ).trim();
+
+  const narration = String(
+    row?.narration ??
+      ""
+  ).trim();
+
+  return /^JE-/i.test(voucher) ||
+    /^Journal Transfer/i.test(narration);
+}
+
 async function getAdjustedQtyForOutward(
   outwardId,
   session = null,
@@ -1481,11 +1500,7 @@ router.get(
 
         const adjusted =
           await getAdjustedQtyForInward(
-            Number(
-              row.legacy_id ??
-                row.id ??
-                row.sl_no
-            )
+            inwardId
           );
 
         const shortagePercent =
@@ -1526,11 +1541,21 @@ router.get(
               shortageQty
           );
 
-        const availableQty =
+        let availableQty =
           normalizeQty(
             netOpeningQty -
               adjusted
           );
+
+        if (
+          isJournalTransferInward(row) &&
+          row.remaining_qty !== undefined &&
+          row.remaining_qty !== null
+        ) {
+          availableQty = normalizeQty(
+            row.remaining_qty
+          );
+        }
 
         if (
           availableQty <=
@@ -2378,11 +2403,29 @@ router.post(
               shortageQty
           );
 
-        const availableQty =
+        const currentRemaining =
+          normalizeQty(
+            inwardRow.remaining_qty ??
+              grossQty
+          );
+
+        let availableQty =
           normalizeQty(
             netOpeningQty -
               alreadyAdjustedForThisInward
           );
+
+        // Journal-created inward lots are real transferred stock lots.
+        // For these rows, remaining_qty is the authoritative balance and
+        // prevents the Adjustment screen from rejecting a valid journal
+        // allocation because the legacy shortage/FIFO calculation differs.
+        if (
+          isJournalTransferInward(inwardRow) &&
+          inwardRow.remaining_qty !== undefined &&
+          inwardRow.remaining_qty !== null
+        ) {
+          availableQty = currentRemaining;
+        }
 
         if (
           adjQty -
@@ -2432,12 +2475,6 @@ router.post(
             }
           );
         }
-
-        const currentRemaining =
-          normalizeQty(
-            inwardRow.remaining_qty ??
-              grossQty
-          );
 
         if (
           adjQty -
