@@ -7780,7 +7780,29 @@ router.get("/sale/:id/summary", async (req, res) => {
             voucher_no: purchase.voucher_no || link.voucher_no || "",
             date: purchase.date || link.date || "",
             farmer_id: purchase.farmer_id || link.farmer_id || "",
-            farmer_name: link.farmer_name || purchase.farmer_name || "",
+            farmer_name: await (async () => {
+              const farmerId = purchase.farmer_id || link.farmer_id || "";
+              const directName = String(purchase.farmer_name || link.farmer_name || "").trim();
+              if (directName) return directName;
+              if (!farmerId) return "";
+
+              const idText = String(farmerId).trim();
+              const filters = [];
+              if (mongoose.Types.ObjectId.isValid(idText)) {
+                filters.push({ _id: idText });
+              }
+              const numericId = Number(idText);
+              if (Number.isFinite(numericId)) {
+                filters.push({ id: numericId });
+                filters.push({ legacy_id: numericId });
+              }
+
+              if (!filters.length) return "";
+              const farmer = await Farmer.findOne({ $or: filters })
+                .select("name farmer_name account_holder_name")
+                .lean();
+              return String(farmer?.name || farmer?.farmer_name || farmer?.account_holder_name || "").trim();
+            })(),
             quantity: Number(purchase.total_qty || purchase.net_weight || purchase.quantity || link.quantity || 0),
             weight: Number(purchase.total_qty || purchase.net_weight || purchase.quantity || link.weight || 0),
             rate: Number(purchase.rate || link.rate || 0),
