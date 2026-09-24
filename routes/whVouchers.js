@@ -256,6 +256,7 @@ function parseVoucherListOptions(req) {
   const buyerId = String(req.query.buyer_id || "").trim();
   const companyAccountId = String(req.query.company_account_id || "").trim();
   const productId = String(req.query.product_id || "").trim();
+  const consigneeId = String(req.query.consignee_id || "").trim();
   const untaggedDirectPurchase = String(req.query.untagged_direct_purchase || "") === "1";
   const excludeSaleId = String(req.query.exclude_sale_id || "").trim();
   const fromDate = toDateOnly(req.query.from_date);
@@ -272,6 +273,7 @@ function parseVoucherListOptions(req) {
     buyerId,
     companyAccountId,
     productId,
+    consigneeId,
     untaggedDirectPurchase,
     excludeSaleId,
     fromDate,
@@ -287,6 +289,7 @@ function applyVoucherListFilters(query, options, type) {
   if (options.companyAccountId) filter.company_account_id = options.companyAccountId;
   if (options.productId) filter.product_id = options.productId;
   if (type === "purchase" && options.farmerId) filter.farmer_id = options.farmerId;
+  if (type === "purchase" && options.consigneeId) filter.consignee_id = options.consigneeId;
   if (type === "sale" && options.buyerId) filter.buyer_id = options.buyerId;
 
   if (options.fromDate || options.toDate) {
