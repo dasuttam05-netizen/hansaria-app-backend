@@ -1901,6 +1901,16 @@ router.put(
           masters
         );
 
+      // Keep an already-saved Inward shortage % when an older/client request
+      // does not send the field. An explicit blank/null still clears it.
+      const hasShortagePercentField = Object.prototype.hasOwnProperty.call(
+        req.body || {},
+        "shortage_percent"
+      );
+      const savedShortagePercent = hasShortagePercentField
+        ? normalizeShortagePercent(shortage_percent)
+        : normalizeShortagePercent(existing?.shortage_percent);
+
       const updated =
         await MongoInward.findOneAndUpdate(
           query,
@@ -1952,9 +1962,7 @@ router.put(
                 weightNumber,
 
               shortage_percent:
-                normalizeShortagePercent(
-                  shortage_percent
-                ),
+                savedShortagePercent,
 
               updated_at:
                 new Date(),
