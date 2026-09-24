@@ -730,8 +730,8 @@ function buildSalePayload(body, voucherNo) {
     payload.cd_amount -
     payload.adjustment_amount -
     payload.tds_amount +
-    payload.additional_amount +
-    payload.round_off;
+    payload.round_off +
+    payload.additional_amount;
   const qtyForFifo = payload.unloading_qty || payload.quantity;
   payload.net_amount = netAmount;
   payload.net_amount_payable = netAmount;
@@ -3918,20 +3918,20 @@ router.get("/receipt-pending-buyers", async (req, res) => {
   }
 });
 
-
-// Persist the final deduction values used by the Sale Summary back to the
-// linked Purchase Vouchers. This keeps Purchase Summary / Payment Adjustment
-// consistent with the Sale Summary. Values are sent per purchase link from
-// the frontend, so multi-purchase tagging remains supported.
+// Persist final Purchase Deduction values edited from Sale Summary.
+// This only updates purchase deduction/payment fields; stock/FIFO logic is untouched.
 async function persistSaleSummaryPurchaseDeductionUpdates(updates) {
   if (!Array.isArray(updates) || !updates.length) return [];
 
   const results = [];
   for (const update of updates) {
     const purchaseId = String(update?.purchase_id || update?.id || update?._id || "").trim();
-    if (!purchaseId || !mongoose.Types.ObjectId.isValid(purchaseId)) continue;
+    if (!purchaseId) continue;
 
-    const purchase = await PurchaseVoucher.findById(purchaseId).lean();
+    const purchaseFilter = mongoose.Types.ObjectId.isValid(purchaseId)
+      ? { _id: purchaseId }
+      : { id: Number.isFinite(Number(purchaseId)) ? Number(purchaseId) : purchaseId };
+    const purchase = await PurchaseVoucher.findOne(purchaseFilter).lean();
     if (!purchase) continue;
 
     const final = update?.final || {};
@@ -3939,7 +3939,6 @@ async function persistSaleSummaryPurchaseDeductionUpdates(updates) {
       const parsed = Number(value);
       return Number.isFinite(parsed) ? parsed : Number(fallback) || 0;
     };
-
     const claim = n(final.claim, purchase.claim_amount ?? purchase.bags_claim);
     const labour = n(final.labour, purchase.labour);
     const freight = n(final.freight, purchase.transport_charge);
@@ -3948,11 +3947,10 @@ async function persistSaleSummaryPurchaseDeductionUpdates(updates) {
     const other = n(final.other, purchase.other_deduction);
     const adjustment = n(final.adjustment, purchase.adjustment_amount);
     const roundOff = n(final.roundOff, purchase.round_off);
-    const totalDeduction = Number((
-      claim + labour + freight + cashDiscount + tds + other + adjustment
-    ).toFixed(2));
+    const totalDeduction = Number((claim + labour + freight + cashDiscount + tds + other + adjustment).toFixed(2));
     const grossAmount = purchaseGrossAmountFromRow(purchase);
     const netPayable = Number(Math.max(grossAmount - totalDeduction + roundOff, 0).toFixed(2));
+
     const deductionDetails = buildPurchaseDeductionDetails({
       ...purchase,
       claim_amount: claim,
@@ -3963,6 +3961,8 @@ async function persistSaleSummaryPurchaseDeductionUpdates(updates) {
       tds_amount: tds,
       other_deduction: other,
       adjustment_amount: adjustment,
+      total_deduction: totalDeduction,
+      round_off: roundOff,
     });
 
     await PurchaseVoucher.collection.updateOne(
@@ -3981,7 +3981,6 @@ async function persistSaleSummaryPurchaseDeductionUpdates(updates) {
           total_deduct_amount: totalDeduction,
           round_off: roundOff,
           net_amount: netPayable,
-          amount: netPayable,
           net_amount_payable: netPayable,
           outstanding: netPayable,
           deduction_details: deductionDetails,
@@ -3992,22 +3991,11 @@ async function persistSaleSummaryPurchaseDeductionUpdates(updates) {
     );
 
     results.push({
-      purchase_id: purchaseId,
-      final: {
-        claim,
-        labour,
-        freight,
-        cashDiscount,
-        tds,
-        other,
-        adjustment,
-        roundOff,
-        totalDeduction,
-      },
+      purchase_id: String(purchase._id),
+      final: { claim, labour, freight, cashDiscount, tds, other, adjustment, roundOff, totalDeduction },
       manual_modes: update?.manual_modes || {},
     });
   }
-
   return results;
 }
 
@@ -4108,6 +4096,8 @@ router.put("/sale/:id", async (req, res) => {
           const transportChargeValue = Number(req.body.transport_charge !== undefined ? req.body.transport_charge : existing.transport_charge) || 0;
           const additionalAmountValue = Number(req.body.additional_amount !== undefined ? req.body.additional_amount : existing.additional_amount) || 0;
           const purchaseDeductionUpdates = Array.isArray(req.body.purchase_deduction_updates) ? req.body.purchase_deduction_updates : [];
+          const hasPurchaseLinksPayload = Array.isArray(req.body.against_purchase_links);
+          const nextPurchaseLinks = hasPurchaseLinksPayload ? req.body.against_purchase_links : null;
           const rateValue = Number(req.body.rate !== undefined ? req.body.rate : existing.rate) || 0;
           const saleQty = Number(existing.quantity || 0);
           const grossAmount = Number(existing.amount || 0);
@@ -4145,37 +4135,39 @@ router.put("/sale/:id", async (req, res) => {
           existing.tds_amount = tdsValue;
           existing.additional_amount = additionalAmountValue;
           existing.round_off = roundOffValue;
+          if (hasPurchaseLinksPayload) {
+            existing.against_purchase_enabled = nextPurchaseLinks.length ? 1 : 0;
+            existing.against_purchase_links = nextPurchaseLinks;
+            if (req.body.against_purchase_farmer_id !== undefined) {
+              existing.against_purchase_farmer_id = req.body.against_purchase_farmer_id;
+            }
+          }
           existing.net_amount = netAmount;
           existing.net_receivable_amount = netAmount;
           existing.net_amount_payable = netAmount;
           existing.outstanding = netAmount;
           const saved = await existing.save();
-          // Persist Add Amount even when the deployed SaleVoucher schema predates this field.
-          await SaleVoucher.collection.updateOne({
-            _id: existing._id,
-          }, {
-            $set: {
-              additional_amount: additionalAmountValue,
-              ...(Array.isArray(req.body.sale_deduction_manual_modes) ? {
-                sale_deduction_manual_modes: req.body.sale_deduction_manual_modes,
-              } : {}),
-            },
-          });
+          // Persist Sale Summary fields even when the deployed schema predates them.
+          const saleExtraFields = { additional_amount: additionalAmountValue };
+          if (req.body.sale_deduction_manual_modes && typeof req.body.sale_deduction_manual_modes === "object") {
+            saleExtraFields.sale_deduction_manual_modes = req.body.sale_deduction_manual_modes;
+          }
+          if (hasPurchaseLinksPayload) {
+            saleExtraFields.against_purchase_enabled = nextPurchaseLinks.length ? 1 : 0;
+            saleExtraFields.against_purchase_links = nextPurchaseLinks;
+            if (req.body.against_purchase_farmer_id !== undefined) {
+              saleExtraFields.against_purchase_farmer_id = req.body.against_purchase_farmer_id;
+            }
+          }
+          await SaleVoucher.collection.updateOne({ _id: existing._id }, { $set: saleExtraFields });
 
-          const persistedPurchaseDeductionUpdates =
-            await persistSaleSummaryPurchaseDeductionUpdates(purchaseDeductionUpdates);
-
-          const linkedPurchaseUpdatesById = new Map(
-            persistedPurchaseDeductionUpdates.map((item) => [String(item.purchase_id), item])
-          );
-
+          const persistedPurchaseDeductionUpdates = await persistSaleSummaryPurchaseDeductionUpdates(purchaseDeductionUpdates);
           if (persistedPurchaseDeductionUpdates.length) {
-            const currentLinks = Array.isArray(existing.against_purchase_links)
-              ? existing.against_purchase_links
-              : [];
+            const updateMap = new Map(persistedPurchaseDeductionUpdates.map((item) => [String(item.purchase_id), item]));
+            const currentLinks = Array.isArray(existing.against_purchase_links) ? existing.against_purchase_links : [];
             const nextLinks = currentLinks.map((link) => {
-              const purchaseId = String(link?.purchase_id || link?.id || link?._id || "");
-              const update = linkedPurchaseUpdatesById.get(purchaseId);
+              const purchaseId = String(link?.purchase_id || link?.id || link?._id || "").trim();
+              const update = updateMap.get(purchaseId);
               if (!update) return link;
               return {
                 ...link,
@@ -4190,18 +4182,12 @@ router.put("/sale/:id", async (req, res) => {
                 adjustment_amount: update.final.adjustment,
                 round_off: update.final.roundOff,
                 total_deduction: update.final.totalDeduction,
-                net_amount_payable: Math.max(
-                  Number(link?.amount || 0) - update.final.totalDeduction + update.final.roundOff,
-                  0
-                ),
+                net_amount_payable: Math.max(Number(link?.amount || 0) - update.final.totalDeduction + update.final.roundOff, 0),
                 purchase_deduction_manual_modes: update.manual_modes || {},
                 purchase_deduction_final: update.final,
               };
             });
-            await SaleVoucher.collection.updateOne(
-              { _id: existing._id },
-              { $set: { against_purchase_links: nextLinks } }
-            );
+            await SaleVoucher.collection.updateOne({ _id: existing._id }, { $set: { against_purchase_links: nextLinks } });
           }
 
           const journals = await recreateSaleDeductionJournals({
@@ -4246,6 +4232,7 @@ router.put("/sale/:id", async (req, res) => {
     const adjustmentValue = Number(req.body.adjustment_amount) || 0;
     const tdsValue = Number(req.body.tds_amount) || 0;
     const transportChargeValue = Number(req.body.transport_charge) || 0;
+    const additionalAmountValue = Number(req.body.additional_amount) || 0;
     const roundOffValue = Number(req.body.round_off) || 0;
     if (!mongoReady()) {
       return res.status(503).json({ error: "MongoDB is not connected. Sale vouchers are MongoDB-primary." });
@@ -4268,7 +4255,7 @@ router.put("/sale/:id", async (req, res) => {
     const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : mongoSale.cd_percent) || 0;
     const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : mongoSale.cd_amount) || 0;
     const totalDeductionValue = Number(req.body.total_deduction) || Number((shortageAmount + claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue).toFixed(2));
-    const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + roundOffValue;
+    const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + additionalAmountValue + roundOffValue;
     const updateDoc = {
       unloading_date: req.body.unloading_date !== undefined ? req.body.unloading_date : mongoSale.unloading_date,
       shortage_quantity: shortageQty,
@@ -4292,6 +4279,10 @@ router.put("/sale/:id", async (req, res) => {
       net_receivable_amount: netAmount,
       net_amount_payable: netAmount,
       outstanding: netAmount,
+      additional_amount: additionalAmountValue,
+      ...(req.body.sale_deduction_manual_modes && typeof req.body.sale_deduction_manual_modes === "object" ? {
+        sale_deduction_manual_modes: req.body.sale_deduction_manual_modes,
+      } : {}),
       ...(Array.isArray(req.body.against_purchase_links) ? {
         against_purchase_enabled: req.body.against_purchase_links.length ? 1 : 0,
         against_purchase_farmer_id: req.body.against_purchase_farmer_id ?? mongoSale.against_purchase_farmer_id ?? "",
@@ -4306,6 +4297,8 @@ router.put("/sale/:id", async (req, res) => {
         { $set: updateDoc },
         { new: true }
       ).lean();
+      const purchaseDeductionUpdates = Array.isArray(req.body.purchase_deduction_updates) ? req.body.purchase_deduction_updates : [];
+      await persistSaleSummaryPurchaseDeductionUpdates(purchaseDeductionUpdates);
       const journals = await recreateSaleDeductionJournals({
         sale: mongoSale,
         body: req.body,
@@ -4313,6 +4306,7 @@ router.put("/sale/:id", async (req, res) => {
         deductionAmount: otherDeductionValue + adjustmentValue,
         cdAmount: cdAmountValue,
         tdsAmount: tdsValue,
+        additionalAmount: additionalAmountValue,
       });
       return res.json({ id, updated: 1, voucher_no: updated?.voucher_no || mongoSale.voucher_no, deduction_only: true, net_amount: netAmount, net_receivable_amount: netAmount, outstanding: netAmount, shortage_quantity: shortageQty, shortage_amount: shortageAmount, journals });
     } catch (updateErr) {
@@ -7678,7 +7672,6 @@ router.get("/sale/:id/pdf", async (req, res) => {
           }
         })();
     const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.transport_charge || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
-    const additionalAmount = Number(row.additional_amount || 0) || 0;
     const directPurchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
     const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
     const profitLoss = netAmount - directPurchaseAmount;
@@ -7825,6 +7818,7 @@ router.get("/sale/:id/summary", async (req, res) => {
       lorryNo: row.lorry_no || "",
     });
     const totalDeduction = Number(row.total_deduction || 0) || Number(row.claim_amount || 0) + Number(row.other_deduction || 0) + Number(row.transport_charge || 0) + Number(row.cd_amount || 0) + Number(row.adjustment_amount || 0) + Number(row.tds_amount || 0);
+    const additionalAmount = Number(row.additional_amount || 0) || 0;
     const directPurchaseAmount = Number(row.direct_purchase_amount || hydratedPurchaseLinks.reduce((sum, item) => sum + Number(item.amount || 0), 0));
     const netAmount = Number(row.net_receivable_amount || row.net_amount_payable || row.outstanding || row.amount || 0);
     const purchaseDeductionTotal = hydratedPurchaseLinks.reduce((sum, item) => sum + Number(item.total_deduction || 0), 0);
