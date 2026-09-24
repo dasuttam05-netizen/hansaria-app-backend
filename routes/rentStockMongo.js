@@ -294,6 +294,9 @@ async function buildRentDetails({ monthList, filters }) {
       const shortageQty = calculateShortageQty(num(row.weight), slab.monthsDiff, row.shortage_percent);
       const balanceQty = num(row.weight)-shortageQty-adjustedQty;
       const balanceRentAmount = Math.max(balanceQty,0)*rentRate*slab.monthsDiff;
+      // Godown rent is calculated on the original Inward quantity.
+      // Keep all existing shortage, adjustment, dispatch-date and slab logic unchanged.
+      const inwardRentAmount = Math.max(num(row.weight),0)*rentRate*slab.monthsDiff;
       // When an outward entry exists, the report's Dispatch Date, Days and Month Slab
       // must all be based on the actual outward entry date.
       const reportReferenceDate = lastDispatchDate || monthEndDate;
@@ -307,7 +310,7 @@ async function buildRentDetails({ monthList, filters }) {
         original_weight:Number(num(row.weight).toFixed(4)), adjusted_qty:Number(adjustedQty.toFixed(4)), shortage_qty:Number(shortageQty.toFixed(4)),
         balance_qty:Number(Math.max(balanceQty,0).toFixed(4)), days_diff:reportDaysDiff, month_slab:reportSlab.monthsDiff, rent_rate:rentRate,
         adjusted_rent_amount:Number(adjustedRentAmount.toFixed(2)), balance_rent_amount:Number(balanceRentAmount.toFixed(2)),
-        rent_amount:Number((adjustedRentAmount+balanceRentAmount).toFixed(2)),
+        rent_amount:Number(inwardRentAmount.toFixed(2)),
       });
     }
   }
