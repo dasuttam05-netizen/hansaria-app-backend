@@ -9,6 +9,7 @@ const {
   Warehouse,
   Product,
   Company,
+  CompanyAccount,
   ConsigneeName,
   isMongoMirrorReady,
 } = require("../db-mongodb");
@@ -46,9 +47,28 @@ async function loadInwards(query) {
 }
 
 function grossQty(row) { return Number(row?.weight ?? row?.quantity ?? 0) || 0; }
-function shortageQty(row) { return Number(calculateShortageQty(grossQty(row), 1, row?.shortage_percent)) || 0; }
-function availableQty(row) {
-  const shortage = shortageQty(row);
+function normalizeShortagePercent(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+function effectiveShortagePercent(row, companyMap, accountMap) {
+  const inwardPercent = normalizeShortagePercent(row?.shortage_percent);
+  if (inwardPercent !== null) return inwardPercent;
+
+  const company = companyMap?.get(String(row?.company_id ?? '').trim()) || {};
+  const companyPercent = normalizeShortagePercent(company?.shortage_percent);
+  if (companyPercent !== null) return companyPercent;
+
+  const account = accountMap?.get(String(row?.company_account_id ?? '').trim()) || {};
+  const accountPercent = normalizeShortagePercent(account?.shortage_percent);
+  return accountPercent;
+}
+function shortageQty(row, shortagePercent = null) {
+  return Number(calculateShortageQty(grossQty(row), 1, shortagePercent)) || 0;
+}
+function availableQty(row, shortagePercent = null) {
+  const shortage = shortageQty(row, shortagePercent);
   if (row?.remaining_qty !== undefined && row?.remaining_qty !== null && row?.remaining_qty !== '') return Math.max(Number(row.remaining_qty) - shortage, 0);
   return Math.max(grossQty(row) - shortage - Number(row?.adjusted_qty || 0), 0);
 }
@@ -59,10 +79,10 @@ async function buildPartyStockRows(query) {
   const inwards = await loadInwards(query);
   if (!inwards.length) return [];
   const db = mongoose.connection.db;
-  const [adjustments,outwards,warehouses,products,companies] = await Promise.all([
-    db.collection('adjustments').find({}).toArray(), Outward.find({}).lean(), Warehouse.find({}).lean(), Product.find({}).lean(), Company.find({}).lean()
+  const [adjustments,outwards,warehouses,products,companies,accounts] = await Promise.all([
+    db.collection('adjustments').find({}).toArray(), Outward.find({}).lean(), Warehouse.find({}).lean(), Product.find({}).lean(), Company.find({}).lean(), CompanyAccount.find({}).lean()
   ]);
-  const outwardMap=buildAliasMap(outwards), warehouseMap=buildAliasMap(warehouses), productMap=buildAliasMap(products), companyMap=buildAliasMap(companies);
+  const outwardMap=buildAliasMap(outwards), warehouseMap=buildAliasMap(warehouses), productMap=buildAliasMap(products), companyMap=buildAliasMap(companies), accountMap=buildAliasMap(accounts);
   const adjustedByInward=new Map(), outwardDatesByInward=new Map();
   for(const adj of adjustments||[]){
     if(String(adj?.source_type||'inward').toLowerCase() !== 'inward') continue;
@@ -73,14 +93,15 @@ async function buildPartyStockRows(query) {
   }
   return inwards.map(row=>{
     const aliases=idAliases(row); let adjusted=0; for(const key of aliases){ if(adjustedByInward.has(key)){adjusted=Number(adjustedByInward.get(key)||0); break;} }
-    const gross=grossQty(row), shortage=shortageQty(row), netOpening=Math.max(gross-shortage,0);
+    const warehouse=warehouseMap.get(String(row?.warehouse_id??''))||{}, product=productMap.get(String(row?.product_id??''))||{}, company=companyMap.get(String(row?.company_id??''))||{}, account=accountMap.get(String(row?.company_account_id??''))||{};
+    const shortagePercent=effectiveShortagePercent(row, companyMap, accountMap);
+    const gross=grossQty(row), shortage=shortageQty(row, shortagePercent), netOpening=Math.max(gross-shortage,0);
     const remainingRaw=Number(row?.remaining_qty);
     const available=Number.isFinite(remainingRaw) ? Math.max(remainingRaw-shortage,0) : Math.max(netOpening-adjusted,0);
-    const warehouse=warehouseMap.get(String(row?.warehouse_id??''))||{}, product=productMap.get(String(row?.product_id??''))||{}, company=companyMap.get(String(row?.company_id??''))||{};
     const dates=aliases.flatMap(k=>outwardDatesByInward.get(k)||[]).filter(Boolean).sort((a,b)=>new Date(a)-new Date(b));
     const inwardDate=row?.date||row?.inward_date||null, outwardDate=dates.at(-1)||row?.outward_date||null;
     const daysDiff=outwardDate&&inwardDate?Math.max(0,Math.floor((new Date(outwardDate)-new Date(inwardDate))/86400000)):0;
-    return {...row, id:row?._id?String(row._id):(row?.legacy_id??row?.sl_no??row?.id), company_name:row?.company_name||company?.name||row?.company||'', company_address:row?.company_address||company?.address||company?.company_address||'', account_name:row?.company_account_name||row?.company_account||row?.account_name||'', lorry_no:row?.lorry_no||'', employee_name:row?.employee_name||'', warehouse_name:row?.warehouse_name||warehouse?.name||row?.warehouse||'', warehouse_address:row?.warehouse_address||warehouse?.address||warehouse?.warehouse_address||'', location_name:row?.location_name||row?.location||'', product_name:row?.product_name||product?.name||row?.product||'', inward_date:inwardDate, outward_date:outwardDate, days_diff:daysDiff, gross_qty:+gross.toFixed(4), shortage_qty:+shortage.toFixed(4), net_opening_qty:+netOpening.toFixed(4), already_adjusted_qty:+adjusted.toFixed(4), available_balance_qty:+available.toFixed(4)};
+    return {...row, id:row?._id?String(row._id):(row?.legacy_id??row?.sl_no??row?.id), company_name:row?.company_name||company?.name||row?.company||'', company_address:row?.company_address||company?.address||company?.company_address||'', account_name:row?.company_account_name||row?.company_account||row?.account_name||account?.account_name||'', lorry_no:row?.lorry_no||'', employee_name:row?.employee_name||'', warehouse_name:row?.warehouse_name||warehouse?.name||row?.warehouse||'', warehouse_address:row?.warehouse_address||warehouse?.address||warehouse?.warehouse_address||'', location_name:row?.location_name||row?.location||'', product_name:row?.product_name||product?.name||row?.product||'', shortage_percent:shortagePercent, inward_shortage_percent:normalizeShortagePercent(row?.shortage_percent), company_shortage_percent:normalizeShortagePercent(company?.shortage_percent), account_shortage_percent:normalizeShortagePercent(account?.shortage_percent), inward_date:inwardDate, outward_date:outwardDate, days_diff:daysDiff, gross_qty:+gross.toFixed(4), shortage_qty:+shortage.toFixed(4), net_opening_qty:+netOpening.toFixed(4), already_adjusted_qty:+adjusted.toFixed(4), available_balance_qty:+available.toFixed(4)};
   });
 }
 
