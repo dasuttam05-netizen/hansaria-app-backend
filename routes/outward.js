@@ -5,6 +5,8 @@ const XLSX = require("xlsx");
 
 const router = express.Router();
 
+const { calculateShortageQty } = require("./shortageHelper");
+
 const {
   userHasPermission,
 } = require("../middleware/auth");
