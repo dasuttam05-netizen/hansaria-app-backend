@@ -47,6 +47,13 @@ function requireMongo(res) {
   return true;
 }
 
+function normalizeGstPercent(value) {
+  if (value === "" || value === undefined || value === null) return 0;
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) return 0;
+  return Math.min(100, Math.max(0, numericValue));
+}
+
 function normalizeId(id) {
   const value = String(id || "").trim();
 
@@ -106,6 +113,9 @@ router.get("/", async (req, res) => {
 
         hsn_code:
           row?.hsn_code || "",
+
+        gst_percent:
+          normalizeGstPercent(row?.gst_percent),
       }))
     );
   } catch (err) {
@@ -152,6 +162,8 @@ router.post("/", async (req, res) => {
       req.body?.hsn_code || ""
     ).trim();
 
+    const gst_percent = normalizeGstPercent(req.body?.gst_percent);
+
     if (!name) {
       return res.status(400).json({
         error:
@@ -177,6 +189,7 @@ router.post("/", async (req, res) => {
     const product = await Product.create({
       name,
       hsn_code,
+      gst_percent,
       created_at: new Date(),
       updated_at: new Date(),
     });
@@ -241,6 +254,8 @@ router.put("/:id", async (req, res) => {
       req.body?.hsn_code || ""
     ).trim();
 
+    const gst_percent = normalizeGstPercent(req.body?.gst_percent);
+
     if (!name) {
       return res.status(400).json({
         error:
@@ -280,6 +295,7 @@ router.put("/:id", async (req, res) => {
 
     existing.name = name;
     existing.hsn_code = hsn_code;
+    existing.gst_percent = gst_percent;
     existing.updated_at = new Date();
 
     await existing.save();
