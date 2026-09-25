@@ -47,13 +47,6 @@ function requireMongo(res) {
   return true;
 }
 
-function normalizeGstPercent(value) {
-  if (value === "" || value === undefined || value === null) return 0;
-  const numericValue = Number(value);
-  if (!Number.isFinite(numericValue)) return 0;
-  return Math.min(100, Math.max(0, numericValue));
-}
-
 function normalizeId(id) {
   const value = String(id || "").trim();
 
@@ -115,7 +108,9 @@ router.get("/", async (req, res) => {
           row?.hsn_code || "",
 
         gst_percent:
-          normalizeGstPercent(row?.gst_percent),
+          Number.isFinite(Number(row?.gst_percent))
+            ? Number(row.gst_percent)
+            : 0,
       }))
     );
   } catch (err) {
@@ -162,12 +157,18 @@ router.post("/", async (req, res) => {
       req.body?.hsn_code || ""
     ).trim();
 
-    const gst_percent = normalizeGstPercent(req.body?.gst_percent);
+    const gst_percent = Number(req.body?.gst_percent ?? 0);
 
     if (!name) {
       return res.status(400).json({
         error:
           "Product name is required",
+      });
+    }
+
+    if (!Number.isFinite(gst_percent) || gst_percent < 0 || gst_percent > 100) {
+      return res.status(400).json({
+        error: "GST % must be between 0 and 100",
       });
     }
 
@@ -254,12 +255,18 @@ router.put("/:id", async (req, res) => {
       req.body?.hsn_code || ""
     ).trim();
 
-    const gst_percent = normalizeGstPercent(req.body?.gst_percent);
+    const gst_percent = Number(req.body?.gst_percent ?? 0);
 
     if (!name) {
       return res.status(400).json({
         error:
           "Product name is required",
+      });
+    }
+
+    if (!Number.isFinite(gst_percent) || gst_percent < 0 || gst_percent > 100) {
+      return res.status(400).json({
+        error: "GST % must be between 0 and 100",
       });
     }
 
