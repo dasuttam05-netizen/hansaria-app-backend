@@ -611,7 +611,7 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
   const cgstPercent = sameState ? gstPercent / 2 : 0;
   const sgstPercent = sameState ? gstPercent / 2 : 0;
   const igstPercent = hasStates && !sameState ? gstPercent : 0;
-  const gstAmount = hasStates ? Number((taxable * gstPercent / 100).toFixed(2)) : 0;
+  const gstAmount = gstPercent > 0 ? Number((taxable * gstPercent / 100).toFixed(2)) : 0;
   const cgstAmount = sameState ? Number((taxable * cgstPercent / 100).toFixed(2)) : 0;
   const sgstAmount = sameState ? Number((taxable * sgstPercent / 100).toFixed(2)) : 0;
   const igstAmount = hasStates && !sameState ? Number((taxable * igstPercent / 100).toFixed(2)) : 0;
@@ -627,7 +627,7 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
     sgst_amount: sgstAmount,
     igst_amount: igstAmount,
     gst_amount: Number((cgstAmount + sgstAmount + igstAmount || gstAmount).toFixed(2)),
-    grand_total: Number(((Number(netAmount) || 0) + (hasStates ? gstAmount : 0)).toFixed(2)),
+    grand_total: Number(((Number(netAmount) || 0) + gstAmount).toFixed(2)),
     warehouse_state: warehouseState,
     party_state: partyState,
   };
