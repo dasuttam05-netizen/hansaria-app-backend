@@ -208,13 +208,6 @@ const locationSchema =
 
     hsn_code: String,
 
-    gst_percent: {
-      type: Number,
-      default: 0,
-      min: 0,
-      max: 100,
-    },
-
     created_at: {
       type: Date,
       default: Date.now,
@@ -520,6 +513,13 @@ const productSchema =
     },
 
     hsn_code: String,
+
+    gst_percent: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
 
     created_at: {
       type: Date,
