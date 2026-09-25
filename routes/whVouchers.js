@@ -1096,11 +1096,21 @@ async function getTransportBiltiMatch({ saleId, voucherNo = "", lorryNo = "" }) 
       if (doc?.data) {
         const data = doc.data || {};
         const matchedField = Object.keys(filter).find((key) => key.startsWith("data."))?.replace("data.", "") || "sale_id";
+        const grossFreight = Number(
+          data.gross_freight ??
+          data.gross_amount ??
+          data.amount ??
+          data.total_amount ??
+          ((Number(data.outward_qty || data.dispatch_qty || data.quantity || 0) || 0) *
+            (Number(data.transport_rate || data.rate || 0) || 0))
+        ) || 0;
         return {
           ...data,
           id: doc.row_id,
           _id: doc._id,
-          transport_amount: Number(data.gross_freight || data.payable_amount || data.net_amount || 0),
+          // Sale Preview must use the Transport Bilti Gross Freight.
+          // Do not replace it with net/payable after transport deductions.
+          transport_amount: grossFreight,
           source: `mongo-mirror:${matchedField}`,
         };
       }
@@ -8027,7 +8037,13 @@ router.get("/sale/:id/summary", async (req, res) => {
       payment_details: paymentDetails,
       journal_details: journalDetails,
       additional_amount: additionalAmount,
-      transport_charge: Number(resolvedTransportRow?.gross_freight || resolvedTransportRow?.transport_amount || resolvedTransportRow?.payable_amount || resolvedTransportRow?.net_amount || 0),
+      transport_charge: Number(
+        resolvedTransportRow?.transport_amount ??
+        resolvedTransportRow?.gross_freight ??
+        resolvedTransportRow?.gross_amount ??
+        resolvedTransportRow?.amount ??
+        0
+      ),
       transport_bilti_no: resolvedTransportRow?.bilti_no || "",
       transport_bilti_id: resolvedTransportRow?.id ? String(resolvedTransportRow.id) : "",
       transport_debug: {
@@ -8036,7 +8052,13 @@ router.get("/sale/:id/summary", async (req, res) => {
         matched_sale_id: String(resolvedTransportRow?.sale_id || ""),
         matched_bilti_id: resolvedTransportRow?.id ? String(resolvedTransportRow.id) : "",
         matched_bilti_no: resolvedTransportRow?.bilti_no || "",
-        matched_payable_amount: Number(resolvedTransportRow?.gross_freight || resolvedTransportRow?.transport_amount || resolvedTransportRow?.payable_amount || resolvedTransportRow?.net_amount || 0),
+        matched_gross_freight: Number(
+          resolvedTransportRow?.transport_amount ??
+          resolvedTransportRow?.gross_freight ??
+          resolvedTransportRow?.gross_amount ??
+          resolvedTransportRow?.amount ??
+          0
+        ),
         matched_voucher_no: resolvedTransportRow?.voucher_no || "",
         matched_lorry_no: resolvedTransportRow?.lorry_no || "",
       },
