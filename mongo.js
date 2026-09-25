@@ -333,6 +333,11 @@ const productSchema =
     name: String,
 
     hsn_code: String,
+
+    gst_percent: {
+      type: Number,
+      default: 0,
+    },
   });
 
 
@@ -378,6 +383,61 @@ const purchaseVoucherSchema =
       },
 
       amount: {
+        type: Number,
+        default: 0,
+      },
+
+      gst_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      gst_type: {
+        type: String,
+        default: "",
+      },
+
+      cgst_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      sgst_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      igst_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      taxable_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      cgst_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      sgst_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      igst_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      gst_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      grand_total: {
         type: Number,
         default: 0,
       },
@@ -603,6 +663,61 @@ const saleVoucherSchema =
       },
 
       amount: {
+        type: Number,
+        default: 0,
+      },
+
+      gst_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      gst_type: {
+        type: String,
+        default: "",
+      },
+
+      cgst_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      sgst_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      igst_percent: {
+        type: Number,
+        default: 0,
+      },
+
+      taxable_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      cgst_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      sgst_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      igst_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      gst_amount: {
+        type: Number,
+        default: 0,
+      },
+
+      grand_total: {
         type: Number,
         default: 0,
       },
