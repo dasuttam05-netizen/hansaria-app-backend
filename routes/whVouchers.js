@@ -612,6 +612,9 @@ function purchaseNetPayableFromRow(row = {}) {
 }
 
 function buildSalePayload(body, voucherNo) {
+  const manualDeductionValues = body?.manual_deduction_values && typeof body.manual_deduction_values === "object"
+    ? body.manual_deduction_values
+    : null;
   const purchaseLinks = Array.isArray(body.against_purchase_links)
     ? body.against_purchase_links
         .map((item) => {
@@ -719,6 +722,14 @@ function buildSalePayload(body, voucherNo) {
     const value = Number(body[field]);
     payload[field] = Number.isFinite(value) ? value : 0;
   });
+
+  if (manualDeductionValues) {
+    ["claim_amount", "other_deduction", "transport_charge", "tds_amount", "adjustment_amount", "round_off"].forEach((field) => {
+      if (manualDeductionValues[field] !== null && manualDeductionValues[field] !== undefined && Number.isFinite(Number(manualDeductionValues[field]))) {
+        payload[field] = Number(manualDeductionValues[field]);
+      }
+    });
+  }
 
   const dueFields = resolveSaleDueFields(body);
   payload.due_date = dueFields.due_date;
@@ -4092,11 +4103,20 @@ router.put("/sale/:id", async (req, res) => {
           const existing = await SaleVoucher.findById(id);
           if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
           const dueFields = resolveSaleDueFields(req.body, existing);
-          const manualClaimValue = Number(req.body.claim_amount !== undefined ? req.body.claim_amount : existing.claim_amount) || 0;
-          const adjustmentValue = Number(req.body.adjustment_amount !== undefined ? req.body.adjustment_amount : existing.adjustment_amount) || 0;
-          const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
-          const roundOffValue = Number(req.body.round_off !== undefined ? req.body.round_off : existing.round_off) || 0;
-          const transportChargeValue = Number(req.body.transport_charge !== undefined ? req.body.transport_charge : existing.transport_charge) || 0;
+          const manualDeductionValues = req.body?.manual_deduction_values && typeof req.body.manual_deduction_values === "object"
+            ? req.body.manual_deduction_values
+            : null;
+          const pickManualOrBody = (field, fallback) => {
+            if (manualDeductionValues && manualDeductionValues[field] !== null && manualDeductionValues[field] !== undefined && Number.isFinite(Number(manualDeductionValues[field]))) {
+              return Number(manualDeductionValues[field]);
+            }
+            return Number(req.body[field] !== undefined ? req.body[field] : fallback) || 0;
+          };
+          const manualClaimValue = pickManualOrBody("claim_amount", existing.claim_amount);
+          const adjustmentValue = pickManualOrBody("adjustment_amount", existing.adjustment_amount);
+          const tdsValue = pickManualOrBody("tds_amount", existing.tds_amount);
+          const roundOffValue = pickManualOrBody("round_off", existing.round_off);
+          const transportChargeValue = pickManualOrBody("transport_charge", existing.transport_charge);
           const additionalAmountValue = Number(req.body.additional_amount !== undefined ? req.body.additional_amount : existing.additional_amount) || 0;
           const purchaseDeductionUpdates = Array.isArray(req.body.purchase_deduction_updates) ? req.body.purchase_deduction_updates : [];
           const hasPurchaseLinksPayload = Array.isArray(req.body.against_purchase_links);
@@ -4109,8 +4129,8 @@ router.put("/sale/:id", async (req, res) => {
           const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
           const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
 
-          const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : 0;
-          const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
+          const claimValue = (manualDeductionValues && manualDeductionValues.claim_amount !== null && manualDeductionValues.claim_amount !== undefined) || req.body.claim_amount !== undefined ? manualClaimValue : 0;
+          const otherDeductionValue = pickManualOrBody("other_deduction", existing.other_deduction);
           const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
           const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
 
