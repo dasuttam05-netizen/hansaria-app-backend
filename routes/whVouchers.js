@@ -502,6 +502,137 @@ function getSaleVoucherRows(req, res) {
 
 const mongoReady = () => mongoose.connection.readyState === 1;
 
+function normalizeGstPercent(value) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue) || numericValue <= 0) return 0;
+  return Math.min(100, numericValue);
+}
+
+function normalizeGstState(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[.\-_]+/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+async function findFarmerForGst(farmerId) {
+  const rawId = String(farmerId || "").trim();
+  if (!rawId) return null;
+  if (mongoose.Types.ObjectId.isValid(rawId)) {
+    return Farmer.findById(rawId).select("state gst_no").lean();
+  }
+  if (Number.isFinite(Number(rawId))) {
+    return Farmer.findOne({
+      $or: [
+        { id: Number(rawId) },
+        { legacy_id: Number(rawId) },
+      ],
+    }).select("state gst_no").lean();
+  }
+  return null;
+}
+
+async function findWarehouseForGst(warehouseId) {
+  const rawId = String(warehouseId || "").trim();
+  if (!rawId) return null;
+  if (mongoose.Types.ObjectId.isValid(rawId)) {
+    return Warehouse.findById(rawId).select("state").lean();
+  }
+  if (Number.isFinite(Number(rawId))) {
+    return Warehouse.findOne({
+      $or: [
+        { id: Number(rawId) },
+        { legacy_id: Number(rawId) },
+      ],
+    }).select("state").lean();
+  }
+  return null;
+}
+
+async function findProductForGst(productId) {
+  const rawId = String(productId || "").trim();
+  if (!rawId) return null;
+  if (mongoose.Types.ObjectId.isValid(rawId)) {
+    return Product.findById(rawId).select("gst_percent").lean();
+  }
+  if (Number.isFinite(Number(rawId))) {
+    return Product.findOne({
+      $or: [
+        { id: Number(rawId) },
+        { legacy_id: Number(rawId) },
+      ],
+    }).select("gst_percent").lean();
+  }
+  return null;
+}
+
+async function findPartyForSaleGst(partyId, consigneeId) {
+  const resolveDedicated = async (kind, rawId) => {
+    const value = String(rawId || "").trim();
+    if (!value) return null;
+    const filters = [];
+    if (mongoose.Types.ObjectId.isValid(value)) filters.push({ _id: value });
+    if (Number.isFinite(Number(value))) {
+      filters.push({ id: Number(value) }, { legacy_id: Number(value) });
+    }
+    if (!filters.length) return null;
+    const rows = await findDedicatedPartyDocs(kind, { $or: filters }, "state gst_no name");
+    return rows?.[0] || null;
+  };
+
+  return (await resolveDedicated("consignee", consigneeId)) || (await resolveDedicated("buyer", partyId));
+}
+
+async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 0, netAmount = 0 }) {
+  let gstPercent = normalizeGstPercent(payload.gst_percent);
+  if (payload.product_id) {
+    const product = await findProductForGst(payload.product_id).catch(() => null);
+    if (product && product.gst_percent !== undefined && product.gst_percent !== null) {
+      gstPercent = normalizeGstPercent(product.gst_percent);
+    }
+  }
+
+  const warehouse = await findWarehouseForGst(payload.warehouse_id).catch(() => null);
+  const warehouseState = normalizeGstState(warehouse?.state || payload.warehouse_state);
+
+  let party = null;
+  if (type === "purchase") {
+    party = await findFarmerForGst(payload.farmer_id).catch(() => null);
+  } else {
+    party = await findPartyForSaleGst(payload.buyer_id || payload.company_id, payload.consignee_id);
+  }
+  const partyState = normalizeGstState(party?.state || payload.party_state);
+
+  const taxable = Number(taxableAmount) || 0;
+  const hasStates = Boolean(warehouseState && partyState);
+  const sameState = hasStates && warehouseState === partyState;
+  const gstType = !gstPercent ? "" : !hasStates ? "STATE NOT SET" : sameState ? "CGST + SGST" : "IGST";
+  const cgstPercent = sameState ? gstPercent / 2 : 0;
+  const sgstPercent = sameState ? gstPercent / 2 : 0;
+  const igstPercent = hasStates && !sameState ? gstPercent : 0;
+  const gstAmount = hasStates ? Number((taxable * gstPercent / 100).toFixed(2)) : 0;
+  const cgstAmount = sameState ? Number((taxable * cgstPercent / 100).toFixed(2)) : 0;
+  const sgstAmount = sameState ? Number((taxable * sgstPercent / 100).toFixed(2)) : 0;
+  const igstAmount = hasStates && !sameState ? Number((taxable * igstPercent / 100).toFixed(2)) : 0;
+
+  return {
+    gst_percent: Number(gstPercent.toFixed(4)),
+    gst_type: gstType,
+    cgst_percent: Number(cgstPercent.toFixed(4)),
+    sgst_percent: Number(sgstPercent.toFixed(4)),
+    igst_percent: Number(igstPercent.toFixed(4)),
+    taxable_amount: Number(taxable.toFixed(2)),
+    cgst_amount: cgstAmount,
+    sgst_amount: sgstAmount,
+    igst_amount: igstAmount,
+    gst_amount: Number((cgstAmount + sgstAmount + igstAmount || gstAmount).toFixed(2)),
+    grand_total: Number(((Number(netAmount) || 0) + (hasStates ? gstAmount : 0)).toFixed(2)),
+    warehouse_state: warehouseState,
+    party_state: partyState,
+  };
+}
+
 const numberFields = [
   "quantity",
   "rate",
@@ -531,9 +662,19 @@ const numberFields = [
   "total_deduction",
   "round_off",
   "net_amount_payable",
+  "gst_percent",
+  "cgst_percent",
+  "sgst_percent",
+  "igst_percent",
+  "taxable_amount",
+  "cgst_amount",
+  "sgst_amount",
+  "igst_amount",
+  "gst_amount",
+  "grand_total",
 ];
 
-function buildPurchasePayload(body, voucherNo) {
+async function buildPurchasePayload(body, voucherNo) {
   const payload = {
     voucher_no: voucherNo || body.voucher_no,
     date: body.date,
@@ -558,6 +699,14 @@ function buildPurchasePayload(body, voucherNo) {
   payload.net_amount_payable = netPayable;
   payload.outstanding = netPayable;
   payload.total_deduction = purchaseDeductionTotalFromRow(payload);
+
+  const gst = await resolveWarehouseTradingGst({
+    type: "purchase",
+    payload,
+    taxableAmount: purchaseGrossAmountFromRow(payload),
+    netAmount: purchaseNetPayableFromRow(payload),
+  });
+  Object.assign(payload, gst);
 
   return payload;
 }
@@ -611,10 +760,7 @@ function purchaseNetPayableFromRow(row = {}) {
   return Number(Math.max(gross - deduction + roundOff, 0).toFixed(2));
 }
 
-function buildSalePayload(body, voucherNo) {
-  const manualDeductionValues = body?.manual_deduction_values && typeof body.manual_deduction_values === "object"
-    ? body.manual_deduction_values
-    : null;
+async function buildSalePayload(body, voucherNo) {
   const purchaseLinks = Array.isArray(body.against_purchase_links)
     ? body.against_purchase_links
         .map((item) => {
@@ -723,14 +869,6 @@ function buildSalePayload(body, voucherNo) {
     payload[field] = Number.isFinite(value) ? value : 0;
   });
 
-  if (manualDeductionValues) {
-    ["claim_amount", "other_deduction", "transport_charge", "tds_amount", "adjustment_amount", "round_off"].forEach((field) => {
-      if (manualDeductionValues[field] !== null && manualDeductionValues[field] !== undefined && Number.isFinite(Number(manualDeductionValues[field]))) {
-        payload[field] = Number(manualDeductionValues[field]);
-      }
-    });
-  }
-
   const dueFields = resolveSaleDueFields(body);
   payload.due_date = dueFields.due_date;
   payload.due_days = dueFields.due_days;
@@ -756,6 +894,14 @@ function buildSalePayload(body, voucherNo) {
   if (payload.sale_type === "direct") {
     payload.direct_purchase_amount = Number((qtyForFifo * payload.direct_purchase_rate).toFixed(2));
   }
+
+  const gst = await resolveWarehouseTradingGst({
+    type: "sale",
+    payload,
+    taxableAmount: grossAmount,
+    netAmount,
+  });
+  Object.assign(payload, gst);
 
   return payload;
 }
@@ -791,6 +937,13 @@ async function createDirectSalePurchaseVoucher(salePayload) {
       consigneeName = String(consignee?.name || "").trim();
     }
   }
+  const directPurchaseGst = await resolveWarehouseTradingGst({
+    type: "purchase",
+    payload: { ...salePayload, farmer_id: farmerId },
+    taxableAmount: amount,
+    netAmount: amount,
+  });
+
   const doc = await PurchaseVoucher.create({
     voucher_no: purchaseVoucherNo,
     date: salePayload.date,
@@ -808,6 +961,7 @@ async function createDirectSalePurchaseVoucher(salePayload) {
     net_weight: qty,
     total_qty: qty,
     net_amount_payable: amount,
+    ...directPurchaseGst,
     description: `Auto direct sale purchase against ${salePayload.voucher_no || "sale"}`,
   });
 
@@ -2360,7 +2514,7 @@ function validatePaymentAdjustments({ farmerId, warehouseId, amount, adjustments
         let purchase = null;
         if (ors.length) {
           purchase = await PurchaseVoucher.findOne({ $or: ors })
-            .select("_id id voucher_no farmer_id warehouse_id company_account_id total_qty net_weight quantity rate claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable amount")
+            .select("_id id voucher_no farmer_id warehouse_id company_account_id total_qty net_weight quantity rate claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable amount gst_percent gst_type cgst_percent sgst_percent igst_percent taxable_amount cgst_amount sgst_amount igst_amount gst_amount grand_total")
             .lean();
         }
 
@@ -3424,7 +3578,7 @@ router.post("/purchase", (req, res) => {
     return createVoucherNoIfMissing("purchase", voucher_no, async (err, generatedVoucherNo) => {
       if (err) return res.status(500).json({ error: err.message });
       try {
-        const payload = buildPurchasePayload(req.body, generatedVoucherNo);
+        const payload = await buildPurchasePayload(req.body, generatedVoucherNo);
         const doc = await PurchaseVoucher.create(payload);
         const deductionDetails = buildPurchaseDeductionDetails(req.body);
         await PurchaseVoucher.collection.updateOne(
@@ -4047,7 +4201,7 @@ router.post("/sale", (req, res) => {
     return createVoucherNoIfMissing("sale", voucher_no, async (err, generatedVoucherNo) => {
       if (err) return res.status(500).json({ error: err.message });
       try {
-        const payload = buildSalePayload(req.body, generatedVoucherNo);
+        const payload = await buildSalePayload(req.body, generatedVoucherNo);
         const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
         if (!isDirectSale) {
           const availableQty = await getAvailableSaleStock({
@@ -4103,20 +4257,11 @@ router.put("/sale/:id", async (req, res) => {
           const existing = await SaleVoucher.findById(id);
           if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
           const dueFields = resolveSaleDueFields(req.body, existing);
-          const manualDeductionValues = req.body?.manual_deduction_values && typeof req.body.manual_deduction_values === "object"
-            ? req.body.manual_deduction_values
-            : null;
-          const pickManualOrBody = (field, fallback) => {
-            if (manualDeductionValues && manualDeductionValues[field] !== null && manualDeductionValues[field] !== undefined && Number.isFinite(Number(manualDeductionValues[field]))) {
-              return Number(manualDeductionValues[field]);
-            }
-            return Number(req.body[field] !== undefined ? req.body[field] : fallback) || 0;
-          };
-          const manualClaimValue = pickManualOrBody("claim_amount", existing.claim_amount);
-          const adjustmentValue = pickManualOrBody("adjustment_amount", existing.adjustment_amount);
-          const tdsValue = pickManualOrBody("tds_amount", existing.tds_amount);
-          const roundOffValue = pickManualOrBody("round_off", existing.round_off);
-          const transportChargeValue = pickManualOrBody("transport_charge", existing.transport_charge);
+          const manualClaimValue = Number(req.body.claim_amount !== undefined ? req.body.claim_amount : existing.claim_amount) || 0;
+          const adjustmentValue = Number(req.body.adjustment_amount !== undefined ? req.body.adjustment_amount : existing.adjustment_amount) || 0;
+          const tdsValue = Number(req.body.tds_amount !== undefined ? req.body.tds_amount : existing.tds_amount) || 0;
+          const roundOffValue = Number(req.body.round_off !== undefined ? req.body.round_off : existing.round_off) || 0;
+          const transportChargeValue = Number(req.body.transport_charge !== undefined ? req.body.transport_charge : existing.transport_charge) || 0;
           const additionalAmountValue = Number(req.body.additional_amount !== undefined ? req.body.additional_amount : existing.additional_amount) || 0;
           const purchaseDeductionUpdates = Array.isArray(req.body.purchase_deduction_updates) ? req.body.purchase_deduction_updates : [];
           const hasPurchaseLinksPayload = Array.isArray(req.body.against_purchase_links);
@@ -4129,8 +4274,8 @@ router.put("/sale/:id", async (req, res) => {
           const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
           const shortageAmount = Number(((Number(req.body.shortage_amount) || shortageQty * rateValue) || 0).toFixed(2));
 
-          const claimValue = (manualDeductionValues && manualDeductionValues.claim_amount !== null && manualDeductionValues.claim_amount !== undefined) || req.body.claim_amount !== undefined ? manualClaimValue : 0;
-          const otherDeductionValue = pickManualOrBody("other_deduction", existing.other_deduction);
+          const claimValue = req.body.claim_amount !== undefined ? manualClaimValue : 0;
+          const otherDeductionValue = Number(req.body.other_deduction !== undefined ? req.body.other_deduction : existing.other_deduction) || 0;
           const cdPercentValue = Number(req.body.cd_percent !== undefined ? req.body.cd_percent : existing.cd_percent) || 0;
           const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : existing.cd_amount) || 0;
 
@@ -4226,7 +4371,7 @@ router.put("/sale/:id", async (req, res) => {
         }
         if (!req.body?.company_account_id) return res.status(400).json({ error: "Account is required for sale voucher" });
         if (!req.body?.product_id) return res.status(400).json({ error: "Product is required for sale voucher" });
-        const payload = buildSalePayload(req.body);
+        const payload = await buildSalePayload(req.body);
         const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
         if (payload.sale_type !== "direct") {
           const availableQty = await getAvailableSaleStock({
@@ -4279,6 +4424,12 @@ router.put("/sale/:id", async (req, res) => {
     const cdAmountValue = Number(req.body.cd_amount !== undefined ? req.body.cd_amount : mongoSale.cd_amount) || 0;
     const totalDeductionValue = Number(req.body.total_deduction) || Number((shortageAmount + claimValue + otherDeductionValue + transportChargeValue + cdAmountValue + adjustmentValue + tdsValue).toFixed(2));
     const netAmount = grossAmount - shortageAmount - claimValue - otherDeductionValue - transportChargeValue - cdAmountValue - adjustmentValue - tdsValue + additionalAmountValue + roundOffValue;
+    const gst = await resolveWarehouseTradingGst({
+      type: "sale",
+      payload: { ...mongoSale, ...req.body },
+      taxableAmount: grossAmount,
+      netAmount,
+    });
     const updateDoc = {
       unloading_date: req.body.unloading_date !== undefined ? req.body.unloading_date : mongoSale.unloading_date,
       shortage_quantity: shortageQty,
@@ -4303,6 +4454,7 @@ router.put("/sale/:id", async (req, res) => {
       net_amount_payable: netAmount,
       outstanding: netAmount,
       additional_amount: additionalAmountValue,
+      ...gst,
       ...(req.body.sale_deduction_manual_modes && typeof req.body.sale_deduction_manual_modes === "object" ? {
         sale_deduction_manual_modes: req.body.sale_deduction_manual_modes,
       } : {}),
@@ -4513,7 +4665,7 @@ router.get("/payment/:id", async (req, res) => {
       ...new Set((adjustments || []).map((row) => String(row.purchase_id || "")).filter(Boolean)),
     ];
 
-    const purchaseSelect = "_id id voucher_no date farmer_id farmer_name warehouse_id warehouse_name company_account_id company_account_name product_id product_name total_qty total_quantity net_weight quantity rate gross_weight tare_weight gross_amount total_amount amount claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable net_amount description bill_no lorry_no moisture less_bags_weight dunki fungus discolour others deduction_details";
+    const purchaseSelect = "_id id voucher_no date farmer_id farmer_name warehouse_id warehouse_name company_account_id company_account_name product_id product_name total_qty total_quantity net_weight quantity rate gross_weight tare_weight gross_amount total_amount amount claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable net_amount description bill_no lorry_no moisture less_bags_weight dunki fungus discolour others deduction_details gst_percent gst_type cgst_percent sgst_percent igst_percent taxable_amount cgst_amount sgst_amount igst_amount gst_amount grand_total";
     const purchaseMap = new Map();
     if (PurchaseVoucher) {
       const or = [];
@@ -4672,7 +4824,7 @@ router.get("/payment/:id/pdf", async (req, res) => {
         or.push({ bill_no: { $regex: `^\\s*${escaped}\\s*$`, $options: "i" } });
       }
       const rows = await PurchaseVoucher.find({ $or: or })
-        .select("_id id voucher_no bill_no date farmer_name warehouse_name company_account_name product_name product total_qty total_quantity net_weight quantity rate amount gross_amount total_amount claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable net_amount lorry_no lorry_number vehicle_no unit qty_unit description")
+        .select("_id id voucher_no bill_no date farmer_name warehouse_name company_account_name product_name product total_qty total_quantity net_weight quantity rate amount gross_amount total_amount claim_amount bags_claim labour transport_charge cd_amount tds_amount other_deduction adjustment_amount total_deduction round_off net_amount_payable net_amount lorry_no lorry_number vehicle_no unit qty_unit description gst_percent gst_type cgst_percent sgst_percent igst_percent taxable_amount cgst_amount sgst_amount igst_amount gst_amount grand_total")
         .lean();
       purchases.push(...rows);
     }
@@ -7906,7 +8058,7 @@ router.get("/sale/:id/summary", async (req, res) => {
 });
 
 // Update purchase voucher
-router.put("/purchase/:id", (req, res) => {
+router.put("/purchase/:id", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.purchase.edit")) {
     return res.status(403).json({ error: "Permission denied" });
   }
@@ -7922,7 +8074,7 @@ router.put("/purchase/:id", (req, res) => {
   if (!ensureWarehouseAccess(req, res, warehouse_id)) return;
 
   if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
-    const payload = buildPurchasePayload(req.body, voucher_no);
+    const payload = await buildPurchasePayload(req.body, voucher_no);
     return PurchaseVoucher.findByIdAndUpdate(id, payload, { new: true })
       .then(async (doc) => {
         if (!doc) return res.status(404).json({ error: "Voucher not found" });
@@ -7947,6 +8099,7 @@ router.put("/purchase/:id", (req, res) => {
         packet, gross_weight, tare_weight, dhalta, less_bags_weight, moisture, dunki, fungus,
         discolour, others, net_weight, bags_claim, labour, total_deduct_amount, total_qty,
         total_deduction, round_off, net_amount_payable, employee_id, location_id, description,
+        gst_percent, gst_type, cgst_percent, sgst_percent, igst_percent, taxable_amount, cgst_amount, sgst_amount, igst_amount, gst_amount, grand_total,
       },
     }
   )
