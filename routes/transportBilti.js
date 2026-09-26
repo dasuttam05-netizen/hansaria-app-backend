@@ -2204,24 +2204,24 @@ router.post(
       let doc;
 
       if (existing) {
-        doc =
-          await TransportBiltiOperational.findById(
-            existing._id
-          );
+        // Always update the exact Mongo document that was opened from Report.
+        // This avoids an old/duplicate legacy id causing the edit to appear
+        // successful in the form while Report continues showing the old row.
+        const updated =
+          await TransportBiltiOperational.findOneAndUpdate(
+            { _id: existing._id },
+            { $set: payload },
+            { new: true, runValidators: false }
+          ).lean();
 
-        if (!doc) {
+        if (!updated) {
           return res.status(404).json({
             error:
               "Bilti not found",
           });
         }
 
-        Object.assign(
-          doc,
-          payload
-        );
-
-        await doc.save();
+        doc = updated;
       } else {
         doc =
           await TransportBiltiOperational.create(
