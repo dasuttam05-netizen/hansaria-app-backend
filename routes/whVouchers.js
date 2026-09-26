@@ -1090,17 +1090,15 @@ async function getTransportBiltiMatch({ saleId, voucherNo = "", lorryNo = "" }) 
 
   const normalize = (value) => String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
   const amountFromTransport = (row = {}) => {
-    // Transport Report's Gross Freight is the amount required by Sale Preview.
-    // Prefer gross fields before payable/net fields so a zero/blank payable
-    // field cannot hide the actual transport freight.
-    const grossCandidates = [
-      row.gross_freight,
-      row.gross_amount,
-      row.gross_amt,
-      row.total_amount,
-      row.amount,
+    // Sale Summary must use the Transport Report/Bilti Net Amount.
+    // Gross Freight remains available separately in the Transport Report.
+    const netCandidates = [
+      row.net_amount,
+      row.payable_amount,
+      row.payable,
+      row.net_payable,
     ];
-    for (const value of grossCandidates) {
+    for (const value of netCandidates) {
       const n = Number(value);
       if (Number.isFinite(n) && n > 0) return n;
     }
@@ -1111,7 +1109,14 @@ async function getTransportBiltiMatch({ saleId, voucherNo = "", lorryNo = "" }) 
       return Number((qty * rate).toFixed(2));
     }
 
-    for (const value of [row.payable_amount, row.net_amount, row.payable, row.net_payable]) {
+    const grossCandidates = [
+      row.gross_freight,
+      row.gross_amount,
+      row.gross_amt,
+      row.total_amount,
+      row.amount,
+    ];
+    for (const value of grossCandidates) {
       const n = Number(value);
       if (Number.isFinite(n) && n > 0) return n;
     }
