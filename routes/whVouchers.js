@@ -2337,6 +2337,29 @@ function paymentImportRowsFromSheet(buffer) {
   return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
 }
 
+function saleImportTemplateBuffer() {
+  const headers = [
+    "Date", "Voucher No", "Sale Type", "Warehouse", "Buyer", "Account",
+    "Farmer", "Consignee", "Product", "Employee", "Location", "Lorry No",
+    "P.O No", "Quantity", "Unloading Qty", "Rate", "Amount", "Packet",
+    "Gross Wt", "Tare Wt", "Net Wt", "Shortage Qty", "Moistur", "Dunki",
+    "Fungas", "Disclour", "Others", "Bags Claim", "Other Deduction",
+    "Transport Charge", "CD %", "CD Amount", "Adjustment Amount", "TDS Amount",
+    "Round Off", "Additional Amount", "Unloading Date", "Due Days", "Narration"
+  ];
+  const sample = [
+    new Date().toISOString().slice(0, 10), "", "warehouse", "Hemtobat Warehouse",
+    "Hemtobat Pvt Ltd", "Agri Rise Pvt Ltd", "", "", "Maize", "Subrajyoti Mondal",
+    "Hemtobat Hub", "WB00A0000", "", 30, 30, 19900, 597000, 0, 0, 0, 30, 0,
+    0, 0, 0, 0, 0, 245, 0, 0, 0, 0, 0, 0, 0, 0, "", "", ""
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
+  ws["!cols"] = headers.map(() => ({ wch: 18 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Sale Import");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
 function purchaseImportTemplateBuffer() {
   const headers = [
     "Date",
@@ -3499,6 +3522,178 @@ router.get("/receipt/import-template", (req, res) => {
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", 'attachment; filename="receipt_voucher_import_format.xlsx"');
   res.send(buffer);
+});
+
+router.get("/sale/import-template", (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.view")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const buffer = saleImportTemplateBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", 'attachment; filename="sale_voucher_import_format.xlsx"');
+  res.send(buffer);
+});
+
+router.post("/sale/import-xlsx", upload.single("file"), async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is not connected. Sale import saves data in MongoDB." });
+  }
+  if (!req.file?.buffer) {
+    return res.status(400).json({ error: "Please upload an Excel file" });
+  }
+
+  try {
+    const rows = purchaseImportRowsFromSheet(req.file.buffer);
+    if (!rows.length) return res.status(400).json({ error: "No rows found in Excel file" });
+
+    const [warehouses, companies, farmers, products, accounts, employees, locations, consignees] = await Promise.all([
+      Warehouse.find({}).lean(),
+      Company.find({}).lean(),
+      Farmer.find({}).lean(),
+      Product.find({}).lean(),
+      CompanyAccount.find({}).lean(),
+      Employee.find({}).lean(),
+      Location.find({}).lean(),
+      Consignee.find({}).lean(),
+    ]);
+
+    const warehouseMap = buildImportMap(warehouses, ["name"]);
+    const companyMap = buildImportMap(companies, ["name"]);
+    const farmerMap = buildImportMap(farmers, ["name", "mobile", "phone", "farmer_no", "farmer_number"]);
+    const productMap = buildImportMap(products, ["name"]);
+    const accountMap = buildImportMap(accounts, ["account_name", "name"]);
+    const employeeMap = buildImportMap(employees, ["name", "mobile", "phone"]);
+    const locationMap = buildImportMap(locations, ["name"]);
+    const consigneeMap = buildImportMap(consignees, ["name"]);
+
+    const imported = [];
+    const errors = [];
+
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const rowNo = index + 2;
+      try {
+        const date = excelDateToIso(firstValue(row, ["Date", "date"]));
+        const saleType = String(firstValue(row, ["Sale Type", "sale_type"]) || "warehouse").trim().toLowerCase() === "direct" ? "direct" : "warehouse";
+        const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse", "Warehouse Name", "warehouse", "warehouse_id"]));
+        const company = resolveByNameOrId(companyMap, firstValue(row, ["Buyer", "Buyer Name", "Company", "buyer", "buyer_id", "company_id"]));
+        const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Farmer Name", "Party", "farmer", "farmer_id"]));
+        const product = resolveByNameOrId(productMap, firstValue(row, ["Product", "Product Name", "product", "product_id"]));
+        const account = resolveByNameOrId(accountMap, firstValue(row, ["Account", "Account Name", "company_account", "company_account_id"]));
+        const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee", "Employee Name", "employee", "employee_id"]));
+        const location = resolveByNameOrId(locationMap, firstValue(row, ["Location", "location", "location_id"]));
+        const consignee = resolveByNameOrId(consigneeMap, firstValue(row, ["Consignee", "Consignee Name", "consignee", "consignee_id"]));
+
+        const missing = [];
+        if (!date) missing.push("Date");
+        if (!warehouse) missing.push("Warehouse");
+        if (!account) missing.push("Account");
+        if (!product) missing.push("Product");
+        if (saleType === "direct") {
+          if (!farmer) missing.push("Farmer");
+          if (!location) missing.push("Location");
+          if (!consignee) missing.push("Consignee");
+        }
+        if (!company) missing.push("Buyer");
+        if (missing.length) {
+          errors.push({ row: rowNo, error: `Missing/invalid: ${missing.join(", ")}` });
+          continue;
+        }
+        if (!canAccessWarehouse(req.user, warehouse._id)) {
+          errors.push({ row: rowNo, error: `No access to warehouse: ${warehouse.name || warehouse._id}` });
+          continue;
+        }
+
+        const number = (names) => importNumber(firstValue(row, names));
+        const quantity = number(["Quantity", "quantity"]);
+        const unloadingQty = number(["Unloading Qty", "Unloading Quantity", "unloading_qty"]);
+        const rate = number(["Rate", "rate"]);
+        const amountCell = firstValue(row, ["Amount", "amount"]);
+        const amount = amountCell === "" || amountCell == null ? Number(((unloadingQty || quantity) * rate).toFixed(2)) : number(["Amount", "amount"]);
+        const payload = await buildSalePayload({
+          voucher_no: String(firstValue(row, ["Voucher No", "Voucher", "voucher_no"]) || "").trim(),
+          date,
+          unloading_date: excelDateToIso(firstValue(row, ["Unloading Date", "unloading_date"])),
+          sale_type: saleType,
+          warehouse_id: String(warehouse._id),
+          buyer_id: String(company._id),
+          company_id: String(company._id),
+          farmer_id: farmer ? String(farmer._id) : "",
+          company_account_id: String(account._id),
+          consignee_id: consignee ? String(consignee._id) : "",
+          po_no: String(firstValue(row, ["P.O No", "PO No", "po_no"]) || ""),
+          lorry_no: String(firstValue(row, ["Lorry No", "Lorry", "lorry_no"]) || ""),
+          product_id: String(product._id),
+          employee_id: employee ? String(employee._id) : "",
+          location_id: location ? String(location._id) : "",
+          quantity,
+          unloading_qty: unloadingQty || quantity,
+          rate,
+          amount,
+          packet: number(["Packet", "packet"]),
+          gross_weight: number(["Gross Wt", "Gross Weight", "gross_weight"]),
+          tare_weight: number(["Tare Wt", "Tare Weight", "Tear Weight", "tare_weight"]),
+          net_weight: number(["Net Wt", "Net Weight", "net_weight"]),
+          shortage_quantity: number(["Shortage Qty", "Shortage Quantity", "shortage_quantity"]),
+          moisture: number(["Moistur", "Moisture", "moisture"]),
+          dunki: number(["Dunki", "dunki"]),
+          fungus: number(["Fungas", "Fungus", "fungas", "fungus"]),
+          discolour: number(["Disclour", "Discolour", "discolour"]),
+          others: number(["Others", "others"]),
+          bags_claim: number(["Bags Claim", "Claim", "bags_claim", "claim_amount"]),
+          claim_amount: number(["Bags Claim", "Claim", "claim_amount", "bags_claim"]),
+          other_deduction: number(["Other Deduction", "Deduction", "other_deduction"]),
+          transport_charge: number(["Transport Charge", "transport_charge"]),
+          cd_percent: number(["CD %", "CD Percent", "cd_percent"]),
+          cd_amount: number(["CD Amount", "cd_amount"]),
+          adjustment_amount: number(["Adjustment Amount", "adjustment_amount"]),
+          tds_amount: number(["TDS Amount", "tds_amount"]),
+          round_off: number(["Round Off", "round_off"]),
+          additional_amount: number(["Additional Amount", "additional_amount"]),
+          due_days: number(["Due Days", "due_days"]),
+          due_date: excelDateToIso(firstValue(row, ["Due Date", "due_date"])),
+          description: String(firstValue(row, ["Narration", "Description", "description"]) || ""),
+        }, null);
+
+        const existingVoucherNo = payload.voucher_no;
+        await new Promise((resolve, reject) => {
+          createVoucherNoIfMissing("sale", existingVoucherNo, (err, generated) => {
+            if (err) return reject(err);
+            payload.voucher_no = generated;
+            resolve();
+          });
+        });
+
+        if (saleType !== "direct") {
+          const availableQty = await getAvailableSaleStock({
+            warehouseId: payload.warehouse_id,
+            productId: payload.product_id,
+          });
+          const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
+          if (saleQty > availableQty + 0.0001) {
+            throw new Error(`Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}`);
+          }
+        } else {
+          const directPurchase = await createDirectSalePurchaseVoucher(payload);
+          payload.against_purchase_enabled = Boolean(directPurchase);
+          payload.against_purchase_farmer_id = directPurchase?.farmer_id || payload.against_purchase_farmer_id || "";
+          payload.against_purchase_links = directPurchase ? [directPurchase] : [];
+        }
+
+        const doc = await SaleVoucher.create(payload);
+        imported.push({ row: rowNo, id: String(doc._id), voucher_no: doc.voucher_no });
+      } catch (err) {
+        errors.push({ row: rowNo, error: err?.message || "Sale import failed" });
+      }
+    }
+
+    return res.json({ imported: imported.length, failed: errors.length, rows: imported, errors });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 router.post("/purchase/import-xlsx", upload.single("file"), async (req, res) => {
