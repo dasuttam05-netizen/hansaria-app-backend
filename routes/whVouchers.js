@@ -62,6 +62,17 @@ const {
   JournalVoucher: MongoJournalVoucher,
 } = require("../db-mongodb");
 
+// Transport Report is maintained outside Warehouse Trading. In the deployed
+// backend its saved Bilti rows are available through the operational model.
+// Keep this optional so Warehouse Trading still starts if that module is not
+// present in an older deployment.
+let TransportBiltiOperational = null;
+try {
+  ({ TransportBiltiOperational } = require("../mongoOperationalModels"));
+} catch (err) {
+  TransportBiltiOperational = null;
+}
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 // STEP 9: Buyer/Consignee are dedicated MongoDB collections. Some older
@@ -611,7 +622,7 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
   const cgstPercent = sameState ? gstPercent / 2 : 0;
   const sgstPercent = sameState ? gstPercent / 2 : 0;
   const igstPercent = hasStates && !sameState ? gstPercent : 0;
-  const gstAmount = gstPercent > 0 ? Number((taxable * gstPercent / 100).toFixed(2)) : 0;
+  const gstAmount = hasStates ? Number((taxable * gstPercent / 100).toFixed(2)) : 0;
   const cgstAmount = sameState ? Number((taxable * cgstPercent / 100).toFixed(2)) : 0;
   const sgstAmount = sameState ? Number((taxable * sgstPercent / 100).toFixed(2)) : 0;
   const igstAmount = hasStates && !sameState ? Number((taxable * igstPercent / 100).toFixed(2)) : 0;
@@ -627,7 +638,7 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
     sgst_amount: sgstAmount,
     igst_amount: igstAmount,
     gst_amount: Number((cgstAmount + sgstAmount + igstAmount || gstAmount).toFixed(2)),
-    grand_total: Number(((Number(netAmount) || 0) + gstAmount).toFixed(2)),
+    grand_total: Number(((Number(netAmount) || 0) + (hasStates ? gstAmount : 0)).toFixed(2)),
     warehouse_state: warehouseState,
     party_state: partyState,
   };
@@ -1077,43 +1088,121 @@ async function getTransportBiltiMatch({ saleId, voucherNo = "", lorryNo = "" }) 
   const voucherNoText = String(voucherNo || "").trim();
   const lorryNoText = String(lorryNo || "").trim();
 
+  const normalize = (value) => String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  const amountFromTransport = (row = {}) => {
+    // Transport Report's Gross Freight is the amount required by Sale Preview.
+    // Prefer gross fields before payable/net fields so a zero/blank payable
+    // field cannot hide the actual transport freight.
+    const grossCandidates = [
+      row.gross_freight,
+      row.gross_amount,
+      row.gross_amt,
+      row.total_amount,
+      row.amount,
+    ];
+    for (const value of grossCandidates) {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+
+    const qty = Number(row.outward_qty ?? row.dispatch_qty ?? row.quantity ?? row.qty ?? 0);
+    const rate = Number(row.transport_rate ?? row.rate ?? row.freight_rate ?? 0);
+    if (Number.isFinite(qty) && Number.isFinite(rate) && qty > 0 && rate > 0) {
+      return Number((qty * rate).toFixed(2));
+    }
+
+    for (const value of [row.payable_amount, row.net_amount, row.payable, row.net_payable]) {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return 0;
+  };
+
+  const decorate = (doc, source) => {
+    if (!doc) return null;
+    const row = doc.data ? { ...doc.data } : { ...doc };
+    return {
+      ...row,
+      id: doc.row_id ?? doc.legacy_id ?? doc.id ?? String(doc._id || ""),
+      _id: doc._id,
+      transport_amount: amountFromTransport(row),
+      source,
+    };
+  };
+
+  // 1) Live Transport Report operational collection. Match the same sale by
+  // voucher number + lorry first; fall back to sale_id and then lorry/voucher.
+  if (mongoose.connection?.db && TransportBiltiOperational) {
+    try {
+      const exactFilters = [];
+      if (voucherNoText && lorryNoText) {
+        exactFilters.push({ voucher_no: voucherNoText, lorry_no: lorryNoText });
+        exactFilters.push({ bill_no: voucherNoText, lorry_no: lorryNoText });
+      }
+      if (saleIdText) {
+        exactFilters.push({ sale_id: saleIdText });
+        if (/^\d+$/.test(saleIdText)) exactFilters.push({ sale_id: Number(saleIdText) });
+      }
+      if (voucherNoText) exactFilters.push({ voucher_no: voucherNoText });
+      if (lorryNoText) exactFilters.push({ lorry_no: lorryNoText });
+
+      for (const filter of exactFilters) {
+        const doc = await TransportBiltiOperational.findOne(filter)
+          .sort({ updated_at: -1, _id: -1 })
+          .lean();
+        if (doc) return decorate(doc, `transport-operational:${Object.keys(filter).join("+")}`);
+      }
+    } catch (err) {
+      console.warn("Operational transport lookup skipped:", err.message);
+    }
+  }
+
+  // 2) Direct collection fallback. This also handles deployments where the
+  // Transport module writes to MongoDB but the operational model is not
+  // exported by mongoOperationalModels.js.
+  if (mongoose.connection?.db) {
+    const collectionNames = ["transportbilti", "transport_bilti", "transport_biltis"];
+    const filters = [];
+    if (voucherNoText && lorryNoText) {
+      filters.push({ voucher_no: voucherNoText, lorry_no: lorryNoText });
+      filters.push({ bill_no: voucherNoText, lorry_no: lorryNoText });
+    }
+    if (voucherNoText) filters.push({ voucher_no: voucherNoText }, { bill_no: voucherNoText });
+    if (lorryNoText) filters.push({ lorry_no: lorryNoText });
+    if (saleIdText) filters.push({ sale_id: saleIdText });
+
+    for (const collectionName of collectionNames) {
+      try {
+        const exists = await mongoose.connection.db.listCollections({ name: collectionName }).hasNext();
+        if (!exists) continue;
+        for (const filter of filters) {
+          const doc = await mongoose.connection.db.collection(collectionName)
+            .findOne(filter, { sort: { updated_at: -1, _id: -1 } });
+          if (doc) return decorate(doc, `mongo:${collectionName}:${Object.keys(filter).join("+")}`);
+        }
+      } catch (err) {
+        console.warn(`Transport collection lookup skipped (${collectionName}):`, err.message);
+      }
+    }
+  }
+
+  // 3) Legacy mirror fallback.
   if (mongoose.connection?.db && MirrorRow) {
     const mongoFilters = [];
+    if (voucherNoText && lorryNoText) {
+      mongoFilters.push({ "data.voucher_no": voucherNoText, "data.lorry_no": lorryNoText });
+    }
     if (saleIdText) {
       mongoFilters.push({ "data.sale_id": saleIdText }, { "data.sale_id": Number(saleIdText) });
     }
-    if (voucherNoText) {
-      mongoFilters.push({ "data.voucher_no": voucherNoText });
-    }
-    if (lorryNoText) {
-      mongoFilters.push({ "data.lorry_no": lorryNoText });
-    }
+    if (voucherNoText) mongoFilters.push({ "data.voucher_no": voucherNoText });
+    if (lorryNoText) mongoFilters.push({ "data.lorry_no": lorryNoText });
 
     for (const filter of mongoFilters) {
       const doc = await MirrorRow.findOne({ table: "transport_bilti", ...filter })
         .sort({ updated_at: -1, row_id: -1 })
         .lean();
-      if (doc?.data) {
-        const data = doc.data || {};
-        const matchedField = Object.keys(filter).find((key) => key.startsWith("data."))?.replace("data.", "") || "sale_id";
-        const grossFreight = Number(
-          data.gross_freight ??
-          data.gross_amount ??
-          data.amount ??
-          data.total_amount ??
-          ((Number(data.outward_qty || data.dispatch_qty || data.quantity || 0) || 0) *
-            (Number(data.transport_rate || data.rate || 0) || 0))
-        ) || 0;
-        return {
-          ...data,
-          id: doc.row_id,
-          _id: doc._id,
-          // Sale Preview must use the Transport Bilti Gross Freight.
-          // Do not replace it with net/payable after transport deductions.
-          transport_amount: grossFreight,
-          source: `mongo-mirror:${matchedField}`,
-        };
-      }
+      if (doc?.data) return decorate(doc, `mongo-mirror:${Object.keys(filter).join("+")}`);
     }
   }
 
@@ -8037,13 +8126,7 @@ router.get("/sale/:id/summary", async (req, res) => {
       payment_details: paymentDetails,
       journal_details: journalDetails,
       additional_amount: additionalAmount,
-      transport_charge: Number(
-        resolvedTransportRow?.transport_amount ??
-        resolvedTransportRow?.gross_freight ??
-        resolvedTransportRow?.gross_amount ??
-        resolvedTransportRow?.amount ??
-        0
-      ),
+      transport_charge: Number(resolvedTransportRow?.transport_amount || resolvedTransportRow?.payable_amount || resolvedTransportRow?.net_amount || resolvedTransportRow?.gross_freight || 0),
       transport_bilti_no: resolvedTransportRow?.bilti_no || "",
       transport_bilti_id: resolvedTransportRow?.id ? String(resolvedTransportRow.id) : "",
       transport_debug: {
@@ -8052,13 +8135,7 @@ router.get("/sale/:id/summary", async (req, res) => {
         matched_sale_id: String(resolvedTransportRow?.sale_id || ""),
         matched_bilti_id: resolvedTransportRow?.id ? String(resolvedTransportRow.id) : "",
         matched_bilti_no: resolvedTransportRow?.bilti_no || "",
-        matched_gross_freight: Number(
-          resolvedTransportRow?.transport_amount ??
-          resolvedTransportRow?.gross_freight ??
-          resolvedTransportRow?.gross_amount ??
-          resolvedTransportRow?.amount ??
-          0
-        ),
+        matched_payable_amount: Number(resolvedTransportRow?.transport_amount || resolvedTransportRow?.payable_amount || resolvedTransportRow?.net_amount || resolvedTransportRow?.gross_freight || 0),
         matched_voucher_no: resolvedTransportRow?.voucher_no || "",
         matched_lorry_no: resolvedTransportRow?.lorry_no || "",
       },
