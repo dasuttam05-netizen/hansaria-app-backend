@@ -2262,6 +2262,16 @@ router.post(
 
         source:
           "mongodb",
+
+        saved_values: {
+          detain_amount: Number(doc.detain_amount || 0),
+          others_exp: Number(doc.others_exp || 0),
+          advance_amount: Number(doc.advance_amount || 0),
+          tds_percent: Number(doc.tds_percent || 0),
+          gross_freight: Number(doc.gross_freight || 0),
+          net_amount: Number(doc.net_amount || 0),
+          payable_amount: Number(doc.payable_amount || 0),
+        },
       });
     } catch (err) {
       console.error(
