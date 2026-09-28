@@ -7467,8 +7467,15 @@ router.get("/report/profit-loss", async (req, res) => {
             id: row.warehouse_id,
             warehouse_id: row.warehouse_id,
             warehouse_name: row.warehouse_name || "",
-            sale_amount: 0,
+            purchase_qty: 0,
             purchase_amount: 0,
+            purchase_rate: 0,
+            sale_qty: 0,
+            sale_amount: 0,
+            sale_rate: 0,
+            gross_amount: 0,
+            additional_amount: 0,
+            total_less: 0,
             profit_loss: 0,
           });
         }
@@ -7478,18 +7485,60 @@ router.get("/report/profit-loss", async (req, res) => {
       };
       purchases.forEach((row) => {
         const item = ensure(row);
-        item.purchase_amount += Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+        const qty = Number(row.total_qty || row.net_weight || row.quantity || 0);
+        const amount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
+        item.purchase_qty += qty;
+        item.purchase_amount += amount;
+        if (qty > 0) item.purchase_rate = ((item.purchase_rate * Math.max(item.purchase_qty - qty, 0)) + amount) / item.purchase_qty;
       });
       sales.forEach((row) => {
         const item = ensure(row);
-        item.sale_amount += Number(row.amount || row.total_amount || 0);
+        const qty = Number(row.quantity || row.total_quantity || row.unloading_qty || 0);
+        const gross = Number(row.amount || row.total_amount || 0);
+        const purchaseLinks = Array.isArray(row.against_purchase_links) ? row.against_purchase_links : [];
+        const purchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, link) => sum + Number(link?.amount || 0), 0) || 0);
+        item.sale_qty += qty;
+        item.sale_amount += Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || gross || 0);
+        item.gross_amount += gross;
+        item.additional_amount += Number(row.additional_amount || 0);
+        item.total_less += Number(row.total_deduction || 0);
+        if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
+        item.purchase_amount += purchaseAmount;
       });
-      return res.json(Array.from(rows.values()).map((row) => ({
+      const output = Array.from(rows.values()).map((row) => ({
         ...row,
-        sale_amount: Number(row.sale_amount.toFixed(2)),
+        purchase_qty: Number(row.purchase_qty.toFixed(4)),
+        purchase_rate: Number((row.purchase_rate || 0).toFixed(2)),
         purchase_amount: Number(row.purchase_amount.toFixed(2)),
+        sale_qty: Number(row.sale_qty.toFixed(4)),
+        sale_rate: Number((row.sale_rate || 0).toFixed(2)),
+        sale_amount: Number(row.sale_amount.toFixed(2)),
+        gross_amount: Number(row.gross_amount.toFixed(2)),
+        additional_amount: Number(row.additional_amount.toFixed(2)),
+        total_less: Number(row.total_less.toFixed(2)),
         profit_loss: Number((row.sale_amount - row.purchase_amount).toFixed(2)),
-      })));
+      }));
+      if (String(req.query.export || "").toLowerCase() === "xlsx") {
+        const exportRows = output.map((row) => ({
+          Warehouse: row.warehouse_name,
+          "Purchase Qty": row.purchase_qty,
+          "Purchase Rate": row.purchase_rate,
+          "Purchase Amount": row.purchase_amount,
+          "Sale Qty": row.sale_qty,
+          "Sale Rate": row.sale_rate,
+          "Gross Amount": row.gross_amount,
+          "Total Add": row.additional_amount,
+          "Total Less": row.total_less,
+          "Profit_Loss": row.profit_loss,
+        }));
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportRows), "Profit Loss");
+        const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", 'attachment; filename="warehouse_profit_loss.xlsx"');
+        return res.end(buffer);
+      }
+      return res.json(output);
     }
 
     if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for direct profit/loss report" });
@@ -7512,33 +7561,80 @@ router.get("/report/profit-loss", async (req, res) => {
       ] }];
     }
 
-    const total = await SaleVoucher.countDocuments(filter);
-    const rows = await SaleVoucher.find(filter)
-      .sort({ date: -1, createdAt: -1, _id: -1 })
-      .skip((page - 1) * pageSize)
-      .limit(pageSize)
-      .lean();
+    const exportMode = String(req.query.export || "").toLowerCase() === "xlsx";
+    const total = exportMode ? await SaleVoucher.countDocuments(filter) : await SaleVoucher.countDocuments(filter);
+    const baseQuery = SaleVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 });
+    const rows = exportMode ? await baseQuery.lean() : await baseQuery.skip((page - 1) * pageSize).limit(pageSize).lean();
     const decorated = await decorateSaleRows(rows);
     const reportRows = decorated.map((row) => {
       const grossAmount = Number(row.amount || row.total_amount || 0);
       const netPayable = Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || grossAmount || 0);
-      const linkedPurchaseAmount = Array.isArray(row.against_purchase_links)
-        ? row.against_purchase_links.reduce((sum, item) => sum + Number(item?.amount || 0), 0)
-        : 0;
-      const purchaseAmount = Number(row.direct_purchase_amount || linkedPurchaseAmount || (Number(row.direct_purchase_rate || 0) * Number(row.quantity || row.total_quantity || 0)) || 0);
+      const purchaseLinks = Array.isArray(row.against_purchase_links) ? row.against_purchase_links : [];
+      const purchaseQty = purchaseLinks.reduce((sum, item) => sum + Number(item?.quantity || item?.weight || 0), 0) || Number(row.total_qty || row.quantity || row.unloading_qty || 0);
+      const linkedPurchaseAmount = purchaseLinks.reduce((sum, item) => sum + Number(item?.amount || 0), 0);
+      const purchaseAmount = Number(row.direct_purchase_amount || linkedPurchaseAmount || (Number(row.direct_purchase_rate || 0) * purchaseQty) || 0);
+      const purchaseRate = purchaseQty > 0 ? purchaseAmount / purchaseQty : Number(row.direct_purchase_rate || 0);
+      const saleQty = Number(row.quantity || row.total_quantity || row.unloading_qty || 0);
+      const totalLess = Number(row.total_deduction || (grossAmount + Number(row.additional_amount || 0) - Number(row.round_off || 0) - netPayable) || 0);
       return {
         ...row,
         date: row.date || "",
+        id: row.id || String(row._id || ""),
         farmer_name: row.farmer_name || row.against_purchase_farmer_name || "-",
         buyer_name: row.buyer_name || row.company_name || row.party_name || "-",
         consignee_name: row.consignee_name || "-",
         lorry_no: row.lorry_no || "-",
-        quantity: Number(row.quantity || row.total_quantity || row.unloading_qty || 0),
-        sale_amount: Number(netPayable.toFixed(2)),
+        quantity: saleQty,
+        purchase_qty: Number(purchaseQty.toFixed(4)),
+        purchase_rate: Number(purchaseRate.toFixed(2)),
         purchase_amount: Number(purchaseAmount.toFixed(2)),
+        sale_rate: Number(row.rate || 0),
+        gross_amount: Number(grossAmount.toFixed(2)),
+        sale_amount: Number(netPayable.toFixed(2)),
+        additional_amount: Number(row.additional_amount || 0),
+        total_less: Number(totalLess.toFixed(2)),
         profit_loss: Number((netPayable - purchaseAmount).toFixed(2)),
       };
     });
+
+    if (exportMode) {
+      const exportRows = reportRows.map((row) => ({
+        Date: row.date,
+        "Sale Invoice No": row.voucher_no || row.bill_no || "",
+        Farmer: row.farmer_name,
+        Buyer: row.buyer_name,
+        Consignee: row.consignee_name,
+        "Purchase Qty": row.purchase_qty,
+        "Purchase Rate": row.purchase_rate,
+        "Purchase Amount": row.purchase_amount,
+        "Sale Qty": row.quantity,
+        "Sale Rate": row.sale_rate,
+        "Gross Amount": row.gross_amount,
+        "Total Add": row.additional_amount,
+        "Claim": Number(row.claim_amount || 0),
+        "Shortage": Number(row.shortage_amount || 0),
+        "Moisture": Number(row.moisture || 0),
+        "Dunki": Number(row.dunki || 0),
+        "Fungus": Number(row.fungus || 0),
+        "Discolour": Number(row.discolour || 0),
+        "Others": Number(row.others || 0),
+        "Other Deduction": Number(row.other_deduction || 0),
+        "CD": Number(row.cd_amount || 0),
+        "Adjustment": Number(row.adjustment_amount || 0),
+        "Transport": Number(row.transport_charge || 0),
+        "TDS": Number(row.tds_amount || 0),
+        "Total Less": row.total_less,
+        "Round Off": Number(row.round_off || 0),
+        "Net Sale Amount": row.sale_amount,
+        "Profit / Loss": row.profit_loss,
+      }));
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportRows), "Profit Loss");
+      const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", 'attachment; filename="warehouse_profit_loss.xlsx"');
+      return res.end(buffer);
+    }
 
     return res.json({
       data: reportRows,
