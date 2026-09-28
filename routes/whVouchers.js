@@ -7439,7 +7439,7 @@ router.get("/report/purchase-summary", async (req, res) => {
 });
 
 
-async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, consigneeId, farmerId }) {
+async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, consigneeId, farmerId, buyerName, consigneeName, farmerName }) {
   const isWarehouse = mode === "warehouse";
   const doc = new PDFDocument({ size: "A4", layout: "landscape", margin: 24, bufferPages: true });
   const pageWidth = doc.page.width;
@@ -7447,18 +7447,33 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const left = 24;
   const right = 24;
   const tableWidth = pageWidth - left - right;
-  const headerFill = "#123b6d";
-  const headerDark = "#0b2d4d";
+
+  // Keep the earlier report colour family: teal + dark teal, with a clean
+  // light summary panel. P/L cells use semantic green/red only.
+  const headerFill = "#117a72";
+  const headerDark = "#0d6660";
   const border = "#cbd5e1";
   const muted = "#475569";
-  const soft = "#f5f8fc";
-  const totalFill = "#eaf4ff";
+  const soft = "#f7fbfb";
+  const totalFill = "#ecfdf5";
   const textColor = "#0f172a";
+  const profitFill = "#dcfce7";
+  const profitBorder = "#16a34a";
+  const lossFill = "#fee2e2";
+  const lossBorder = "#dc2626";
+
   const fmt = (value, decimals = 2) => {
     const num = Number(value || 0);
     return Number.isFinite(num) ? num.toFixed(decimals) : (0).toFixed(decimals);
   };
   const safeText = (value) => String(value ?? "-").trim() || "-";
+  const formatDate = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return "-";
+    const datePart = raw.includes("T") ? raw.split("T")[0] : raw.slice(0, 10);
+    const match = datePart.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    return match ? `${match[3]}/${match[2]}/${match[1]}` : raw;
+  };
 
   const totalPurchaseQty = rows.reduce((sum, row) => sum + Number(row.purchase_qty || 0), 0);
   const totalSaleQty = rows.reduce((sum, row) => sum + Number(row.quantity ?? row.sale_qty ?? 0), 0);
@@ -7474,22 +7489,31 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   doc.pipe(res);
 
   const title = isWarehouse ? "PROFIT / LOSS — WAREHOUSE WISE" : "PROFIT / LOSS — DIRECT LOADING";
-  const subtitle = [
-    fromDate || toDate ? `Period: ${fromDate || "Beginning"} to ${toDate || "Today"}` : "Period: All Dates",
-    buyerId ? `Buyer Filter: ${buyerId}` : "Buyer: All",
-    consigneeId ? `Consignee: ${consigneeId}` : "Consignee: All",
-    farmerId ? `Farmer: ${farmerId}` : "Farmer: All",
-  ].join("    •    ");
+  const dateLabel = fromDate || toDate
+    ? `${formatDate(fromDate) || "Beginning"} - ${formatDate(toDate) || "Today"}`
+    : "All Dates";
+  const buyerRow = buyerId ? rows.find((row) => String(row?.buyer_id || row?.company_id || "") === String(buyerId)) : null;
+  const consigneeRow = consigneeId ? rows.find((row) => String(row?.consignee_id || "") === String(consigneeId)) : null;
+  const farmerRow = farmerId ? rows.find((row) => String(row?.farmer_id || "") === String(farmerId)) : null;
+  const buyerLabel = buyerName || buyerRow?.buyer_name || buyerRow?.company_name || (buyerId ? String(buyerId) : "All");
+  const consigneeLabel = consigneeName || consigneeRow?.consignee_name || (consigneeId ? String(consigneeId) : "All");
+  const farmerLabel = farmerName || farmerRow?.farmer_name || (farmerId ? String(farmerId) : "All");
 
   const drawPageTitle = () => {
-    doc.roundedRect(left, 22, tableWidth, 54, 8).fill(headerFill);
-    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(16).text(title, left + 14, 31, { width: tableWidth - 28, lineBreak: false });
-    doc.font("Helvetica").fontSize(7.6).fillColor("#dbeafe").text(subtitle, left + 14, 53, { width: tableWidth - 28, lineBreak: false });
+    // Main title banner: same teal family as the earlier design.
+    doc.roundedRect(left, 20, tableWidth, 62, 9).fill(headerFill);
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(17)
+      .text(title, left + 14, 29, { width: tableWidth - 28, lineBreak: false });
+
+    // Filters directly under the title, laid out cleanly for readability.
+    doc.font("Helvetica").fontSize(8.2).fillColor("#dff7f4")
+      .text(`Period: ${dateLabel}`, left + 14, 55, { width: 150, lineBreak: false });
+    doc.text(`Buyer: ${buyerLabel}`, left + 170, 55, { width: 210, lineBreak: false });
+    doc.text(`Consignee: ${consigneeLabel}`, left + 385, 55, { width: 220, lineBreak: false });
+    doc.text(`Farmer: ${farmerLabel}`, left + 610, 55, { width: tableWidth - 624, lineBreak: false });
     doc.fillColor(textColor);
   };
 
-  // Keep the report focused on the requested business fields. Purchase/Sale
-  // quantities remain visible in TOTAL SUMMARY below the table.
   const directCols = [
     ["Date", 52],
     ["Sale Inv", 72],
@@ -7510,15 +7534,15 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const scale = tableWidth / rawWidthTotal;
   const widths = cols.map(([label, width]) => [label, width * scale]);
   let y = 0;
-  const headerHeight = 25;
+  const headerHeight = 28;
   const minRowHeight = 28;
 
   const drawHeader = () => {
     let x = left;
     doc.roundedRect(left, y, tableWidth, headerHeight, 5).fill(headerDark);
-    doc.font("Helvetica-Bold").fontSize(7.2).fillColor("#ffffff");
+    doc.font("Helvetica-Bold").fontSize(7.6).fillColor("#ffffff");
     widths.forEach(([label, width]) => {
-      doc.text(label, x + 4, y + 8, { width: width - 8, align: "left", lineBreak: false });
+      doc.text(label, x + 5, y + 9, { width: width - 10, align: "left", lineBreak: false });
       x += width;
     });
     doc.fillColor(textColor);
@@ -7527,46 +7551,64 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
 
   const valueHeight = (value, width, fontSize = 7) => {
     doc.font("Helvetica").fontSize(fontSize);
-    return doc.heightOfString(safeText(value), { width: Math.max(width - 8, 10), lineGap: 0.5 });
+    return doc.heightOfString(safeText(value), { width: Math.max(width - 10, 10), lineGap: 0.7 });
   };
 
   const drawRow = (values, isTotal = false) => {
-    const rowHeights = values.map((value, index) => valueHeight(value, widths[index][1], 6.6));
-    const rowHeight = Math.max(minRowHeight, Math.ceil(Math.max(...rowHeights) + 10));
+    const rowHeights = values.map((value, index) => valueHeight(value, widths[index][1], 7.1));
+    const rowHeight = Math.max(minRowHeight, Math.ceil(Math.max(...rowHeights) + 12));
 
-    if (y + rowHeight > pageHeight - 72) {
+    if (y + rowHeight > pageHeight - 80) {
       doc.addPage({ size: "A4", layout: "landscape", margin: 24 });
       drawPageTitle();
-      y = 88;
+      y = 94;
       drawHeader();
     }
 
-    let x = left;
-    doc.fillColor(isTotal ? totalFill : (Math.floor((y - 88 - headerHeight) / minRowHeight) % 2 === 0 ? "#ffffff" : soft));
+    const stripe = Math.floor((y - 94 - headerHeight) / minRowHeight) % 2 === 0;
+    doc.fillColor(isTotal ? totalFill : (stripe ? "#ffffff" : soft));
     doc.rect(left, y, tableWidth, rowHeight).fill();
-    doc.strokeColor(border).lineWidth(0.25);
+    doc.strokeColor(border).lineWidth(0.35);
     doc.rect(left, y, tableWidth, rowHeight).stroke();
 
+    let x = left;
     values.forEach((value, index) => {
       const width = widths[index][1];
-      const isNumeric = isWarehouse ? index >= 1 : index >= 5;
-      doc.font("Helvetica").fontSize(6.6).fillColor(textColor);
-      doc.text(safeText(value), x + 4, y + 6, {
-        width: width - 8,
-        align: isNumeric ? "right" : "left",
-        lineGap: 0.5,
-      });
+      const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 5);
+      const numericStartIndex = isWarehouse ? 1 : 5;
+      const isNumeric = index >= numericStartIndex;
+      const numericValue = Number(value);
+
+      if (isProfitColumn && Number.isFinite(numericValue)) {
+        const isProfit = numericValue > 0;
+        const isLoss = numericValue < 0;
+        if (isProfit || isLoss) {
+          doc.fillColor(isProfit ? profitFill : lossFill);
+          doc.roundedRect(x + 2, y + 2, width - 4, rowHeight - 4, 4).fill();
+          doc.strokeColor(isProfit ? profitBorder : lossBorder).lineWidth(0.8);
+          doc.roundedRect(x + 2, y + 2, width - 4, rowHeight - 4, 4).stroke();
+        }
+      }
+
+      doc.font("Helvetica").fontSize(7.1)
+        .fillColor(isProfitColumn && numericValue > 0 ? profitBorder : isProfitColumn && numericValue < 0 ? lossBorder : textColor)
+        .text(safeText(value), x + 5, y + 7, {
+          width: width - 10,
+          align: isNumeric ? "right" : "left",
+          lineGap: 0.7,
+        });
       x += width;
     });
     y += rowHeight;
   };
 
   drawPageTitle();
-  y = 88;
+  y = 94;
   drawHeader();
 
   if (!rows.length) {
-    doc.font("Helvetica").fontSize(10).fillColor(muted).text("No Profit / Loss data available for the selected filters.", left, y + 18);
+    doc.font("Helvetica").fontSize(10).fillColor(muted)
+      .text("No Profit / Loss data available for the selected filters.", left, y + 18);
   } else {
     for (const row of rows) {
       if (isWarehouse) {
@@ -7580,7 +7622,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
         ]);
       } else {
         drawRow([
-          row.date ? String(row.date).slice(0, 10) : "-",
+          formatDate(row.date),
           row.voucher_no || row.bill_no || "-",
           row.farmer_name || "-",
           row.buyer_name || "-",
@@ -7594,38 +7636,65 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
       }
     }
 
-    if (y + 104 > pageHeight - 24) {
+    // Total summary is always directly below the last report row.
+    if (y + 116 > pageHeight - 24) {
       doc.addPage({ size: "A4", layout: "landscape", margin: 24 });
       drawPageTitle();
-      y = 88;
+      y = 94;
     }
-    y += 10;
-    const summaryHeight = isWarehouse ? 58 : 78;
-    doc.roundedRect(left, y, tableWidth, summaryHeight, 8).fill(totalFill).stroke(border);
-    doc.fillColor(headerDark).font("Helvetica-Bold").fontSize(9.4).text("TOTAL SUMMARY", left + 12, y + 9);
-    doc.font("Helvetica-Bold").fontSize(8).fillColor(textColor);
 
+    y += 8;
     const summary = isWarehouse
       ? [
-          ["Total Purchase Qty", fmt(totalPurchaseQty, 4)], ["Total Sale Qty", fmt(totalSaleQty, 4)],
-          ["Total Purchase Amount", fmt(totalPurchaseAmount)], ["Total S.Amount", fmt(totalGrossAmount)],
-          ["Total Add", fmt(totalAdd)], ["Total Less", fmt(totalLess)], ["Total Profit / Loss", fmt(totalProfitLoss)],
+          ["Total Purchase Qty", fmt(totalPurchaseQty, 4)],
+          ["Total Sale Qty", fmt(totalSaleQty, 4)],
+          ["Total Purchase Amount", fmt(totalPurchaseAmount)],
+          ["Total S.Amount", fmt(totalGrossAmount)],
+          ["Total Add", fmt(totalAdd)],
+          ["Total Less", fmt(totalLess)],
+          ["Total Profit / Loss", fmt(totalProfitLoss)],
         ]
       : [
-          ["Total Purchase Qty", fmt(totalPurchaseQty, 4)], ["Total Sale Qty", fmt(totalSaleQty, 4)],
-          ["Total Purchase Amount", fmt(totalPurchaseAmount)], ["Total S.Amount", fmt(totalGrossAmount)],
-          ["Total Add", fmt(totalAdd)], ["Total Less", fmt(totalLess)], ["Total Net Sale", fmt(totalNetSale)],
+          ["Total Purchase Qty", fmt(totalPurchaseQty, 4)],
+          ["Total Sale Qty", fmt(totalSaleQty, 4)],
+          ["Total Purchase Amount", fmt(totalPurchaseAmount)],
+          ["Total S.Amount", fmt(totalGrossAmount)],
+          ["Total Add", fmt(totalAdd)],
+          ["Total Less", fmt(totalLess)],
+          ["Total Net Sale", fmt(totalNetSale)],
           ["Total Profit / Loss", fmt(totalProfitLoss)],
         ];
+
+    const summaryRows = Math.ceil(summary.length / 4);
+    const summaryHeight = 34 + summaryRows * 28;
+    doc.roundedRect(left, y, tableWidth, summaryHeight, 9).fill(totalFill);
+    doc.strokeColor(border).lineWidth(0.5).roundedRect(left, y, tableWidth, summaryHeight, 9).stroke();
+    doc.fillColor(headerDark).font("Helvetica-Bold").fontSize(10).text("TOTAL SUMMARY", left + 12, y + 9);
 
     const boxWidth = (tableWidth - 24) / 4;
     summary.forEach(([label, value], index) => {
       const col = index % 4;
       const rowIndex = Math.floor(index / 4);
       const sx = left + 12 + col * boxWidth;
-      const sy = y + 25 + rowIndex * 25;
-      doc.font("Helvetica").fontSize(6.2).fillColor(muted).text(label, sx, sy, { width: boxWidth - 8, lineBreak: false });
-      doc.font("Helvetica-Bold").fontSize(8.2).fillColor(textColor).text(value, sx, sy + 7, { width: boxWidth - 8, lineBreak: false });
+      const sy = y + 28 + rowIndex * 28;
+      const isProfitSummary = label === "Total Profit / Loss";
+      const profitNumber = Number(value);
+
+      if (isProfitSummary && Number.isFinite(profitNumber)) {
+        const isProfit = profitNumber > 0;
+        const isLoss = profitNumber < 0;
+        if (isProfit || isLoss) {
+          doc.fillColor(isProfit ? profitFill : lossFill);
+          doc.strokeColor(isProfit ? profitBorder : lossBorder).lineWidth(0.9);
+          doc.roundedRect(sx - 4, sy - 4, boxWidth - 8, 25, 5).fillAndStroke();
+        }
+      }
+
+      doc.font("Helvetica").fontSize(6.5).fillColor(muted)
+        .text(label, sx, sy, { width: boxWidth - 8, lineBreak: false });
+      doc.font("Helvetica-Bold").fontSize(8.6)
+        .fillColor(isProfitSummary && profitNumber > 0 ? profitBorder : isProfitSummary && profitNumber < 0 ? lossBorder : textColor)
+        .text(value, sx, sy + 9, { width: boxWidth - 8, lineBreak: false });
     });
   }
 
