@@ -7438,6 +7438,185 @@ router.get("/report/purchase-summary", async (req, res) => {
   return res.status(503).json({ error: "MongoDB is required for purchase summary" });
 });
 
+
+async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, consigneeId, farmerId }) {
+  const isWarehouse = mode === "warehouse";
+  const doc = new PDFDocument({ size: "A4", layout: "landscape", margin: 24, bufferPages: true });
+  const pageWidth = doc.page.width;
+  const pageHeight = doc.page.height;
+  const left = 24;
+  const right = 24;
+  const tableWidth = pageWidth - left - right;
+  const headerFill = "#0f766e";
+  const headerDark = "#115e59";
+  const border = "#cbd5e1";
+  const muted = "#475569";
+  const soft = "#f1f5f9";
+  const totalFill = "#ecfdf5";
+  const textColor = "#0f172a";
+  const fmt = (value, decimals = 2) => {
+    const num = Number(value || 0);
+    return Number.isFinite(num) ? num.toFixed(decimals) : (0).toFixed(decimals);
+  };
+  const safeText = (value) => String(value ?? "-").trim() || "-";
+  const fit = (value, width, fontSize = 6.8) => {
+    const raw = safeText(value);
+    doc.fontSize(fontSize);
+    if (doc.widthOfString(raw) <= width - 6) return raw;
+    let out = raw;
+    while (out.length > 3 && doc.widthOfString(`${out.slice(0, -3)}...`) > width - 6) out = out.slice(0, -1);
+    return `${out.slice(0, -3)}...`;
+  };
+
+  const totalPurchaseQty = rows.reduce((sum, row) => sum + Number(row.purchase_qty || 0), 0);
+  const totalSaleQty = rows.reduce((sum, row) => sum + Number(row.quantity ?? row.sale_qty ?? 0), 0);
+  const totalPurchaseAmount = rows.reduce((sum, row) => sum + Number(row.purchase_amount || 0), 0);
+  const totalGrossAmount = rows.reduce((sum, row) => sum + Number(row.gross_amount || row.sale_amount || 0), 0);
+  const totalAdd = rows.reduce((sum, row) => sum + Number(row.additional_amount || 0), 0);
+  const totalLess = rows.reduce((sum, row) => sum + Number(row.total_less || 0), 0);
+  const totalNetSale = rows.reduce((sum, row) => sum + Number(row.sale_amount || 0), 0);
+  const totalProfitLoss = rows.reduce((sum, row) => sum + Number(row.profit_loss || 0), 0);
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="warehouse_profit_loss_${new Date().toISOString().slice(0,10)}.pdf"`);
+  doc.pipe(res);
+
+  const title = isWarehouse ? "PROFIT / LOSS — WAREHOUSE WISE" : "PROFIT / LOSS — DIRECT LOADING";
+  const subtitle = [
+    fromDate || toDate ? `Period: ${fromDate || "Beginning"} to ${toDate || "Today"}` : "Period: All Dates",
+    buyerId ? `Buyer Filter: ${buyerId}` : "Buyer: All",
+    consigneeId ? `Consignee Filter: ${consigneeId}` : "Consignee: All",
+    farmerId ? `Farmer Filter: ${farmerId}` : "Farmer: All",
+  ].join("    •    ");
+
+  const drawPageTitle = () => {
+    doc.roundedRect(left, 22, tableWidth, 48, 8).fill(headerFill);
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(15).text(title, left + 14, 32, { width: tableWidth - 28 });
+    doc.font("Helvetica").fontSize(7.5).fillColor("#d1fae5").text(subtitle, left + 14, 51, { width: tableWidth - 28 });
+    doc.fillColor(textColor);
+  };
+
+  const directCols = [
+    ["Date", 44], ["Sale Inv", 58], ["Farmer", 72], ["Buyer", 68], ["Consignee", 68],
+    ["P.Qty", 44], ["P.Rate", 46], ["P.Amount", 57], ["S.Qty", 44], ["S.Rate", 46],
+    ["Gross", 57], ["Add", 46], ["Less", 48], ["P/L", 58],
+  ];
+  const warehouseCols = [
+    ["Warehouse", 102], ["P.Qty", 60], ["P.Rate", 58], ["P.Amount", 78], ["S.Qty", 60],
+    ["S.Rate", 58], ["Gross", 82], ["Add", 60], ["Less", 68], ["P/L", 76],
+  ];
+  const cols = isWarehouse ? warehouseCols : directCols;
+  const scale = tableWidth / cols.reduce((sum, [, width]) => sum + width, 0);
+  const widths = cols.map(([label, width]) => [label, width * scale]);
+  let y = 0;
+  const headerHeight = 23;
+  const rowHeight = 20;
+
+  const drawHeader = () => {
+    let x = left;
+    doc.roundedRect(left, y, tableWidth, headerHeight, 5).fill(headerDark);
+    doc.font("Helvetica-Bold").fontSize(6.5).fillColor("#ffffff");
+    widths.forEach(([label, width]) => {
+      doc.text(label, x + 3, y + 7, { width: width - 6, align: "left", lineBreak: false });
+      x += width;
+    });
+    doc.fillColor(textColor);
+    y += headerHeight;
+  };
+
+  const drawRow = (values, isTotal = false) => {
+    if (y + rowHeight > pageHeight - 70) {
+      doc.addPage({ size: "A4", layout: "landscape", margin: 24 });
+      drawPageTitle();
+      y = 82;
+      drawHeader();
+    }
+    let x = left;
+    doc.fillColor(isTotal ? totalFill : (Math.floor((y - 82 - headerHeight) / rowHeight) % 2 === 0 ? "#ffffff" : soft));
+    doc.rect(left, y, tableWidth, rowHeight).fill();
+    doc.strokeColor(border).lineWidth(0.25);
+    doc.rect(left, y, tableWidth, rowHeight).stroke();
+    doc.font("Helvetica").fontSize(6.4).fillColor(textColor);
+    values.forEach((value, index) => {
+      const width = widths[index][1];
+      doc.text(fit(value, width, 6.4), x + 3, y + 6, { width: width - 6, align: index >= (isWarehouse ? 1 : 5) ? "right" : "left", lineBreak: false });
+      x += width;
+    });
+    y += rowHeight;
+  };
+
+  drawPageTitle();
+  y = 82;
+  drawHeader();
+
+  if (!rows.length) {
+    doc.font("Helvetica").fontSize(10).fillColor(muted).text("No Profit / Loss data available for the selected filters.", left, y + 18);
+  } else {
+    for (const row of rows) {
+      if (isWarehouse) {
+        drawRow([
+          row.warehouse_name || row.warehouse_id || "-",
+          fmt(row.purchase_qty, 4), fmt(row.purchase_rate), fmt(row.purchase_amount),
+          fmt(row.sale_qty, 4), fmt(row.sale_rate), fmt(row.gross_amount), fmt(row.additional_amount),
+          fmt(row.total_less), fmt(row.profit_loss),
+        ]);
+      } else {
+        drawRow([
+          row.date ? String(row.date).slice(0, 10) : "-",
+          row.voucher_no || row.bill_no || "-",
+          row.farmer_name || "-",
+          row.buyer_name || "-",
+          row.consignee_name || "-",
+          fmt(row.purchase_qty, 4), fmt(row.purchase_rate), fmt(row.purchase_amount),
+          fmt(row.quantity, 4), fmt(row.sale_rate), fmt(row.gross_amount), fmt(row.additional_amount),
+          fmt(row.total_less), fmt(row.profit_loss),
+        ]);
+      }
+    }
+
+    if (y + 56 > pageHeight - 24) {
+      doc.addPage({ size: "A4", layout: "landscape", margin: 24 });
+      drawPageTitle();
+      y = 82;
+    }
+    y += 10;
+    doc.roundedRect(left, y, tableWidth, 58, 7).fill(totalFill).stroke(border);
+    doc.fillColor(headerDark).font("Helvetica-Bold").fontSize(9).text("TOTAL SUMMARY", left + 12, y + 9);
+    doc.font("Helvetica-Bold").fontSize(8).fillColor(textColor);
+    const summary = isWarehouse
+      ? [
+          ["Total Purchase Qty", fmt(totalPurchaseQty, 4)], ["Total Sale Qty", fmt(totalSaleQty, 4)],
+          ["Total Purchase Amount", fmt(totalPurchaseAmount)], ["Total Gross Amount", fmt(totalGrossAmount)],
+          ["Total Add", fmt(totalAdd)], ["Total Less", fmt(totalLess)], ["Total Profit / Loss", fmt(totalProfitLoss)],
+        ]
+      : [
+          ["Total Purchase Qty", fmt(totalPurchaseQty, 4)], ["Total Sale Qty", fmt(totalSaleQty, 4)],
+          ["Total Purchase Amount", fmt(totalPurchaseAmount)], ["Total Gross Amount", fmt(totalGrossAmount)],
+          ["Total Add", fmt(totalAdd)], ["Total Less", fmt(totalLess)], ["Total Net Sale", fmt(totalNetSale)],
+          ["Total Profit / Loss", fmt(totalProfitLoss)],
+        ];
+    let sx = left + 12;
+    let sy = y + 25;
+    const boxWidth = (tableWidth - 24) / 4;
+    summary.forEach(([label, value], index) => {
+      const col = index % 4;
+      const rowIndex = Math.floor(index / 4);
+      sx = left + 12 + col * boxWidth;
+      sy = y + 25 + rowIndex * 19;
+      doc.font("Helvetica").fontSize(6.2).fillColor(muted).text(label, sx, sy, { width: boxWidth - 8 });
+      doc.font("Helvetica-Bold").fontSize(8).fillColor(textColor).text(value, sx, sy + 7, { width: boxWidth - 8 });
+    });
+  }
+
+  const range = doc.bufferedPageRange();
+  for (let i = 0; i < range.count; i += 1) {
+    doc.switchToPage(i);
+    doc.fillColor(muted).font("Helvetica").fontSize(6.5);
+    doc.text(`Warehouse Trading • Profit/Loss • Page ${i + 1} of ${range.count}`, left, pageHeight - 18, { width: tableWidth, align: "right" });
+  }
+  doc.end();
+}
+
 router.get("/report/profit-loss", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.profitLoss")) {
     return res.status(403).json({ error: "Permission denied" });
@@ -7449,8 +7628,10 @@ router.get("/report/profit-loss", async (req, res) => {
     const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
     const fromDate = String(req.query.from_date || "").trim();
     const toDate = String(req.query.to_date || "").trim();
-    const locationId = String(req.query.location_id || "").trim();
-    const employeeId = String(req.query.employee_id || "").trim();
+    // Profit/Loss Direct filters: UI fields are Buyer, Consignee and All Farmers.
+    // Keep the old query names as fallback for compatibility with older clients.
+    const buyerId = String(req.query.buyer_id || req.query.location_id || "").trim();
+    const consigneeId = String(req.query.consignee_id || req.query.employee_id || "").trim();
     const farmerId = String(req.query.farmer_id || "").trim();
     const search = String(req.query.search || "").trim();
 
@@ -7531,12 +7712,26 @@ router.get("/report/profit-loss", async (req, res) => {
           "Total Less": row.total_less,
           "Profit_Loss": row.profit_loss,
         }));
+        const totalRow = {
+          Warehouse: "TOTAL",
+          "Purchase Qty": Number(output.reduce((s, r) => s + Number(r.purchase_qty || 0), 0).toFixed(4)),
+          "Purchase Amount": Number(output.reduce((s, r) => s + Number(r.purchase_amount || 0), 0).toFixed(2)),
+          "Sale Qty": Number(output.reduce((s, r) => s + Number(r.sale_qty || 0), 0).toFixed(4)),
+          "Gross Amount": Number(output.reduce((s, r) => s + Number(r.gross_amount || 0), 0).toFixed(2)),
+          "Total Add": Number(output.reduce((s, r) => s + Number(r.additional_amount || 0), 0).toFixed(2)),
+          "Total Less": Number(output.reduce((s, r) => s + Number(r.total_less || 0), 0).toFixed(2)),
+          "Profit_Loss": Number(output.reduce((s, r) => s + Number(r.profit_loss || 0), 0).toFixed(2)),
+        };
+        exportRows.push(totalRow);
         const workbook = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportRows), "Profit Loss");
         const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
         res.setHeader("Content-Disposition", 'attachment; filename="warehouse_profit_loss.xlsx"');
         return res.end(buffer);
+      }
+      if (String(req.query.export || "").toLowerCase() === "pdf") {
+        return sendProfitLossPdf(res, { mode, rows: output, fromDate, toDate, buyerId, consigneeId, farmerId });
       }
       return res.json(output);
     }
@@ -7545,8 +7740,8 @@ router.get("/report/profit-loss", async (req, res) => {
 
     const filter = { ...mongoSaleScope(req.user), sale_type: "direct" };
     if (farmerId) filter.farmer_id = farmerId;
-    if (locationId) filter.location_id = locationId;
-    if (employeeId) filter.employee_id = employeeId;
+    if (buyerId) filter.buyer_id = buyerId;
+    if (consigneeId) filter.consignee_id = consigneeId;
     if (fromDate || toDate) {
       filter.date = {};
       if (fromDate) filter.date.$gte = fromDate;
@@ -7628,12 +7823,26 @@ router.get("/report/profit-loss", async (req, res) => {
         "Net Sale Amount": row.sale_amount,
         "Profit / Loss": row.profit_loss,
       }));
+      exportRows.push({
+        Date: "TOTAL",
+        "Purchase Qty": Number(reportRows.reduce((s, r) => s + Number(r.purchase_qty || 0), 0).toFixed(4)),
+        "Purchase Amount": Number(reportRows.reduce((s, r) => s + Number(r.purchase_amount || 0), 0).toFixed(2)),
+        "Sale Qty": Number(reportRows.reduce((s, r) => s + Number(r.quantity || 0), 0).toFixed(4)),
+        "Gross Amount": Number(reportRows.reduce((s, r) => s + Number(r.gross_amount || 0), 0).toFixed(2)),
+        "Total Add": Number(reportRows.reduce((s, r) => s + Number(r.additional_amount || 0), 0).toFixed(2)),
+        "Total Less": Number(reportRows.reduce((s, r) => s + Number(r.total_less || 0), 0).toFixed(2)),
+        "Net Sale Amount": Number(reportRows.reduce((s, r) => s + Number(r.sale_amount || 0), 0).toFixed(2)),
+        "Profit / Loss": Number(reportRows.reduce((s, r) => s + Number(r.profit_loss || 0), 0).toFixed(2)),
+      });
       const workbook = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportRows), "Profit Loss");
       const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
       res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
       res.setHeader("Content-Disposition", 'attachment; filename="warehouse_profit_loss.xlsx"');
       return res.end(buffer);
+    }
+    if (String(req.query.export || "").toLowerCase() === "pdf") {
+      return sendProfitLossPdf(res, { mode, rows: reportRows, fromDate, toDate, buyerId, consigneeId, farmerId });
     }
 
     return res.json({
