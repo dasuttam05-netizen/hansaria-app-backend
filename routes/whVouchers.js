@@ -7233,6 +7233,9 @@ router.get("/report/filter-options", async (req, res) => {
         if (Number.isFinite(numeric)) ors.push({ id: numeric }, { legacy_id: numeric });
         ors.push({ id: value }, { legacy_id: value });
         const refs = new Set([value]);
+        if (mongoose.Types.ObjectId.isValid(value)) refs.add(new mongoose.Types.ObjectId(value));
+        const numericValue = Number(value);
+        if (Number.isFinite(numericValue)) refs.add(numericValue);
         try {
           if (dedicatedKind) {
             const dedicated = await findDedicatedPartyDocs(dedicatedKind, { $or: ors }, "_id id legacy_id").catch(() => []);
@@ -7260,6 +7263,9 @@ router.get("/report/filter-options", async (req, res) => {
       const consigneeRefsSelected = await resolveRefs(Consignee, consigneeId, "consignee");
       const farmerRefsSelected = await resolveRefs(Farmer, farmerId);
 
+      // Filter-option lists stay complete (same as the old dropdown behaviour):
+      // only the optional date range narrows the source rows. Party selections
+      // are not used to shrink the dropdown options.
       const rows = await SaleVoucher.find(baseFilter)
         .select([
           "date",
@@ -7298,13 +7304,6 @@ router.get("/report/filter-options", async (req, res) => {
         if (fromDate && date < fromDate) return false;
         if (toDate && date > toDate) return false;
 
-        const buyerValues = [row?.buyer_id, row?.company_id].map((v) => String(v || "").trim()).filter(Boolean);
-        const farmerValues = [row?.farmer_id, row?.against_purchase_farmer_id].map((v) => String(v || "").trim()).filter(Boolean);
-        const consigneeValues = [row?.consignee_id].map((v) => String(v || "").trim()).filter(Boolean);
-
-        if (buyerRefsSelected.length && !buyerValues.some((v) => buyerRefsSelected.includes(v))) return false;
-        if (farmerRefsSelected.length && !farmerValues.some((v) => farmerRefsSelected.includes(v))) return false;
-        if (consigneeRefsSelected.length && !consigneeValues.some((v) => consigneeRefsSelected.includes(v))) return false;
         return true;
       });
 
@@ -8036,21 +8035,27 @@ router.get("/report/profit-loss", async (req, res) => {
       const value = String(rawValue || "").trim();
       if (!value || !Model) return [];
       const ors = [];
-      if (mongoose.Types.ObjectId.isValid(value)) ors.push({ _id: value });
+      const refs = new Set([value]);
+      if (mongoose.Types.ObjectId.isValid(value)) {
+        ors.push({ _id: value });
+      }
       const numeric = Number(value);
-      if (Number.isFinite(numeric)) ors.push({ id: numeric }, { legacy_id: numeric });
+      if (Number.isFinite(numeric)) {
+        ors.push({ id: numeric }, { legacy_id: numeric });
+      }
       ors.push({ id: value }, { legacy_id: value });
       try {
         const docs = await Model.find({ $or: ors }).select("_id id legacy_id").lean();
-        const refs = new Set([value]);
         (docs || []).forEach((doc) => {
           [doc?._id, doc?.id, doc?.legacy_id]
             .filter((x) => x !== undefined && x !== null && String(x).trim())
-            .forEach((x) => refs.add(String(x)));
+            .forEach((x) => {
+              refs.add(String(x));
+            });
         });
         return Array.from(refs);
       } catch {
-        return [value];
+        return Array.from(refs);
       }
     };
 
