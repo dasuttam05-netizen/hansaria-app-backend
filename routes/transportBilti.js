@@ -197,6 +197,128 @@ async function getMongoName(
   return "";
 }
 
+
+/*
+====================================================
+BULK MASTER LOOKUP
+====================================================
+*/
+function addUniqueCondition(list, condition) {
+  const key = JSON.stringify(condition);
+  if (!list.some((item) => JSON.stringify(item) === key)) {
+    list.push(condition);
+  }
+}
+
+async function buildMongoNameMap(
+  Model,
+  values,
+  fields = ["name"]
+) {
+  const rawValues = Array.from(
+    new Set(
+      (values || [])
+        .map((v) => text(v))
+        .filter(Boolean)
+    )
+  );
+
+  if (!rawValues.length) {
+    return new Map();
+  }
+
+  const conditions = [];
+
+  for (const value of rawValues) {
+    for (const condition of idConditions(value)) {
+      addUniqueCondition(
+        conditions,
+        condition
+      );
+    }
+  }
+
+  if (!conditions.length) {
+    return new Map();
+  }
+
+  const selectFields = {
+    _id: 1,
+    id: 1,
+    legacy_id: 1,
+    sl_no: 1,
+  };
+
+  for (const field of fields) {
+    selectFields[field] = 1;
+  }
+
+  const docs =
+    await Model.find({
+      $or: conditions,
+    })
+      .select(selectFields)
+      .lean();
+
+  const map = new Map();
+
+  for (const doc of docs || []) {
+    let name = "";
+
+    for (const field of fields) {
+      if (
+        doc[field] !== undefined &&
+        doc[field] !== null &&
+        String(doc[field]).trim()
+      ) {
+        name =
+          String(doc[field]).trim();
+        break;
+      }
+    }
+
+    if (!name) {
+      continue;
+    }
+
+    for (const key of [
+      doc._id,
+      doc.id,
+      doc.legacy_id,
+      doc.sl_no,
+    ]) {
+      if (
+        key !== undefined &&
+        key !== null &&
+        String(key).trim()
+      ) {
+        map.set(
+          String(key),
+          name
+        );
+      }
+    }
+  }
+
+  return map;
+}
+
+function mapName(map, value) {
+  if (
+    !map ||
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return "";
+  }
+
+  return (
+    map.get(String(value)) ||
+    ""
+  );
+}
+
 async function getMongoTransporter(
   id
 ) {
@@ -494,7 +616,8 @@ SALE DECORATION
 */
 
 async function decorateMongoSale(
-  row
+  row,
+  lookupMaps = null
 ) {
   const buyerId =
     row?.buyer_id;
@@ -514,70 +637,123 @@ async function decorateMongoSale(
   const consigneeId =
     row?.consignee_id;
 
-  const [
-    buyerName,
-    companyName,
-    accountName,
-    warehouseName,
-    productName,
-    consigneeName,
-  ] =
-    await Promise.all([
-      getMongoName(
-        BuyerName,
-        buyerId,
-        ["name"]
-      ),
+  let buyerName = "";
+  let companyName = "";
+  let accountName = "";
+  let warehouseName = "";
+  let productName = "";
+  let consigneeName = "";
 
+  if (lookupMaps) {
+    buyerName =
+      mapName(
+        lookupMaps.buyer,
+        buyerId
+      );
+
+    companyName =
       row.company_name
-        ? String(
-            row.company_name
-          )
-        : getMongoName(
-            CompanyOperational,
-            companyId,
-            ["name"]
-          ),
+        ? String(row.company_name)
+        : mapName(
+            lookupMaps.company,
+            companyId
+          );
 
+    accountName =
       row.company_account_name
-        ? String(
-            row.company_account_name
-          )
-        : getMongoName(
-            CompanyAccountOperational,
-            accountId,
-            [
-              "account_name",
-              "name",
-            ]
-          ),
+        ? String(row.company_account_name)
+        : mapName(
+            lookupMaps.account,
+            accountId
+          );
 
+    warehouseName =
       row.warehouse_name
-        ? String(
-            row.warehouse_name
-          )
-        : getMongoName(
-            WarehouseOperational,
-            warehouseId,
-            ["name"]
-          ),
+        ? String(row.warehouse_name)
+        : mapName(
+            lookupMaps.warehouse,
+            warehouseId
+          );
 
+    productName =
       row.product_name
-        ? String(
-            row.product_name
-          )
-        : getMongoName(
-            ProductOperational,
-            productId,
-            ["name"]
-          ),
+        ? String(row.product_name)
+        : mapName(
+            lookupMaps.product,
+            productId
+          );
 
-      getMongoName(
-        ConsigneeName,
-        consigneeId,
-        ["name"]
-      ),
-    ]);
+    consigneeName =
+      mapName(
+        lookupMaps.consignee,
+        consigneeId
+      );
+  } else {
+    [
+      buyerName,
+      companyName,
+      accountName,
+      warehouseName,
+      productName,
+      consigneeName,
+    ] =
+      await Promise.all([
+        getMongoName(
+          BuyerName,
+          buyerId,
+          ["name"]
+        ),
+
+        row.company_name
+          ? String(
+              row.company_name
+            )
+          : getMongoName(
+              CompanyOperational,
+              companyId,
+              ["name"]
+            ),
+
+        row.company_account_name
+          ? String(
+              row.company_account_name
+            )
+          : getMongoName(
+              CompanyAccountOperational,
+              accountId,
+              [
+                "account_name",
+                "name",
+              ]
+            ),
+
+        row.warehouse_name
+          ? String(
+              row.warehouse_name
+            )
+          : getMongoName(
+              WarehouseOperational,
+              warehouseId,
+              ["name"]
+            ),
+
+        row.product_name
+          ? String(
+              row.product_name
+            )
+          : getMongoName(
+              ProductOperational,
+              productId,
+              ["name"]
+            ),
+
+        getMongoName(
+          ConsigneeName,
+          consigneeId,
+          ["name"]
+        ),
+      ]);
+  }
 
   return {
     ...row,
@@ -909,8 +1085,13 @@ router.get(
         });
       }
 
-      const biltiRows =
-        await TransportBiltiOperational.find({
+      // Run both reads together instead of waiting for one query
+      // before starting the other.
+      const [
+        biltiRows,
+        allSaleDocs,
+      ] = await Promise.all([
+        TransportBiltiOperational.find({
           sale_id: {
             $nin: [
               null,
@@ -922,13 +1103,51 @@ router.get(
             sale_id: 1,
             legacy_id: 1,
           })
-          .lean();
+          .lean(),
+
+        SaleVoucher.find({})
+          .select({
+            _id: 1,
+            voucher_no: 1,
+            bill_no: 1,
+            date: 1,
+            bill_date: 1,
+            lorry_no: 1,
+            quantity: 1,
+            unloading_qty: 1,
+            rate: 1,
+            amount: 1,
+
+            buyer_id: 1,
+            buyer_name: 1,
+
+            company_id: 1,
+            company_name: 1,
+
+            company_account_id: 1,
+            company_account_name: 1,
+            account_name: 1,
+
+            warehouse_id: 1,
+            warehouse_name: 1,
+
+            product_id: 1,
+            product_name: 1,
+
+            consignee_id: 1,
+            consignee_name: 1,
+          })
+          .sort({
+            date: -1,
+            createdAt: -1,
+            _id: -1,
+          })
+          .lean(),
+      ]);
 
       const alreadyBiltied =
         new Set(
-          (
-            biltiRows || []
-          ).map(
+          (biltiRows || []).map(
             (row) =>
               String(
                 row.sale_id
@@ -936,47 +1155,115 @@ router.get(
           )
         );
 
+      // Same pending-sale behavior as the old route,
+      // but already-biltied rows never enter the decoration loop.
       const docs =
-        await SaleVoucher.find({})
-          .sort({
-            date: -1,
-            createdAt: -1,
-            _id: -1,
-          })
-          .lean();
+        (allSaleDocs || []).filter(
+          (doc) =>
+            doc?._id &&
+            !alreadyBiltied.has(
+              String(doc._id)
+            )
+        );
+
+      if (!docs.length) {
+        return res.json([]);
+      }
+
+      // Bulk master lookups: 6 queries for the full Sale list
+      // instead of up to 6 queries per Sale row.
+      const [
+        buyerMap,
+        companyMap,
+        accountMap,
+        warehouseMap,
+        productMap,
+        consigneeMap,
+      ] = await Promise.all([
+        buildMongoNameMap(
+          BuyerName,
+          docs.map(
+            (doc) => doc.buyer_id
+          ),
+          ["name"]
+        ),
+
+        buildMongoNameMap(
+          CompanyOperational,
+          docs.map(
+            (doc) => doc.company_id
+          ),
+          ["name"]
+        ),
+
+        buildMongoNameMap(
+          CompanyAccountOperational,
+          docs.map(
+            (doc) =>
+              doc.company_account_id
+          ),
+          [
+            "account_name",
+            "name",
+          ]
+        ),
+
+        buildMongoNameMap(
+          WarehouseOperational,
+          docs.map(
+            (doc) => doc.warehouse_id
+          ),
+          ["name"]
+        ),
+
+        buildMongoNameMap(
+          ProductOperational,
+          docs.map(
+            (doc) => doc.product_id
+          ),
+          ["name"]
+        ),
+
+        buildMongoNameMap(
+          ConsigneeName,
+          docs.map(
+            (doc) => doc.consignee_id
+          ),
+          ["name"]
+        ),
+      ]);
+
+      const lookupMaps = {
+        buyer: buyerMap,
+        company: companyMap,
+        account: accountMap,
+        warehouse: warehouseMap,
+        product: productMap,
+        consignee: consigneeMap,
+      };
 
       const pending =
         [];
 
       for (
-        const doc of
-          docs || []
+        const doc of docs
       ) {
-        const mongoId =
-          String(
-            doc._id || ""
-          );
-
-        if (
-          !mongoId ||
-          alreadyBiltied.has(
-            mongoId
-          )
-        ) {
-          continue;
-        }
-
         const decorated =
           await decorateMongoSale(
-            doc
+            doc,
+            lookupMaps
           );
 
         pending.push({
           id:
-            mongoId,
+            String(
+              doc._id
+            ),
 
           sale_id:
-            mongoId,
+            String(
+              doc._id
+            ),
 
           bilti_id:
             null,
