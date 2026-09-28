@@ -7502,8 +7502,8 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const drawPageTitle = () => {
     // Main title banner: same teal family as the earlier design.
     doc.roundedRect(left, 20, tableWidth, 62, 9).fill(headerFill);
-    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(17)
-      .text(title, left + 14, 29, { width: tableWidth - 28, lineBreak: false });
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(17.5)
+      .text(title, left + 12, 28, { width: tableWidth - 24, align: "center", lineBreak: false });
 
     // Filters directly under the title, laid out cleanly for readability.
     doc.font("Helvetica").fontSize(8.2).fillColor("#dff7f4")
@@ -7575,8 +7575,6 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     values.forEach((value, index) => {
       const width = widths[index][1];
       const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 5);
-      const numericStartIndex = isWarehouse ? 1 : 5;
-      const isNumeric = index >= numericStartIndex;
       const numericValue = Number(value);
 
       if (isProfitColumn && Number.isFinite(numericValue)) {
@@ -7594,7 +7592,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
         .fillColor(isProfitColumn && numericValue > 0 ? profitBorder : isProfitColumn && numericValue < 0 ? lossBorder : textColor)
         .text(safeText(value), x + 5, y + 7, {
           width: width - 10,
-          align: isNumeric ? "right" : "left",
+          align: "left",
           lineGap: 0.7,
         });
       x += width;
@@ -7698,11 +7696,23 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     });
   }
 
+  // PDFKit buffers all pages so the final page count is known before writing
+  // the footer. Keep the footer on EVERY report page as Page 1 of 4, Page 2 of 4...
   const range = doc.bufferedPageRange();
-  for (let i = 0; i < range.count; i += 1) {
+  const totalPages = Math.max(Number(range.count || 0), 1);
+  for (let i = 0; i < totalPages; i += 1) {
     doc.switchToPage(i);
+    doc.save();
+    doc.fillColor("#f8fafc");
+    doc.rect(left, pageHeight - 28, tableWidth, 18).fill();
     doc.fillColor(muted).font("Helvetica").fontSize(6.5);
-    doc.text(`Warehouse Trading • Profit/Loss • Page ${i + 1} of ${range.count}`, left, pageHeight - 18, { width: tableWidth, align: "right", lineBreak: false });
+    doc.text(
+      `Warehouse Trading • Profit/Loss • Page ${i + 1} of ${totalPages}`,
+      left,
+      pageHeight - 22,
+      { width: tableWidth, align: "right", lineBreak: false }
+    );
+    doc.restore();
   }
   doc.end();
 }
