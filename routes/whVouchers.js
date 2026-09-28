@@ -7839,21 +7839,104 @@ router.get("/report/profit-loss", async (req, res) => {
     if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for direct profit/loss report" });
 
     const filter = { ...mongoSaleScope(req.user), sale_type: "direct" };
-    if (farmerId) filter.farmer_id = farmerId;
-    if (buyerId) filter.buyer_id = buyerId;
-    if (consigneeId) filter.consignee_id = consigneeId;
+
+    // Resolve selected master IDs against both ObjectId and legacy/id fields.
+    // Existing SaleVoucher documents may store references in different formats.
+    const resolveReferenceIds = async (Model, rawValue) => {
+      const value = String(rawValue || "").trim();
+      if (!value || !Model) return [];
+      const ors = [];
+      if (mongoose.Types.ObjectId.isValid(value)) ors.push({ _id: value });
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) ors.push({ id: numeric }, { legacy_id: numeric });
+      ors.push({ id: value }, { legacy_id: value });
+      try {
+        const docs = await Model.find({ $or: ors }).select("_id id legacy_id").lean();
+        const refs = new Set([value]);
+        (docs || []).forEach((doc) => {
+          [doc?._id, doc?.id, doc?.legacy_id]
+            .filter((x) => x !== undefined && x !== null && String(x).trim())
+            .forEach((x) => refs.add(String(x)));
+        });
+        return Array.from(refs);
+      } catch {
+        return [value];
+      }
+    };
+
+    if (farmerId) {
+      const refs = await resolveReferenceIds(Farmer, farmerId);
+      filter.farmer_id = { $in: refs };
+    }
+
+    if (buyerId) {
+      const refs = await resolveReferenceIds(Company, buyerId);
+      filter.$and = [
+        ...(filter.$and || []),
+        { $or: [
+          { buyer_id: { $in: refs } },
+          { company_id: { $in: refs } },
+        ] },
+      ];
+    }
+
+    if (consigneeId) {
+      const refs = await resolveReferenceIds(Consignee, consigneeId);
+      filter.consignee_id = { $in: refs };
+    }
+
     if (fromDate || toDate) {
       filter.date = {};
       if (fromDate) filter.date.$gte = fromDate;
       if (toDate) filter.date.$lte = toDate;
     }
+
     if (search) {
       const safe = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const rx = new RegExp(safe, "i");
-      filter.$and = [{ $or: [
-        { voucher_no: rx }, { bill_no: rx }, { farmer_name: rx }, { buyer_name: rx },
-        { company_name: rx }, { consignee_name: rx }, { lorry_no: rx }, { warehouse_name: rx },
-      ] }];
+
+      // Name search must work even when names are added by decorateSaleRows()
+      // after the initial SaleVoucher query.
+      const [matchingFarmers, matchingCompanies, matchingConsignees] = await Promise.all([
+        Farmer?.find({ name: rx }).select("_id id legacy_id").lean().catch(() => []),
+        Company?.find({ $or: [{ name: rx }, { company_name: rx }, { buyer_name: rx }, { party_name: rx }] })
+          .select("_id id legacy_id").lean().catch(() => []),
+        Consignee?.find({ name: rx }).select("_id id legacy_id").lean().catch(() => []),
+      ]);
+
+      const refValues = (docs) => Array.from(new Set(
+        (docs || []).flatMap((doc) =>
+          [doc?._id, doc?.id, doc?.legacy_id]
+            .filter((x) => x !== undefined && x !== null && String(x).trim())
+            .map((x) => String(x))
+        )
+      ));
+
+      const farmerRefs = refValues(matchingFarmers);
+      const companyRefs = refValues(matchingCompanies);
+      const consigneeRefs = refValues(matchingConsignees);
+
+      const searchOr = [
+        { voucher_no: rx },
+        { bill_no: rx },
+        { farmer_name: rx },
+        { buyer_name: rx },
+        { company_name: rx },
+        { consignee_name: rx },
+        { lorry_no: rx },
+        { warehouse_name: rx },
+      ];
+      if (farmerRefs.length) searchOr.push({ farmer_id: { $in: farmerRefs } });
+      if (companyRefs.length) {
+        searchOr.push({ buyer_id: { $in: companyRefs } });
+        searchOr.push({ company_id: { $in: companyRefs } });
+      }
+      if (consigneeRefs.length) searchOr.push({ consignee_id: { $in: consigneeRefs } });
+
+      filter.$and = [
+        ...(filter.$and || []),
+        { $or: searchOr },
+      ];
     }
 
     const exportMode = String(req.query.export || "").toLowerCase() === "xlsx";
