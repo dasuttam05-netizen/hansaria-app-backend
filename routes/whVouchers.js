@@ -7447,26 +7447,18 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const left = 24;
   const right = 24;
   const tableWidth = pageWidth - left - right;
-  const headerFill = "#0f766e";
-  const headerDark = "#115e59";
+  const headerFill = "#123b6d";
+  const headerDark = "#0b2d4d";
   const border = "#cbd5e1";
   const muted = "#475569";
-  const soft = "#f1f5f9";
-  const totalFill = "#ecfdf5";
+  const soft = "#f5f8fc";
+  const totalFill = "#eaf4ff";
   const textColor = "#0f172a";
   const fmt = (value, decimals = 2) => {
     const num = Number(value || 0);
     return Number.isFinite(num) ? num.toFixed(decimals) : (0).toFixed(decimals);
   };
   const safeText = (value) => String(value ?? "-").trim() || "-";
-  const fit = (value, width, fontSize = 6.8) => {
-    const raw = safeText(value);
-    doc.fontSize(fontSize);
-    if (doc.widthOfString(raw) <= width - 6) return raw;
-    let out = raw;
-    while (out.length > 3 && doc.widthOfString(`${out.slice(0, -3)}...`) > width - 6) out = out.slice(0, -1);
-    return `${out.slice(0, -3)}...`;
-  };
 
   const totalPurchaseQty = rows.reduce((sum, row) => sum + Number(row.purchase_qty || 0), 0);
   const totalSaleQty = rows.reduce((sum, row) => sum + Number(row.quantity ?? row.sale_qty ?? 0), 0);
@@ -7485,68 +7477,92 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const subtitle = [
     fromDate || toDate ? `Period: ${fromDate || "Beginning"} to ${toDate || "Today"}` : "Period: All Dates",
     buyerId ? `Buyer Filter: ${buyerId}` : "Buyer: All",
-    consigneeId ? `Consignee Filter: ${consigneeId}` : "Consignee: All",
-    farmerId ? `Farmer Filter: ${farmerId}` : "Farmer: All",
+    consigneeId ? `Consignee: ${consigneeId}` : "Consignee: All",
+    farmerId ? `Farmer: ${farmerId}` : "Farmer: All",
   ].join("    •    ");
 
   const drawPageTitle = () => {
-    doc.roundedRect(left, 22, tableWidth, 48, 8).fill(headerFill);
-    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(15).text(title, left + 14, 32, { width: tableWidth - 28 });
-    doc.font("Helvetica").fontSize(7.5).fillColor("#d1fae5").text(subtitle, left + 14, 51, { width: tableWidth - 28 });
+    doc.roundedRect(left, 22, tableWidth, 54, 8).fill(headerFill);
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(16).text(title, left + 14, 31, { width: tableWidth - 28, lineBreak: false });
+    doc.font("Helvetica").fontSize(7.6).fillColor("#dbeafe").text(subtitle, left + 14, 53, { width: tableWidth - 28, lineBreak: false });
     doc.fillColor(textColor);
   };
 
+  // Keep the report focused on the requested business fields. Purchase/Sale
+  // quantities remain visible in TOTAL SUMMARY below the table.
   const directCols = [
-    ["Date", 44], ["Sale Inv", 58], ["Farmer", 72], ["Buyer", 68], ["Consignee", 68],
-    ["P.Qty", 44], ["P.Rate", 46], ["P.Amount", 57], ["S.Qty", 44], ["S.Rate", 46],
-    ["Gross", 57], ["Add", 46], ["Less", 48], ["P/L", 58],
+    ["Date", 52],
+    ["Sale Inv", 72],
+    ["Farmer", 108],
+    ["Buyer", 108],
+    ["Consignee", 108],
+    ["P.Amount", 70],
+    ["S.Amount", 72],
+    ["Add", 50],
+    ["Less", 52],
+    ["P/L", 52],
   ];
   const warehouseCols = [
-    ["Warehouse", 102], ["P.Qty", 60], ["P.Rate", 58], ["P.Amount", 78], ["S.Qty", 60],
-    ["S.Rate", 58], ["Gross", 82], ["Add", 60], ["Less", 68], ["P/L", 76],
+    ["Warehouse", 170], ["P.Amount", 92], ["S.Amount", 92], ["Add", 72], ["Less", 86], ["P/L", 88],
   ];
   const cols = isWarehouse ? warehouseCols : directCols;
-  const scale = tableWidth / cols.reduce((sum, [, width]) => sum + width, 0);
+  const rawWidthTotal = cols.reduce((sum, [, width]) => sum + width, 0);
+  const scale = tableWidth / rawWidthTotal;
   const widths = cols.map(([label, width]) => [label, width * scale]);
   let y = 0;
-  const headerHeight = 23;
-  const rowHeight = 20;
+  const headerHeight = 25;
+  const minRowHeight = 28;
 
   const drawHeader = () => {
     let x = left;
     doc.roundedRect(left, y, tableWidth, headerHeight, 5).fill(headerDark);
-    doc.font("Helvetica-Bold").fontSize(6.5).fillColor("#ffffff");
+    doc.font("Helvetica-Bold").fontSize(7.2).fillColor("#ffffff");
     widths.forEach(([label, width]) => {
-      doc.text(label, x + 3, y + 7, { width: width - 6, align: "left", lineBreak: false });
+      doc.text(label, x + 4, y + 8, { width: width - 8, align: "left", lineBreak: false });
       x += width;
     });
     doc.fillColor(textColor);
     y += headerHeight;
   };
 
+  const valueHeight = (value, width, fontSize = 7) => {
+    doc.font("Helvetica").fontSize(fontSize);
+    return doc.heightOfString(safeText(value), { width: Math.max(width - 8, 10), lineGap: 0.5 });
+  };
+
   const drawRow = (values, isTotal = false) => {
-    if (y + rowHeight > pageHeight - 70) {
+    const rowHeights = values.map((value, index) => valueHeight(value, widths[index][1], 6.6));
+    const rowHeight = Math.max(minRowHeight, Math.ceil(Math.max(...rowHeights) + 10));
+
+    if (y + rowHeight > pageHeight - 72) {
       doc.addPage({ size: "A4", layout: "landscape", margin: 24 });
       drawPageTitle();
-      y = 82;
+      y = 88;
       drawHeader();
     }
+
     let x = left;
-    doc.fillColor(isTotal ? totalFill : (Math.floor((y - 82 - headerHeight) / rowHeight) % 2 === 0 ? "#ffffff" : soft));
+    doc.fillColor(isTotal ? totalFill : (Math.floor((y - 88 - headerHeight) / minRowHeight) % 2 === 0 ? "#ffffff" : soft));
     doc.rect(left, y, tableWidth, rowHeight).fill();
     doc.strokeColor(border).lineWidth(0.25);
     doc.rect(left, y, tableWidth, rowHeight).stroke();
-    doc.font("Helvetica").fontSize(6.4).fillColor(textColor);
+
     values.forEach((value, index) => {
       const width = widths[index][1];
-      doc.text(fit(value, width, 6.4), x + 3, y + 6, { width: width - 6, align: index >= (isWarehouse ? 1 : 5) ? "right" : "left", lineBreak: false });
+      const isNumeric = isWarehouse ? index >= 1 : index >= 5;
+      doc.font("Helvetica").fontSize(6.6).fillColor(textColor);
+      doc.text(safeText(value), x + 4, y + 6, {
+        width: width - 8,
+        align: isNumeric ? "right" : "left",
+        lineGap: 0.5,
+      });
       x += width;
     });
     y += rowHeight;
   };
 
   drawPageTitle();
-  y = 82;
+  y = 88;
   drawHeader();
 
   if (!rows.length) {
@@ -7556,9 +7572,11 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
       if (isWarehouse) {
         drawRow([
           row.warehouse_name || row.warehouse_id || "-",
-          fmt(row.purchase_qty, 4), fmt(row.purchase_rate), fmt(row.purchase_amount),
-          fmt(row.sale_qty, 4), fmt(row.sale_rate), fmt(row.gross_amount), fmt(row.additional_amount),
-          fmt(row.total_less), fmt(row.profit_loss),
+          fmt(row.purchase_amount),
+          fmt(row.gross_amount || row.sale_amount),
+          fmt(row.additional_amount),
+          fmt(row.total_less),
+          fmt(row.profit_loss),
         ]);
       } else {
         drawRow([
@@ -7567,44 +7585,47 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           row.farmer_name || "-",
           row.buyer_name || "-",
           row.consignee_name || "-",
-          fmt(row.purchase_qty, 4), fmt(row.purchase_rate), fmt(row.purchase_amount),
-          fmt(row.quantity, 4), fmt(row.sale_rate), fmt(row.gross_amount), fmt(row.additional_amount),
-          fmt(row.total_less), fmt(row.profit_loss),
+          fmt(row.purchase_amount),
+          fmt(row.gross_amount),
+          fmt(row.additional_amount),
+          fmt(row.total_less),
+          fmt(row.profit_loss),
         ]);
       }
     }
 
-    if (y + 56 > pageHeight - 24) {
+    if (y + 104 > pageHeight - 24) {
       doc.addPage({ size: "A4", layout: "landscape", margin: 24 });
       drawPageTitle();
-      y = 82;
+      y = 88;
     }
     y += 10;
-    doc.roundedRect(left, y, tableWidth, 58, 7).fill(totalFill).stroke(border);
-    doc.fillColor(headerDark).font("Helvetica-Bold").fontSize(9).text("TOTAL SUMMARY", left + 12, y + 9);
+    const summaryHeight = isWarehouse ? 58 : 78;
+    doc.roundedRect(left, y, tableWidth, summaryHeight, 8).fill(totalFill).stroke(border);
+    doc.fillColor(headerDark).font("Helvetica-Bold").fontSize(9.4).text("TOTAL SUMMARY", left + 12, y + 9);
     doc.font("Helvetica-Bold").fontSize(8).fillColor(textColor);
+
     const summary = isWarehouse
       ? [
           ["Total Purchase Qty", fmt(totalPurchaseQty, 4)], ["Total Sale Qty", fmt(totalSaleQty, 4)],
-          ["Total Purchase Amount", fmt(totalPurchaseAmount)], ["Total Gross Amount", fmt(totalGrossAmount)],
+          ["Total Purchase Amount", fmt(totalPurchaseAmount)], ["Total S.Amount", fmt(totalGrossAmount)],
           ["Total Add", fmt(totalAdd)], ["Total Less", fmt(totalLess)], ["Total Profit / Loss", fmt(totalProfitLoss)],
         ]
       : [
           ["Total Purchase Qty", fmt(totalPurchaseQty, 4)], ["Total Sale Qty", fmt(totalSaleQty, 4)],
-          ["Total Purchase Amount", fmt(totalPurchaseAmount)], ["Total Gross Amount", fmt(totalGrossAmount)],
+          ["Total Purchase Amount", fmt(totalPurchaseAmount)], ["Total S.Amount", fmt(totalGrossAmount)],
           ["Total Add", fmt(totalAdd)], ["Total Less", fmt(totalLess)], ["Total Net Sale", fmt(totalNetSale)],
           ["Total Profit / Loss", fmt(totalProfitLoss)],
         ];
-    let sx = left + 12;
-    let sy = y + 25;
+
     const boxWidth = (tableWidth - 24) / 4;
     summary.forEach(([label, value], index) => {
       const col = index % 4;
       const rowIndex = Math.floor(index / 4);
-      sx = left + 12 + col * boxWidth;
-      sy = y + 25 + rowIndex * 19;
-      doc.font("Helvetica").fontSize(6.2).fillColor(muted).text(label, sx, sy, { width: boxWidth - 8 });
-      doc.font("Helvetica-Bold").fontSize(8).fillColor(textColor).text(value, sx, sy + 7, { width: boxWidth - 8 });
+      const sx = left + 12 + col * boxWidth;
+      const sy = y + 25 + rowIndex * 25;
+      doc.font("Helvetica").fontSize(6.2).fillColor(muted).text(label, sx, sy, { width: boxWidth - 8, lineBreak: false });
+      doc.font("Helvetica-Bold").fontSize(8.2).fillColor(textColor).text(value, sx, sy + 7, { width: boxWidth - 8, lineBreak: false });
     });
   }
 
@@ -7612,7 +7633,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   for (let i = 0; i < range.count; i += 1) {
     doc.switchToPage(i);
     doc.fillColor(muted).font("Helvetica").fontSize(6.5);
-    doc.text(`Warehouse Trading • Profit/Loss • Page ${i + 1} of ${range.count}`, left, pageHeight - 18, { width: tableWidth, align: "right" });
+    doc.text(`Warehouse Trading • Profit/Loss • Page ${i + 1} of ${range.count}`, left, pageHeight - 18, { width: tableWidth, align: "right", lineBreak: false });
   }
   doc.end();
 }
@@ -7804,7 +7825,7 @@ router.get("/report/profit-loss", async (req, res) => {
         "Purchase Amount": row.purchase_amount,
         "Sale Qty": row.quantity,
         "Sale Rate": row.sale_rate,
-        "Gross Amount": row.gross_amount,
+        "S.Amount": row.gross_amount,
         "Total Add": row.additional_amount,
         "Claim": Number(row.claim_amount || 0),
         "Shortage": Number(row.shortage_amount || 0),
@@ -7828,7 +7849,7 @@ router.get("/report/profit-loss", async (req, res) => {
         "Purchase Qty": Number(reportRows.reduce((s, r) => s + Number(r.purchase_qty || 0), 0).toFixed(4)),
         "Purchase Amount": Number(reportRows.reduce((s, r) => s + Number(r.purchase_amount || 0), 0).toFixed(2)),
         "Sale Qty": Number(reportRows.reduce((s, r) => s + Number(r.quantity || 0), 0).toFixed(4)),
-        "Gross Amount": Number(reportRows.reduce((s, r) => s + Number(r.gross_amount || 0), 0).toFixed(2)),
+        "S.Amount": Number(reportRows.reduce((s, r) => s + Number(r.gross_amount || 0), 0).toFixed(2)),
         "Total Add": Number(reportRows.reduce((s, r) => s + Number(r.additional_amount || 0), 0).toFixed(2)),
         "Total Less": Number(reportRows.reduce((s, r) => s + Number(r.total_less || 0), 0).toFixed(2)),
         "Net Sale Amount": Number(reportRows.reduce((s, r) => s + Number(r.sale_amount || 0), 0).toFixed(2)),
