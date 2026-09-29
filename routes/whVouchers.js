@@ -5907,6 +5907,137 @@ router.delete("/payment/:id", async (req, res) => {
 // ===========================
 // RECEIPT VOUCHERS
 // ===========================
+
+// Receipt MongoDB helper functions.
+// The Receipt create/edit/delete routes below use these helpers; keep them
+// self-contained so Receipt Entry works without any legacy SQL dependency.
+
+async function getNextMongoReceiptId() {
+  if (!mongoReady() || !MongoReceiptVoucher) {
+    throw new Error("MongoDB receipt model is unavailable");
+  }
+
+  const rows = await MongoReceiptVoucher.find({})
+    .select("id")
+    .lean();
+
+  let maxId = 0;
+  for (const row of rows || []) {
+    const value = Number(row?.id);
+    if (Number.isFinite(value) && value > maxId) {
+      maxId = value;
+    }
+  }
+
+  return maxId + 1;
+}
+
+async function findMongoReceiptById(receiptId) {
+  if (!mongoReady() || !MongoReceiptVoucher) return null;
+
+  const numericId = Number(receiptId);
+  if (!Number.isFinite(numericId) || numericId <= 0) return null;
+
+  return MongoReceiptVoucher.findOne({ id: numericId }).lean();
+}
+
+async function getMongoReceiptAdjustments(receiptId) {
+  if (!mongoReady() || !MongoReceiptAdjustment) return [];
+
+  const key = String(receiptId ?? "").trim();
+  if (!key) return [];
+
+  const numericId = Number(key);
+  const or = [
+    { receipt_id: key },
+    { "data.receipt_id": key },
+  ];
+
+  if (Number.isFinite(numericId)) {
+    or.push({ receipt_id: numericId });
+    or.push({ "data.receipt_id": numericId });
+  }
+
+  return MongoReceiptAdjustment.find({ $or: or })
+    .sort({ id: 1, _id: 1 })
+    .lean();
+}
+
+async function saveMongoReceiptAdjustments(receiptId, adjustments) {
+  if (!mongoReady() || !MongoReceiptAdjustment) {
+    throw new Error("MongoDB receipt adjustments are unavailable");
+  }
+
+  const key = String(receiptId ?? "").trim();
+  if (!key) throw new Error("Receipt voucher ID is required");
+
+  await MongoReceiptAdjustment.deleteMany({
+    $or: [
+      { receipt_id: key },
+      { "data.receipt_id": key },
+      ...(Number.isFinite(Number(key))
+        ? [
+            { receipt_id: Number(key) },
+            { "data.receipt_id": Number(key) },
+          ]
+        : []),
+    ],
+  });
+
+  const clean = normalizeReceiptAdjustments(adjustments);
+  if (!clean.length) return [];
+
+  const docs = clean.map((item) => ({
+    receipt_id: key,
+    sale_id: String(item.sale_id),
+    adjusted_amount: Number(item.adjusted_amount || 0),
+    voucher_no: item.voucher_no || "",
+    created_at: new Date(),
+    updated_at: new Date(),
+  }));
+
+  await MongoReceiptAdjustment.insertMany(docs);
+  return docs;
+}
+
+async function getMongoReceiptIdempotency(key) {
+  if (!mongoReady() || !mongoose.connection?.db || !key) return null;
+
+  const row = await mongoose.connection.db
+    .collection("voucheridempotency")
+    .findOne({
+      key: String(key),
+      route: "receipt",
+    });
+
+  return row?.response_id ?? null;
+}
+
+async function saveMongoReceiptIdempotency(key, responseId) {
+  if (!mongoReady() || !mongoose.connection?.db || !key) return;
+
+  await mongoose.connection.db
+    .collection("voucheridempotency")
+    .updateOne(
+      {
+        key: String(key),
+        route: "receipt",
+      },
+      {
+        $set: {
+          key: String(key),
+          route: "receipt",
+          response_id: Number(responseId),
+          updated_at: new Date(),
+        },
+        $setOnInsert: {
+          created_at: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+}
+
 async function getMongoReceiptRowsForUser(req) {
   if (!mongoReady()) return [];
 
