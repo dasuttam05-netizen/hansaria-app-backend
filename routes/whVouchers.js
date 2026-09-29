@@ -229,7 +229,8 @@ function calculateSaleFollowupMeta(row) {
   if (!dueDays && dueDate && unloadingDate) {
     dueDays = calculateDaysDiff(unloadingDate, dueDate);
   }
-  const daysOverdue = dueDate ? calculateDaysDiff(dueDate, today) : 0;
+  const calculatedDaysOverdue = dueDate ? calculateDaysDiff(dueDate, today) : 0;
+  const overdueDays = outstanding > 0 ? Math.max(0, calculatedDaysOverdue) : 0;
 
   let followupStatus = "pending";
   let followupPriority = 1000;
@@ -239,15 +240,13 @@ function calculateSaleFollowupMeta(row) {
   } else if (outstanding <= 0) {
     followupStatus = "payment_done";
     followupPriority = 0;
-  } else if (daysOverdue > 0) {
-    followupStatus = "overdue";
-    followupPriority = 3000 + daysOverdue;
   }
 
   return {
     due_date: dueDate,
     due_days: Number.isFinite(dueDays) ? dueDays : 0,
-    days_overdue: followupStatus === "overdue" ? daysOverdue : 0,
+    overdue_days: Number.isFinite(overdueDays) ? overdueDays : 0,
+    days_overdue: Number.isFinite(overdueDays) ? overdueDays : 0,
     followup_status: followupStatus,
     followup_priority: followupPriority,
     balance: outstanding,
@@ -8962,7 +8961,8 @@ router.get("/report/sale-followup", async (req, res) => {
           pending_amount: outstanding,
           due_date: dueDate || "",
           due_days: dueDays,
-          days_overdue: 0,
+          overdue_days: outstanding > 0 ? Math.max(0, calculateDaysDiff(toDateOnly(dueDate || ""), toDateOnly(new Date().toISOString().slice(0, 10)))) : 0,
+          days_overdue: outstanding > 0 ? Math.max(0, calculateDaysDiff(toDateOnly(dueDate || ""), toDateOnly(new Date().toISOString().slice(0, 10)))) : 0,
           followup_status: followupStatus,
           followup_priority: followupPriority,
           followup_status_label: getFollowupStatusLabel(followupStatus),
@@ -8989,7 +8989,29 @@ router.get("/report/sale-followup", async (req, res) => {
         });
       });
 
-    res.json(rows);
+    // Sale Follow-up must not show the same Sale/Lorry twice. Keep one row per
+    // unique Sale Bill; for legacy rows without a voucher number, fall back to
+    // lorry + date + buyer + amount + quantity so only exact duplicates collapse.
+    const uniqueRows = [];
+    const seenFollowupKeys = new Set();
+    for (const row of rows) {
+      const voucherNo = String(row.voucher_no || row.bill_no || "").trim();
+      const fallbackKey = [
+        String(row.date || "").trim(),
+        String(row.lorry_no || "").trim().toLowerCase(),
+        String(row.buyer_id || row.company_id || "").trim(),
+        String(row.company_account_id || "").trim(),
+        String(row.warehouse_id || "").trim(),
+        Number(row.quantity || row.total_quantity || 0).toFixed(4),
+        Number(row.amount || row.total_amount || 0).toFixed(2),
+      ].join("::");
+      const key = voucherNo ? `voucher::${voucherNo}` : `fallback::${fallbackKey}`;
+      if (seenFollowupKeys.has(key)) continue;
+      seenFollowupKeys.add(key);
+      uniqueRows.push(row);
+    }
+
+    res.json(uniqueRows);
   } catch (err) {
     console.error("Sale follow-up failed:", err);
     res.status(500).json({ error: err.message || "Failed to load sale follow-up" });
