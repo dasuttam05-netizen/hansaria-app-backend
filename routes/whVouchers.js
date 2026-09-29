@@ -8888,27 +8888,96 @@ router.get("/report/sale-followup", async (req, res) => {
   try {
     const companyAccountId = String(req.query.company_account_id || "").trim();
     const buyerId = String(req.query.company_id || req.query.buyer_id || "").trim();
-    const statusFilter = String(req.query.status || "").trim().toLowerCase();
+    const requestedStatus = String(req.query.status || "").trim().toLowerCase();
 
-    const rows = (await getSaleReportRowsForUser(req.user))
+    // Sale Follow-up uses Receipt Adjustments as the payment source of truth.
+    // This prevents a fully paid Sale Bill from remaining in Overdue/Pending
+    // because the Sale document's cached outstanding field is stale.
+    const [sales, receiptAdjustedMap] = await Promise.all([
+      getSaleReportRowsForUser(req.user),
+      new Promise((resolve, reject) => {
+        getReceiptAdjustmentsBySale((err, map) => {
+          if (err) return reject(err);
+          resolve(map || new Map());
+        });
+      }),
+    ]);
+
+    const rows = (sales || [])
       .filter((row) => {
         if (companyAccountId && String(row.company_account_id || "") !== companyAccountId) return false;
         if (buyerId && String(row.buyer_id || row.company_id || "") !== buyerId) return false;
-        if (statusFilter && String(row.followup_status || "").toLowerCase() !== statusFilter) return false;
         return true;
       })
-      .map((row) => ({
-        ...row,
-        buyer_email: row.buyer_email || row.consignee_email || "",
-        buyer_mobile: row.buyer_mobile || row.consignee_mobile || "",
-        party_name: row.party_name || row.buyer_name || row.company_name || "-",
-        balance: Number(row.balance || row.bill_balance || row.outstanding || row.sale_amount || 0),
-        due_days: Number.isFinite(Number(row.due_days)) ? Number(row.due_days) : calculateDaysDiff(row.unloading_date || row.date, row.due_date),
-        days_overdue: Number.isFinite(Number(row.days_overdue)) ? Number(row.days_overdue) : calculateDaysDiff(row.due_date, new Date().toISOString().slice(0, 10)),
-        contact_email: row.buyer_email || row.consignee_email || "",
-        contact_mobile: row.buyer_mobile || row.consignee_mobile || "",
-        followup_status_label: getFollowupStatusLabel(row.followup_status),
-      }))
+      .map((row) => {
+        const saleId = String(row.id || row._id || "");
+        const grossReceivable = Number(
+          row.net_receivable_amount ??
+          row.net_amount_payable ??
+          row.net_amount ??
+          row.amount ??
+          row.total_amount ??
+          0
+        );
+        const receiptAdjusted = Number(receiptAdjustedMap.get(saleId) || 0);
+        const outstanding = Number(
+          Math.max(0, grossReceivable - receiptAdjusted).toFixed(2)
+        );
+
+        const dueDate = row.due_date || (
+          row.unloading_date && Number(row.due_days) > 0
+            ? addDaysToDate(toDateOnly(row.unloading_date), Number(row.due_days))
+            : ""
+        );
+        const unloadingDate = toDateOnly(row.unloading_date);
+        let dueDays = Number.isFinite(Number(row.due_days)) ? Number(row.due_days) : 0;
+        if (!dueDays && dueDate && unloadingDate) {
+          dueDays = calculateDaysDiff(unloadingDate, toDateOnly(dueDate));
+        }
+
+        let followupStatus = "pending";
+        let followupPriority = 1000;
+        if (!unloadingDate) {
+          followupStatus = "unloading_pending";
+          followupPriority = 2000;
+        } else if (outstanding <= 0.0001) {
+          followupStatus = "payment_done";
+          followupPriority = 0;
+        } else {
+          // IMPORTANT: no overdue state. Even after the due date passes,
+          // an unpaid bill remains under Payment Pending.
+          followupStatus = "pending";
+          followupPriority = 1000;
+        }
+
+        return {
+          ...row,
+          buyer_email: row.buyer_email || row.consignee_email || "",
+          buyer_mobile: row.buyer_mobile || row.consignee_mobile || "",
+          party_name: row.party_name || row.buyer_name || row.company_name || "-",
+          gross_receivable: Number(grossReceivable.toFixed(2)),
+          receipt_adjusted_amount: Number(receiptAdjusted.toFixed(2)),
+          outstanding,
+          balance: outstanding,
+          pending_amount: outstanding,
+          due_date: dueDate || "",
+          due_days: dueDays,
+          days_overdue: 0,
+          followup_status: followupStatus,
+          followup_priority: followupPriority,
+          followup_status_label: getFollowupStatusLabel(followupStatus),
+          due_date_note: dueDate ? `Due Date: ${fmtDate(dueDate)}` : "Due date not set",
+          contact_email: row.buyer_email || row.consignee_email || "",
+          contact_mobile: row.buyer_mobile || row.consignee_mobile || "",
+        };
+      })
+      .filter((row) => {
+        // Keep legacy callers safe, but never expose an overdue category.
+        const status = String(requestedStatus || "").toLowerCase();
+        if (!status || status === "all") return true;
+        if (status === "overdue") return false;
+        return String(row.followup_status || "pending").toLowerCase() === status;
+      })
       .sort((a, b) => {
         if (a.followup_priority !== b.followup_priority) return a.followup_priority - b.followup_priority;
         const dateA = new Date(a.due_date || a.date || 0).getTime();
@@ -8922,7 +8991,8 @@ router.get("/report/sale-followup", async (req, res) => {
 
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Sale follow-up failed:", err);
+    res.status(500).json({ error: err.message || "Failed to load sale follow-up" });
   }
 });
 
