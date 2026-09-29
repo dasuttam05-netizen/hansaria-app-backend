@@ -5907,6 +5907,93 @@ router.delete("/payment/:id", async (req, res) => {
 // ===========================
 // RECEIPT VOUCHERS
 // ===========================
+// Receipt detail/create/edit routes call these helpers. Keep them MongoDB-only
+// and use the same numeric legacy receipt ID that the routes already use.
+async function findMongoReceiptById(receiptId) {
+  if (!mongoReady() || !MongoReceiptVoucher) return null;
+  const numericId = Number(receiptId);
+  if (!Number.isFinite(numericId) || numericId <= 0) return null;
+  return MongoReceiptVoucher.findOne({ id: numericId }).lean();
+}
+
+async function getMongoReceiptAdjustments(receiptId) {
+  if (!mongoReady() || !MongoReceiptAdjustment) return [];
+  const key = String(receiptId ?? '').trim();
+  if (!key) return [];
+  const numericId = Number(key);
+  const or = [
+    { receipt_id: key },
+    { 'data.receipt_id': key },
+  ];
+  if (Number.isFinite(numericId)) {
+    or.push({ receipt_id: numericId });
+    or.push({ 'data.receipt_id': numericId });
+  }
+  return MongoReceiptAdjustment.find({ $or: or })
+    .sort({ id: 1, _id: 1 })
+    .lean();
+}
+
+async function saveMongoReceiptAdjustments(receiptId, adjustments) {
+  if (!mongoReady() || !MongoReceiptAdjustment) {
+    throw new Error('MongoDB receipt adjustments are unavailable');
+  }
+  const key = String(receiptId ?? '').trim();
+  if (!key) throw new Error('Receipt voucher ID is required');
+
+  await MongoReceiptAdjustment.deleteMany({
+    $or: [
+      { receipt_id: key },
+      { 'data.receipt_id': key },
+      ...(Number.isFinite(Number(key)) ? [
+        { receipt_id: Number(key) },
+        { 'data.receipt_id': Number(key) },
+      ] : []),
+    ],
+  });
+
+  const clean = normalizeReceiptAdjustments(adjustments);
+  if (!clean.length) return [];
+
+  const docs = clean.map((item) => ({
+    receipt_id: key,
+    sale_id: String(item.sale_id),
+    adjusted_amount: Number(item.adjusted_amount || 0),
+    voucher_no: item.voucher_no || '',
+    created_at: new Date(),
+    updated_at: new Date(),
+  }));
+  await MongoReceiptAdjustment.insertMany(docs);
+  return docs;
+}
+
+async function getMongoReceiptIdempotency(key) {
+  if (!mongoReady() || !mongoose.connection?.db || !key) return null;
+  const row = await mongoose.connection.db
+    .collection('voucheridempotency')
+    .findOne({ key: String(key), route: 'receipt' });
+  return row?.response_id ?? null;
+}
+
+async function saveMongoReceiptIdempotency(key, responseId) {
+  if (!mongoReady() || !mongoose.connection?.db || !key) return;
+  await mongoose.connection.db
+    .collection('voucheridempotency')
+    .updateOne(
+      { key: String(key), route: 'receipt' },
+      {
+        $set: {
+          key: String(key),
+          route: 'receipt',
+          response_id: Number(responseId),
+          updated_at: new Date(),
+        },
+        $setOnInsert: { created_at: new Date() },
+      },
+      { upsert: true }
+    );
+}
+
 async function getMongoReceiptRowsForUser(req) {
   if (!mongoReady()) return [];
 
@@ -7203,197 +7290,8 @@ router.get("/report/filter-options", async (req, res) => {
   const type = String(req.query.type || "purchase").trim().toLowerCase();
   if (!mongoReady()) return res.status(503).json({ error: "MongoDB is required for Trading report filters" });
 
-  const isProfitLoss = type === "profit-loss";
   const isSale = type === "sale" || type === "sale-party-ledger" || type === "sale-followup" || type === "sale-journey";
   const isPurchase = type === "purchase" || type === "purchase-party-ledger" || type === "fifo-stock";
-
-  // Profit/Loss filter options are built from the same Direct Loading Sale records
-  // used by the report. This keeps the dropdowns limited to parties that actually
-  // have dated report rows and also works with legacy/ObjectId reference formats.
-  if (isProfitLoss) {
-    try {
-      const fromDate = String(req.query.from_date || "").trim();
-      const toDate = String(req.query.to_date || "").trim();
-      const buyerId = String(req.query.buyer_id || "").trim();
-      const consigneeId = String(req.query.consignee_id || "").trim();
-      const farmerId = String(req.query.farmer_id || "").trim();
-
-      const baseFilter = {
-        ...mongoSaleScope(req.user),
-        sale_type: "direct",
-        date: { $exists: true, $nin: ["", null] },
-      };
-
-      const resolveRefs = async (Model, rawValue, dedicatedKind = null) => {
-        const value = String(rawValue || "").trim();
-        if (!value) return [];
-        const ors = [];
-        if (mongoose.Types.ObjectId.isValid(value)) ors.push({ _id: value });
-        const numeric = Number(value);
-        if (Number.isFinite(numeric)) ors.push({ id: numeric }, { legacy_id: numeric });
-        ors.push({ id: value }, { legacy_id: value });
-        const refs = new Set([value]);
-        if (mongoose.Types.ObjectId.isValid(value)) refs.add(new mongoose.Types.ObjectId(value));
-        const numericValue = Number(value);
-        if (Number.isFinite(numericValue)) refs.add(numericValue);
-        try {
-          if (dedicatedKind) {
-            const dedicated = await findDedicatedPartyDocs(dedicatedKind, { $or: ors }, "_id id legacy_id").catch(() => []);
-            (dedicated || []).forEach((doc) => {
-              [doc?._id, doc?.id, doc?.legacy_id]
-                .filter((x) => x !== undefined && x !== null && String(x).trim())
-                .forEach((x) => refs.add(String(x)));
-            });
-          }
-        } catch {}
-        try {
-          if (Model) {
-            const docs = await Model.find({ $or: ors }).select("_id id legacy_id").lean();
-            (docs || []).forEach((doc) => {
-              [doc?._id, doc?.id, doc?.legacy_id]
-                .filter((x) => x !== undefined && x !== null && String(x).trim())
-                .forEach((x) => refs.add(String(x)));
-            });
-          }
-        } catch {}
-        return Array.from(refs);
-      };
-
-      const buyerRefsSelected = await resolveRefs(Company, buyerId, "buyer");
-      const consigneeRefsSelected = await resolveRefs(Consignee, consigneeId, "consignee");
-      const farmerRefsSelected = await resolveRefs(Farmer, farmerId);
-
-      // Filter-option lists stay complete (same as the old dropdown behaviour):
-      // only the optional date range narrows the source rows. Party selections
-      // are not used to shrink the dropdown options.
-      const rows = await SaleVoucher.find(baseFilter)
-        .select([
-          "date",
-          "farmer_id",
-          "against_purchase_farmer_id",
-          "farmer_name",
-          "against_purchase_farmer_name",
-          "buyer_id",
-          "company_id",
-          "buyer_name",
-          "company_name",
-          "party_name",
-          "consignee_id",
-          "consignee_name",
-        ].join(" "))
-        .lean();
-
-      const normalizeDateOnly = (value) => {
-        if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
-        const raw = String(value || "").trim();
-        if (!raw) return "";
-        const iso = raw.match(/^(\d{4}-\d{2}-\d{2})/);
-        if (iso) return iso[1];
-        const parsed = new Date(raw);
-        return Number.isNaN(parsed.getTime()) ? raw.slice(0, 10) : parsed.toISOString().slice(0, 10);
-      };
-
-      const rowMatchesRef = (value, refs) => {
-        if (!refs.length) return true;
-        return refs.includes(String(value || "").trim());
-      };
-
-      const filteredRows = (rows || []).filter((row) => {
-        const date = normalizeDateOnly(row?.date);
-        if (!date) return false;
-        if (fromDate && date < fromDate) return false;
-        if (toDate && date > toDate) return false;
-
-        return true;
-      });
-
-      const addRef = (map, ref, name) => {
-        const cleanRef = String(ref || "").trim();
-        const cleanName = String(name || "").trim();
-        if (!cleanRef || !cleanName || cleanName === "-") return;
-        if (!map.has(cleanRef)) map.set(cleanRef, { id: cleanRef, name: cleanName });
-      };
-
-      const buyerMap = new Map();
-      const consigneeMap = new Map();
-      const farmerMap = new Map();
-      const dateSet = new Set();
-
-      filteredRows.forEach((row) => {
-        const date = normalizeDateOnly(row?.date);
-        if (date) dateSet.add(date);
-
-        const buyerName = row?.buyer_name || row?.company_name || row?.party_name || "";
-        addRef(buyerMap, row?.buyer_id, buyerName);
-        addRef(buyerMap, row?.company_id, buyerName);
-
-        const consigneeName = row?.consignee_name || "";
-        addRef(consigneeMap, row?.consignee_id, consigneeName);
-
-        const farmerName = row?.farmer_name || row?.against_purchase_farmer_name || "";
-        addRef(farmerMap, row?.farmer_id, farmerName);
-        addRef(farmerMap, row?.against_purchase_farmer_id, farmerName);
-      });
-
-      const uniqueRefs = (map) => Array.from(map.keys()).filter(Boolean);
-      const buildOr = (refs) => {
-        const clauses = [];
-        (refs || []).forEach((ref) => {
-          const text = String(ref || "").trim();
-          if (!text) return;
-          if (mongoose.Types.ObjectId.isValid(text)) clauses.push({ _id: text });
-          clauses.push({ id: text }, { legacy_id: text });
-          const numeric = Number(text);
-          if (Number.isFinite(numeric)) clauses.push({ id: numeric }, { legacy_id: numeric });
-        });
-        return clauses.length ? clauses : [{ _id: "000000000000000000000000" }];
-      };
-
-      const buyerRefs = uniqueRefs(buyerMap);
-      const consigneeRefs = uniqueRefs(consigneeMap);
-      const farmerRefs = uniqueRefs(farmerMap);
-
-      const [farmers, dedicatedBuyers, companyBuyers, dedicatedConsignees, modelConsignees] = await Promise.all([
-        farmerRefs.length ? Farmer.find({ $or: buildOr(farmerRefs) }).select("_id id legacy_id name farmer_name account_holder_name").lean().catch(() => []) : [],
-        buyerRefs.length ? findDedicatedPartyDocs("buyer", { $or: buildOr(buyerRefs) }, "_id id legacy_id name buyer_name company_name party_name").catch(() => []) : [],
-        buyerRefs.length ? Company.find({ $or: buildOr(buyerRefs) }).select("_id id legacy_id name buyer_name company_name party_name").lean().catch(() => []) : [],
-        consigneeRefs.length ? findDedicatedPartyDocs("consignee", { $or: buildOr(consigneeRefs) }, "_id id legacy_id name consignee_name").catch(() => []) : [],
-        consigneeRefs.length ? Consignee.find({ $or: buildOr(consigneeRefs) }).select("_id id legacy_id name consignee_name").lean().catch(() => []) : [],
-      ]);
-
-      const mergeMasterNames = (map, docs, nameFields) => {
-        (docs || []).forEach((doc) => {
-          const name = nameFields.map((field) => doc?.[field]).find((value) => String(value || "").trim());
-          const cleanName = String(name || "").trim();
-          if (!cleanName) return;
-          [doc?._id, doc?.id, doc?.legacy_id]
-            .filter((x) => x !== undefined && x !== null && String(x).trim())
-            .forEach((ref) => {
-              const key = String(ref).trim();
-              if (map.has(key)) map.set(key, { id: key, name: cleanName });
-            });
-        });
-      };
-
-      mergeMasterNames(farmerMap, farmers, ["name", "farmer_name", "account_holder_name"]);
-      mergeMasterNames(buyerMap, [...(dedicatedBuyers || []), ...(companyBuyers || [])], ["name", "buyer_name", "company_name", "party_name"]);
-      mergeMasterNames(consigneeMap, [...(dedicatedConsignees || []), ...(modelConsignees || [])], ["name", "consignee_name"]);
-
-      return res.json({
-        buyers: Array.from(buyerMap.values()).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" })),
-        consignees: Array.from(consigneeMap.values()).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" })),
-        farmers: Array.from(farmerMap.values()).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" })),
-        buyer_ids: Array.from(buyerMap.keys()),
-        consignee_ids: Array.from(consigneeMap.keys()),
-        farmer_ids: Array.from(farmerMap.keys()),
-        dates: Array.from(dateSet).sort(),
-      });
-    } catch (err) {
-      console.error("Profit/Loss filter options failed:", err);
-      return res.status(500).json({ error: err.message || "Failed to load Profit/Loss filters" });
-    }
-  }
-
   if (!isSale && !isPurchase) return res.status(400).json({ error: "Unsupported report type" });
 
   const accountId = String(req.query.company_account_id || "").trim();
@@ -8035,39 +7933,27 @@ router.get("/report/profit-loss", async (req, res) => {
       const value = String(rawValue || "").trim();
       if (!value || !Model) return [];
       const ors = [];
-      const refs = new Set([value]);
-      if (mongoose.Types.ObjectId.isValid(value)) {
-        ors.push({ _id: value });
-      }
+      if (mongoose.Types.ObjectId.isValid(value)) ors.push({ _id: value });
       const numeric = Number(value);
-      if (Number.isFinite(numeric)) {
-        ors.push({ id: numeric }, { legacy_id: numeric });
-      }
+      if (Number.isFinite(numeric)) ors.push({ id: numeric }, { legacy_id: numeric });
       ors.push({ id: value }, { legacy_id: value });
       try {
         const docs = await Model.find({ $or: ors }).select("_id id legacy_id").lean();
+        const refs = new Set([value]);
         (docs || []).forEach((doc) => {
           [doc?._id, doc?.id, doc?.legacy_id]
             .filter((x) => x !== undefined && x !== null && String(x).trim())
-            .forEach((x) => {
-              refs.add(String(x));
-            });
+            .forEach((x) => refs.add(String(x)));
         });
         return Array.from(refs);
       } catch {
-        return Array.from(refs);
+        return [value];
       }
     };
 
     if (farmerId) {
       const refs = await resolveReferenceIds(Farmer, farmerId);
-      filter.$and = [
-        ...(filter.$and || []),
-        { $or: [
-          { farmer_id: { $in: refs } },
-          { against_purchase_farmer_id: { $in: refs } },
-        ] },
-      ];
+      filter.farmer_id = { $in: refs };
     }
 
     if (buyerId) {
