@@ -6068,6 +6068,34 @@ async function getMongoReceiptRowsForUser(req) {
     companyMap,
   } = await getVoucherDisplayMaps();
 
+  // Resolve Receipt Buyer/Party names once for the complete list so the
+  // Company column can show the actual pending buyer, even when company_id
+  // uses a legacy_id/ObjectId or the dedicated Buyer collection.
+  const receiptCompanyIds = [...new Set(
+    rawRows
+      .map((doc) => normalizeMongoMirrorVoucher(doc))
+      .map((row) => String(row?.buyer_id || row?.company_id || "").trim())
+      .filter(Boolean)
+  )];
+  const receiptBuyerFilters = [
+    ...receiptCompanyIds
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .map((id) => ({ _id: id })),
+    ...receiptCompanyIds
+      .map(Number)
+      .filter(Number.isFinite)
+      .flatMap((id) => [{ id }, { legacy_id: id }]),
+  ];
+  const receiptBuyerDocs = receiptBuyerFilters.length
+    ? await findDedicatedPartyDocs("buyer", { $or: receiptBuyerFilters }, "_id id legacy_id name buyer_name company_name party_name")
+    : [];
+  const receiptBuyerMap = new Map();
+  (receiptBuyerDocs || []).forEach((buyer) => {
+    [buyer?._id, buyer?.id, buyer?.legacy_id]
+      .filter((value) => value !== undefined && value !== null && String(value).trim())
+      .forEach((value) => receiptBuyerMap.set(String(value).trim(), buyer));
+  });
+
   const rows = rawRows
     .map(normalizeMongoMirrorVoucher)
     .filter((row) => {
@@ -6094,8 +6122,32 @@ async function getMongoReceiptRowsForUser(req) {
 
       const company =
         companyMap.get(
-          String(row.company_id)
+          String(row.company_id || row.buyer_id || "")
         ) || {};
+      const buyer =
+        receiptBuyerMap.get(
+          String(row.buyer_id || row.company_id || "")
+        ) || {};
+
+      const resolvedBuyerName = [
+        row.buyer_name,
+        row.party_name,
+        buyer.name,
+        buyer.buyer_name,
+        buyer.company_name,
+        buyer.party_name,
+        company.name,
+        company.company_name,
+        company.buyer_name,
+        company.party_name,
+        row.company_name,
+        row.company_account_name,
+        account.account_name,
+        account.name,
+        row.account_name,
+      ]
+        .map((value) => String(value ?? "").trim())
+        .find((value) => value && value !== "-" && value.toLowerCase() !== "unknown party") || "";
 
       return {
         ...row,
@@ -6117,10 +6169,15 @@ async function getMongoReceiptRowsForUser(req) {
           account.name ||
           "",
 
+        buyer_name:
+          row.buyer_name ||
+          resolvedBuyerName,
+
+        receipt_buyer_name:
+          resolvedBuyerName,
+
         company_name:
-          row.company_name ||
-          company.name ||
-          "",
+          resolvedBuyerName,
       };
     });
 
