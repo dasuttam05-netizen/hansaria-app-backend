@@ -8657,6 +8657,11 @@ router.get("/report/sale-party-ledger", async (req, res) => {
         sale_date: sale?.date || sale?.unloading_date || item.sale_date || "",
         sale_voucher_no: sale?.voucher_no || item.sale_voucher_no || item.sale_id,
         sale_amount: Number(sale?.amount || sale?.total_amount || item.sale_amount || 0),
+        sale_total_amount: Number(sale?.amount || sale?.total_amount || item.sale_amount || 0),
+        product_id: sale?.product_id || item.product_id || "",
+        product_name: sale?.product_name || item.product_name || "",
+        quantity: Number(sale?.quantity || sale?.total_quantity || sale?.unloading_qty || item.quantity || 0),
+        rate: Number(sale?.rate || item.rate || 0),
         receipt_date: receipt?.date || "",
         receipt_voucher_no: receipt?.voucher_no || item.receipt_voucher_no || "",
         receipt_amount: Number(receipt?.amount || 0),
@@ -8804,13 +8809,56 @@ router.get("/report/sale-party-ledger", async (req, res) => {
     (receipts || []).forEach((row) => {
       const details = byReceipt.get(String(row.id)) || [];
       const isOnAccount = !details.length && !String(row.reference_id || "").trim();
+
+      // Keep the Receipt credit amount, but also expose the Sale Bill details
+      // that this receipt is adjusted against in the same ledger row.
+      const uniqueSaleDetails = Array.from(
+        new Map(
+          details
+            .filter((item) => String(item?.sale_id || item?.sale_voucher_no || "").trim())
+            .map((item) => [String(item.sale_id || item.sale_voucher_no), item])
+        ).values()
+      );
+      const receiptProductNames = [...new Set(
+        uniqueSaleDetails
+          .map((item) => String(item?.product_name || "").trim())
+          .filter((name) => name && name !== "-")
+      )];
+      const receiptSaleAmount = uniqueSaleDetails.reduce(
+        (sum, item) => sum + Number(item?.sale_amount || item?.sale_total_amount || 0),
+        0
+      );
+      const receiptSaleQuantity = uniqueSaleDetails.reduce(
+        (sum, item) => sum + Number(item?.quantity || 0),
+        0
+      );
+      const singleSaleRate = uniqueSaleDetails.length === 1
+        ? Number(uniqueSaleDetails[0]?.rate || 0)
+        : 0;
+
       ledgerRows.push({
         ...row,
         date: row.date,
         voucher_no: row.voucher_no,
         voucher_type: "Receipt",
+        product_id: uniqueSaleDetails.length === 1 ? (uniqueSaleDetails[0]?.product_id || row.product_id || "") : (row.product_id || ""),
+        product_name: receiptProductNames.join(", "),
+        quantity: Number(receiptSaleQuantity.toFixed(4)),
+        total_quantity: Number(receiptSaleQuantity.toFixed(4)),
+        rate: singleSaleRate,
+        gross_amount: Number(receiptSaleAmount.toFixed(2)),
+        sale_amount: Number(receiptSaleAmount.toFixed(2)),
+        total_amount: Number(receiptSaleAmount.toFixed(2)),
         particulars: isOnAccount ? "Unadjusted on account" : `Receipt adjusted against ${details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || row.reference_id || "sale bill"}`,
-        adjustment_details: details.map((item) => `${item.sale_date || "-"} | ${item.sale_voucher_no || "-"} | Rs.${fmtNum(item.adjusted_amount)}`).join("; "),
+        adjustment_details: details.map((item) => {
+          const paymentDate = item.receipt_date || row.date || "-";
+          const paymentVoucher = item.receipt_voucher_no || row.voucher_no || "-";
+          const billDate = item.sale_date || "-";
+          const billVoucher = item.sale_voucher_no || "-";
+          const billAmount = Number(item.sale_amount || item.sale_total_amount || 0);
+          const adjustedAmount = Number(item.adjusted_amount || 0);
+          return `${paymentDate} | ${paymentVoucher} | Bill ${billDate} | ${billVoucher} | Bill Amount Rs.${fmtNum(billAmount)} | Adjusted Rs.${fmtNum(adjustedAmount)}`;
+        }).join("; "),
         reference_id: row.reference_id || details.map((item) => item.sale_voucher_no).filter(Boolean).join(", ") || (isOnAccount ? "On account" : ""),
         receipt_details: details,
         debit: 0,
