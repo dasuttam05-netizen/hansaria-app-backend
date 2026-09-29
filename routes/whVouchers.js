@@ -5909,6 +5909,19 @@ router.delete("/payment/:id", async (req, res) => {
 // ===========================
 // Receipt detail/create/edit routes call these helpers. Keep them MongoDB-only
 // and use the same numeric legacy receipt ID that the routes already use.
+async function getNextMongoReceiptId() {
+  if (!mongoReady() || !MongoReceiptVoucher) {
+    throw new Error("MongoDB receipt vouchers are unavailable");
+  }
+
+  const last = await MongoReceiptVoucher.findOne({})
+    .sort({ id: -1 })
+    .select("id")
+    .lean();
+
+  return Number(last?.id || 0) + 1;
+}
+
 async function findMongoReceiptById(receiptId) {
   if (!mongoReady() || !MongoReceiptVoucher) return null;
   const numericId = Number(receiptId);
