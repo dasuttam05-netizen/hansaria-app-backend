@@ -6037,6 +6037,40 @@ async function getMongoReceiptRowsForUser(req) {
     companyMap,
   } = await getVoucherDisplayMaps();
 
+  // Receipt company_id is the Buyer/Party ID used by SaleVoucher.
+  // Resolve it from the dedicated Buyer collection so Receipt lists and
+  // Sale Party Ledger show the actual buyer name instead of "-".
+  const buyerIds = Array.from(new Set(
+    rawRows
+      .map((doc) => normalizeMongoMirrorVoucher(doc))
+      .map((row) => String(row?.company_id || row?.buyer_id || '').trim())
+      .filter(Boolean)
+  ));
+  const buyerLegacyIds = buyerIds
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id));
+  const buyerObjectIds = buyerIds
+    .filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const buyerQuery = buyerIds.length ? {
+    $or: [
+      ...(buyerLegacyIds.length ? [{ legacy_id: { $in: buyerLegacyIds } }] : []),
+      ...(buyerObjectIds.length ? [{ _id: { $in: buyerObjectIds } }] : []),
+    ],
+  } : null;
+  const buyerRows = buyerQuery
+    ? await findDedicatedPartyDocs('buyer', buyerQuery)
+    : [];
+  const buyerMap = new Map();
+  for (const buyer of buyerRows || []) {
+    if (buyer?._id) buyerMap.set(String(buyer._id), buyer);
+    if (buyer?.legacy_id !== undefined && buyer?.legacy_id !== null) {
+      buyerMap.set(String(buyer.legacy_id), buyer);
+    }
+    if (buyer?.id !== undefined && buyer?.id !== null) {
+      buyerMap.set(String(buyer.id), buyer);
+    }
+  }
+
   const rows = rawRows
     .map(normalizeMongoMirrorVoucher)
     .filter((row) => {
@@ -6065,6 +6099,18 @@ async function getMongoReceiptRowsForUser(req) {
         companyMap.get(
           String(row.company_id)
         ) || {};
+      const buyer =
+        buyerMap.get(
+          String(row.company_id || row.buyer_id || '')
+        ) || {};
+      const buyerName =
+        buyer.name ||
+        buyer.buyer_name ||
+        buyer.company_name ||
+        row.buyer_name ||
+        row.party_name ||
+        company.name ||
+        '';
 
       return {
         ...row,
@@ -6086,7 +6132,18 @@ async function getMongoReceiptRowsForUser(req) {
           account.name ||
           "",
 
+        buyer_id:
+          String(row.buyer_id || row.company_id || ''),
+
+        buyer_name:
+          buyerName,
+
+        party_name:
+          row.party_name ||
+          buyerName,
+
         company_name:
+          buyerName ||
           row.company_name ||
           company.name ||
           "",
