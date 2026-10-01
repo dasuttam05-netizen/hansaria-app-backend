@@ -42,7 +42,7 @@ function num(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-const WORK_DESCRIPTIONS = new Set(["PALTI", "WAREHOUSE UNLOAD", "LOCAL SALE", "PARTY ACCOUNT", "OTHERS"]);
+const WORK_DESCRIPTIONS = new Set(["PALTI", "WAREHOUSE UNLOAD", "LOCAL SALE", "PARTY ACCOUNT", "OTHERS", "SEND TO FACTORY"]);
 const REASONS = new Set(["HIGH FUNGUS", "HIGH MOISTURE", "DISCOLOUR", "DAMAGE", "LIVE INSECT", "WATER DAMAGE", "OTHERS"]);
 
 function normalizeStatus(value) {
@@ -461,13 +461,81 @@ router.patch("/:id/assign", async (req, res) => {
     const existing = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
 
+    // SEND TO FACTORY form data.
+    // These fields are optional for all other work descriptions and are only
+    // written when the selected Work Description is SEND TO FACTORY.
+    const factoryDateRaw = text(req.body?.factory_date);
+    const factoryDate = factoryDateRaw ? new Date(factoryDateRaw) : null;
+    if (actionType === "SEND TO FACTORY" && factoryDateRaw && Number.isNaN(factoryDate.getTime())) {
+      return res.status(400).json({ error: "Invalid factory date" });
+    }
+
+    const factoryRejectionQty = actionType === "SEND TO FACTORY"
+      ? num(req.body?.factory_rejection_qty ?? existing.rejection_qty)
+      : 0;
+    const factoryOtherQty = actionType === "SEND TO FACTORY"
+      ? Math.max(num(req.body?.factory_other_qty), 0)
+      : 0;
+    const factoryTotalQty = actionType === "SEND TO FACTORY"
+      ? factoryRejectionQty + factoryOtherQty
+      : 0;
+    const factoryRate = actionType === "SEND TO FACTORY"
+      ? num(req.body?.factory_rate)
+      : 0;
+    const factoryAmount = actionType === "SEND TO FACTORY"
+      ? factoryTotalQty * factoryRate
+      : 0;
+
+    if (actionType === "SEND TO FACTORY" && factoryRejectionQty < 0) {
+      return res.status(400).json({ error: "Factory rejection quantity cannot be negative" });
+    }
+    if (actionType === "SEND TO FACTORY" && factoryOtherQty < 0) {
+      return res.status(400).json({ error: "Factory other quantity cannot be negative" });
+    }
+    if (actionType === "SEND TO FACTORY" && factoryRate < 0) {
+      return res.status(400).json({ error: "Factory rate cannot be negative" });
+    }
+
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({ action: "ASSIGNED_AND_STARTED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: now, status: "RUNNING", assigned_to: String(employee._id), action_type: actionType });
 
+    const assignSet = {
+      assigned_to: String(employee._id),
+      assigned_to_name: employee.name || "",
+      assigned_by: currentUserId(req.user),
+      assigned_at: now,
+      action_type: actionType,
+      status: "RUNNING",
+      started_at: now,
+      started_by: currentUserId(req.user),
+      updated_at: now,
+      history,
+    };
+
+    if (actionType === "SEND TO FACTORY") {
+      assignSet.factory_date = factoryDate || now;
+      assignSet.factory_invoice_no = text(req.body?.factory_invoice_no);
+      assignSet.factory_lorry_no = text(req.body?.factory_lorry_no);
+      assignSet.factory_company_id = text(req.body?.factory_company_id) || null;
+      assignSet.factory_company_name = text(req.body?.factory_company_name);
+      assignSet.factory_company_account_id = text(req.body?.factory_company_account_id) || null;
+      assignSet.factory_company_account_name = text(req.body?.factory_company_account_name);
+      assignSet.factory_buyer_id = text(req.body?.factory_buyer_id) || null;
+      assignSet.factory_buyer_name = text(req.body?.factory_buyer_name);
+      assignSet.factory_consignee_id = text(req.body?.factory_consignee_id) || null;
+      assignSet.factory_consignee_name = text(req.body?.factory_consignee_name);
+      assignSet.factory_rejection_qty = factoryRejectionQty;
+      assignSet.factory_other_qty = factoryOtherQty;
+      assignSet.factory_total_qty = factoryTotalQty;
+      assignSet.factory_rate = factoryRate;
+      assignSet.factory_amount = factoryAmount;
+      assignSet.factory_created_at = now;
+    }
+
     await collection.updateOne(
       { _id: existing._id },
-      { $set: { assigned_to: String(employee._id), assigned_to_name: employee.name || "", assigned_by: currentUserId(req.user), assigned_at: now, action_type: actionType, status: "RUNNING", started_at: now, started_by: currentUserId(req.user), updated_at: now, history } }
+      { $set: assignSet }
     );
     res.json({ ok: true });
   } catch (err) {
