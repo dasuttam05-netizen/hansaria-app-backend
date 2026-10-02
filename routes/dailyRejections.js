@@ -160,14 +160,6 @@ async function hydrateRows(rows) {
     location_name: row.location_name || lm.get(idOf(row.location_id))?.name || "",
     employee_name: row.employee_name || em.get(idOf(row.employee_id))?.name || "",
     assigned_to_name: row.assigned_to_name || em.get(idOf(row.assigned_to))?.name || "",
-    assignment_narration: row.assignment_narration || "",
-    progress_completed_qty: num(row.progress_completed_qty),
-    additional_rejection_qty: num(row.additional_rejection_qty),
-    required_qty: num(row.required_qty) || Math.max(num(row.original_qty), num(row.rejection_qty) + num(row.additional_rejection_qty)),
-    remaining_work_qty: row.remaining_work_qty !== undefined && row.remaining_work_qty !== null
-      ? num(row.remaining_work_qty)
-      : Math.max((num(row.required_qty) || Math.max(num(row.original_qty), num(row.rejection_qty) + num(row.additional_rejection_qty))) - num(row.progress_completed_qty), 0),
-    progress_narration: row.progress_narration || "",
   }));
 }
 
@@ -370,6 +362,18 @@ router.post("/", async (req, res) => {
       completed_by: null,
       completion_qty: 0,
       completion_remarks: "",
+      assignment_narration: "",
+      chain_target_qty: originalQty,
+      chain_processed_qty: 0,
+      chain_remaining_qty: originalQty,
+      chain_updated_at: null,
+      latest_processed_qty: 0,
+      latest_new_rejection_qty: 0,
+      latest_new_lorry_no: "",
+      latest_destination_type: "",
+      latest_warehouse_id: "",
+      latest_warehouse_name: "",
+      latest_progress_narration: "",
       status: "PENDING",
       history: [{ action: "CREATED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: new Date(), status: "PENDING" }],
       created_at: new Date(),
@@ -451,6 +455,18 @@ router.put("/:id", async (req, res) => {
   }
 });
 
+
+function chainNum(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function chainRemaining(row) {
+  const target = chainNum(row?.chain_target_qty || row?.original_qty || 0);
+  const processed = chainNum(row?.chain_processed_qty || 0);
+  return Math.max(target - processed, 0);
+}
+
 router.patch("/:id/assign", async (req, res) => {
   try {
     if (!assertPermission(req.user, ASSIGN, res)) return;
@@ -485,11 +501,13 @@ router.patch("/:id/assign", async (req, res) => {
       updated_at: now,
       history,
       assignment_narration: text(req.body?.assignment_narration),
-      progress_completed_qty: num(existing.progress_completed_qty),
-      additional_rejection_qty: num(existing.additional_rejection_qty),
-      required_qty: Math.max(num(existing.original_qty), num(existing.rejection_qty) + num(existing.additional_rejection_qty)),
-      remaining_work_qty: Math.max(Math.max(num(existing.original_qty), num(existing.rejection_qty) + num(existing.additional_rejection_qty)) - num(existing.progress_completed_qty), 0),
+      chain_target_qty: chainNum(existing.chain_target_qty || existing.original_qty || 0),
+      chain_processed_qty: chainNum(existing.chain_processed_qty || 0),
+      chain_remaining_qty: chainRemaining(existing),
+      chain_updated_at: now,
     };
+
+    history[history.length - 1].assignment_narration = text(req.body?.assignment_narration);
 
     // Keep the factory popup details on the same rejection row so the
     // assigned employee receives the complete details with the assignment.
@@ -523,90 +541,93 @@ router.patch("/:id/assign", async (req, res) => {
   }
 });
 
-router.patch("/:id/progress", async (req, res) => {
+
+router.post("/:id/progress", async (req, res) => {
   try {
     if (!requireMongo(res)) return;
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid rejection id" });
     const collection = mongoose.connection.db.collection("daily_rejections");
     const existing = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
+
     const uid = currentUserId(req.user);
     if (String(existing.assigned_to || "") !== uid && !isManager(req.user)) {
-      return res.status(403).json({ error: "Only the assigned employee can update progress" });
+      return res.status(403).json({ error: "Only the assigned employee can update this work" });
     }
     if (normalizeStatus(existing.status) !== "RUNNING") {
-      return res.status(400).json({ error: "Only Running rejection can receive progress" });
+      return res.status(400).json({ error: "Only Running work can receive progress" });
     }
 
-    const progressQty = num(req.body?.progress_qty);
-    const newRejectionQty = num(req.body?.new_rejection_qty);
-    if (progressQty < 0 || newRejectionQty < 0 || (progressQty <= 0 && newRejectionQty <= 0)) {
-      return res.status(400).json({ error: "Enter a progress quantity or a new rejection quantity" });
+    const processedQty = chainNum(req.body?.processed_qty);
+    const newRejectionQty = chainNum(req.body?.new_rejection_qty);
+    if (processedQty <= 0 && newRejectionQty <= 0) {
+      return res.status(400).json({ error: "Processed Qty or New Rejection Qty is required" });
     }
 
-    const previousCompleted = num(existing.progress_completed_qty);
-    const previousAdditional = num(existing.additional_rejection_qty);
-    const completedQty = previousCompleted + progressQty;
-    const additionalQty = previousAdditional + newRejectionQty;
-    const requiredQty = Math.max(num(existing.original_qty), num(existing.rejection_qty) + additionalQty);
-    const remainingQty = Math.max(requiredQty - completedQty, 0);
-    const complete = remainingQty <= 0;
+    const currentTarget = chainNum(existing.chain_target_qty || existing.original_qty || 0);
+    const currentProcessed = chainNum(existing.chain_processed_qty || 0);
+    const nextTarget = currentTarget + newRejectionQty;
+    const nextProcessed = currentProcessed + processedQty;
+    const remaining = Math.max(nextTarget - nextProcessed, 0);
+    const complete = remaining <= 0.000001;
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({
-      action: complete ? "PROGRESS_COMPLETED" : "PROGRESS_UPDATED",
+      action: complete ? "PROGRESS_COMPLETED" : "PROGRESS_SAVED_PENDING",
       by: uid,
       by_name: req.user?.name || req.user?.username || "",
       at: now,
       status: complete ? "COMPLETE" : "PENDING",
-      progress_qty: progressQty,
+      processed_qty: processedQty,
       new_rejection_qty: newRejectionQty,
-      cumulative_completed_qty: completedQty,
-      required_qty: requiredQty,
-      remaining_qty: remainingQty,
-      narration: text(req.body?.narration),
+      new_lorry_no: text(req.body?.new_lorry_no),
+      destination_type: text(req.body?.destination_type),
+      warehouse_id: text(req.body?.warehouse_id),
+      warehouse_name: text(req.body?.warehouse_name),
+      progress_narration: text(req.body?.progress_narration),
     });
 
     const setData = {
-      progress_completed_qty: completedQty,
-      additional_rejection_qty: additionalQty,
-      required_qty: requiredQty,
-      remaining_work_qty: remainingQty,
-      last_progress_qty: progressQty,
-      last_new_rejection_qty: newRejectionQty,
-      progress_narration: text(req.body?.narration),
+      chain_target_qty: nextTarget,
+      chain_processed_qty: nextProcessed,
+      chain_remaining_qty: remaining,
+      chain_updated_at: now,
+      latest_processed_qty: processedQty,
+      latest_new_rejection_qty: newRejectionQty,
+      latest_new_lorry_no: text(req.body?.new_lorry_no),
+      latest_destination_type: text(req.body?.destination_type),
+      latest_warehouse_id: text(req.body?.warehouse_id),
+      latest_warehouse_name: text(req.body?.warehouse_name),
+      latest_progress_narration: text(req.body?.progress_narration),
       updated_at: now,
       history,
     };
 
     if (complete) {
-      setData.status = "COMPLETE";
-      setData.completed_at = now;
-      setData.completed_by = uid;
-      setData.completion_qty = completedQty;
+      Object.assign(setData, {
+        status: "COMPLETE",
+        completion_qty: nextProcessed,
+        completion_remarks: text(req.body?.progress_narration),
+        completed_at: now,
+        completed_by: uid,
+      });
     } else {
-      // Incomplete work returns to Pending so the person with Assign access can
-      // decide who should receive the next task. Keep the full progress history.
-      setData.status = "PENDING";
-      setData.assigned_to = null;
-      setData.assigned_to_name = "";
-      setData.assigned_by = null;
-      setData.assigned_at = null;
-      setData.started_at = null;
-      setData.started_by = null;
+      Object.assign(setData, {
+        status: "PENDING",
+        assigned_to: null,
+        assigned_to_name: "",
+        assigned_by: null,
+        assigned_at: null,
+        started_at: null,
+        started_by: null,
+      });
     }
 
     await collection.updateOne({ _id: existing._id }, { $set: setData });
-    res.json({
-      ok: true,
-      status: complete ? "COMPLETE" : "PENDING",
-      required_qty: requiredQty,
-      completed_qty: completedQty,
-      remaining_qty: remainingQty,
-    });
+    res.json({ ok: true, status: setData.status, chain_target_qty: nextTarget, chain_processed_qty: nextProcessed, chain_remaining_qty: remaining });
   } catch (err) {
     console.error("[daily-rejections:progress]", err);
-    res.status(500).json({ error: err.message || "Failed to update rejection progress" });
+    res.status(500).json({ error: err.message || "Failed to save progress" });
   }
 });
 
@@ -644,9 +665,11 @@ router.post("/:id/complete", async (req, res) => {
     const managerCanComplete = isManager(req.user);
     if (!isAssignedEmployee && !managerCanComplete) return res.status(403).json({ error: "Only the assigned employee or manager can complete this work" });
     if (normalizeStatus(existing.status) !== "RUNNING") return res.status(400).json({ error: "Only Running rejection can be completed" });
+    const remainingQty = chainRemaining(existing);
+    if (remainingQty > 0.000001) return res.status(400).json({ error: `Work cannot be completed. Remaining Qty: ${remainingQty}` });
 
     const now = new Date();
-    const completionQty = num(req.body?.completion_qty || existing.rejection_qty);
+    const completionQty = chainNum(existing.chain_processed_qty || req.body?.completion_qty || existing.rejection_qty);
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({ action: "COMPLETED", by: uid, by_name: req.user?.name || req.user?.username || "", at: now, status: "COMPLETE", completion_qty: completionQty });
 
