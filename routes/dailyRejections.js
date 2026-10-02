@@ -42,7 +42,7 @@ function num(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-const WORK_DESCRIPTIONS = new Set(["PALTI", "WAREHOUSE UNLOAD", "LOCAL SALE", "PARTY ACCOUNT", "OTHERS", "SEND TO FACTORY"]);
+const WORK_DESCRIPTIONS = new Set(["PALTI", "WAREHOUSE UNLOAD", "LOCAL SALE", "PARTY ACCOUNT", "OTHERS"]);
 const REASONS = new Set(["HIGH FUNGUS", "HIGH MOISTURE", "DISCOLOUR", "DAMAGE", "LIVE INSECT", "WATER DAMAGE", "OTHERS"]);
 
 function normalizeStatus(value) {
@@ -116,7 +116,7 @@ function userCanSeeRow(user, row) {
   }
 
   const uid = currentUserId(user);
-  return String(row?.employee_id || "") === uid || String(row?.assigned_to || "") === uid;
+  return String(row?.assigned_to || "") === uid;
 }
 
 async function generateRejectionNo(dateValue) {
@@ -214,7 +214,7 @@ router.get("/summary", async (req, res) => {
       if (from) query.entry_date.$gte = new Date(`${from}T00:00:00`);
       if (to) query.entry_date.$lte = new Date(`${to}T23:59:59.999`);
     }
-    if (!isManager(req.user)) query.$or = [{ employee_id: currentUserId(req.user) }, { assigned_to: currentUserId(req.user) }];
+    if (!isManager(req.user)) query.assigned_to = currentUserId(req.user);
     const rows = await collection.find(query).project({ status: 1 }).toArray();
     const summary = { total: rows.length, pending: 0, assigned: 0, running: 0, complete: 0 };
     rows.forEach((r) => { const s = normalizeStatus(r.status).toLowerCase(); if (summary[s] !== undefined) summary[s] += 1; });
@@ -258,7 +258,7 @@ router.get("/", async (req, res) => {
     if (actionType && WORK_DESCRIPTIONS.has(actionType)) query.action_type = actionType;
 
     if (!isManager(req.user)) {
-      query.$or = [{ employee_id: currentUserId(req.user) }, { assigned_to: currentUserId(req.user) }];
+      query.assigned_to = currentUserId(req.user);
     }
 
     const rows = await collection.find(query).sort({ entry_date: -1, created_at: -1 }).limit(2000).toArray();
@@ -286,7 +286,7 @@ router.get("/report", async (req, res) => {
       if (to) query.entry_date.$lte = new Date(`${to}T23:59:59.999`);
     }
     if (actionType && actionType !== "ALL") query.action_type = actionType;
-    if (!isManager(req.user)) query.$or = [{ employee_id: currentUserId(req.user) }, { assigned_to: currentUserId(req.user) }];
+    if (!isManager(req.user)) query.assigned_to = currentUserId(req.user);
     const rows = await mongoose.connection.db.collection("daily_rejections").find(query).sort({ entry_date: -1, created_at: -1 }).limit(5000).toArray();
     res.json({ rows: await hydrateRows(rows), count: rows.length });
   } catch (err) {
@@ -461,81 +461,13 @@ router.patch("/:id/assign", async (req, res) => {
     const existing = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
 
-    // SEND TO FACTORY form data.
-    // These fields are optional for all other work descriptions and are only
-    // written when the selected Work Description is SEND TO FACTORY.
-    const factoryDateRaw = text(req.body?.factory_date);
-    const factoryDate = factoryDateRaw ? new Date(factoryDateRaw) : null;
-    if (actionType === "SEND TO FACTORY" && factoryDateRaw && Number.isNaN(factoryDate.getTime())) {
-      return res.status(400).json({ error: "Invalid factory date" });
-    }
-
-    const factoryRejectionQty = actionType === "SEND TO FACTORY"
-      ? num(req.body?.factory_rejection_qty ?? existing.rejection_qty)
-      : 0;
-    const factoryOtherQty = actionType === "SEND TO FACTORY"
-      ? Math.max(num(req.body?.factory_other_qty), 0)
-      : 0;
-    const factoryTotalQty = actionType === "SEND TO FACTORY"
-      ? factoryRejectionQty + factoryOtherQty
-      : 0;
-    const factoryRate = actionType === "SEND TO FACTORY"
-      ? num(req.body?.factory_rate)
-      : 0;
-    const factoryAmount = actionType === "SEND TO FACTORY"
-      ? factoryTotalQty * factoryRate
-      : 0;
-
-    if (actionType === "SEND TO FACTORY" && factoryRejectionQty < 0) {
-      return res.status(400).json({ error: "Factory rejection quantity cannot be negative" });
-    }
-    if (actionType === "SEND TO FACTORY" && factoryOtherQty < 0) {
-      return res.status(400).json({ error: "Factory other quantity cannot be negative" });
-    }
-    if (actionType === "SEND TO FACTORY" && factoryRate < 0) {
-      return res.status(400).json({ error: "Factory rate cannot be negative" });
-    }
-
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({ action: "ASSIGNED_AND_STARTED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: now, status: "RUNNING", assigned_to: String(employee._id), action_type: actionType });
 
-    const assignSet = {
-      assigned_to: String(employee._id),
-      assigned_to_name: employee.name || "",
-      assigned_by: currentUserId(req.user),
-      assigned_at: now,
-      action_type: actionType,
-      status: "RUNNING",
-      started_at: now,
-      started_by: currentUserId(req.user),
-      updated_at: now,
-      history,
-    };
-
-    if (actionType === "SEND TO FACTORY") {
-      assignSet.factory_date = factoryDate || now;
-      assignSet.factory_invoice_no = text(req.body?.factory_invoice_no);
-      assignSet.factory_lorry_no = text(req.body?.factory_lorry_no);
-      assignSet.factory_company_id = text(req.body?.factory_company_id) || null;
-      assignSet.factory_company_name = text(req.body?.factory_company_name);
-      assignSet.factory_company_account_id = text(req.body?.factory_company_account_id) || null;
-      assignSet.factory_company_account_name = text(req.body?.factory_company_account_name);
-      assignSet.factory_buyer_id = text(req.body?.factory_buyer_id) || null;
-      assignSet.factory_buyer_name = text(req.body?.factory_buyer_name);
-      assignSet.factory_consignee_id = text(req.body?.factory_consignee_id) || null;
-      assignSet.factory_consignee_name = text(req.body?.factory_consignee_name);
-      assignSet.factory_rejection_qty = factoryRejectionQty;
-      assignSet.factory_other_qty = factoryOtherQty;
-      assignSet.factory_total_qty = factoryTotalQty;
-      assignSet.factory_rate = factoryRate;
-      assignSet.factory_amount = factoryAmount;
-      assignSet.factory_created_at = now;
-    }
-
     await collection.updateOne(
       { _id: existing._id },
-      { $set: assignSet }
+      { $set: { assigned_to: String(employee._id), assigned_to_name: employee.name || "", assigned_by: currentUserId(req.user), assigned_at: now, action_type: actionType, status: "RUNNING", started_at: now, started_by: currentUserId(req.user), updated_at: now, history } }
     );
     res.json({ ok: true });
   } catch (err) {
@@ -575,7 +507,8 @@ router.post("/:id/complete", async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
     const uid = currentUserId(req.user);
     const isAssignedEmployee = String(existing.assigned_to || "") === uid;
-    if (!isAssignedEmployee && !userHasPermission(req.user, COMPLETE)) return res.status(403).json({ error: "Only the assigned employee or authorised user can complete this work" });
+    const managerCanComplete = isManager(req.user);
+    if (!isAssignedEmployee && !managerCanComplete) return res.status(403).json({ error: "Only the assigned employee or manager can complete this work" });
     if (normalizeStatus(existing.status) !== "RUNNING") return res.status(400).json({ error: "Only Running rejection can be completed" });
 
     const now = new Date();
