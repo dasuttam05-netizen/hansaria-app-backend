@@ -42,7 +42,7 @@ function num(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-const WORK_DESCRIPTIONS = new Set(["PALTI", "WAREHOUSE UNLOAD", "LOCAL SALE", "PARTY ACCOUNT", "OTHERS"]);
+const WORK_DESCRIPTIONS = new Set(["PALTI", "WAREHOUSE UNLOAD", "LOCAL SALE", "PARTY ACCOUNT", "OTHERS", "SEND TO FACTORY"]);
 const REASONS = new Set(["HIGH FUNGUS", "HIGH MOISTURE", "DISCOLOUR", "DAMAGE", "LIVE INSECT", "WATER DAMAGE", "OTHERS"]);
 
 function normalizeStatus(value) {
@@ -465,10 +465,43 @@ router.patch("/:id/assign", async (req, res) => {
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({ action: "ASSIGNED_AND_STARTED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: now, status: "RUNNING", assigned_to: String(employee._id), action_type: actionType });
 
-    await collection.updateOne(
-      { _id: existing._id },
-      { $set: { assigned_to: String(employee._id), assigned_to_name: employee.name || "", assigned_by: currentUserId(req.user), assigned_at: now, action_type: actionType, status: "RUNNING", started_at: now, started_by: currentUserId(req.user), updated_at: now, history } }
-    );
+    const setData = {
+      assigned_to: String(employee._id),
+      assigned_to_name: employee.name || "",
+      assigned_by: currentUserId(req.user),
+      assigned_at: now,
+      action_type: actionType,
+      status: "RUNNING",
+      started_at: now,
+      started_by: currentUserId(req.user),
+      updated_at: now,
+      history,
+    };
+
+    // Keep the factory popup details on the same rejection row so the
+    // assigned employee receives the complete details with the assignment.
+    if (actionType === "SEND TO FACTORY") {
+      Object.assign(setData, {
+        factory_date: text(req.body?.factory_date),
+        factory_invoice_no: text(req.body?.factory_invoice_no),
+        factory_lorry_no: text(req.body?.factory_lorry_no),
+        factory_company_id: text(req.body?.factory_company_id),
+        factory_company_name: text(req.body?.factory_company_name),
+        factory_company_account_id: text(req.body?.factory_company_account_id),
+        factory_company_account_name: text(req.body?.factory_company_account_name),
+        factory_buyer_id: text(req.body?.factory_buyer_id),
+        factory_buyer_name: text(req.body?.factory_buyer_name),
+        factory_consignee_id: text(req.body?.factory_consignee_id),
+        factory_consignee_name: text(req.body?.factory_consignee_name),
+        factory_rejection_qty: Number(req.body?.factory_rejection_qty || 0),
+        factory_other_qty: Number(req.body?.factory_other_qty || 0),
+        factory_total_qty: Number(req.body?.factory_total_qty || 0),
+        factory_rate: Number(req.body?.factory_rate || 0),
+        factory_amount: Number(req.body?.factory_amount || 0),
+      });
+    }
+
+    await collection.updateOne({ _id: existing._id }, { $set: setData });
     res.json({ ok: true });
   } catch (err) {
     console.error("[daily-rejections:assign]", err);
