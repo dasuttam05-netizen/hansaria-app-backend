@@ -362,6 +362,10 @@ router.post("/", async (req, res) => {
       completed_by: null,
       completion_qty: 0,
       completion_remarks: "",
+      work_target_qty: originalQty,
+      work_completed_qty: 0,
+      assignment_narration: "",
+      progress_narration: "",
       status: "PENDING",
       history: [{ action: "CREATED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: new Date(), status: "PENDING" }],
       created_at: new Date(),
@@ -410,6 +414,8 @@ router.put("/:id", async (req, res) => {
 
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({ action: "EDITED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: new Date(), status: normalizeStatus(existing.status) });
+    const existingTargetQty = num(existing.work_target_qty);
+    const workTargetQty = Math.max(existingTargetQty, originalQty);
 
     await collection.updateOne(
       { _id: existing._id },
@@ -432,6 +438,7 @@ router.put("/:id", async (req, res) => {
         rejection_qty: rejectionQty,
         reason,
         remarks: text(body.remarks),
+        work_target_qty: workTargetQty,
         updated_at: new Date(),
         history,
       } }
@@ -451,8 +458,10 @@ router.patch("/:id/assign", async (req, res) => {
 
     const assignedTo = text(req.body?.assigned_to);
     const actionType = text(req.body?.action_type).toUpperCase();
+    const assignmentNarration = text(req.body?.assignment_narration);
     if (!assignedTo) return res.status(400).json({ error: "Employee is required" });
     if (!actionType || !WORK_DESCRIPTIONS.has(actionType)) return res.status(400).json({ error: "Work Description is required" });
+    if (!assignmentNarration) return res.status(400).json({ error: "Assignment narration / work instruction is required" });
 
     const employee = await Employee.findById(objectIdOrValue(assignedTo), { name: 1 }).lean();
     if (!employee) return res.status(404).json({ error: "Assigned employee not found" });
@@ -474,6 +483,9 @@ router.patch("/:id/assign", async (req, res) => {
       status: "RUNNING",
       started_at: now,
       started_by: currentUserId(req.user),
+      assignment_narration: assignmentNarration,
+      work_target_qty: Math.max(num(existing.work_target_qty), num(existing.original_qty), num(existing.rejection_qty)),
+      work_completed_qty: num(existing.work_completed_qty),
       updated_at: now,
       history,
     };
@@ -542,22 +554,76 @@ router.post("/:id/complete", async (req, res) => {
     const uid = currentUserId(req.user);
     const isAssignedEmployee = String(existing.assigned_to || "") === uid;
     const managerCanComplete = isManager(req.user);
-    if (!isAssignedEmployee && !managerCanComplete) return res.status(403).json({ error: "Only the assigned employee or manager can complete this work" });
-    if (normalizeStatus(existing.status) !== "RUNNING") return res.status(400).json({ error: "Only Running rejection can be completed" });
+    if (!isAssignedEmployee && !managerCanComplete) return res.status(403).json({ error: "Only the assigned employee or manager can update this work" });
+    if (normalizeStatus(existing.status) !== "RUNNING") return res.status(400).json({ error: "Only Running rejection can be updated" });
 
     const now = new Date();
-    const completionQty = num(req.body?.completion_qty || existing.rejection_qty);
-    const history = Array.isArray(existing.history) ? existing.history : [];
-    history.push({ action: "COMPLETED", by: uid, by_name: req.user?.name || req.user?.username || "", at: now, status: "COMPLETE", completion_qty: completionQty });
+    const targetQty = Math.max(num(existing.work_target_qty), num(existing.original_qty), num(existing.rejection_qty));
+    const currentQty = num(existing.work_completed_qty);
+    const requestedQty = req.body?.progress_qty !== undefined ? num(req.body.progress_qty) : num(req.body?.completion_qty || targetQty);
+    if (requestedQty < currentQty) return res.status(400).json({ error: `Progress quantity cannot be less than already completed ${currentQty}` });
+    if (requestedQty > targetQty) return res.status(400).json({ error: `Progress quantity cannot exceed target ${targetQty}` });
 
+    const progressNarration = text(req.body?.progress_narration || req.body?.completion_remarks);
+    const remainingQty = Math.max(targetQty - requestedQty, 0);
+    const completed = remainingQty <= 0.000001;
+    const history = Array.isArray(existing.history) ? existing.history : [];
+    history.push({
+      action: completed ? "COMPLETED" : "PROGRESS_SAVED",
+      by: uid,
+      by_name: req.user?.name || req.user?.username || "",
+      at: now,
+      status: completed ? "COMPLETE" : "PENDING",
+      progress_qty: requestedQty,
+      target_qty: targetQty,
+      remaining_qty: remainingQty,
+      progress_narration: progressNarration,
+    });
+
+    if (completed) {
+      await collection.updateOne(
+        { _id: existing._id },
+        { $set: {
+          status: "COMPLETE",
+          work_target_qty: targetQty,
+          work_completed_qty: requestedQty,
+          completion_qty: requestedQty,
+          completion_remarks: progressNarration,
+          progress_narration: progressNarration,
+          completed_at: now,
+          completed_by: uid,
+          updated_at: now,
+          history,
+        } }
+      );
+      return res.json({ ok: true, completed: true, status: "COMPLETE", target_qty: targetQty, completed_qty: requestedQty, remaining_qty: 0 });
+    }
+
+    // Partial progress goes back to PENDING so an authorised assigner can assign
+    // the remaining quantity again. The history remains on the same rejection.
     await collection.updateOne(
       { _id: existing._id },
-      { $set: { status: "COMPLETE", completion_qty: completionQty, completion_remarks: text(req.body?.completion_remarks), completed_at: now, completed_by: uid, updated_at: now, history } }
+      { $set: {
+        status: "PENDING",
+        assigned_to: null,
+        assigned_to_name: "",
+        assigned_by: null,
+        assigned_at: null,
+        started_at: null,
+        started_by: null,
+        work_target_qty: targetQty,
+        work_completed_qty: requestedQty,
+        completion_qty: requestedQty,
+        completion_remarks: progressNarration,
+        progress_narration: progressNarration,
+        updated_at: now,
+        history,
+      } }
     );
-    res.json({ ok: true });
+    return res.json({ ok: true, completed: false, status: "PENDING", target_qty: targetQty, completed_qty: requestedQty, remaining_qty: remainingQty });
   } catch (err) {
     console.error("[daily-rejections:complete]", err);
-    res.status(500).json({ error: err.message || "Failed to complete rejection" });
+    res.status(500).json({ error: err.message || "Failed to update rejection work" });
   }
 });
 
