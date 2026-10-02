@@ -496,6 +496,7 @@ router.patch("/:id/assign", async (req, res) => {
         factory_rejection_qty: Number(req.body?.factory_rejection_qty || 0),
         factory_other_qty: Number(req.body?.factory_other_qty || 0),
         factory_total_qty: Number(req.body?.factory_total_qty || 0),
+        factory_weight: Number(req.body?.factory_weight ?? req.body?.factory_total_qty ?? 0),
         factory_rate: Number(req.body?.factory_rate || 0),
         factory_amount: Number(req.body?.factory_amount || 0),
       });
