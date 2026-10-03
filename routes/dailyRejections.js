@@ -604,7 +604,17 @@ router.patch("/:id/assign", async (req, res) => {
 
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
-    history.push({ action: "ASSIGNED_AND_STARTED", by: currentUserId(req.user), by_name: req.user?.name || req.user?.username || "", at: now, status: "RUNNING", assigned_to: String(employee._id), action_type: actionType });
+    history.push({
+      action: "ASSIGNED_AND_STARTED",
+      by: currentUserId(req.user),
+      by_name: req.user?.name || req.user?.username || "",
+      at: now,
+      status: "RUNNING",
+      assigned_to: String(employee._id),
+      assigned_to_name: employee.name || "",
+      action_type: actionType,
+      assignment_narration: text(req.body?.assignment_narration),
+    });
 
     const setData = {
       assigned_to: String(employee._id),
@@ -827,6 +837,10 @@ router.post("/:id/progress", async (req, res) => {
       by_name: req.user?.name || req.user?.username || "",
       at: now,
       status: complete ? "COMPLETE" : "PENDING",
+      assigned_to: String(existing.assigned_to || ""),
+      assigned_to_name: String(existing.assigned_to_name || ""),
+      action_type: String(existing.action_type || ""),
+      assignment_narration: String(existing.assignment_narration || ""),
 
       unloading_qty_for_rejection: rejectionProcessedQty,
       rejection_unloading_qty: rejectionProcessedQty,
@@ -942,6 +956,35 @@ router.post("/:id/progress", async (req, res) => {
   }
 });
 
+router.get("/:id/history", async (req, res) => {
+  try {
+    if (!requireMongo(res)) return;
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid rejection id" });
+
+    const collection = mongoose.connection.db.collection("daily_rejections");
+    const row = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
+    if (!row) return res.status(404).json({ error: "Daily Rejection not found" });
+
+    // Admin/manager can inspect all visible rejection history. A normal staff
+    // member can inspect history only for work currently assigned to them.
+    if (!userCanSeeRow(req.user, row)) {
+      return res.status(403).json({ error: "You are not allowed to view this rejection history" });
+    }
+
+    const history = Array.isArray(row.history) ? row.history.slice().sort((a, b) => new Date(a?.at || 0) - new Date(b?.at || 0)) : [];
+    const hydrated = (await hydrateRows([row]))[0] || row;
+    res.json({
+      ok: true,
+      row: hydrated,
+      history,
+      count: history.length,
+    });
+  } catch (err) {
+    console.error("[daily-rejections:history]", err);
+    res.status(500).json({ error: err.message || "Failed to load rejection history" });
+  }
+});
+
 router.post("/:id/start", async (req, res) => {
   try {
     if (!assertPermission(req.user, START, res)) return;
@@ -955,7 +998,17 @@ router.post("/:id/start", async (req, res) => {
     if (!["ASSIGNED", "PENDING"].includes(normalizeStatus(existing.status))) return res.status(400).json({ error: "Only Pending or Assigned rejection can be started" });
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
-    history.push({ action: "STARTED", by: uid, by_name: req.user?.name || req.user?.username || "", at: now, status: "RUNNING" });
+    history.push({
+      action: "STARTED",
+      by: uid,
+      by_name: req.user?.name || req.user?.username || "",
+      at: now,
+      status: "RUNNING",
+      assigned_to: String(existing.assigned_to || ""),
+      assigned_to_name: String(existing.assigned_to_name || ""),
+      action_type: String(existing.action_type || ""),
+      assignment_narration: String(existing.assignment_narration || ""),
+    });
     await collection.updateOne({ _id: existing._id }, { $set: { status: "RUNNING", started_at: now, started_by: uid, updated_at: now, history } });
     res.json({ ok: true });
   } catch (err) {
