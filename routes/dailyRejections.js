@@ -688,9 +688,29 @@ router.patch("/:id/assign", async (req, res) => {
 
     history[history.length - 1].assignment_narration = text(req.body?.assignment_narration);
 
-    // Keep the factory popup details on the same rejection row so the
-    // assigned employee receives the complete details with the assignment.
+    // Keep the factory popup details on both the rejection row AND the
+    // assignment history event so S.L.-wise history shows exactly what was
+    // entered in the Send To Factory popup.
     if (actionType === "SEND TO FACTORY") {
+      Object.assign(history[history.length - 1], {
+        factory_date: text(req.body?.factory_date),
+        factory_invoice_no: text(req.body?.factory_invoice_no),
+        factory_lorry_no: text(req.body?.factory_lorry_no),
+        factory_company_id: text(req.body?.factory_company_id),
+        factory_company_name: text(req.body?.factory_company_name),
+        factory_company_account_id: text(req.body?.factory_company_account_id),
+        factory_company_account_name: text(req.body?.factory_company_account_name),
+        factory_buyer_id: text(req.body?.factory_buyer_id),
+        factory_buyer_name: text(req.body?.factory_buyer_name),
+        factory_consignee_id: text(req.body?.factory_consignee_id),
+        factory_consignee_name: text(req.body?.factory_consignee_name),
+        factory_rejection_qty: Number(req.body?.factory_rejection_qty || 0),
+        factory_other_qty: Number(req.body?.factory_other_qty || 0),
+        factory_total_qty: Number(req.body?.factory_total_qty || 0),
+        factory_weight: Number(req.body?.factory_weight ?? req.body?.factory_total_qty ?? 0),
+        factory_rate: Number(req.body?.factory_rate || 0),
+        factory_amount: Number(req.body?.factory_amount || 0),
+      });
       Object.assign(setData, {
         factory_date: text(req.body?.factory_date),
         factory_invoice_no: text(req.body?.factory_invoice_no),
