@@ -23,6 +23,22 @@ const { canAccessWarehouse } = require("../helpers/access");
 
 const router = express.Router();
 
+// This route uses Mongo documents directly. These lightweight indexes keep
+// list/assignment/reassignment lookups responsive as Daily Rejection grows.
+function ensureDailyRejectionIndexes() {
+  try {
+    if (!mongoose.connection?.db) return;
+    const collection = mongoose.connection.db.collection("daily_rejections");
+    Promise.allSettled([
+      collection.createIndex({ rejection_no: 1 }, { name: "daily_rejection_no" }),
+      collection.createIndex({ status: 1, entry_date: -1 }, { name: "daily_rejection_status_date" }),
+      collection.createIndex({ assigned_to: 1, status: 1 }, { name: "daily_rejection_assigned_status" }),
+    ]).catch(() => {});
+  } catch (_) {}
+}
+setImmediate(ensureDailyRejectionIndexes);
+
+
 const VIEW = "dailyRejection.view";
 const CREATE = "dailyRejection.create";
 const ASSIGN = "dailyRejection.assign";
@@ -150,17 +166,47 @@ async function hydrateRows(rows) {
   const map = (items) => new Map(items.map((x) => [String(x._id), x]));
   const cm = map(companies), am = map(accounts), pm = map(products), wm = map(warehouses), lm = map(locations), em = map(employees);
 
-  return rows.map((row) => ({
-    ...row,
-    id: String(row._id),
-    company_name: row.company_name || cm.get(idOf(row.company_id))?.name || "",
-    company_account_name: row.company_account_name || am.get(idOf(row.company_account_id))?.account_name || "",
-    product_name: row.product_name || pm.get(idOf(row.product_id))?.name || "",
-    warehouse_name: row.warehouse_name || wm.get(idOf(row.warehouse_id))?.name || "",
-    location_name: row.location_name || lm.get(idOf(row.location_id))?.name || "",
-    employee_name: row.employee_name || em.get(idOf(row.employee_id))?.name || "",
-    assigned_to_name: row.assigned_to_name || em.get(idOf(row.assigned_to))?.name || "",
-  }));
+  return rows.map((row) => {
+    const rejectionTarget = chainNum(row?.chain_target_qty ?? row?.original_rejection_qty ?? row?.rejection_qty ?? 0);
+    const rejectionProcessed = chainNum(row?.chain_processed_qty ?? row?.processed_rejection_qty ?? 0);
+    const rejectionRemaining = Number.isFinite(Number(row?.chain_remaining_qty))
+      ? Math.max(0, chainNum(row.chain_remaining_qty))
+      : Math.max(0, rejectionTarget - rejectionProcessed);
+
+    const otherTarget = chainNum(
+      row?.chain_other_target_qty ??
+      row?.other_target_qty ??
+      row?.factory_other_qty ??
+      0
+    );
+    const otherProcessed = chainNum(row?.chain_other_processed_qty ?? 0);
+    const otherRemaining = Number.isFinite(Number(row?.chain_other_remaining_qty))
+      ? Math.max(0, chainNum(row.chain_other_remaining_qty))
+      : Math.max(0, otherTarget - otherProcessed);
+
+    return {
+      ...row,
+      id: String(row._id),
+      chain_target_qty: rejectionTarget,
+      chain_processed_qty: rejectionProcessed,
+      chain_remaining_qty: normalizeStatus(row.status) === "COMPLETE" ? 0 : rejectionRemaining,
+      chain_other_target_qty: otherTarget,
+      chain_other_processed_qty: otherProcessed,
+      chain_other_remaining_qty: normalizeStatus(row.status) === "COMPLETE" ? 0 : otherRemaining,
+      chain_total_target_qty: Number((rejectionTarget + otherTarget).toFixed(4)),
+      chain_total_processed_qty: Number((rejectionProcessed + otherProcessed).toFixed(4)),
+      chain_total_remaining_qty: normalizeStatus(row.status) === "COMPLETE"
+        ? 0
+        : Number((rejectionRemaining + otherRemaining).toFixed(4)),
+      company_name: row.company_name || cm.get(idOf(row.company_id))?.name || "",
+      company_account_name: row.company_account_name || am.get(idOf(row.company_account_id))?.account_name || "",
+      product_name: row.product_name || pm.get(idOf(row.product_id))?.name || "",
+      warehouse_name: row.warehouse_name || wm.get(idOf(row.warehouse_id))?.name || "",
+      location_name: row.location_name || lm.get(idOf(row.location_id))?.name || "",
+      employee_name: row.employee_name || em.get(idOf(row.employee_id))?.name || "",
+      assigned_to_name: row.assigned_to_name || em.get(idOf(row.assigned_to))?.name || "",
+    };
+  });
 }
 
 router.get("/masters", async (req, res) => {
@@ -363,11 +409,37 @@ router.post("/", async (req, res) => {
       completion_qty: 0,
       completion_remarks: "",
       assignment_narration: "",
-      chain_target_qty: originalQty,
+      chain_target_qty: rejectionQty,
       chain_processed_qty: 0,
-      chain_remaining_qty: originalQty,
+      chain_remaining_qty: rejectionQty,
+      chain_other_target_qty: num(
+        body.chain_other_target_qty ??
+        body.other_target_qty ??
+        body.other_qty ??
+        0
+      ),
+      chain_other_processed_qty: 0,
+      chain_other_remaining_qty: num(
+        body.chain_other_target_qty ??
+        body.other_target_qty ??
+        body.other_qty ??
+        0
+      ),
+      chain_total_target_qty: Number((
+        rejectionQty +
+        num(body.chain_other_target_qty ?? body.other_target_qty ?? body.other_qty ?? 0)
+      ).toFixed(4)),
+      chain_total_processed_qty: 0,
+      chain_total_remaining_qty: Number((
+        rejectionQty +
+        num(body.chain_other_target_qty ?? body.other_target_qty ?? body.other_qty ?? 0)
+      ).toFixed(4)),
       chain_updated_at: null,
       latest_processed_qty: 0,
+      latest_rejection_unloading_qty: 0,
+      latest_rejection_adjustment_qty: 0,
+      latest_other_processed_qty: 0,
+      latest_other_adjustment_qty: 0,
       latest_new_rejection_qty: 0,
       latest_new_lorry_no: "",
       latest_destination_type: "",
@@ -461,10 +533,55 @@ function chainNum(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function chainTarget(row) {
+  return chainNum(
+    row?.chain_target_qty ??
+    row?.original_rejection_qty ??
+    row?.rejection_qty ??
+    row?.original_qty ??
+    0
+  );
+}
+
+function chainProcessed(row) {
+  return chainNum(
+    row?.chain_processed_qty ??
+    row?.processed_rejection_qty ??
+    0
+  );
+}
+
 function chainRemaining(row) {
-  const target = chainNum(row?.chain_target_qty || row?.original_qty || 0);
-  const processed = chainNum(row?.chain_processed_qty || 0);
-  return Math.max(target - processed, 0);
+  const explicit = row?.chain_remaining_qty;
+  if (explicit !== undefined && explicit !== null && explicit !== "") {
+    return Math.max(0, chainNum(explicit));
+  }
+  return Math.max(chainTarget(row) - chainProcessed(row), 0);
+}
+
+function chainOtherTarget(row) {
+  return chainNum(
+    row?.chain_other_target_qty ??
+    row?.other_target_qty ??
+    row?.factory_other_qty ??
+    0
+  );
+}
+
+function chainOtherProcessed(row) {
+  return chainNum(row?.chain_other_processed_qty ?? 0);
+}
+
+function chainOtherRemaining(row) {
+  const explicit = row?.chain_other_remaining_qty;
+  if (explicit !== undefined && explicit !== null && explicit !== "") {
+    return Math.max(0, chainNum(explicit));
+  }
+  return Math.max(chainOtherTarget(row) - chainOtherProcessed(row), 0);
+}
+
+function chainTotalRemaining(row) {
+  return Math.max(chainRemaining(row) + chainOtherRemaining(row), 0);
 }
 
 router.patch("/:id/assign", async (req, res) => {
@@ -501,9 +618,61 @@ router.patch("/:id/assign", async (req, res) => {
       updated_at: now,
       history,
       assignment_narration: text(req.body?.assignment_narration),
-      chain_target_qty: chainNum(existing.chain_target_qty || existing.original_qty || 0),
-      chain_processed_qty: chainNum(existing.chain_processed_qty || 0),
+      chain_target_qty: chainTarget(existing),
+      chain_processed_qty: chainProcessed(existing),
       chain_remaining_qty: chainRemaining(existing),
+      chain_other_target_qty: Math.max(
+        chainOtherTarget(existing),
+        chainNum(
+          req.body?.chain_other_target_qty ??
+          req.body?.other_target_qty ??
+          req.body?.factory_other_qty ??
+          0
+        )
+      ),
+      chain_other_processed_qty: chainOtherProcessed(existing),
+      chain_other_remaining_qty: Math.max(
+        0,
+        Math.max(
+          chainOtherTarget(existing),
+          chainNum(
+            req.body?.chain_other_target_qty ??
+            req.body?.other_target_qty ??
+            req.body?.factory_other_qty ??
+            0
+          )
+        ) - chainOtherProcessed(existing)
+      ),
+      chain_total_target_qty: Number((
+        chainTarget(existing) +
+        Math.max(
+          chainOtherTarget(existing),
+          chainNum(
+            req.body?.chain_other_target_qty ??
+            req.body?.other_target_qty ??
+            req.body?.factory_other_qty ??
+            0
+          )
+        )
+      ).toFixed(4)),
+      chain_total_processed_qty: Number((
+        chainProcessed(existing) + chainOtherProcessed(existing)
+      ).toFixed(4)),
+      chain_total_remaining_qty: Number((
+        chainRemaining(existing) +
+        Math.max(
+          0,
+          Math.max(
+            chainOtherTarget(existing),
+            chainNum(
+              req.body?.chain_other_target_qty ??
+              req.body?.other_target_qty ??
+              req.body?.factory_other_qty ??
+              0
+            )
+          ) - chainOtherProcessed(existing)
+        )
+      ).toFixed(4)),
       chain_updated_at: now,
     };
 
@@ -546,6 +715,7 @@ router.post("/:id/progress", async (req, res) => {
   try {
     if (!requireMongo(res)) return;
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid rejection id" });
+
     const collection = mongoose.connection.db.collection("daily_rejections");
     const existing = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
@@ -558,47 +728,159 @@ router.post("/:id/progress", async (req, res) => {
       return res.status(400).json({ error: "Only Running work can receive progress" });
     }
 
-    const processedQty = chainNum(req.body?.processed_qty);
+    // REJECTION and OTHER are two independent balances.
+    // Rejection balance is consumed only by "Unloading Qty for Rejection".
+    // Other balance is consumed only by "Other Qty".
+    const rejectionProcessedQty = chainNum(
+      req.body?.unloading_qty_for_rejection ??
+      req.body?.rejection_unloading_qty ??
+      req.body?.processed_qty ??
+      0
+    );
+    const otherProcessedQty = chainNum(
+      req.body?.other_processed_qty ??
+      req.body?.other_adjustment_qty ??
+      req.body?.adjusted_other_qty ??
+      req.body?.other_qty ??
+      0
+    );
     const newRejectionQty = chainNum(req.body?.new_rejection_qty);
-    if (processedQty <= 0 && newRejectionQty <= 0) {
-      return res.status(400).json({ error: "Processed Qty or New Rejection Qty is required" });
+
+    if (rejectionProcessedQty <= 0 && otherProcessedQty <= 0 && newRejectionQty <= 0) {
+      return res.status(400).json({
+        error: "Enter Unloading Qty for Rejection or Other Qty first",
+      });
     }
 
-    const currentTarget = chainNum(existing.chain_target_qty || existing.original_qty || 0);
-    const currentProcessed = chainNum(existing.chain_processed_qty || 0);
-    const nextTarget = currentTarget + newRejectionQty;
-    const nextProcessed = currentProcessed + processedQty;
-    const remaining = Math.max(nextTarget - nextProcessed, 0);
-    const complete = remaining <= 0.000001;
+    const currentRejectionTarget = chainTarget(existing);
+    const currentRejectionProcessed = chainProcessed(existing);
+    const currentRejectionRemaining = chainRemaining(existing);
+
+    const currentOtherTarget = chainOtherTarget(existing);
+    const currentOtherProcessed = chainOtherProcessed(existing);
+    const currentOtherRemaining = chainOtherRemaining(existing);
+
+    if (rejectionProcessedQty > currentRejectionRemaining + 0.0001) {
+      return res.status(400).json({
+        error: `Unloading Qty for Rejection cannot exceed pending rejection balance ${currentRejectionRemaining.toFixed(2)}`,
+      });
+    }
+
+    // If an older row did not have an Other target, allow the progress request
+    // to establish one explicitly. This is used for flows such as:
+    // Other target 10.00 -> adjust 8.50 -> pending 1.50.
+    const requestedOtherTarget = chainNum(
+      req.body?.chain_other_target_qty ??
+      req.body?.other_target_qty ??
+      existing?.other_target_qty ??
+      existing?.factory_other_qty ??
+      0
+    );
+    const nextOtherTarget = Math.max(currentOtherTarget, requestedOtherTarget);
+
+    if (nextOtherTarget <= 0 && otherProcessedQty > 0) {
+      return res.status(400).json({
+        error: "Other Qty was entered but no Other target/balance is available",
+      });
+    }
+
+    if (otherProcessedQty > Math.max(nextOtherTarget - currentOtherProcessed, 0) + 0.0001) {
+      return res.status(400).json({
+        error: `Other Qty cannot exceed pending other balance ${Math.max(nextOtherTarget - currentOtherProcessed, 0).toFixed(2)}`,
+      });
+    }
+
     const now = new Date();
-    const history = Array.isArray(existing.history) ? existing.history : [];
+
+    const nextRejectionTarget = Number((currentRejectionTarget + newRejectionQty).toFixed(4));
+    const nextRejectionProcessed = Number((currentRejectionProcessed + rejectionProcessedQty).toFixed(4));
+    const nextRejectionRemaining = Math.max(
+      0,
+      Number((nextRejectionTarget - nextRejectionProcessed).toFixed(4))
+    );
+
+    const nextOtherProcessed = Number((currentOtherProcessed + otherProcessedQty).toFixed(4));
+    const nextOtherRemaining = Math.max(
+      0,
+      Number((nextOtherTarget - nextOtherProcessed).toFixed(4))
+    );
+
+    const totalRemaining = Number((
+      nextRejectionRemaining + nextOtherRemaining
+    ).toFixed(4));
+
+    const complete = totalRemaining <= 0.0001;
+
+    const rejectionAdjustmentQty = Math.max(
+      0,
+      Number((currentRejectionRemaining - rejectionProcessedQty).toFixed(4))
+    );
+    const otherAdjustmentQty = Math.max(
+      0,
+      Number((nextOtherTarget - nextOtherProcessed).toFixed(4))
+    );
+
+    const history = Array.isArray(existing.history) ? existing.history.slice() : [];
     history.push({
       action: complete ? "PROGRESS_COMPLETED" : "PROGRESS_SAVED_PENDING",
       by: uid,
       by_name: req.user?.name || req.user?.username || "",
       at: now,
       status: complete ? "COMPLETE" : "PENDING",
-      processed_qty: processedQty,
+
+      unloading_qty_for_rejection: rejectionProcessedQty,
+      rejection_unloading_qty: rejectionProcessedQty,
+      rejection_adjustment_qty: rejectionAdjustmentQty,
+      adjusted_rejection_qty: rejectionAdjustmentQty,
+
+      other_processed_qty: otherProcessedQty,
+      other_adjustment_qty: otherAdjustmentQty,
+      adjusted_other_qty: otherAdjustmentQty,
+
       new_rejection_qty: newRejectionQty,
       new_lorry_no: text(req.body?.new_lorry_no),
       destination_type: text(req.body?.destination_type),
       warehouse_id: text(req.body?.warehouse_id),
       warehouse_name: text(req.body?.warehouse_name),
       progress_narration: text(req.body?.progress_narration),
+
+      chain_target_qty: nextRejectionTarget,
+      chain_processed_qty: nextRejectionProcessed,
+      chain_remaining_qty: nextRejectionRemaining,
+      chain_other_target_qty: nextOtherTarget,
+      chain_other_processed_qty: nextOtherProcessed,
+      chain_other_remaining_qty: nextOtherRemaining,
+      chain_total_remaining_qty: totalRemaining,
     });
 
     const setData = {
-      chain_target_qty: nextTarget,
-      chain_processed_qty: nextProcessed,
-      chain_remaining_qty: remaining,
+      chain_target_qty: nextRejectionTarget,
+      chain_processed_qty: nextRejectionProcessed,
+      chain_remaining_qty: nextRejectionRemaining,
+
+      chain_other_target_qty: nextOtherTarget,
+      chain_other_processed_qty: nextOtherProcessed,
+      chain_other_remaining_qty: nextOtherRemaining,
+
+      chain_total_target_qty: Number((nextRejectionTarget + nextOtherTarget).toFixed(4)),
+      chain_total_processed_qty: Number((nextRejectionProcessed + nextOtherProcessed).toFixed(4)),
+      chain_total_remaining_qty: totalRemaining,
+
       chain_updated_at: now,
-      latest_processed_qty: processedQty,
+
+      latest_processed_qty: rejectionProcessedQty,
+      latest_rejection_unloading_qty: rejectionProcessedQty,
+      latest_rejection_adjustment_qty: rejectionAdjustmentQty,
+      latest_other_processed_qty: otherProcessedQty,
+      latest_other_adjustment_qty: otherAdjustmentQty,
       latest_new_rejection_qty: newRejectionQty,
+
       latest_new_lorry_no: text(req.body?.new_lorry_no),
       latest_destination_type: text(req.body?.destination_type),
       latest_warehouse_id: text(req.body?.warehouse_id),
       latest_warehouse_name: text(req.body?.warehouse_name),
       latest_progress_narration: text(req.body?.progress_narration),
+
       updated_at: now,
       history,
     };
@@ -606,12 +888,16 @@ router.post("/:id/progress", async (req, res) => {
     if (complete) {
       Object.assign(setData, {
         status: "COMPLETE",
-        completion_qty: nextProcessed,
+        completion_qty: nextRejectionProcessed,
         completion_remarks: text(req.body?.progress_narration),
         completed_at: now,
         completed_by: uid,
       });
     } else {
+      // IMPORTANT:
+      // Any partial balance becomes PENDING and the current assignment is
+      // cleared. The same Rejection No. stays open and can be reassigned by
+      // an authorised user to another employee.
       Object.assign(setData, {
         status: "PENDING",
         assigned_to: null,
@@ -620,11 +906,36 @@ router.post("/:id/progress", async (req, res) => {
         assigned_at: null,
         started_at: null,
         started_by: null,
+        completed_at: null,
+        completed_by: null,
       });
     }
 
-    await collection.updateOne({ _id: existing._id }, { $set: setData });
-    res.json({ ok: true, status: setData.status, chain_target_qty: nextTarget, chain_processed_qty: nextProcessed, chain_remaining_qty: remaining });
+    await collection.updateOne(
+      { _id: existing._id },
+      { $set: setData }
+    );
+
+    res.json({
+      ok: true,
+      rejection_no: existing.rejection_no || "",
+      status: complete ? "COMPLETE" : "PENDING",
+      closed: complete,
+
+      rejection_target_qty: nextRejectionTarget,
+      rejection_processed_qty: nextRejectionProcessed,
+      rejection_remaining_qty: nextRejectionRemaining,
+      rejection_adjustment_qty: rejectionAdjustmentQty,
+
+      other_target_qty: nextOtherTarget,
+      other_processed_qty: nextOtherProcessed,
+      other_remaining_qty: nextOtherRemaining,
+      other_adjustment_qty: otherAdjustmentQty,
+
+      total_target_qty: Number((nextRejectionTarget + nextOtherTarget).toFixed(4)),
+      total_processed_qty: Number((nextRejectionProcessed + nextOtherProcessed).toFixed(4)),
+      total_remaining_qty: totalRemaining,
+    });
   } catch (err) {
     console.error("[daily-rejections:progress]", err);
     res.status(500).json({ error: err.message || "Failed to save progress" });
@@ -665,19 +976,43 @@ router.post("/:id/complete", async (req, res) => {
     const managerCanComplete = isManager(req.user);
     if (!isAssignedEmployee && !managerCanComplete) return res.status(403).json({ error: "Only the assigned employee or manager can complete this work" });
     if (normalizeStatus(existing.status) !== "RUNNING") return res.status(400).json({ error: "Only Running rejection can be completed" });
-    const remainingQty = chainRemaining(existing);
-    if (remainingQty > 0.000001) return res.status(400).json({ error: `Work cannot be completed. Remaining Qty: ${remainingQty}` });
+    const rejectionRemainingQty = chainRemaining(existing);
+    const otherRemainingQty = chainOtherRemaining(existing);
+    const totalRemainingQty = chainTotalRemaining(existing);
+    if (rejectionRemainingQty > 0.000001 || otherRemainingQty > 0.000001) {
+      return res.status(400).json({
+        error: `Work cannot be completed. Rejection Balance: ${rejectionRemainingQty.toFixed(2)}, Other Balance: ${otherRemainingQty.toFixed(2)}`
+      });
+    }
 
     const now = new Date();
-    const completionQty = chainNum(existing.chain_processed_qty || req.body?.completion_qty || existing.rejection_qty);
+    const completionQty = chainNum(existing.chain_processed_qty ?? req.body?.completion_qty ?? existing.rejection_qty);
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({ action: "COMPLETED", by: uid, by_name: req.user?.name || req.user?.username || "", at: now, status: "COMPLETE", completion_qty: completionQty });
 
     await collection.updateOne(
       { _id: existing._id },
-      { $set: { status: "COMPLETE", completion_qty: completionQty, completion_remarks: text(req.body?.completion_remarks), completed_at: now, completed_by: uid, updated_at: now, history } }
+      { $set: {
+          status: "COMPLETE",
+          completion_qty: completionQty,
+          completion_remarks: text(req.body?.completion_remarks),
+          completed_at: now,
+          completed_by: uid,
+          chain_remaining_qty: 0,
+          chain_other_remaining_qty: 0,
+          chain_total_remaining_qty: 0,
+          updated_at: now,
+          history
+        } }
     );
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      status: "COMPLETE",
+      closed: true,
+      rejection_remaining_qty: 0,
+      other_remaining_qty: 0,
+      total_remaining_qty: 0
+    });
   } catch (err) {
     console.error("[daily-rejections:complete]", err);
     res.status(500).json({ error: err.message || "Failed to complete rejection" });
