@@ -2584,7 +2584,14 @@ const HOST =
   process.env.HOST ||
   "0.0.0.0";
 
-function startServer(port) {
+async function startServer(port) {
+  // Wait for the existing MongoDB bootstrap connection before accepting
+  // application traffic. This prevents the first requests after a Render
+  // cold-start from racing the database connection.
+  if (mongoose.connection.readyState !== 1) {
+    await mongoose.connection.asPromise();
+  }
+
   const server = app.listen(
     port,
     HOST,
@@ -2601,7 +2608,12 @@ function startServer(port) {
       console.warn(
         `Port ${port} is already in use. Trying ${nextPort}...`
       );
-      server.close(() => startServer(nextPort));
+      server.close(() => {
+        startServer(nextPort).catch((startupError) => {
+          console.error("Backend startup failed:", startupError.message);
+          process.exitCode = 1;
+        });
+      });
       return;
     }
 
@@ -2609,26 +2621,8 @@ function startServer(port) {
   });
 }
 
-async function waitForMongoBeforeServing() {
-  const startedAt = Date.now();
-  const maxWaitMs = 30000;
-
-  while (mongoose.connection.readyState !== 1) {
-    if (Date.now() - startedAt >= maxWaitMs) {
-      throw new Error("MongoDB did not become ready within 30 seconds.");
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-}
-
-(async () => {
-  try {
-    await waitForMongoBeforeServing();
-    startServer(PORT);
-  } catch (error) {
-    console.error("Backend startup aborted: MongoDB is not ready:", error.message);
-    process.exitCode = 1;
-  }
-})();
+startServer(PORT).catch((startupError) => {
+  console.error("Backend startup failed:", startupError.message);
+  process.exitCode = 1;
+});
 
