@@ -338,6 +338,9 @@ const warehouseRoutes =
 const warehouseRentBookingRoutes =
   require("./routes/warehouseRentBooking");
 
+const warehouseRentBillRoutes =
+  require("./routes/warehouseRentBill");
+
 const productsRoute =
   require("./routes/products");
 
@@ -630,6 +633,20 @@ app.use(
     "expense.edit",
   ]),
   warehouseRoutes
+);
+
+app.use(
+  "/api/warehouse-rent-bookings",
+  authenticate,
+  authorize("warehouses.manage"),
+  warehouseRentBookingRoutes
+);
+
+app.use(
+  "/api/warehouse-rent-bills",
+  authenticate,
+  authorize(["warehouses.manage", "report.warehouseRentLedger", "report.warehouseRentMonthEnd"]),
+  warehouseRentBillRoutes
 );
 
 app.use(
@@ -2522,6 +2539,27 @@ app.use(
     });
   }
 );
+
+/*
+========================================
+WAREHOUSE RENT AUTO-CLOSE
+========================================
+*/
+
+async function runWarehouseRentAutoCloseJob() {
+  try {
+    if (typeof warehouseRentBillRoutes.runWarehouseRentAutoClose === "function") {
+      await warehouseRentBillRoutes.runWarehouseRentAutoClose();
+    }
+  } catch (error) {
+    console.error("Warehouse rent auto-close job error:", error.message);
+  }
+}
+
+// Run once after startup and periodically thereafter. This is additive and
+// only creates receivable/company rent bills for completed calendar months.
+setTimeout(runWarehouseRentAutoCloseJob, 15000);
+setInterval(runWarehouseRentAutoCloseJob, 15 * 60 * 1000);
 
 /*
 ========================================
