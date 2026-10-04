@@ -815,6 +815,21 @@ inwardSchema.index({
   product_id: 1,
 });
 
+// Performance-only indexes for common report/filter combinations.
+// These indexes do not modify document data or query results.
+inwardSchema.index(
+  { warehouse_id: 1, product_id: 1, date: -1 },
+  { name: "inward_warehouse_product_date" }
+);
+inwardSchema.index(
+  { company_account_id: 1, date: -1 },
+  { name: "inward_company_account_date" }
+);
+inwardSchema.index(
+  { location_id: 1, date: -1 },
+  { name: "inward_location_date" }
+);
+
 /*
 ====================================================
 OUTWARD
@@ -951,6 +966,24 @@ outwardSchema.index({
   date: -1,
 });
 
+// Performance-only indexes for frequent stock/report lookups.
+outwardSchema.index(
+  { warehouse_id: 1, product_id: 1, status: 1, date: -1 },
+  { name: "outward_warehouse_product_status_date" }
+);
+outwardSchema.index(
+  { company_account_id: 1, date: -1 },
+  { name: "outward_company_account_date" }
+);
+outwardSchema.index(
+  { location_id: 1, date: -1 },
+  { name: "outward_location_date" }
+);
+outwardSchema.index(
+  { buyer_id: 1, date: -1 },
+  { name: "outward_buyer_date" }
+);
+
 /*
 ====================================================
 ADJUSTMENT
@@ -1054,6 +1087,16 @@ const buyerAdjustmentSchema =
       default: Date.now,
     },
   });
+
+buyerAdjustmentSchema.index(
+  { outward_id: 1, created_at: -1 },
+  { name: "buyer_adjustment_outward_created" }
+);
+
+buyerAdjustmentSchema.index(
+  { unloading_date: -1, status: 1 },
+  { name: "buyer_adjustment_unloading_status" }
+);
 
 /*
 ====================================================
@@ -1258,6 +1301,12 @@ expenseSchema.index({
   expense_date: -1,
 });
 
+// Common company/account filtered expense listing.
+expenseSchema.index(
+  { company_id: 1, company_account_id: 1, expense_date: -1 },
+  { name: "expense_company_account_date" }
+);
+
 /*
 ====================================================
 CASH ENTRY
@@ -1339,6 +1388,11 @@ const cashEntrySchema =
 cashEntrySchema.index({
   entry_date: 1,
 });
+
+cashEntrySchema.index(
+  { warehouse_id: 1, company_account_id: 1, entry_date: -1 },
+  { name: "cash_entry_warehouse_account_date" }
+);
 
 /*
 ====================================================
@@ -1537,6 +1591,11 @@ nativePaymentVoucherSchema.index({
   date: -1,
   id: -1,
 });
+
+nativePaymentVoucherSchema.index(
+  { warehouse_id: 1, company_account_id: 1, farmer_id: 1, date: -1 },
+  { name: "payment_voucher_warehouse_account_farmer_date" }
+);
 
 /*
 ====================================================
