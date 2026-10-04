@@ -293,6 +293,14 @@ const warehouseSchema =
       default: 0,
     },
 
+    // New additive rent workflow flag. Existing warehouses remain payable
+    // by default so old data/behaviour is unchanged.
+    rent_flow: {
+      type: String,
+      enum: ["payable", "receivable"],
+      default: "payable",
+    },
+
     location_id: {
       type:
         mongoose.Schema.Types.ObjectId,
@@ -1004,13 +1012,76 @@ const warehouseRentBookingSchema =
     }
   );
 
-warehouseRentBookingSchema.index(
-  {
-    warehouse_id: 1,
-    rent_month: 1,
+warehouseRentBookingSchema.add({
+  rent_flow: {
+    type: String,
+    enum: ["payable", "receivable"],
+    default: "payable",
   },
+
+  auto_booked: {
+    type: Boolean,
+    default: false,
+  },
+
+  bill_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "WarehouseRentBill",
+    default: null,
+    index: true,
+  },
+
+  billing_status: {
+    type: String,
+    enum: ["not_applicable", "pending", "billed"],
+    default: "not_applicable",
+  },
+});
+
+
+// =========================
+// WAREHOUSE RENT BILL
+// =========================
+const warehouseRentBillItemSchema = new mongoose.Schema(
+  {
+    warehouse_id: { type: mongoose.Schema.Types.ObjectId, ref: "Warehouse", required: true },
+    booking_id: { type: mongoose.Schema.Types.ObjectId, ref: "WarehouseRentBooking", required: true },
+    warehouse_name: { type: String, default: "" },
+    monthly_rent: { type: Number, default: 0 },
+  },
+  { _id: false }
+);
+
+const warehouseRentBillSchema = new mongoose.Schema(
+  {
+    bill_no: { type: String, unique: true, index: true },
+    bill_date: { type: String, required: true },
+    rent_month: { type: String, required: true, index: true },
+    company_id: { type: mongoose.Schema.Types.ObjectId, ref: "Company", required: true, index: true },
+    items: { type: [warehouseRentBillItemSchema], default: [] },
+    total_amount: { type: Number, default: 0 },
+    collected_amount: { type: Number, default: 0 },
+    balance_amount: { type: Number, default: 0 },
+    status: {
+      type: String,
+      enum: ["pending", "partial", "collected", "cancelled"],
+      default: "pending",
+      index: true,
+    },
+    collection_date: { type: String, default: "" },
+    collection_mode: { type: String, default: "" },
+    reference_no: { type: String, default: "" },
+    remarks: { type: String, default: "" },
+    auto_generated: { type: Boolean, default: false },
+  },
+  { timestamps: true }
+);
+
+warehouseRentBillSchema.index(
+  { company_id: 1, rent_month: 1 },
   {
     unique: true,
+    partialFilterExpression: { company_id: { $type: "objectId" } },
   }
 );
 
@@ -1068,6 +1139,13 @@ module.exports = {
     mongoose.model(
       "WarehouseRentBooking",
       warehouseRentBookingSchema
+    ),
+
+  WarehouseRentBill:
+    mongoose.models.WarehouseRentBill ||
+    mongoose.model(
+      "WarehouseRentBill",
+      warehouseRentBillSchema
     ),
 
   Product:
