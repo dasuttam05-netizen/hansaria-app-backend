@@ -1421,6 +1421,9 @@ app.get(
       ========================================
       */
 
+      // Dashboard only consumes a small projection of these documents. Keep the
+      // exact calculations/results unchanged, but avoid transferring and
+      // materializing unrelated fields from large MongoDB documents.
       const [
         locations,
         employees,
@@ -1436,107 +1439,124 @@ app.get(
         allInwardRows,
       ] = await Promise.all([
         canReadLocations
-          ? Location.find({})
-              .sort({
-                _id: -1,
-              })
+          ? Location.find({}, { _id: 1, id: 1, legacy_id: 1, name: 1, account_name: 1 })
+              .sort({ _id: -1 })
               .lean()
           : Promise.resolve([]),
 
         canReadEmployees
-          ? Employee.find({})
-              .sort({
-                _id: -1,
-              })
+          ? Employee.find({}, { _id: 1, id: 1, legacy_id: 1, name: 1 })
+              .sort({ _id: -1 })
               .lean()
           : Promise.resolve([]),
 
         canReadCompanies
-          ? Company.find({})
-              .sort({
-                _id: -1,
-              })
+          ? Company.find({}, { _id: 1, id: 1, legacy_id: 1, name: 1 })
+              .sort({ _id: -1 })
               .lean()
           : Promise.resolve([]),
 
         canReadCompanyAccounts
-          ? CompanyAccount.find({})
-              .sort({
-                _id: -1,
-              })
+          ? CompanyAccount.find({}, { _id: 1, id: 1, legacy_id: 1, account_name: 1, name: 1 })
+              .sort({ _id: -1 })
               .lean()
           : Promise.resolve([]),
 
         canReadWarehouses
-          ? Warehouse.find({})
-              .sort({
-                _id: -1,
-              })
+          ? Warehouse.find({}, { _id: 1, id: 1, legacy_id: 1, name: 1 })
+              .sort({ _id: -1 })
               .lean()
           : Promise.resolve([]),
 
         canReadProducts
-          ? Product.find({})
-              .sort({
-                _id: -1,
-              })
+          ? Product.find({}, { _id: 1, id: 1, legacy_id: 1, name: 1 })
+              .sort({ _id: -1 })
               .lean()
           : Promise.resolve([]),
 
         canReadInwards
-          ? Inward.find({})
-              .sort({
-                date: -1,
-                _id: -1,
-              })
+          ? Inward.find({}, {
+              _id: 1,
+              id: 1,
+              legacy_id: 1,
+              voucher_no: 1,
+              inward_no: 1,
+              inwardNo: 1,
+              voucherNo: 1,
+              date: 1,
+              company_name: 1,
+              company: 1,
+              company_account_name: 1,
+              company_account: 1,
+              account_name: 1,
+              weight: 1,
+              quantity: 1,
+            })
+              .sort({ date: -1, _id: -1 })
               .limit(200)
               .lean()
           : Promise.resolve([]),
 
         canReadOutwards
-          ? Outward.find({})
-              .sort({
-                date: -1,
-                _id: -1,
-              })
+          ? Outward.find({}, {
+              _id: 1,
+              id: 1,
+              legacy_id: 1,
+              inv_no: 1,
+              outward_no: 1,
+              outwardNo: 1,
+              invoice_no: 1,
+              voucher_no: 1,
+              voucherNo: 1,
+              date: 1,
+              party_name: 1,
+              buyer_name: 1,
+              buyer: 1,
+              company_name: 1,
+              company: 1,
+              company_account_name: 1,
+              company_account: 1,
+              account_name: 1,
+              weight: 1,
+              quantity: 1,
+              lorry_no: 1,
+            })
+              .sort({ date: -1, _id: -1 })
               .limit(200)
               .lean()
           : Promise.resolve([]),
 
         Adjustment.find({})
-          .sort({
-            createdAt: -1,
-            _id: -1,
-          })
           .lean(),
 
-        MirrorRow.find({
-          table:
-            "transport_bilti",
-        })
-          .select({
-            table: 1,
-            row_id: 1,
-            data: 1,
-          })
-          .sort({
-            row_id: 1,
-          })
+        MirrorRow.find({ table: "transport_bilti" })
+          .select({ table: 1, row_id: 1, data: 1 })
           .lean(),
 
-        BuyerAdjustment.find({})
-          .sort({
-            unloading_date: -1,
-            _id: -1,
-          })
+        BuyerAdjustment.find({}, { outward_id: 1, unloading_date: 1, created_at: 1 })
           .lean(),
 
         canReadInwards
-          ? Inward.find({})
-              .sort({
-                date: 1,
-                _id: 1,
-              })
+          ? Inward.find({}, {
+              _id: 1,
+              id: 1,
+              legacy_id: 1,
+              weight: 1,
+              quantity: 1,
+              date: 1,
+              shortage_percent: 1,
+              company_account_name: 1,
+              company_name: 1,
+              company_account: 1,
+              company: 1,
+              warehouse_name: 1,
+              location_name: 1,
+              location: 1,
+              voucher_no: 1,
+              inward_no: 1,
+              lorry_no: 1,
+            })
+              .sort({ date: 1, _id: 1 })
               .lean()
           : Promise.resolve([]),
       ]);
@@ -2584,14 +2604,7 @@ const HOST =
   process.env.HOST ||
   "0.0.0.0";
 
-async function startServer(port) {
-  // Wait for the existing MongoDB bootstrap connection before accepting
-  // application traffic. This prevents the first requests after a Render
-  // cold-start from racing the database connection.
-  if (mongoose.connection.readyState !== 1) {
-    await mongoose.connection.asPromise();
-  }
-
+function startServer(port) {
   const server = app.listen(
     port,
     HOST,
@@ -2608,12 +2621,7 @@ async function startServer(port) {
       console.warn(
         `Port ${port} is already in use. Trying ${nextPort}...`
       );
-      server.close(() => {
-        startServer(nextPort).catch((startupError) => {
-          console.error("Backend startup failed:", startupError.message);
-          process.exitCode = 1;
-        });
-      });
+      server.close(() => startServer(nextPort));
       return;
     }
 
@@ -2621,8 +2629,5 @@ async function startServer(port) {
   });
 }
 
-startServer(PORT).catch((startupError) => {
-  console.error("Backend startup failed:", startupError.message);
-  process.exitCode = 1;
-});
+startServer(PORT);
 
