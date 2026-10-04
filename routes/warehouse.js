@@ -132,8 +132,20 @@ router.post("/", async (req, res) => {
     const {
       name,
       address,
+      pincode,
+      state,
+      district,
+      city,
+      room_floor_building,
+      street_locality_landmark,
       location_id,
       employee_id,
+      employee_ids,
+      opening_balance,
+      opening_balance_type,
+      company_id,
+      monthly_rent,
+      rent_flow,
     } = req.body;
 
     if (
@@ -155,11 +167,25 @@ router.post("/", async (req, res) => {
 
         address,
 
+        pincode: pincode || null,
+        state: state || null,
+        district: district || null,
+        city: city || null,
+        room_floor_building: room_floor_building || null,
+        street_locality_landmark: street_locality_landmark || null,
+
         location_id:
           location_id || null,
 
         employee_id:
           employee_id || null,
+
+        employee_ids: Array.isArray(employee_ids) ? employee_ids.filter(Boolean) : (employee_id ? [employee_id] : []),
+        opening_balance: Number.isFinite(Number(opening_balance)) ? Number(opening_balance) : 0,
+        opening_balance_type: String(opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
+        company_id: company_id || null,
+        monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
+        rent_flow: String(rent_flow || "payable").toLowerCase() === "receivable" ? "receivable" : "payable",
 
       });
 
@@ -202,8 +228,20 @@ router.put("/:id", async (req, res) => {
     const {
       name,
       address,
+      pincode,
+      state,
+      district,
+      city,
+      room_floor_building,
+      street_locality_landmark,
       location_id,
       employee_id,
+      employee_ids,
+      opening_balance,
+      opening_balance_type,
+      company_id,
+      monthly_rent,
+      rent_flow,
     } = req.body;
 
     const updated =
@@ -215,11 +253,25 @@ router.put("/:id", async (req, res) => {
 
           address,
 
+          pincode: pincode || null,
+          state: state || null,
+          district: district || null,
+          city: city || null,
+          room_floor_building: room_floor_building || null,
+          street_locality_landmark: street_locality_landmark || null,
+
           location_id:
             location_id || null,
 
           employee_id:
             employee_id || null,
+
+          employee_ids: Array.isArray(employee_ids) ? employee_ids.filter(Boolean) : (employee_id ? [employee_id] : []),
+          opening_balance: Number.isFinite(Number(opening_balance)) ? Number(opening_balance) : 0,
+          opening_balance_type: String(opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
+          company_id: company_id || null,
+          monthly_rent: Number.isFinite(Number(monthly_rent)) ? Number(monthly_rent) : 0,
+          rent_flow: String(rent_flow || "payable").toLowerCase() === "receivable" ? "receivable" : "payable",
         },
 
         {
