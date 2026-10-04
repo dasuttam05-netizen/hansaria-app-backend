@@ -2609,5 +2609,26 @@ function startServer(port) {
   });
 }
 
-startServer(PORT);
+async function waitForMongoBeforeServing() {
+  const startedAt = Date.now();
+  const maxWaitMs = 30000;
+
+  while (mongoose.connection.readyState !== 1) {
+    if (Date.now() - startedAt >= maxWaitMs) {
+      throw new Error("MongoDB did not become ready within 30 seconds.");
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+(async () => {
+  try {
+    await waitForMongoBeforeServing();
+    startServer(PORT);
+  } catch (error) {
+    console.error("Backend startup aborted: MongoDB is not ready:", error.message);
+    process.exitCode = 1;
+  }
+})();
 
