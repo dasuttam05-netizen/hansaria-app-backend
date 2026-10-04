@@ -38,12 +38,14 @@ function addIdFilter(filter, field, value) {
   filter[field] = values.length > 1 ? { $in: values } : values[0];
 }
 
-async function loadInwards(query) {
+async function loadInwards(query, projection = null) {
   const filter = dateFilter(query);
   ["company_id", "warehouse_id", "product_id", "location_id", "employee_id", "company_account_id"].forEach((field) => {
     addIdFilter(filter, field, query[field] || query[`${field}s`]);
   });
-  return Inward.find(filter).sort({ date: 1, _id: 1 }).lean();
+  const cursor = Inward.find(filter).sort({ date: 1, _id: 1 });
+  if (projection) cursor.select(projection);
+  return cursor.lean();
 }
 
 function grossQty(row) { return Number(row?.weight ?? row?.quantity ?? 0) || 0; }
@@ -75,12 +77,49 @@ function availableQty(row, shortagePercent = null) {
 function idAliases(row) { return [row?._id,row?.legacy_id,row?.id,row?.sl_no].filter(v => v !== undefined && v !== null && String(v).trim()).map(String); }
 function buildAliasMap(rows) { const map=new Map(); for(const row of rows||[]) for(const id of idAliases(row)) map.set(id,row); return map; }
 
+function buildOutwardIdConditions(ids) {
+  const conditions = [];
+  for (const raw of ids || []) {
+    const value = String(raw ?? '').trim();
+    if (!value) continue;
+    conditions.push({ id: value }, { legacy_id: value }, { sl_no: value });
+    if (mongoose.Types.ObjectId.isValid(value)) conditions.push({ _id: new mongoose.Types.ObjectId(value) });
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) conditions.push({ id: numeric }, { legacy_id: numeric }, { sl_no: numeric });
+  }
+  return conditions;
+}
+
 async function buildPartyStockRows(query) {
   const inwards = await loadInwards(query);
   if (!inwards.length) return [];
   const db = mongoose.connection.db;
-  const [adjustments,outwards,warehouses,products,companies,accounts] = await Promise.all([
-    db.collection('adjustments').find({}).toArray(), Outward.find({}).lean(), Warehouse.find({}).lean(), Product.find({}).lean(), Company.find({}).lean(), CompanyAccount.find({}).lean()
+
+  // Only inward adjustments can affect this report. Keep legacy rows whose
+  // source_type is missing/blank because the old code treated those as inward.
+  const inwardAdjustmentFilter = {
+    $or: [
+      { source_type: { $regex: /^inward$/i } },
+      { source_type: { $exists: false } },
+      { source_type: null },
+      { source_type: "" },
+    ],
+  };
+  const adjustments = await db.collection('adjustments')
+    .find(inwardAdjustmentFilter, { projection: { inward_id: 1, qty: 1, quantity: 1, outward_id: 1 } })
+    .toArray();
+
+  const outwardIds = Array.from(new Set(
+    adjustments.map((row) => String(row?.outward_id ?? '').trim()).filter(Boolean)
+  ));
+  const outwardConditions = buildOutwardIdConditions(outwardIds);
+
+  const [outwards, warehouses, products, companies, accounts] = await Promise.all([
+    outwardConditions.length ? Outward.find({ $or: outwardConditions }).select({ _id: 1, legacy_id: 1, id: 1, sl_no: 1, date: 1, outward_date: 1 }).lean() : [],
+    Warehouse.find({}).select({ _id: 1, legacy_id: 1, id: 1, sl_no: 1, name: 1, address: 1, warehouse_address: 1 }).lean(),
+    Product.find({}).select({ _id: 1, legacy_id: 1, id: 1, sl_no: 1, name: 1 }).lean(),
+    Company.find({}).select({ _id: 1, legacy_id: 1, id: 1, sl_no: 1, name: 1, address: 1, company_address: 1, shortage_percent: 1 }).lean(),
+    CompanyAccount.find({}).select({ _id: 1, legacy_id: 1, id: 1, sl_no: 1, account_name: 1, shortage_percent: 1 }).lean(),
   ]);
   const outwardMap=buildAliasMap(outwards), warehouseMap=buildAliasMap(warehouses), productMap=buildAliasMap(products), companyMap=buildAliasMap(companies), accountMap=buildAliasMap(accounts);
   const adjustedByInward=new Map(), outwardDatesByInward=new Map();
@@ -144,7 +183,13 @@ router.get("/party-stock", authorizeReport("report.partyStock"), async (req, res
 
 router.get("/warehouse-stock", authorizeReport("report.partyStock"), async (req, res) => {
   try {
-    const rows = (await loadInwards(req.query)).map((row) => ({ ...row, stock: availableQty(row) }));
+    const rows = (await loadInwards(req.query, {
+      _id: 1,
+      warehouse_id: 1, warehouse_name: 1,
+      company_id: 1, company_name: 1, company: 1,
+      location_id: 1, location_name: 1, location: 1,
+      weight: 1, quantity: 1, remaining_qty: 1, adjusted_qty: 1,
+    })).map((row) => ({ ...row, stock: availableQty(row) }));
     return res.json(summaryBy(rows, (row) => `${row.warehouse_name || row.warehouse_id || "Unknown"}::${row.company_name || row.company || "Unknown"}::${row.location_name || row.location_id || "Unknown"}`, (row) => ({
       warehouse: row.warehouse_name || "Unknown", party: row.company_name || row.company || "Unknown", location: row.location_name || "Unknown", stock: Number(row.stock || 0),
     })));
@@ -152,13 +197,21 @@ router.get("/warehouse-stock", authorizeReport("report.partyStock"), async (req,
 });
 
 router.get("/total-stock", authorizeReport("report.partyStock"), async (req, res) => {
-  try { const rows = await loadInwards(req.query); return res.json({ total: Number(rows.reduce((sum, row) => sum + availableQty(row), 0).toFixed(4)) }); }
+  try {
+    const rows = await loadInwards(req.query, {
+      weight: 1, quantity: 1, remaining_qty: 1, adjusted_qty: 1,
+    });
+    return res.json({ total: Number(rows.reduce((sum, row) => sum + availableQty(row), 0).toFixed(4)) });
+  }
   catch (error) { return res.status(500).json({ error: error.message }); }
 });
 
 router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger"), async (req, res) => {
   try {
-    const data = (await loadInwards(req.query)).map((row) => ({ id: row._id, inward_date: row.date, party_name: row.company_name || row.company, warehouse_name: row.warehouse_name, voucher_no: row.voucher_no, original_weight: Number(row.weight || 0), balance_qty: Number(availableQty(row).toFixed(4)) }));
+    const data = (await loadInwards(req.query, {
+      _id: 1, date: 1, company_name: 1, company: 1, warehouse_name: 1, voucher_no: 1,
+      weight: 1, quantity: 1, remaining_qty: 1, adjusted_qty: 1,
+    })).map((row) => ({ id: row._id, inward_date: row.date, party_name: row.company_name || row.company, warehouse_name: row.warehouse_name, voucher_no: row.voucher_no, original_weight: Number(row.weight || 0), balance_qty: Number(availableQty(row).toFixed(4)) }));
     return res.json(req.query.page || req.query.page_size ? { data, pagination: { page: Number(req.query.page) || 1, pageSize: Number(req.query.page_size) || data.length, totalCount: data.length, totalPages: data.length ? 1 : 0 } } : data);
   } catch (error) { return res.status(500).json({ error: error.message }); }
 });
@@ -206,9 +259,18 @@ router.get("/palti-lorry-adjustment", authorizeReport("report.paltiLorryAdjustme
 
     // Load Palti entries themselves, not only adjustment rows. This report must
     // still show Palti balance even when a Palti entry has not been adjusted yet.
-    const paltiRows = await db.collection("paltilorryentries").find({}).sort({ expense_date: 1, _id: 1 }).toArray();
+    const paltiRows = await db.collection("paltilorryentries").find({}, {
+      projection: {
+        _id: 1, legacy_id: 1, id: 1, sl_no: 1, voucher_no: 1,
+        expense_date: 1, date: 1, company_id: 1, warehouse_id: 1, product_id: 1,
+        reg_from_consignee_id: 1, reg_from_company_id: 1, warehouse_name: 1, product_name: 1,
+        company_name: 1, reg_from_name: 1, reg_lorry_no: 1, new_lorry_no: 1, new_weight: 1, balance: 1,
+      },
+    }).sort({ expense_date: 1, _id: 1 }).toArray();
     const adjustments = await db.collection("adjustments")
-      .find({ source_type: "palti_lorry" })
+      .find({ source_type: "palti_lorry" }, {
+        projection: { _id: 1, palti_lorry_id: 1, outward_id: 1, qty: 1, created_at: 1, updated_at: 1 },
+      })
       .sort({ created_at: 1, _id: 1 })
       .toArray();
 
