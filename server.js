@@ -415,6 +415,9 @@ const whVouchersRoutes =
 const cashEntriesRoutes =
   require("./routes/cashEntries");
 
+const transportPaymentsRoutes =
+  require("./routes/transportPayments");
+
 const mongoHealthRoutes =
   require("./routes/mongoHealth");
 
@@ -2458,6 +2461,12 @@ app.use(
   cashEntriesRoutes
 );
 
+app.use(
+  "/api/transport-payments",
+  authenticate,
+  authorize("expense.entry"),
+  transportPaymentsRoutes
+);
 
 app.use(
   "/api/daily-rejections",
