@@ -319,6 +319,109 @@ function mapName(map, value) {
   );
 }
 
+async function buildMongoDocMap(
+  Model,
+  values,
+  fields = []
+) {
+  const rawValues = Array.from(
+    new Set(
+      (values || [])
+        .map((v) => text(v))
+        .filter(Boolean)
+    )
+  );
+
+  if (!rawValues.length) {
+    return new Map();
+  }
+
+  const conditions = [];
+  for (const value of rawValues) {
+    for (const condition of idConditions(value)) {
+      addUniqueCondition(conditions, condition);
+    }
+  }
+
+  if (!conditions.length) {
+    return new Map();
+  }
+
+  const selectFields = {
+    _id: 1,
+    id: 1,
+    legacy_id: 1,
+    sl_no: 1,
+  };
+
+  for (const field of fields) {
+    selectFields[field] = 1;
+  }
+
+  const docs = await Model.find({ $or: conditions })
+    .select(selectFields)
+    .lean();
+
+  const map = new Map();
+  for (const doc of docs || []) {
+    for (const key of [doc._id, doc.id, doc.legacy_id, doc.sl_no]) {
+      if (key !== undefined && key !== null && String(key).trim()) {
+        map.set(String(key), doc);
+      }
+    }
+  }
+
+  return map;
+}
+
+function decorateMongoOutwardWithMaps(row, lookupMaps = {}) {
+  if (!row) return null;
+
+  const companyName = row.company_name || mapName(lookupMaps.company, row.company_id);
+  const accountName =
+    row.company_account_name ||
+    row.account_name ||
+    mapName(lookupMaps.account, row.company_account_id);
+  const warehouseName = row.warehouse_name || mapName(lookupMaps.warehouse, row.warehouse_id);
+  const productName = row.product_name || mapName(lookupMaps.product, row.product_id);
+
+  return {
+    ...row,
+    company_name: companyName || "",
+    company_account_name: accountName || "",
+    account_name: accountName || "",
+    warehouse_name: warehouseName || "",
+    product_name: productName || "",
+  };
+}
+
+function decorateMongoBiltiWithMaps(row, lookupMaps = {}) {
+  const r = normalizeMongoDoc(row) || {};
+  return applyCalculatedBilti({
+    ...r,
+    transporter_name:
+      r.transporter_name ||
+      mapName(lookupMaps.transporter, r.transporter_id) ||
+      "",
+    company_name:
+      r.company_name ||
+      mapName(lookupMaps.company, r.company_id) ||
+      "",
+    account_name:
+      r.account_name ||
+      mapName(lookupMaps.account, r.company_account_id) ||
+      "",
+    warehouse_name:
+      r.warehouse_name ||
+      mapName(lookupMaps.warehouse, r.warehouse_id) ||
+      "",
+    product_name:
+      r.product_name ||
+      mapName(lookupMaps.product, r.product_id) ||
+      "",
+  });
+}
+
 async function getMongoTransporter(
   id
 ) {
@@ -915,154 +1018,133 @@ router.get(
         });
       }
 
-      const [
-        rows,
-        biltiRows,
-      ] =
-        await Promise.all([
-          OutwardOperational.find({})
-            .sort({
-              date: -1,
-              legacy_id: -1,
-              _id: -1,
-            })
-            .lean(),
-
-          TransportBiltiOperational.find({
-            outward_id: {
-              $nin: [
-                null,
-                "",
-              ],
-            },
+      const [rows, biltiRows] = await Promise.all([
+        OutwardOperational.find({})
+          .select({
+            _id: 1,
+            id: 1,
+            legacy_id: 1,
+            sl_no: 1,
+            voucher_no: 1,
+            outward_no: 1,
+            inv_no: 1,
+            date: 1,
+            lorry_no: 1,
+            quantity: 1,
+            weight: 1,
+            rate: 1,
+            buyer_name: 1,
+            consignee_name: 1,
+            company_id: 1,
+            company_name: 1,
+            company_account_id: 1,
+            company_account_name: 1,
+            account_name: 1,
+            warehouse_id: 1,
+            warehouse_name: 1,
+            product_id: 1,
+            product_name: 1,
           })
-            .select({
-              legacy_id: 1,
-              outward_id: 1,
-            })
-            .lean(),
-        ]);
+          .sort({
+            date: -1,
+            legacy_id: -1,
+            _id: -1,
+          })
+          .lean(),
 
-      const biltiMap =
-        new Map();
+        TransportBiltiOperational.find({
+          outward_id: {
+            $nin: [null, ""],
+          },
+        })
+          .select({
+            legacy_id: 1,
+            outward_id: 1,
+          })
+          .lean(),
+      ]);
 
-      for (
-        const b of
-          biltiRows || []
-      ) {
+      const biltiMap = new Map();
+      for (const b of biltiRows || []) {
         biltiMap.set(
-          String(
-            b.outward_id
-          ),
-          b.legacy_id ??
-            String(
-              b._id
-            )
+          String(b.outward_id),
+          b.legacy_id ?? String(b._id)
         );
       }
 
-      const result =
-        [];
+      const [companyMap, accountMap, warehouseMap, productMap] = await Promise.all([
+        buildMongoNameMap(
+          CompanyOperational,
+          rows.map((row) => row.company_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          CompanyAccountOperational,
+          rows.map((row) => row.company_account_id),
+          ["account_name", "name"]
+        ),
+        buildMongoNameMap(
+          WarehouseOperational,
+          rows.map((row) => row.warehouse_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          ProductOperational,
+          rows.map((row) => row.product_id),
+          ["name"]
+        ),
+      ]);
 
-      for (
-        const row of
-          rows || []
-      ) {
+      const lookupMaps = {
+        company: companyMap,
+        account: accountMap,
+        warehouse: warehouseMap,
+        product: productMap,
+      };
+
+      const result = (rows || []).map((row) => {
         const id =
           row.legacy_id ??
           row.id ??
           row.sl_no ??
           row._id;
 
-        const decorated =
-          await decorateMongoOutward(
-            row
-          );
+        const decorated = decorateMongoOutwardWithMaps(
+          row,
+          lookupMaps
+        );
 
-        result.push({
-          id:
-            String(id),
-
-          bilti_id:
-            biltiMap.get(
-              String(id)
-            ) ||
-            null,
-
+        return {
+          id: String(id),
+          bilti_id: biltiMap.get(String(id)) || null,
           voucher_no:
             decorated.voucher_no ||
             decorated.outward_no ||
             decorated.inv_no ||
             "",
+          date: decorated.date || "",
+          lorry_no: decorated.lorry_no || "",
+          quantity: num(decorated.quantity || decorated.weight),
+          weight: num(decorated.weight || decorated.quantity),
+          rate: num(decorated.rate),
+          buyer_name: decorated.buyer_name || decorated.company_name || "",
+          consignee_name: decorated.consignee_name || "",
+          company_name: decorated.company_name || "",
+          account_name: decorated.company_account_name || decorated.account_name || "",
+          warehouse_name: decorated.warehouse_name || "",
+          product_name: decorated.product_name || "",
+          source: "mongo",
+        };
+      });
 
-          date:
-            decorated.date ||
-            "",
-
-          lorry_no:
-            decorated.lorry_no ||
-            "",
-
-          quantity:
-            num(
-              decorated.quantity ||
-                decorated.weight
-            ),
-
-          weight:
-            num(
-              decorated.weight ||
-                decorated.quantity
-            ),
-
-          rate:
-            num(
-              decorated.rate
-            ),
-
-          buyer_name:
-            decorated.buyer_name ||
-            decorated.company_name ||
-            "",
-
-          consignee_name:
-            decorated.consignee_name ||
-            "",
-
-          company_name:
-            decorated.company_name ||
-            "",
-
-          account_name:
-            decorated.company_account_name ||
-            decorated.account_name ||
-            "",
-
-          warehouse_name:
-            decorated.warehouse_name ||
-            "",
-
-          product_name:
-            decorated.product_name ||
-            "",
-
-          source:
-            "mongo",
-        });
-      }
-
-      return res.json(
-        result
-      );
+      return res.json(result);
     } catch (err) {
       console.error(
         "Mongo outward-list failed:",
         err
       );
-
       return res.status(500).json({
-        error:
-          err.message,
+        error: err.message,
       });
     }
   }
@@ -1368,201 +1450,318 @@ router.get(
         });
       }
 
-      const fromDate =
-        text(
-          req.query.from_date
-        );
-
-      const toDate =
-        text(
-          req.query.to_date
-        );
-
+      const fromDate = text(req.query.from_date);
+      const toDate = text(req.query.to_date);
       const filter = {};
 
-      if (
-        fromDate ||
-        toDate
-      ) {
+      if (fromDate || toDate) {
         filter.dispatch_date = {};
-
-        if (fromDate) {
-          filter.dispatch_date.$gte =
-            fromDate;
-        }
-
-        if (toDate) {
-          filter.dispatch_date.$lte =
-            toDate;
-        }
+        if (fromDate) filter.dispatch_date.$gte = fromDate;
+        if (toDate) filter.dispatch_date.$lte = toDate;
       }
 
-      const rows =
-        await TransportBiltiOperational.find(
-          filter
-        )
-          .sort({
-            dispatch_date: -1,
-            legacy_id: -1,
-            _id: -1,
-          })
-          .lean();
+      const rows = await TransportBiltiOperational.find(filter)
+        .sort({
+          dispatch_date: -1,
+          legacy_id: -1,
+          _id: -1,
+        })
+        .lean();
 
-      const output =
-        [];
+      if (!rows.length) {
+        return res.json([]);
+      }
 
-      for (
-        const row of
-          rows
-      ) {
-        const decorated =
-          await decorateMongoBilti(
-            row
-          );
+      const saleFields = {
+        _id: 1,
+        id: 1,
+        legacy_id: 1,
+        sl_no: 1,
+        voucher_no: 1,
+        bill_no: 1,
+        date: 1,
+        bill_date: 1,
+        unloading_date: 1,
+        lorry_no: 1,
+        quantity: 1,
+        unloading_qty: 1,
+        rate: 1,
+        buyer_id: 1,
+        buyer_name: 1,
+        company_id: 1,
+        company_name: 1,
+        company_account_id: 1,
+        company_account_name: 1,
+        account_name: 1,
+        warehouse_id: 1,
+        warehouse_name: 1,
+        product_id: 1,
+        product_name: 1,
+        consignee_id: 1,
+        consignee_name: 1,
+      };
 
-        let sale =
-          null;
+      const outwardFields = {
+        _id: 1,
+        id: 1,
+        legacy_id: 1,
+        sl_no: 1,
+        voucher_no: 1,
+        outward_no: 1,
+        inv_no: 1,
+        date: 1,
+        lorry_no: 1,
+        quantity: 1,
+        weight: 1,
+        rate: 1,
+        buyer_name: 1,
+        consignee_name: 1,
+        company_id: 1,
+        company_name: 1,
+        company_account_id: 1,
+        company_account_name: 1,
+        account_name: 1,
+        warehouse_id: 1,
+        warehouse_name: 1,
+        product_id: 1,
+        product_name: 1,
+      };
 
-        let outward =
-          null;
+      const [
+        transporterMap,
+        companyMap,
+        accountMap,
+        warehouseMap,
+        productMap,
+        saleMap,
+        outwardMap,
+      ] = await Promise.all([
+        buildMongoNameMap(
+          TransporterOperational,
+          rows.map((row) => row.transporter_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          CompanyOperational,
+          rows.map((row) => row.company_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          CompanyAccountOperational,
+          rows.map((row) => row.company_account_id),
+          ["account_name", "name"]
+        ),
+        buildMongoNameMap(
+          WarehouseOperational,
+          rows.map((row) => row.warehouse_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          ProductOperational,
+          rows.map((row) => row.product_id),
+          ["name"]
+        ),
+        buildMongoDocMap(
+          SaleVoucher,
+          rows.map((row) => row.sale_id),
+          Object.keys(saleFields)
+        ),
+        buildMongoDocMap(
+          OutwardOperational,
+          rows.map((row) => row.outward_id),
+          Object.keys(outwardFields)
+        ),
+      ]);
 
-        if (
-          row.sale_id
-        ) {
-          sale =
-            await findByIdFlexible(
-              SaleVoucher,
-              row.sale_id
-            );
-        }
+      const saleDocs = Array.from(saleMap.values());
+      const outwardDocs = Array.from(outwardMap.values());
 
-        if (
-          row.outward_id
-        ) {
-          outward =
-            await findByIdFlexible(
-              OutwardOperational,
-              row.outward_id
-            );
-        }
+      const [
+        saleBuyerMap,
+        saleCompanyMap,
+        saleAccountMap,
+        saleWarehouseMap,
+        saleProductMap,
+        saleConsigneeMap,
+        outwardCompanyMap,
+        outwardAccountMap,
+        outwardWarehouseMap,
+        outwardProductMap,
+      ] = await Promise.all([
+        buildMongoNameMap(
+          BuyerName,
+          saleDocs.map((doc) => doc.buyer_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          CompanyOperational,
+          saleDocs.map((doc) => doc.company_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          CompanyAccountOperational,
+          saleDocs.map((doc) => doc.company_account_id),
+          ["account_name", "name"]
+        ),
+        buildMongoNameMap(
+          WarehouseOperational,
+          saleDocs.map((doc) => doc.warehouse_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          ProductOperational,
+          saleDocs.map((doc) => doc.product_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          ConsigneeName,
+          saleDocs.map((doc) => doc.consignee_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          CompanyOperational,
+          outwardDocs.map((doc) => doc.company_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          CompanyAccountOperational,
+          outwardDocs.map((doc) => doc.company_account_id),
+          ["account_name", "name"]
+        ),
+        buildMongoNameMap(
+          WarehouseOperational,
+          outwardDocs.map((doc) => doc.warehouse_id),
+          ["name"]
+        ),
+        buildMongoNameMap(
+          ProductOperational,
+          outwardDocs.map((doc) => doc.product_id),
+          ["name"]
+        ),
+      ]);
 
-        const decoratedSale =
-          sale
-            ? await decorateMongoSale(
-                sale
-              )
-            : null;
+      const saleLookupMaps = {
+        buyer: saleBuyerMap,
+        company: saleCompanyMap,
+        account: saleAccountMap,
+        warehouse: saleWarehouseMap,
+        product: saleProductMap,
+        consignee: saleConsigneeMap,
+      };
 
-        const decoratedOutward =
-          outward
-            ? await decorateMongoOutward(
-                outward
-              )
-            : null;
+      const outwardLookupMaps = {
+        company: outwardCompanyMap,
+        account: outwardAccountMap,
+        warehouse: outwardWarehouseMap,
+        product: outwardProductMap,
+      };
 
-        output.push({
+      const biltiLookupMaps = {
+        transporter: transporterMap,
+        company: companyMap,
+        account: accountMap,
+        warehouse: warehouseMap,
+        product: productMap,
+      };
+
+      const output = await Promise.all(rows.map(async (row) => {
+        const decorated = decorateMongoBiltiWithMaps(
+          row,
+          biltiLookupMaps
+        );
+
+        const sale = row.sale_id
+          ? saleMap.get(String(row.sale_id))
+          : null;
+        const outward = row.outward_id
+          ? outwardMap.get(String(row.outward_id))
+          : null;
+
+        const decoratedSale = sale
+          ? decorateMongoSale(sale, saleLookupMaps)
+          : null;
+
+        const decoratedOutward = outward
+          ? decorateMongoOutwardWithMaps(
+              outward,
+              outwardLookupMaps
+            )
+          : null;
+
+        return {
           ...decorated,
 
           outward_voucher_no:
             decoratedOutward?.voucher_no ||
             decoratedOutward?.outward_no ||
             "",
-
           outward_entry_date:
             decoratedOutward?.date ||
             "",
-
           outward_buyer_name:
             decoratedOutward?.buyer_name ||
             decoratedOutward?.company_name ||
             "",
-
           outward_consignee_name:
             decoratedOutward?.consignee_name ||
             "",
-
           outward_lorry_no:
             decoratedOutward?.lorry_no ||
             "",
-
           outward_company_name:
             decoratedOutward?.company_name ||
             "",
-
           outward_account_name:
             decoratedOutward?.company_account_name ||
             "",
-
           outward_warehouse_name:
             decoratedOutward?.warehouse_name ||
             "",
-
           outward_product_name:
             decoratedOutward?.product_name ||
             "",
-
           sale_voucher_no:
             decoratedSale?.voucher_no ||
             decoratedSale?.bill_no ||
             "",
-
           sale_entry_date:
             decoratedSale?.date ||
             "",
-
           sale_quantity:
-            num(
-              decoratedSale?.quantity
-            ),
-
+            num(decoratedSale?.quantity),
           sale_unloading_qty:
-            num(
-              decoratedSale?.unloading_qty
-            ),
-
+            num(decoratedSale?.unloading_qty),
           sale_master_rate:
-            num(
-              decoratedSale?.rate
-            ),
-
+            num(decoratedSale?.rate),
           sale_lorry_no:
             decoratedSale?.lorry_no ||
             "",
-
           sale_buyer_name:
             decoratedSale?.sale_buyer_name ||
             "",
-
           sale_consignee_name:
             decoratedSale?.sale_consignee_name ||
             "",
-
           sale_account_name:
             decoratedSale?.sale_account_name ||
             "",
-
           sale_warehouse_name:
             decoratedSale?.sale_warehouse_name ||
             "",
-
           sale_product_name:
             decoratedSale?.sale_product_name ||
             "",
-        });
-      }
+        };
+      }));
 
-      return res.json(
-        output
-      );
+      return res.json(output);
     } catch (err) {
       console.error(
         "Mongo transport report failed:",
         err
       );
-
       return res.status(500).json({
-        error:
-          err.message,
+        error: err.message,
       });
     }
   }
