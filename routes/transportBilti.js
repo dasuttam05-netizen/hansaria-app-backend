@@ -1238,25 +1238,29 @@ router.get(
       ]);
 
       const alreadyBiltied =
-        new Set(
-          (biltiRows || []).map(
-            (row) =>
-              String(
-                row.sale_id
-              )
-          )
+        new Set();
+      const saleBiltiMap = new Map();
+      for (const row of biltiRows || []) {
+        const saleKey = String(row.sale_id);
+        alreadyBiltied.add(saleKey);
+        saleBiltiMap.set(
+          saleKey,
+          row.legacy_id || row._id || null
         );
+      }
 
       // Same pending-sale behavior as the old route,
       // but already-biltied rows never enter the decoration loop.
       const completedOnly =
         String(req.query.completed || "0") === "1";
+      const includeBilti =
+        String(req.query.include_bilti || "0") === "1";
 
       const docs =
         (allSaleDocs || []).filter(
           (doc) => {
             if (!doc?._id) return false;
-            if (alreadyBiltied.has(String(doc._id))) return false;
+            if (!includeBilti && alreadyBiltied.has(String(doc._id))) return false;
             const isCompleted = Boolean(
               doc.unloading_date &&
               String(doc.unloading_date).trim()
@@ -1365,7 +1369,7 @@ router.get(
             ),
 
           bilti_id:
-            null,
+            saleBiltiMap.get(String(doc._id)) || null,
 
           voucher_no:
             decorated.voucher_no ||
