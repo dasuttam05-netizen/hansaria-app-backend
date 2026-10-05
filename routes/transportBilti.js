@@ -2357,6 +2357,7 @@ router.post(
         transport_rate,
         detain_amount,
         others_exp,
+        advance_date,
         advance_amount,
         tds_percent,
         round_off,
@@ -2686,6 +2687,9 @@ router.post(
         others_exp:
           computed.others_exp,
 
+        advance_date:
+          text(advance_date),
+
         advance_amount:
           computed.advance_amount,
 
@@ -2778,6 +2782,7 @@ router.post(
         saved_values: {
           detain_amount: Number(doc.detain_amount || 0),
           others_exp: Number(doc.others_exp || 0),
+          advance_date: doc.advance_date || "",
           advance_amount: Number(doc.advance_amount || 0),
           tds_percent: Number(doc.tds_percent || 0),
           round_off: Number(doc.round_off || 0),
