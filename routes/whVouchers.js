@@ -4384,90 +4384,49 @@ router.get("/receipt-pending-buyers", async (req, res) => {
   }
 });
 
+// Sale Summary is a reporting-only workspace. Its manual adjustments must not
+// modify SaleVoucher/PurchaseVoucher because those documents feed the ledgers.
+const saleSummaryAdjustmentCollection = () => {
+  if (!mongoReady() || !mongoose?.connection?.db) return null;
+  return mongoose.connection.db.collection("warehouse_sale_summary_adjustments");
+};
+
+async function saveSaleSummaryOnlyAdjustments({ saleId, saleFields = {}, purchaseUpdates = [], manualModes = {}, userId = "" }) {
+  const collection = saleSummaryAdjustmentCollection();
+  if (!collection || !saleId) throw new Error("Sale Summary storage is unavailable");
+  const now = new Date();
+  const purchaseMap = {};
+  for (const update of Array.isArray(purchaseUpdates) ? purchaseUpdates : []) {
+    const purchaseId = String(update?.purchase_id || update?.id || update?._id || "").trim();
+    if (!purchaseId) continue;
+    purchaseMap[purchaseId] = {
+      final: update?.final || {},
+      manual_modes: update?.manual_modes || {},
+    };
+  }
+  const filter = { sale_id: String(saleId) };
+  await collection.updateOne(
+    filter,
+    { $set: { sale_id: String(saleId), sale_fields: saleFields, purchase_updates: purchaseMap, sale_deduction_manual_modes: manualModes, updated_at: now, updated_by: String(userId || "") }, $setOnInsert: { created_at: now } },
+    { upsert: true }
+  );
+  return collection.findOne(filter);
+}
+
+async function getSaleSummaryOnlyAdjustments(saleId) {
+  const collection = saleSummaryAdjustmentCollection();
+  if (!collection || !saleId) return null;
+  return collection.findOne({ sale_id: String(saleId) });
+}
+
 // Persist final Purchase Deduction values edited from Sale Summary.
 // This only updates purchase deduction/payment fields; stock/FIFO logic is untouched.
 async function persistSaleSummaryPurchaseDeductionUpdates(updates) {
-  if (!Array.isArray(updates) || !updates.length) return [];
-
-  const results = [];
-  for (const update of updates) {
-    const purchaseId = String(update?.purchase_id || update?.id || update?._id || "").trim();
-    if (!purchaseId) continue;
-
-    const purchaseFilter = mongoose.Types.ObjectId.isValid(purchaseId)
-      ? { _id: purchaseId }
-      : { id: Number.isFinite(Number(purchaseId)) ? Number(purchaseId) : purchaseId };
-    const purchase = await PurchaseVoucher.findOne(purchaseFilter).lean();
-    if (!purchase) continue;
-
-    const final = update?.final || {};
-    const n = (value, fallback = 0) => {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) ? parsed : Number(fallback) || 0;
-    };
-    const claim = n(final.claim, purchase.claim_amount ?? purchase.bags_claim);
-    const labour = n(final.labour, purchase.labour);
-    const freight = n(final.freight, purchase.transport_charge);
-    const cashDiscount = n(final.cashDiscount, purchase.cd_amount);
-    const tds = n(final.tds, purchase.tds_amount);
-    const other = n(final.other, purchase.other_deduction);
-    const adjustment = n(final.adjustment, purchase.adjustment_amount);
-    const roundOff = n(final.roundOff, purchase.round_off);
-    const totalDeduction = Number((claim + labour + freight + cashDiscount + tds + other + adjustment).toFixed(2));
-    const grossAmount = purchaseGrossAmountFromRow(purchase);
-    const netPayable = Number(Math.max(grossAmount - totalDeduction + roundOff, 0).toFixed(2));
-
-    const deductionDetails = buildPurchaseDeductionDetails({
-      ...purchase,
-      claim_amount: claim,
-      bags_claim: claim,
-      labour,
-      transport_charge: freight,
-      cd_amount: cashDiscount,
-      tds_amount: tds,
-      other_deduction: other,
-      adjustment_amount: adjustment,
-      total_deduction: totalDeduction,
-      round_off: roundOff,
-    });
-
-    await PurchaseVoucher.collection.updateOne(
-      { _id: purchase._id },
-      {
-        $set: {
-          claim_amount: claim,
-          bags_claim: claim,
-          labour,
-          transport_charge: freight,
-          cd_amount: cashDiscount,
-          tds_amount: tds,
-          other_deduction: other,
-          adjustment_amount: adjustment,
-          total_deduction: totalDeduction,
-          total_deduct_amount: totalDeduction,
-          round_off: roundOff,
-          net_amount: netPayable,
-          net_amount_payable: netPayable,
-          outstanding: netPayable,
-          deduction_details: deductionDetails,
-          sale_summary_manual_modes: update?.manual_modes || {},
-          updated_at: new Date(),
-        },
-      }
-    );
-
-    results.push({
-      purchase_id: String(purchase._id),
-      final: { claim, labour, freight, cashDiscount, tds, other, adjustment, roundOff, totalDeduction },
-      manual_modes: update?.manual_modes || {},
-    });
-  }
-  return results;
+  // Kept for compatibility with older callers. Sale Summary must never write
+  // PurchaseVoucher deduction fields because that would change Purchase Ledger.
+  return Array.isArray(updates) ? updates : [];
 }
 
-// ===========================
-// SALE VOUCHERS
-// ===========================
 router.get("/sale", (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.sale.view")) {
     return res.status(403).json({ error: "Permission denied" });
@@ -4552,6 +4511,32 @@ router.put("/sale/:id", async (req, res) => {
     return (async () => {
       try {
         if (deductionOnly) {
+          // Sale Summary Save is intentionally isolated from the source vouchers.
+          // Nothing written here can change Sale Ledger or Purchase Ledger.
+          if (req.body?.sale_summary_only) {
+            const summaryFields = {
+              shortage_quantity: Number(req.body.shortage_quantity || 0) || 0,
+              shortage_amount: Number(req.body.shortage_amount || 0) || 0,
+              claim_amount: Number(req.body.claim_amount || 0) || 0,
+              other_deduction: Number(req.body.other_deduction || 0) || 0,
+              cd_amount: Number(req.body.cd_amount || 0) || 0,
+              adjustment_amount: Number(req.body.adjustment_amount || 0) || 0,
+              transport_charge: Number(req.body.transport_charge || 0) || 0,
+              additional_amount: Number(req.body.additional_amount || 0) || 0,
+              round_off: Number(req.body.round_off || 0) || 0,
+              // TDS is intentionally excluded from Sale Summary.
+              tds_amount: 0,
+            };
+            const saved = await saveSaleSummaryOnlyAdjustments({
+              saleId: id,
+              saleFields: summaryFields,
+              purchaseUpdates: req.body.purchase_deduction_updates || [],
+              manualModes: req.body.sale_deduction_manual_modes || {},
+              userId: req.user?.id || req.user?._id || req.user?.user_id || "",
+            });
+            return res.json({ saved: true, sale_summary_only: true, id, updated_at: saved?.updated_at || new Date() });
+          }
+
           const existing = await SaleVoucher.findById(id);
           if (!existing) return res.status(404).json({ error: "Sale voucher not found" });
           const dueFields = resolveSaleDueFields(req.body, existing);
@@ -7871,54 +7856,22 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const buyerRow = buyerId ? rows.find((row) => String(row?.buyer_id || row?.company_id || "") === String(buyerId)) : null;
   const consigneeRow = consigneeId ? rows.find((row) => String(row?.consignee_id || "") === String(consigneeId)) : null;
   const farmerRow = farmerId ? rows.find((row) => String(row?.farmer_id || "") === String(farmerId)) : null;
-
-  // Resolve selected master IDs to names for the PDF header. Some older rows
-  // store only the Mongo ObjectId, so never print the raw ID when a master
-  // record can be resolved.
-  const resolveMasterName = async (Model, rawId) => {
-    if (!rawId || !Model) return "";
-    const value = String(rawId).trim();
-    if (!value) return "";
-    try {
-      if (mongoose.Types.ObjectId.isValid(value)) {
-        const byObjectId = await Model.findById(value).select("name company_name consignee_name").lean();
-        if (byObjectId?.name || byObjectId?.company_name || byObjectId?.consignee_name) {
-          return String(byObjectId.name || byObjectId.company_name || byObjectId.consignee_name).trim();
-        }
-      }
-      const numeric = Number(value);
-      const clauses = [{ id: value }, { legacy_id: value }];
-      if (Number.isFinite(numeric)) clauses.push({ id: numeric }, { legacy_id: numeric });
-      const byLegacy = await Model.findOne({ $or: clauses }).select("name company_name consignee_name").lean();
-      return String(byLegacy?.name || byLegacy?.company_name || byLegacy?.consignee_name || "").trim();
-    } catch {
-      return "";
-    }
-  };
-
-  const [resolvedBuyerName, resolvedConsigneeName, resolvedFarmerName] = await Promise.all([
-    resolveMasterName(Company, buyerId),
-    resolveMasterName(Consignee, consigneeId),
-    resolveMasterName(Farmer, farmerId),
-  ]);
-
-  const buyerLabel = buyerName || buyerRow?.buyer_name || buyerRow?.company_name || resolvedBuyerName || (buyerId ? String(buyerId) : "All");
-  const consigneeLabel = consigneeName || consigneeRow?.consignee_name || resolvedConsigneeName || (consigneeId ? String(consigneeId) : "All");
-  const farmerLabel = farmerName || farmerRow?.farmer_name || resolvedFarmerName || (farmerId ? String(farmerId) : "All");
+  const buyerLabel = buyerName || buyerRow?.buyer_name || buyerRow?.company_name || (buyerId ? String(buyerId) : "All");
+  const consigneeLabel = consigneeName || consigneeRow?.consignee_name || (consigneeId ? String(consigneeId) : "All");
+  const farmerLabel = farmerName || farmerRow?.farmer_name || (farmerId ? String(farmerId) : "All");
 
   const drawPageTitle = () => {
-    // Main title banner.
+    // Main title banner: same teal family as the earlier design.
     doc.roundedRect(left, 20, tableWidth, 62, 9).fill(headerFill);
     doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(17.5)
       .text(title, left + 12, 28, { width: tableWidth - 24, align: "center", lineBreak: false });
 
-    // Filter summary uses the same light-green background as TOTAL SUMMARY.
-    doc.roundedRect(left + 8, 50, tableWidth - 16, 25, 5).fill(totalFill);
-    doc.font("Helvetica").fontSize(8.1).fillColor(headerDark)
-      .text(`Period: ${dateLabel}`, left + 14, 58, { width: 150, lineBreak: false });
-    doc.text(`Buyer: ${buyerLabel}`, left + 170, 58, { width: 210, lineBreak: false });
-    doc.text(`Consignee: ${consigneeLabel}`, left + 385, 58, { width: 220, lineBreak: false });
-    doc.text(`Farmer: ${farmerLabel}`, left + 610, 58, { width: tableWidth - 624, lineBreak: false });
+    // Filters directly under the title, laid out cleanly for readability.
+    doc.font("Helvetica").fontSize(8.2).fillColor("#dff7f4")
+      .text(`Period: ${dateLabel}`, left + 14, 55, { width: 150, lineBreak: false });
+    doc.text(`Buyer: ${buyerLabel}`, left + 170, 55, { width: 210, lineBreak: false });
+    doc.text(`Consignee: ${consigneeLabel}`, left + 385, 55, { width: 220, lineBreak: false });
+    doc.text(`Farmer: ${farmerLabel}`, left + 610, 55, { width: tableWidth - 624, lineBreak: false });
     doc.fillColor(textColor);
   };
 
@@ -8250,48 +8203,32 @@ router.get("/report/profit-loss", async (req, res) => {
 
     // Resolve selected master IDs against both ObjectId and legacy/id fields.
     // Existing SaleVoucher documents may store references in different formats.
-    const resolveReferenceIds = async (Model, rawValue, dedicatedKind = null) => {
+    const resolveReferenceIds = async (Model, rawValue) => {
       const value = String(rawValue || "").trim();
-      if (!value) return [];
+      if (!value || !Model) return [];
       const ors = [];
       const refs = new Set([value]);
       if (mongoose.Types.ObjectId.isValid(value)) {
         ors.push({ _id: value });
-        refs.add(String(value));
       }
       const numeric = Number(value);
       if (Number.isFinite(numeric)) {
         ors.push({ id: numeric }, { legacy_id: numeric });
-        refs.add(String(numeric));
       }
       ors.push({ id: value }, { legacy_id: value });
-
-      // Buyer/Consignee masters are maintained in dedicated collections in
-      // current MongoDB data. SaleVoucher rows can reference either the
-      // dedicated master ID or the older Company/Consignee ID. Resolve both
-      // forms so the Profit/Loss filter works for every existing row.
-      if (dedicatedKind) {
-        try {
-          const dedicatedDocs = await findDedicatedPartyDocs(dedicatedKind, { $or: ors }, "_id id legacy_id");
-          (dedicatedDocs || []).forEach((doc) => {
-            [doc?._id, doc?.id, doc?.legacy_id]
-              .filter((x) => x !== undefined && x !== null && String(x).trim())
-              .forEach((x) => refs.add(String(x)));
-          });
-        } catch {}
+      try {
+        const docs = await Model.find({ $or: ors }).select("_id id legacy_id").lean();
+        (docs || []).forEach((doc) => {
+          [doc?._id, doc?.id, doc?.legacy_id]
+            .filter((x) => x !== undefined && x !== null && String(x).trim())
+            .forEach((x) => {
+              refs.add(String(x));
+            });
+        });
+        return Array.from(refs);
+      } catch {
+        return Array.from(refs);
       }
-
-      if (Model) {
-        try {
-          const docs = await Model.find({ $or: ors }).select("_id id legacy_id").lean();
-          (docs || []).forEach((doc) => {
-            [doc?._id, doc?.id, doc?.legacy_id]
-              .filter((x) => x !== undefined && x !== null && String(x).trim())
-              .forEach((x) => refs.add(String(x)));
-          });
-        } catch {}
-      }
-      return Array.from(refs);
     };
 
     if (farmerId) {
@@ -8306,7 +8243,7 @@ router.get("/report/profit-loss", async (req, res) => {
     }
 
     if (buyerId) {
-      const refs = await resolveReferenceIds(Company, buyerId, "buyer");
+      const refs = await resolveReferenceIds(Company, buyerId);
       filter.$and = [
         ...(filter.$and || []),
         { $or: [
@@ -8317,7 +8254,7 @@ router.get("/report/profit-loss", async (req, res) => {
     }
 
     if (consigneeId) {
-      const refs = await resolveReferenceIds(Consignee, consigneeId, "consignee");
+      const refs = await resolveReferenceIds(Consignee, consigneeId);
       filter.consignee_id = { $in: refs };
     }
 
@@ -9292,6 +9229,15 @@ router.get("/sale/:id/summary", async (req, res) => {
     if (!row) return res.status(404).json({ error: "Not found" });
     if (!(await ensureWarehouseAccess(req, res, row.warehouse_id, row.location_id))) return;
 
+    const summaryOnly = await getSaleSummaryOnlyAdjustments(id);
+    const summarySaleFields = summaryOnly?.sale_fields || {};
+    // Apply report-only overrides to the response object, never to SaleVoucher.
+    if (Object.keys(summarySaleFields).length) {
+      row = { ...row, ...summarySaleFields, tds_amount: 0 };
+    } else {
+      row = { ...row, tds_amount: 0 };
+    }
+
     const purchaseLinks = Array.isArray(row.against_purchase_links)
       ? row.against_purchase_links
       : (() => {
@@ -9371,6 +9317,29 @@ router.get("/sale/:id/summary", async (req, res) => {
         }
       })
     );
+    const purchaseSummaryOverrides = summaryOnly?.purchase_updates || {};
+    const summaryPurchaseLinks = hydratedPurchaseLinks.map((link) => {
+      const purchaseId = String(link?.purchase_id || link?.id || link?._id || "").trim();
+      const override = purchaseSummaryOverrides?.[purchaseId];
+      if (!override?.final) return { ...link, tds_amount: 0 };
+      const final = override.final || {};
+      const next = {
+        ...link,
+        claim_amount: Number(final.claim || 0),
+        labour: Number(final.labour || 0),
+        transport_charge: Number(final.freight || 0),
+        cd_amount: Number(final.cashDiscount || 0),
+        other_deduction: Number(final.other || 0),
+        adjustment_amount: Number(final.adjustment || 0),
+        round_off: Number(final.roundOff || 0),
+        tds_amount: 0,
+        purchase_deduction_manual_modes: override.manual_modes || {},
+      };
+      next.total_deduction = Number((next.claim_amount + next.labour + next.transport_charge + next.cd_amount + next.other_deduction + next.adjustment_amount).toFixed(2));
+      next.net_amount_payable = Math.max(Number(link.amount || 0) - next.total_deduction + next.round_off, 0);
+      return next;
+    });
+    hydratedPurchaseLinks.splice(0, hydratedPurchaseLinks.length, ...summaryPurchaseLinks);
     const paymentDetails = Array.isArray(row.payment_details) ? row.payment_details : [];
     const journalDetails = Array.isArray(row.journal_details) ? row.journal_details : [];
     const resolvedTransportRow = await getTransportBiltiMatch({
