@@ -9126,11 +9126,11 @@ router.get("/sale/:id/pdf", async (req, res) => {
 
     let row = null;
     if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
-      const doc = await SaleVoucher.findById(id).lean();
-      if (doc) {
-        const decorated = await decorateSaleRows([doc]);
-        row = decorated[0] || null;
-      }
+      // Sale Preview already has the sale voucher row. For the single-sale
+      // summary endpoint, do not run the full report decoration pipeline
+      // (warehouse/product/account/buyer/consignee/farmer lookups). That
+      // pipeline is useful for list reports but unnecessarily slow here.
+      row = await SaleVoucher.findById(id).lean();
     }
 
     if (!row) return res.status(404).json({ error: "Not found" });
@@ -9219,11 +9219,11 @@ router.get("/sale/:id/summary", async (req, res) => {
 
     let row = null;
     if (mongoReady() && mongoose.Types.ObjectId.isValid(String(id))) {
-      const doc = await SaleVoucher.findById(id).lean();
-      if (doc) {
-        const decorated = await decorateSaleRows([doc]);
-        row = decorated[0] || null;
-      }
+      // Sale Preview already has the sale voucher row. For the single-sale
+      // summary endpoint, do not run the full report decoration pipeline
+      // (warehouse/product/account/buyer/consignee/farmer lookups). That
+      // pipeline is useful for list reports but unnecessarily slow here.
+      row = await SaleVoucher.findById(id).lean();
     }
 
     if (!row) return res.status(404).json({ error: "Not found" });
