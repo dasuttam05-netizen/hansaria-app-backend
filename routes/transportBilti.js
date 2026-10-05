@@ -502,6 +502,11 @@ function calculateBilti(
       data.tds_percent
     );
 
+  const roundOff =
+    num(
+      data.round_off
+    );
+
   const shortageQty =
     Math.max(
       outwardQty -
@@ -541,7 +546,8 @@ function calculateBilti(
   const payableAmount =
     netAmount -
     advanceAmount -
-    tdsAmount;
+    tdsAmount +
+    roundOff;
 
   return {
     outward_qty:
@@ -582,6 +588,9 @@ function calculateBilti(
 
     tds_amount:
       tdsAmount,
+
+    round_off:
+      roundOff,
 
     net_amount:
       netAmount,
@@ -1194,6 +1203,7 @@ router.get(
             bill_no: 1,
             date: 1,
             bill_date: 1,
+            unloading_date: 1,
             lorry_no: 1,
             quantity: 1,
             unloading_qty: 1,
@@ -1239,13 +1249,20 @@ router.get(
 
       // Same pending-sale behavior as the old route,
       // but already-biltied rows never enter the decoration loop.
+      const completedOnly =
+        String(req.query.completed || "0") === "1";
+
       const docs =
         (allSaleDocs || []).filter(
-          (doc) =>
-            doc?._id &&
-            !alreadyBiltied.has(
-              String(doc._id)
-            )
+          (doc) => {
+            if (!doc?._id) return false;
+            if (alreadyBiltied.has(String(doc._id))) return false;
+            const isCompleted = Boolean(
+              doc.unloading_date &&
+              String(doc.unloading_date).trim()
+            );
+            return completedOnly ? isCompleted : !isCompleted;
+          }
         );
 
       if (!docs.length) {
@@ -1358,6 +1375,10 @@ router.get(
           date:
             decorated.date ||
             decorated.bill_date ||
+            "",
+
+          unloading_date:
+            decorated.unloading_date ||
             "",
 
           lorry_no:
@@ -2338,6 +2359,7 @@ router.post(
         others_exp,
         advance_amount,
         tds_percent,
+        round_off,
         narration,
       } = req.body || {};
 
@@ -2359,6 +2381,7 @@ router.post(
           others_exp,
           advance_amount,
           tds_percent,
+          round_off,
         });
 
       let sourceOutward =
@@ -2669,6 +2692,9 @@ router.post(
         tds_percent:
           computed.tds_percent,
 
+        round_off:
+          computed.round_off,
+
         tds_amount:
           computed.tds_amount,
 
@@ -2754,6 +2780,7 @@ router.post(
           others_exp: Number(doc.others_exp || 0),
           advance_amount: Number(doc.advance_amount || 0),
           tds_percent: Number(doc.tds_percent || 0),
+          round_off: Number(doc.round_off || 0),
           gross_freight: Number(doc.gross_freight || 0),
           net_amount: Number(doc.net_amount || 0),
           payable_amount: Number(doc.payable_amount || 0),
