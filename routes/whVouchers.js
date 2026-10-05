@@ -7871,22 +7871,54 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const buyerRow = buyerId ? rows.find((row) => String(row?.buyer_id || row?.company_id || "") === String(buyerId)) : null;
   const consigneeRow = consigneeId ? rows.find((row) => String(row?.consignee_id || "") === String(consigneeId)) : null;
   const farmerRow = farmerId ? rows.find((row) => String(row?.farmer_id || "") === String(farmerId)) : null;
-  const buyerLabel = buyerName || buyerRow?.buyer_name || buyerRow?.company_name || (buyerId ? String(buyerId) : "All");
-  const consigneeLabel = consigneeName || consigneeRow?.consignee_name || (consigneeId ? String(consigneeId) : "All");
-  const farmerLabel = farmerName || farmerRow?.farmer_name || (farmerId ? String(farmerId) : "All");
+
+  // Resolve selected master IDs to names for the PDF header. Some older rows
+  // store only the Mongo ObjectId, so never print the raw ID when a master
+  // record can be resolved.
+  const resolveMasterName = async (Model, rawId) => {
+    if (!rawId || !Model) return "";
+    const value = String(rawId).trim();
+    if (!value) return "";
+    try {
+      if (mongoose.Types.ObjectId.isValid(value)) {
+        const byObjectId = await Model.findById(value).select("name company_name consignee_name").lean();
+        if (byObjectId?.name || byObjectId?.company_name || byObjectId?.consignee_name) {
+          return String(byObjectId.name || byObjectId.company_name || byObjectId.consignee_name).trim();
+        }
+      }
+      const numeric = Number(value);
+      const clauses = [{ id: value }, { legacy_id: value }];
+      if (Number.isFinite(numeric)) clauses.push({ id: numeric }, { legacy_id: numeric });
+      const byLegacy = await Model.findOne({ $or: clauses }).select("name company_name consignee_name").lean();
+      return String(byLegacy?.name || byLegacy?.company_name || byLegacy?.consignee_name || "").trim();
+    } catch {
+      return "";
+    }
+  };
+
+  const [resolvedBuyerName, resolvedConsigneeName, resolvedFarmerName] = await Promise.all([
+    resolveMasterName(Company, buyerId),
+    resolveMasterName(Consignee, consigneeId),
+    resolveMasterName(Farmer, farmerId),
+  ]);
+
+  const buyerLabel = buyerName || buyerRow?.buyer_name || buyerRow?.company_name || resolvedBuyerName || (buyerId ? String(buyerId) : "All");
+  const consigneeLabel = consigneeName || consigneeRow?.consignee_name || resolvedConsigneeName || (consigneeId ? String(consigneeId) : "All");
+  const farmerLabel = farmerName || farmerRow?.farmer_name || resolvedFarmerName || (farmerId ? String(farmerId) : "All");
 
   const drawPageTitle = () => {
-    // Main title banner: same teal family as the earlier design.
+    // Main title banner.
     doc.roundedRect(left, 20, tableWidth, 62, 9).fill(headerFill);
     doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(17.5)
       .text(title, left + 12, 28, { width: tableWidth - 24, align: "center", lineBreak: false });
 
-    // Filters directly under the title, laid out cleanly for readability.
-    doc.font("Helvetica").fontSize(8.2).fillColor("#dff7f4")
-      .text(`Period: ${dateLabel}`, left + 14, 55, { width: 150, lineBreak: false });
-    doc.text(`Buyer: ${buyerLabel}`, left + 170, 55, { width: 210, lineBreak: false });
-    doc.text(`Consignee: ${consigneeLabel}`, left + 385, 55, { width: 220, lineBreak: false });
-    doc.text(`Farmer: ${farmerLabel}`, left + 610, 55, { width: tableWidth - 624, lineBreak: false });
+    // Filter summary uses the same light-green background as TOTAL SUMMARY.
+    doc.roundedRect(left + 8, 50, tableWidth - 16, 25, 5).fill(totalFill);
+    doc.font("Helvetica").fontSize(8.1).fillColor(headerDark)
+      .text(`Period: ${dateLabel}`, left + 14, 58, { width: 150, lineBreak: false });
+    doc.text(`Buyer: ${buyerLabel}`, left + 170, 58, { width: 210, lineBreak: false });
+    doc.text(`Consignee: ${consigneeLabel}`, left + 385, 58, { width: 220, lineBreak: false });
+    doc.text(`Farmer: ${farmerLabel}`, left + 610, 58, { width: tableWidth - 624, lineBreak: false });
     doc.fillColor(textColor);
   };
 
