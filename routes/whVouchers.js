@@ -8218,32 +8218,48 @@ router.get("/report/profit-loss", async (req, res) => {
 
     // Resolve selected master IDs against both ObjectId and legacy/id fields.
     // Existing SaleVoucher documents may store references in different formats.
-    const resolveReferenceIds = async (Model, rawValue) => {
+    const resolveReferenceIds = async (Model, rawValue, dedicatedKind = null) => {
       const value = String(rawValue || "").trim();
-      if (!value || !Model) return [];
+      if (!value) return [];
       const ors = [];
       const refs = new Set([value]);
       if (mongoose.Types.ObjectId.isValid(value)) {
         ors.push({ _id: value });
+        refs.add(String(value));
       }
       const numeric = Number(value);
       if (Number.isFinite(numeric)) {
         ors.push({ id: numeric }, { legacy_id: numeric });
+        refs.add(String(numeric));
       }
       ors.push({ id: value }, { legacy_id: value });
-      try {
-        const docs = await Model.find({ $or: ors }).select("_id id legacy_id").lean();
-        (docs || []).forEach((doc) => {
-          [doc?._id, doc?.id, doc?.legacy_id]
-            .filter((x) => x !== undefined && x !== null && String(x).trim())
-            .forEach((x) => {
-              refs.add(String(x));
-            });
-        });
-        return Array.from(refs);
-      } catch {
-        return Array.from(refs);
+
+      // Buyer/Consignee masters are maintained in dedicated collections in
+      // current MongoDB data. SaleVoucher rows can reference either the
+      // dedicated master ID or the older Company/Consignee ID. Resolve both
+      // forms so the Profit/Loss filter works for every existing row.
+      if (dedicatedKind) {
+        try {
+          const dedicatedDocs = await findDedicatedPartyDocs(dedicatedKind, { $or: ors }, "_id id legacy_id");
+          (dedicatedDocs || []).forEach((doc) => {
+            [doc?._id, doc?.id, doc?.legacy_id]
+              .filter((x) => x !== undefined && x !== null && String(x).trim())
+              .forEach((x) => refs.add(String(x)));
+          });
+        } catch {}
       }
+
+      if (Model) {
+        try {
+          const docs = await Model.find({ $or: ors }).select("_id id legacy_id").lean();
+          (docs || []).forEach((doc) => {
+            [doc?._id, doc?.id, doc?.legacy_id]
+              .filter((x) => x !== undefined && x !== null && String(x).trim())
+              .forEach((x) => refs.add(String(x)));
+          });
+        } catch {}
+      }
+      return Array.from(refs);
     };
 
     if (farmerId) {
@@ -8258,7 +8274,7 @@ router.get("/report/profit-loss", async (req, res) => {
     }
 
     if (buyerId) {
-      const refs = await resolveReferenceIds(Company, buyerId);
+      const refs = await resolveReferenceIds(Company, buyerId, "buyer");
       filter.$and = [
         ...(filter.$and || []),
         { $or: [
@@ -8269,7 +8285,7 @@ router.get("/report/profit-loss", async (req, res) => {
     }
 
     if (consigneeId) {
-      const refs = await resolveReferenceIds(Consignee, consigneeId);
+      const refs = await resolveReferenceIds(Consignee, consigneeId, "consignee");
       filter.consignee_id = { $in: refs };
     }
 
