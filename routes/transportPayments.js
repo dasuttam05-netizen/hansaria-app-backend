@@ -26,7 +26,9 @@ const PaymentEntry =
   mongoose.model(
     "TransportPaymentEntry",
     new mongoose.Schema(
-      {},
+      {
+        id: { type: Number, index: true },
+      },
       {
         strict: false,
         minimize: false,
