@@ -160,7 +160,7 @@ async function resolveSourceData(bilti) {
   };
 }
 
-async function allocatedMapForBills(billIds, transporterId) {
+async function allocatedMapForBills(billIds, transporterId, excludedPaymentId = "") {
   const ids = (billIds || []).map(text).filter(Boolean);
   const map = new Map();
   if (!ids.length) return map;
@@ -171,11 +171,17 @@ async function allocatedMapForBills(billIds, transporterId) {
     : {};
 
   const payments = await PaymentEntry.find(query)
-    .select({ allocations: 1 })
+    .select({ _id: 1, id: 1, allocations: 1, adjustments: 1 })
     .lean();
 
   for (const payment of payments || []) {
-    for (const allocation of Array.isArray(payment?.allocations) ? payment.allocations : []) {
+    if (excludedPaymentId && String(payment?._id) === String(excludedPaymentId)) continue;
+    const paymentAllocations = Array.isArray(payment?.adjustments) && payment.adjustments.length
+      ? payment.adjustments
+      : Array.isArray(payment?.allocations)
+      ? payment.allocations
+      : [];
+    for (const allocation of paymentAllocations) {
       const key = text(allocation?.bilti_id);
       if (!key || !ids.includes(key)) continue;
       map.set(key, round2((map.get(key) || 0) + num(allocation?.adjusted_amount)));
@@ -185,7 +191,7 @@ async function allocatedMapForBills(billIds, transporterId) {
   return map;
 }
 
-async function getPendingBills(transporterId) {
+async function getPendingBills(transporterId, excludedPaymentId = "") {
   const variants = idVariants(transporterId);
   if (!variants.length) return [];
 
@@ -200,7 +206,7 @@ async function getPendingBills(transporterId) {
     .lean();
 
   const billIds = bills.map((b) => text(b?.legacy_id ?? b?.id ?? b?._id)).filter(Boolean);
-  const allocated = await allocatedMapForBills(billIds, transporterId);
+  const allocated = await allocatedMapForBills(billIds, transporterId, excludedPaymentId);
 
   const output = [];
   for (const bill of bills) {
@@ -261,7 +267,10 @@ router.get("/pending", async (req, res) => {
     }
 
     const transporter = await findFlexible(TransporterOperational, transporterId);
-    const bills = await getPendingBills(transporterId);
+    const bills = await getPendingBills(
+      transporterId,
+      text(req.query.exclude_payment_id)
+    );
 
     return res.json({
       transporter: transporter
@@ -487,6 +496,151 @@ router.post("/", async (req, res) => {
   } catch (err) {
     console.error("Transport payment save failed:", err);
     return res.status(500).json({ error: err.message || "Failed to save transport payment" });
+  }
+});
+
+router.put("/:id", async (req, res) => {
+  try {
+    if (!requireAccess(req, res)) return;
+
+    const payment = await PaymentEntry.findById(req.params.id);
+    if (!payment) return res.status(404).json({ error: "Transport payment not found" });
+
+    const body = req.body || {};
+    const transporterId = text(body.transporter_id);
+    const date = text(body.date);
+    const paymentMethod = text(body.payment_method) || "Cash";
+    const amount = round2(body.amount);
+    const advanceAmount = round2(body.advance_amount);
+    const onAccountAmount = round2(body.on_account_amount);
+    const adjustments = Array.isArray(body.adjustments) ? body.adjustments : [];
+
+    if (!transporterId) return res.status(400).json({ error: "Transport Name is required" });
+    if (!date) return res.status(400).json({ error: "Date is required" });
+    if (amount <= 0) return res.status(400).json({ error: "Amount must be greater than 0" });
+    if (advanceAmount < 0 || onAccountAmount < 0) {
+      return res.status(400).json({ error: "Advance and On Account cannot be negative" });
+    }
+
+    const transporter = await findFlexible(TransporterOperational, transporterId);
+    if (!transporter) return res.status(400).json({ error: "Invalid Transport Name" });
+
+    const pendingBills = await getPendingBills(transporterId, String(payment._id));
+    const pendingMap = new Map(pendingBills.map((bill) => [text(bill.bilti_id), bill]));
+    const cleanAdjustments = [];
+    const seenBills = new Set();
+
+    for (const item of adjustments) {
+      const biltiId = text(item?.bilti_id ?? item?.id ?? item?.biltiId);
+      const adjustedAmount = round2(item?.adjusted_amount ?? item?.amount);
+      if (!biltiId || adjustedAmount <= 0) continue;
+      if (seenBills.has(biltiId)) return res.status(400).json({ error: `Duplicate transport bill adjustment ${biltiId}` });
+      seenBills.add(biltiId);
+
+      const bill = pendingMap.get(biltiId);
+      if (!bill) return res.status(400).json({ error: `Transport bill ${biltiId} is no longer pending` });
+      if (adjustedAmount > round2(bill.pending_amount) + 0.009) {
+        return res.status(400).json({ error: `Adjustment exceeds pending amount for ${bill.bilti_no}` });
+      }
+
+      cleanAdjustments.push({
+        bilti_id: biltiId,
+        bilti_no: bill.bilti_no,
+        bill_amount: bill.bill_amount,
+        pending_before: bill.pending_amount,
+        adjusted_amount: adjustedAmount,
+        warehouse_id: bill.warehouse_id,
+        warehouse_name: bill.warehouse_name,
+        sale_id: bill.sale_id,
+        sale_voucher_no: bill.sale_voucher_no,
+        outward_id: bill.outward_id,
+        outward_voucher_no: bill.outward_voucher_no,
+        lorry_no: bill.lorry_no,
+      });
+    }
+
+    const adjustedTotal = round2(cleanAdjustments.reduce((sum, row) => sum + num(row.adjusted_amount), 0));
+    const allocatedTotal = round2(adjustedTotal + advanceAmount + onAccountAmount);
+    if (Math.abs(allocatedTotal - amount) > 0.009) {
+      return res.status(400).json({
+        error: "Amount allocation mismatch",
+        details: {
+          amount,
+          adjusted_total: adjustedTotal,
+          advance_amount: advanceAmount,
+          on_account_amount: onAccountAmount,
+          allocated_total: allocatedTotal,
+        },
+      });
+    }
+
+    const primaryWarehouse = cleanAdjustments.length === 1 ? cleanAdjustments[0].warehouse_id : text(body.warehouse_id);
+    const primaryWarehouseName = cleanAdjustments.length === 1 ? cleanAdjustments[0].warehouse_name : text(body.warehouse_name);
+    const primarySaleId = cleanAdjustments.length === 1 ? cleanAdjustments[0].sale_id : text(body.sale_id);
+    const primarySaleVoucherNo = cleanAdjustments.length === 1 ? cleanAdjustments[0].sale_voucher_no : text(body.sale_voucher_no);
+    const primaryOutwardId = cleanAdjustments.length === 1 ? cleanAdjustments[0].outward_id : text(body.outward_id);
+    const primaryOutwardVoucherNo = cleanAdjustments.length === 1 ? cleanAdjustments[0].outward_voucher_no : text(body.outward_voucher_no);
+    const voucherNo = text(body.voucher_no) || text(payment.voucher_no);
+    const updatedAt = new Date();
+
+    const cashEntry = await CashEntry.findOne({
+      $or: [
+        { linked_entry_id: payment._id },
+        { source_expense_id: `transport_payment:${payment.id}` },
+      ],
+    });
+
+    if (cashEntry) {
+      await CashEntry.updateOne(
+        { _id: cashEntry._id },
+        {
+          $set: {
+            voucher_no: voucherNo,
+            entry_date: new Date(`${date}T00:00:00`),
+            warehouse_id: primaryWarehouse || null,
+            description: `Transport Payment - ${transporter?.name || "Transporter"}`,
+            amount,
+            payment_method: paymentMethod,
+            reference_no: voucherNo,
+            narration: text(body.narration) || "Transport Payment",
+            fund_source: text(body.fund_source) || "main_cash",
+            updated_at: updatedAt,
+          },
+        }
+      );
+    }
+
+    await PaymentEntry.updateOne(
+      { _id: payment._id },
+      {
+        $set: {
+          voucher_no: voucherNo,
+          date,
+          transporter_id: String(transporter?._id || transporter?.legacy_id || transporter?.id || transporterId),
+          transporter_name: transporter?.name || "",
+          warehouse_id: primaryWarehouse || null,
+          warehouse_name: primaryWarehouseName || "",
+          sale_id: primarySaleId || null,
+          sale_voucher_no: primarySaleVoucherNo || "",
+          outward_id: primaryOutwardId || null,
+          outward_voucher_no: primaryOutwardVoucherNo || "",
+          amount,
+          adjusted_amount: adjustedTotal,
+          advance_amount: advanceAmount,
+          on_account_amount: onAccountAmount,
+          payment_method: paymentMethod,
+          fund_source: text(body.fund_source) || "main_cash",
+          narration: text(body.narration),
+          adjustments: cleanAdjustments,
+          updated_at: updatedAt,
+        },
+      }
+    );
+
+    return res.json({ message: "Transport payment updated successfully", id: payment.id, voucher_no: voucherNo });
+  } catch (err) {
+    console.error("Transport payment update failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to update transport payment" });
   }
 });
 
