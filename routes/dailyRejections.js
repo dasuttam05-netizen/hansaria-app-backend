@@ -839,7 +839,9 @@ router.post("/:id/progress", async (req, res) => {
       nextRejectionRemaining + nextOtherRemaining
     ).toFixed(4));
 
-    const complete = totalRemaining <= 0.0001;
+    // Completion rule: ONLY the original Reject Qty chain controls completion.
+    // Factory Other Qty remains view/history data and never blocks closing the work.
+    const complete = nextRejectionRemaining <= 0.0001;
 
     const rejectionAdjustmentQty = Math.max(
       0,
@@ -968,7 +970,8 @@ router.post("/:id/progress", async (req, res) => {
 
       total_target_qty: Number((nextRejectionTarget + nextOtherTarget).toFixed(4)),
       total_processed_qty: Number((nextRejectionProcessed + nextOtherProcessed).toFixed(4)),
-      total_remaining_qty: totalRemaining,
+      // Informational only: completion is controlled by rejection balance.
+      total_remaining_qty: Number((nextRejectionRemaining + nextOtherRemaining).toFixed(4)),
     });
   } catch (err) {
     console.error("[daily-rejections:progress]", err);
@@ -1050,11 +1053,10 @@ router.post("/:id/complete", async (req, res) => {
     if (!isAssignedEmployee && !managerCanComplete) return res.status(403).json({ error: "Only the assigned employee or manager can complete this work" });
     if (normalizeStatus(existing.status) !== "RUNNING") return res.status(400).json({ error: "Only Running rejection can be completed" });
     const rejectionRemainingQty = chainRemaining(existing);
-    const otherRemainingQty = chainOtherRemaining(existing);
-    const totalRemainingQty = chainTotalRemaining(existing);
-    if (rejectionRemainingQty > 0.000001 || otherRemainingQty > 0.000001) {
+    // Other Qty is informational/view-only and must NOT block completion.
+    if (rejectionRemainingQty > 0.000001) {
       return res.status(400).json({
-        error: `Work cannot be completed. Rejection Balance: ${rejectionRemainingQty.toFixed(2)}, Other Balance: ${otherRemainingQty.toFixed(2)}`
+        error: `Work cannot be completed. Rejection Balance: ${rejectionRemainingQty.toFixed(2)}`
       });
     }
 
@@ -1072,8 +1074,8 @@ router.post("/:id/complete", async (req, res) => {
           completed_at: now,
           completed_by: uid,
           chain_remaining_qty: 0,
-          chain_other_remaining_qty: 0,
-          chain_total_remaining_qty: 0,
+          // Other Qty is view/history only; do not consume or clear it on completion.
+          chain_total_remaining_qty: Number(chainOtherRemaining(existing).toFixed(4)),
           updated_at: now,
           history
         } }
@@ -1083,8 +1085,8 @@ router.post("/:id/complete", async (req, res) => {
       status: "COMPLETE",
       closed: true,
       rejection_remaining_qty: 0,
-      other_remaining_qty: 0,
-      total_remaining_qty: 0
+      other_remaining_qty: chainOtherRemaining(existing),
+      total_remaining_qty: chainOtherRemaining(existing)
     });
   } catch (err) {
     console.error("[daily-rejections:complete]", err);
