@@ -27,6 +27,20 @@ const {
   ProductOperational,
 } = require("../mongoOperationalModels");
 
+const TransportPaymentEntry =
+  mongoose.models.TransportPaymentEntry ||
+  mongoose.model(
+    "TransportPaymentEntry",
+    new mongoose.Schema(
+      { id: { type: Number, index: true } },
+      {
+        strict: false,
+        minimize: false,
+        collection: "transportpaymententries",
+      }
+    )
+  );
+
 /*
 ====================================================
 COMMON HELPERS
@@ -1497,6 +1511,51 @@ router.get(
         return res.json([]);
       }
 
+      const paymentBillKeys = new Map();
+      for (const row of rows) {
+        const summary = { amount: 0, date: "" };
+        const keys = [row.legacy_id, row.id, row.sl_no, row._id]
+          .map(text)
+          .filter(Boolean);
+        for (const key of keys) paymentBillKeys.set(key, summary);
+      }
+
+      const paymentQueryValues = [...paymentBillKeys.keys()].flatMap((key) =>
+        /^\d+$/.test(key) ? [key, Number(key)] : [key]
+      );
+      const paymentClauses = [
+        "adjustments.bilti_id",
+        "adjustments.bill_id",
+        "adjustments.id",
+        "allocations.bilti_id",
+        "allocations.bill_id",
+        "allocations.id",
+      ].map((path) => ({ [path]: { $in: paymentQueryValues } }));
+      const paymentEntries = await TransportPaymentEntry.find({ $or: paymentClauses })
+        .select({ date: 1, adjustments: 1, allocations: 1 })
+        .lean();
+
+      for (const payment of paymentEntries) {
+        const items = Array.isArray(payment.adjustments) && payment.adjustments.length
+          ? payment.adjustments
+          : Array.isArray(payment.allocations)
+          ? payment.allocations
+          : [];
+        const rawDate = payment.date instanceof Date
+          ? payment.date.toISOString().slice(0, 10)
+          : text(payment.date).slice(0, 10);
+
+        for (const item of items) {
+          const billKey = text(item.bilti_id ?? item.bill_id ?? item.id);
+          const summary = paymentBillKeys.get(billKey);
+          if (!summary) continue;
+
+          const amount = num(item.adjusted_amount ?? item.amount);
+          summary.amount = Math.round((summary.amount + amount + Number.EPSILON) * 100) / 100;
+          if (rawDate && rawDate > summary.date) summary.date = rawDate;
+        }
+      }
+
       const saleFields = {
         _id: 1,
         id: 1,
@@ -1712,9 +1771,20 @@ router.get(
               outwardLookupMaps
             )
           : null;
+        const paymentSummary = paymentBillKeys.get(
+          text(row.legacy_id ?? row.id ?? row.sl_no ?? row._id)
+        );
+        const paidAmount = paymentSummary?.amount || num(
+          decorated.pay_amount ?? decorated.paid_amount ?? decorated.payment_amount
+        );
+        const paymentDate = paymentSummary?.date ||
+          decorated.pa_date || decorated.pay_date || decorated.payment_date || "";
 
         return {
           ...decorated,
+          pa_date: paymentDate,
+          pay_amount: paidAmount,
+          balance_amount: Math.max(0, num(decorated.payable_amount) - paidAmount),
 
           outward_voucher_no:
             decoratedOutward?.voucher_no ||
