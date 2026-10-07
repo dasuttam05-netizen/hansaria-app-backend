@@ -1,21 +1,16 @@
 const express = require("express");
-const mongoose = require("mongoose");
-
-const router = express.Router();
-
 const {
-  mongoose: MongoMongoose,
+  mongoose,
+  BuyerName,
+  ConsigneeName,
   SaleVoucher,
   CompanyAccount,
   Product,
   Company,
   Warehouse,
-} = require("../mongo");
-
-const {
-  BuyerName,
-  ConsigneeName,
 } = require("../db-mongodb");
+
+const router = express.Router();
 
 const {
   TransportBiltiOperational,
