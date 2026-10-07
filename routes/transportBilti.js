@@ -3,7 +3,6 @@ const {
   mongoose,
   BuyerName,
   ConsigneeName,
-  SaleVoucher,
   CompanyAccount,
   Product,
   Company,
@@ -11,6 +10,16 @@ const {
 } = require("../db-mongodb");
 
 const router = express.Router();
+
+// Transport Report also reads Warehouse Trading sale vouchers.
+// db-mongodb does not export SaleVoucher, so use the same MongoDB
+// `salevouchers` collection directly instead of an undefined model.
+const SaleVoucher =
+  mongoose.models.TransportSaleVoucher ||
+  mongoose.model(
+    "TransportSaleVoucher",
+    new mongoose.Schema({}, { strict: false, timestamps: false, collection: "salevouchers" })
+  );
 
 const {
   TransportBiltiOperational,
