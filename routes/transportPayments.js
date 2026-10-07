@@ -415,7 +415,8 @@ router.post("/", async (req, res) => {
     if (!voucherNo) voucherNo = await nextTransportPaymentNo();
 
     const paymentId = await nextPaymentId();
-    const cashEntryId = await nextCashEntryId();
+    const isCashPayment = /^(cash|main\s*cash)$/i.test(paymentMethod);
+    const cashEntryId = isCashPayment ? await nextCashEntryId() : null;
 
     const primaryWarehouse = cleanAdjustments.length === 1 ? cleanAdjustments[0].warehouse_id : text(body.warehouse_id);
     const primaryWarehouseName = cleanAdjustments.length === 1 ? cleanAdjustments[0].warehouse_name : text(body.warehouse_name);
@@ -449,8 +450,9 @@ router.post("/", async (req, res) => {
       updated_at: new Date(),
     });
 
-    try {
-      const cashEntry = await CashEntry.create({
+    if (isCashPayment) {
+      try {
+        const cashEntry = await CashEntry.create({
         id: cashEntryId,
         voucher_no: voucherNo,
         entry_date: new Date(`${date}T00:00:00`),
@@ -473,13 +475,14 @@ router.post("/", async (req, res) => {
         updated_at: new Date(),
       });
 
-      await PaymentEntry.updateOne(
-        { _id: paymentDoc._id },
-        { $set: { cash_entry_id: cashEntry?._id ? String(cashEntry._id) : String(cashEntryId) } }
-      );
-    } catch (cashErr) {
-      await PaymentEntry.deleteOne({ _id: paymentDoc._id });
-      throw cashErr;
+        await PaymentEntry.updateOne(
+          { _id: paymentDoc._id },
+          { $set: { cash_entry_id: cashEntry?._id ? String(cashEntry._id) : String(cashEntryId) } }
+        );
+      } catch (cashErr) {
+        await PaymentEntry.deleteOne({ _id: paymentDoc._id });
+        throw cashErr;
+      }
     }
 
     return res.status(201).json({
@@ -590,23 +593,61 @@ router.put("/:id", async (req, res) => {
       ],
     });
 
-    if (cashEntry) {
-      await CashEntry.updateOne(
-        { _id: cashEntry._id },
-        {
-          $set: {
-            voucher_no: voucherNo,
-            entry_date: new Date(`${date}T00:00:00`),
-            warehouse_id: primaryWarehouse || null,
-            description: `Transport Payment - ${transporter?.name || "Transporter"}`,
-            amount,
-            payment_method: paymentMethod,
-            reference_no: voucherNo,
-            narration: text(body.narration) || "Transport Payment",
-            fund_source: text(body.fund_source) || "main_cash",
-            updated_at: updatedAt,
-          },
-        }
+    const isCashPayment = /^(cash|main\s*cash)$/i.test(paymentMethod);
+
+    if (isCashPayment) {
+      if (cashEntry) {
+        await CashEntry.updateOne(
+          { _id: cashEntry._id },
+          {
+            $set: {
+              voucher_no: voucherNo,
+              entry_date: new Date(`${date}T00:00:00`),
+              warehouse_id: primaryWarehouse || null,
+              description: `Transport Payment - ${transporter?.name || "Transporter"}`,
+              amount,
+              payment_method: paymentMethod,
+              reference_no: voucherNo,
+              narration: text(body.narration) || "Transport Payment",
+              fund_source: text(body.fund_source) || "main_cash",
+              updated_at: updatedAt,
+            },
+          }
+        );
+      } else {
+        const newCashEntryId = await nextCashEntryId();
+        const created = await CashEntry.create({
+          id: newCashEntryId,
+          voucher_no: voucherNo,
+          entry_date: new Date(`${date}T00:00:00`),
+          entry_type: "expense",
+          warehouse_id: primaryWarehouse || null,
+          company_id: null,
+          company_account_id: null,
+          description: `Transport Payment - ${transporter?.name || "Transporter"}`,
+          amount,
+          payment_method: paymentMethod,
+          reference_no: voucherNo,
+          narration: text(body.narration) || "Transport Payment",
+          created_by: Number(req.user?.id) || null,
+          employee_id: null,
+          fund_source: "main_cash",
+          status: "posted",
+          linked_entry_id: payment._id,
+          source_expense_id: `transport_payment:${payment.id}`,
+          created_at: updatedAt,
+          updated_at: updatedAt,
+        });
+        await PaymentEntry.updateOne(
+          { _id: payment._id },
+          { $set: { cash_entry_id: String(created?._id || newCashEntryId) } }
+        );
+      }
+    } else if (cashEntry) {
+      await CashEntry.deleteOne({ _id: cashEntry._id });
+      await PaymentEntry.updateOne(
+        { _id: payment._id },
+        { $unset: { cash_entry_id: 1 } }
       );
     }
 
