@@ -602,6 +602,23 @@ router.patch("/:id/assign", async (req, res) => {
     const existing = await collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
     if (!existing) return res.status(404).json({ error: "Daily Rejection not found" });
 
+    // SEND TO FACTORY rule:
+    // Reject Qty must be completed in full before the factory assignment is saved.
+    // Other Qty is only a separate/noting quantity and is intentionally NOT
+    // restricted by the current Other balance.
+    if (actionType === "SEND TO FACTORY") {
+      const pendingRejection = chainRemaining(existing);
+      const factoryRejectionQty = chainNum(req.body?.factory_rejection_qty);
+      if (factoryRejectionQty <= 0) {
+        return res.status(400).json({ error: "Reject Qty is required for Send To Factory" });
+      }
+      if (Math.abs(factoryRejectionQty - pendingRejection) > 0.0001) {
+        return res.status(400).json({
+          error: `Reject Qty must be completed. Current pending rejection is ${pendingRejection.toFixed(2)} MT`,
+        });
+      }
+    }
+
     const now = new Date();
     const history = Array.isArray(existing.history) ? existing.history : [];
     history.push({
