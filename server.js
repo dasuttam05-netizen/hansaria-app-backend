@@ -848,11 +848,17 @@ app.get(
   async (req, res) => {
     try {
       const { user } = req;
+      // Fast bootstrap skips only the stock/rent summaries that the Dashboard
+      // refreshes from the same live report endpoints immediately afterwards.
+      // The normal /api/dashboard response and all report calculations remain unchanged.
+      const isFastDashboard = String(req.query.fast || "") === "1";
 
-      const cachedDashboard = getCachedDashboardResponse(user);
-      if (cachedDashboard) {
-        res.set("Cache-Control", "private, max-age=20, stale-while-revalidate=20");
-        return res.json(cachedDashboard);
+      if (!isFastDashboard) {
+        const cachedDashboard = getCachedDashboardResponse(user);
+        if (cachedDashboard) {
+          res.set("Cache-Control", "private, max-age=20, stale-while-revalidate=20");
+          return res.json(cachedDashboard);
+        }
       }
 
       if (
@@ -1526,17 +1532,23 @@ app.get(
               .lean()
           : Promise.resolve([]),
 
-        Adjustment.find({})
-          .lean(),
+        isFastDashboard
+          ? Promise.resolve([])
+          : Adjustment.find({})
+              .lean(),
 
-        MirrorRow.find({ table: "transport_bilti" })
-          .select({ table: 1, row_id: 1, data: 1 })
-          .lean(),
+        isFastDashboard
+          ? Promise.resolve([])
+          : MirrorRow.find({ table: "transport_bilti" })
+              .select({ table: 1, row_id: 1, data: 1 })
+              .lean(),
 
-        BuyerAdjustment.find({}, { outward_id: 1, unloading_date: 1, created_at: 1 })
-          .lean(),
+        isFastDashboard
+          ? Promise.resolve([])
+          : BuyerAdjustment.find({}, { outward_id: 1, unloading_date: 1, created_at: 1 })
+              .lean(),
 
-        canReadInwards
+        canReadInwards && !isFastDashboard
           ? Inward.find({}, {
               _id: 1,
               id: 1,
@@ -1760,6 +1772,21 @@ app.get(
               0,
           })),
       };
+
+      if (isFastDashboard) {
+        // Return the same master/recent-entry lists quickly. Summary values are
+        // loaded by the existing report APIs on the Dashboard. The regular
+        // /api/dashboard route still returns full summaries for existing clients.
+        res.set("Cache-Control", "private, no-store");
+        return res.json({
+          ...listPayload,
+          partyStock: [],
+          warehouseStock: [],
+          totalStock: null,
+          monthEndRentSummary: [],
+          meta: { currentMonth, currentDate, source: "mongodb", partial: true },
+        });
+      }
 
       /*
       ========================================
