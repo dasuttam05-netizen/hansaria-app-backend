@@ -308,11 +308,13 @@ function adjustmentMap(inwardIds = null) {
 }
 
 async function buildRentDetails({ monthList, filters }) {
-  const rows = await buildInwardRows(filters);
-  const adjByInward = await adjustmentMap();
-  // Rent calculation uses only these fields. Projecting them avoids loading
-  // full outward/buyer documents while keeping the report calculation intact.
-  const [outwards, buyers] = await Promise.all([
+  // These reads are independent: run them concurrently rather than waiting
+  // for Inward/master mapping and the full Adjustment read to finish in series.
+  // Only query execution order changes; fields, mappings and rent calculations
+  // below remain unchanged.
+  const [rows, adjByInward, outwards, buyers] = await Promise.all([
+    buildInwardRows(filters),
+    adjustmentMap(),
     OutwardOperational.find({})
       .select({ _id: 1, id: 1, legacy_id: 1, date: 1, outward_date: 1 })
       .lean(),
