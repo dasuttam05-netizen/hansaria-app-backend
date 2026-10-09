@@ -3,6 +3,10 @@ const router = express.Router();
 const { userHasPermission } = require("../middleware/auth");
 const { calculateShortageQty } = require("./shortageHelper");
 const {
+  buildWarehouseStockSummary,
+  buildTotalStock,
+} = require("../helpers/reportStockSummary");
+const {
   mongoose,
   Inward,
   Outward,
@@ -90,8 +94,8 @@ function buildOutwardIdConditions(ids) {
   return conditions;
 }
 
-async function buildPartyStockRows(query) {
-  const inwards = await loadInwards(query);
+async function buildPartyStockRows(query, loadedInwards = null) {
+  const inwards = loadedInwards || await loadInwards(query);
   if (!inwards.length) return [];
   const db = mongoose.connection.db;
 
@@ -173,26 +177,33 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), async (req, r
 
 router.get("/party-stock", authorizeReport("report.partyStock"), async (req, res) => {
   try {
-    const rows = await buildPartyStockRows(req.query);
+    const includeDashboardSummaries = String(req.query.dashboard_summaries || "") === "1";
+    const inwardRows = includeDashboardSummaries ? await loadInwards(req.query) : null;
+    const rows = await buildPartyStockRows(req.query, inwardRows);
     const summary = summaryBy(rows, row => `${row.company_name || "Unknown"}::${row.warehouse_name || row.warehouse_id || "Unknown"}`, row => ({
       party_name: row.company_name || "Unknown Party", company_address: row.company_address || "", warehouse_name: row.warehouse_name || "Unknown", gross_qty: Number(row.gross_qty||0), shortage_qty: Number(row.shortage_qty||0), net_opening_qty: Number(row.net_opening_qty||0), already_adjusted_qty: Number(row.already_adjusted_qty||0), available_balance_qty: Number(row.available_balance_qty||0),
     }));
-    return res.json({ summary, details: rows });
+    const response = { summary, details: rows };
+    if (includeDashboardSummaries) {
+      response.dashboardSummaries = {
+        warehouseStock: buildWarehouseStockSummary(inwardRows, availableQty),
+        totalStock: buildTotalStock(inwardRows, availableQty),
+      };
+    }
+    return res.json(response);
   } catch (error) { console.error("Party stock report failed:", error); return res.status(500).json({ error: error.message }); }
 });
 
 router.get("/warehouse-stock", authorizeReport("report.partyStock"), async (req, res) => {
   try {
-    const rows = (await loadInwards(req.query, {
+    const rows = await loadInwards(req.query, {
       _id: 1,
       warehouse_id: 1, warehouse_name: 1,
       company_id: 1, company_name: 1, company: 1,
       location_id: 1, location_name: 1, location: 1,
       weight: 1, quantity: 1, remaining_qty: 1, adjusted_qty: 1,
-    })).map((row) => ({ ...row, stock: availableQty(row) }));
-    return res.json(summaryBy(rows, (row) => `${row.warehouse_name || row.warehouse_id || "Unknown"}::${row.company_name || row.company || "Unknown"}::${row.location_name || row.location_id || "Unknown"}`, (row) => ({
-      warehouse: row.warehouse_name || "Unknown", party: row.company_name || row.company || "Unknown", location: row.location_name || "Unknown", stock: Number(row.stock || 0),
-    })));
+    });
+    return res.json(buildWarehouseStockSummary(rows, availableQty));
   } catch (error) { return res.status(500).json({ error: error.message }); }
 });
 
@@ -201,7 +212,7 @@ router.get("/total-stock", authorizeReport("report.partyStock"), async (req, res
     const rows = await loadInwards(req.query, {
       weight: 1, quantity: 1, remaining_qty: 1, adjusted_qty: 1,
     });
-    return res.json({ total: Number(rows.reduce((sum, row) => sum + availableQty(row), 0).toFixed(4)) });
+    return res.json({ total: buildTotalStock(rows, availableQty) });
   }
   catch (error) { return res.status(500).json({ error: error.message }); }
 });
