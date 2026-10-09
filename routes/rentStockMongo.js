@@ -163,7 +163,7 @@ function masterAddress(map, id, name) {
 }
 function idsFromQuery(v) { return new Set(String(v || '').split(',').map(s=>s.trim()).filter(Boolean)); }
 
-async function buildInwardRows(filters = {}) {
+async function buildInwardRowsUnshared(filters = {}) {
   const from = dateOnly(filters.from_date), to = dateOnly(filters.to_date);
   const companyIds = idsFromQuery(filters.company_ids || filters.company_id);
   const warehouseIds = idsFromQuery(filters.warehouse_ids || filters.warehouse_id);
@@ -240,7 +240,42 @@ async function buildInwardRows(filters = {}) {
   }).filter(r => r.__selectedCompany && r.__selectedWarehouse && r.__selectedLocation).map(({__selectedCompany,__selectedWarehouse,__selectedLocation,...row}) => row);
 }
 
-async function adjustmentMap(inwardIds = null) {
+// Share only database work that is already in progress for identical report
+// inputs. Entries are removed as soon as the promise settles: this is not a
+// persistent cache and never serves old stock/accounting data to later requests.
+function shareInFlight(cache, key, work) {
+  const existing = cache.get(key);
+  if (existing) return existing;
+  const task = Promise.resolve().then(work);
+  cache.set(key, task);
+  task.then(
+    () => { if (cache.get(key) === task) cache.delete(key); },
+    () => { if (cache.get(key) === task) cache.delete(key); },
+  );
+  return task;
+}
+
+const inwardRowsInFlight = new Map();
+function inwardRowsKey(filters = {}) {
+  return JSON.stringify([
+    dateOnly(filters.from_date),
+    dateOnly(filters.to_date),
+    String(filters.company_ids || filters.company_id || ''),
+    String(filters.warehouse_ids || filters.warehouse_id || ''),
+    String(filters.location_ids || filters.location_id || ''),
+    String(filters.product_id || ''),
+    String(filters.employee_id || ''),
+  ]);
+}
+function buildInwardRows(filters = {}) {
+  return shareInFlight(
+    inwardRowsInFlight,
+    inwardRowsKey(filters),
+    () => buildInwardRowsUnshared(filters),
+  );
+}
+
+async function adjustmentMapUnshared(inwardIds = null) {
   const ids = inwardIds ? queryValues(inwardIds) : null;
   const query = ids && ids.length
     ? flexibleRefs(['inward_id','inwardId','source_inward_id','sourceInwardId'], ids)
@@ -261,6 +296,16 @@ async function adjustmentMap(inwardIds = null) {
   return m;
 }
 
+const adjustmentMapInFlight = new Map();
+function adjustmentMap(inwardIds = null) {
+  const ids = inwardIds ? queryValues(inwardIds).sort() : null;
+  const key = JSON.stringify(ids && ids.length ? ids : null);
+  return shareInFlight(
+    adjustmentMapInFlight,
+    key,
+    () => adjustmentMapUnshared(ids && ids.length ? ids : null),
+  );
+}
 
 async function buildRentDetails({ monthList, filters }) {
   const rows = await buildInwardRows(filters);
