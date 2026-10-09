@@ -9,7 +9,6 @@ const {
   LocationOperational,
   ProductOperational,
   EmployeeOperational,
-  FarmerOperational,
   InwardOperational,
   AdjustmentOperational,
   OutwardOperational,
@@ -141,18 +140,17 @@ async function masterMapsForRows(rows) {
   const location = pick('location_id', ['location_name', 'location']);
   const product = pick('product_id', ['product_name', 'product']);
   const employee = pick('employee_id', ['employee_name']);
-  const farmer = pick('farmer_id', ['farmer_name', 'farmer']);
-
-  const [companies, accounts, warehouses, locations, products, employees, farmers] = await Promise.all([
+  // Farmer master data was fetched here but never used to build the report
+  // rows. Skip that unused query; it does not change any returned field/value.
+  const [companies, accounts, warehouses, locations, products, employees] = await Promise.all([
     CompanyOperational.find(masterQuery(company.ids, company.names)).select({ name: 1, address: 1, company_address: 1, location: 1, city: 1, district: 1, id: 1, legacy_id: 1 }).lean(),
     CompanyAccountOperational.find(masterQuery(account.ids, account.names)).select({ name: 1, account_name: 1, address: 1, location: 1, id: 1, legacy_id: 1 }).lean(),
     WarehouseOperational.find(masterQuery(warehouse.ids, warehouse.names)).select({ name: 1, address: 1, warehouse_address: 1, location: 1, full_address: 1, city: 1, district: 1, id: 1, legacy_id: 1 }).lean(),
     LocationOperational.find(masterQuery(location.ids, location.names)).select({ name: 1, id: 1, legacy_id: 1 }).lean(),
     ProductOperational.find(masterQuery(product.ids, product.names)).select({ name: 1, id: 1, legacy_id: 1 }).lean(),
     EmployeeOperational.find(masterQuery(employee.ids, employee.names)).select({ name: 1, id: 1, legacy_id: 1 }).lean(),
-    FarmerOperational.find(masterQuery(farmer.ids, farmer.names)).select({ name: 1, id: 1, legacy_id: 1 }).lean(),
   ]);
-  return { companies: makeMap(companies), accounts: makeMap(accounts), warehouses: makeMap(warehouses), locations: makeMap(locations), products: makeMap(products), employees: makeMap(employees), farmers: makeMap(farmers) };
+  return { companies: makeMap(companies), accounts: makeMap(accounts), warehouses: makeMap(warehouses), locations: makeMap(locations), products: makeMap(products), employees: makeMap(employees) };
 }
 async function masterMaps() {
   return masterMapsForRows([]);
@@ -267,8 +265,16 @@ async function adjustmentMap(inwardIds = null) {
 async function buildRentDetails({ monthList, filters }) {
   const rows = await buildInwardRows(filters);
   const adjByInward = await adjustmentMap();
-  const outwards = await OutwardOperational.find({}).lean();
-  const buyers = await BuyerAdjustmentOperational.find({}).lean();
+  // Rent calculation uses only these fields. Projecting them avoids loading
+  // full outward/buyer documents while keeping the report calculation intact.
+  const [outwards, buyers] = await Promise.all([
+    OutwardOperational.find({})
+      .select({ _id: 1, id: 1, legacy_id: 1, date: 1, outward_date: 1 })
+      .lean(),
+    BuyerAdjustmentOperational.find({})
+      .select({ outward_id: 1, unloading_date: 1 })
+      .lean(),
+  ]);
   const outById = new Map(outwards.map(r => [String(r.legacy_id ?? r.id ?? r._id), r]));
   const buyerByOutward = new Map();
   buyers.forEach(r => buyerByOutward.set(String(r.outward_id), r));
