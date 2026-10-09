@@ -404,8 +404,28 @@ async function findMasterByIdOrLegacyOrName(
 }
 
 async function resolveOutwardMasters(
-  body
+  body,
+  lookupCache = null
 ) {
+  const findMaster = (Model, id, name, legacyFields) => {
+    if (!lookupCache) {
+      return findMasterByIdOrLegacyOrName(Model, id, name, legacyFields);
+    }
+
+    const key = [
+      Model?.modelName || "unknown",
+      normalizeId(id) || "",
+      safeText(name)?.toLowerCase() || "",
+    ].join(":");
+    if (!lookupCache.has(key)) {
+      lookupCache.set(
+        key,
+        findMasterByIdOrLegacyOrName(Model, id, name, legacyFields)
+      );
+    }
+    return lookupCache.get(key);
+  };
+
   const [
     employee,
     location,
@@ -413,7 +433,7 @@ async function resolveOutwardMasters(
     product,
     company,
   ] = await Promise.all([
-    findMasterByIdOrLegacyOrName(
+    findMaster(
       MongoEmployee,
       body?.employee_id,
       body?.employee_name,
@@ -424,7 +444,7 @@ async function resolveOutwardMasters(
       ]
     ),
 
-    findMasterByIdOrLegacyOrName(
+    findMaster(
       MongoLocation,
       body?.location_id,
       body?.location_name,
@@ -434,7 +454,7 @@ async function resolveOutwardMasters(
       ]
     ),
 
-    findMasterByIdOrLegacyOrName(
+    findMaster(
       MongoWarehouse,
       body?.warehouse_id,
       body?.warehouse_name,
@@ -444,7 +464,7 @@ async function resolveOutwardMasters(
       ]
     ),
 
-    findMasterByIdOrLegacyOrName(
+    findMaster(
       MongoProduct,
       body?.product_id,
       body?.product_name,
@@ -454,7 +474,7 @@ async function resolveOutwardMasters(
       ]
     ),
 
-    findMasterByIdOrLegacyOrName(
+    findMaster(
       MongoCompany,
       body?.company_id,
       body?.company_name,
@@ -466,7 +486,7 @@ async function resolveOutwardMasters(
   ]);
 
   let companyAccount =
-    await findMasterByIdOrLegacyOrName(
+    await findMaster(
       MongoCompanyAccount,
       body?.company_account_id,
       body?.company_account_name,
@@ -485,15 +505,18 @@ async function resolveOutwardMasters(
     company?._id
   ) {
     try {
-      companyAccount =
-        await MongoCompanyAccount.findOne({
-          company_id:
-            company._id,
+      const cacheKey = `default-account:${String(company._id)}`;
+      if (lookupCache?.has(cacheKey)) {
+        companyAccount = await lookupCache.get(cacheKey);
+      } else {
+        const accountPromise = MongoCompanyAccount.findOne({
+          company_id: company._id,
         })
-          .sort({
-            _id: 1,
-          })
+          .sort({ _id: 1 })
           .lean();
+        if (lookupCache) lookupCache.set(cacheKey, accountPromise);
+        companyAccount = await accountPromise;
+      }
     } catch {}
   }
 
@@ -828,6 +851,7 @@ DISPLAY DECORATION
 async function decorateOutwardDocs(
   docs
 ) {
+  const masterLookupCache = new Map();
   const result = await Promise.all(
     (docs || []).map(async (doc) => {
     const masters =
@@ -867,7 +891,7 @@ async function decorateOutwardDocs(
 
         company_account_name:
           doc?.company_account_name,
-      });
+      }, masterLookupCache);
 
     const names =
       masterNames(
@@ -1975,19 +1999,10 @@ router.get(
           })
           .lean();
 
-      const rows =
-        await decorateOutwardDocs(
-          docs
-        );
-
-      const filtered =
-        rows.filter(
-          (row) =>
-            canAccessOutwardRow(
-              req.user,
-              row
-            )
-        );
+      const accessibleDocs = docs.filter((doc) =>
+        canAccessOutwardRow(req.user, doc)
+      );
+      const filtered = await decorateOutwardDocs(accessibleDocs);
 
       return res.json(
         filtered
@@ -2439,19 +2454,10 @@ router.get(
           })
           .lean();
 
-      const rows =
-        await decorateOutwardDocs(
-          docs
-        );
-
-      const filtered =
-        rows.filter(
-          (row) =>
-            canAccessOutwardRow(
-              req.user,
-              row
-            )
-        );
+      const accessibleDocs = docs.filter((doc) =>
+        canAccessOutwardRow(req.user, doc)
+      );
+      const filtered = await decorateOutwardDocs(accessibleDocs);
 
       return res.json(
         filtered
