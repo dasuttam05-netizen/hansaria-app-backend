@@ -217,7 +217,14 @@ router.get("/warehouse-rent-ledger", authorizeReport("report.warehouseRentLedger
 });
 
 router.get("/warehouse-rent-month-end", authorizeReport("report.warehouseRentMonthEnd"), async (req, res) => {
-  try { const details = await loadInwards(req.query); return res.json({ month: req.query.month || req.query.from_month, summary: [], details }); }
+  try {
+    const month = req.query.month || req.query.from_month;
+    if (String(req.query.summary_only || "") === "1") {
+      return res.json({ month, summary: [], details: [] });
+    }
+    const details = await loadInwards(req.query);
+    return res.json({ month, summary: [], details });
+  }
   catch (error) { return res.status(500).json({ error: error.message }); }
 });
 
