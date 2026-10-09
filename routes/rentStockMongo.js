@@ -164,6 +164,9 @@ function masterAddress(map, id, name) {
 function idsFromQuery(v) { return new Set(String(v || '').split(',').map(s=>s.trim()).filter(Boolean)); }
 
 async function buildInwardRowsUnshared(filters = {}) {
+  // Fine-grained timings are diagnostic only; they do not alter report values.
+  const innerTimings = {};
+  const stageStartedAt = process.hrtime.bigint();
   const from = dateOnly(filters.from_date), to = dateOnly(filters.to_date);
   const companyIds = idsFromQuery(filters.company_ids || filters.company_id);
   const warehouseIds = idsFromQuery(filters.warehouse_ids || filters.warehouse_id);
@@ -186,13 +189,19 @@ async function buildInwardRowsUnshared(filters = {}) {
     product_id: 1, product_name: 1, product: 1, employee_id: 1, employee_name: 1,
     lorry_no: 1, voucher_no: 1, outward_date: 1, company_address: 1, warehouse_address: 1,
   }).lean();
+  innerTimings.inward_query = Number(process.hrtime.bigint() - stageStartedAt) / 1e6;
+  let innerStageStartedAt = process.hrtime.bigint();
   const filtered = docs.filter(r => {
     const d = dateOnly(r.inward_date) || dateOnly(r.date);
     if (from && (!d || d < from)) return false;
     if (to && (!d || d > to)) return false;
     return true;
   });
+  innerTimings.inward_filter = Number(process.hrtime.bigint() - innerStageStartedAt) / 1e6;
+  innerStageStartedAt = process.hrtime.bigint();
   const maps = await masterMapsForRows(filtered);
+  innerTimings.inward_master_queries = Number(process.hrtime.bigint() - innerStageStartedAt) / 1e6;
+  innerStageStartedAt = process.hrtime.bigint();
   const matchesSelected = (row, selectedIds, master, idFields, nameFields) => {
     if (!selectedIds.size) return true;
     const values = [];
@@ -210,7 +219,7 @@ async function buildInwardRowsUnshared(filters = {}) {
     }
     return false;
   };
-  return filtered.map(r => {
+  const result = filtered.map(r => {
     const c = findMaster(maps.companies, r.company_id, r.company_name || r.company);
     const a = findMaster(maps.accounts, r.company_account_id, r.company_account_name || r.company_account || r.account_name);
     const w = findMaster(maps.warehouses, r.warehouse_id, r.warehouse_name || r.warehouse);
@@ -238,6 +247,9 @@ async function buildInwardRowsUnshared(filters = {}) {
       __selectedLocation: matchesSelected(r, locationIds, l, ['location_id','locationId'], ['location_name','location']),
     };
   }).filter(r => r.__selectedCompany && r.__selectedWarehouse && r.__selectedLocation).map(({__selectedCompany,__selectedWarehouse,__selectedLocation,...row}) => row);
+  innerTimings.inward_map_rows = Number(process.hrtime.bigint() - innerStageStartedAt) / 1e6;
+  Object.defineProperty(result, '__serverTiming', { value: innerTimings, enumerable: false });
+  return result;
 }
 
 // Share only database work that is already in progress for identical report
@@ -280,18 +292,28 @@ async function adjustmentMapUnshared(inwardIds = null) {
   const query = ids && ids.length
     ? flexibleRefs(['inward_id','inwardId','source_inward_id','sourceInwardId'], ids)
     : {};
+  const queryStartedAt = process.hrtime.bigint();
   // Use the native collection here because the legacy adjustment documents contain
   // fields such as inward_id/outward_id/qty that are not declared in the Mongoose schema.
   const rows = await nativeCollection('adjustments')
     .find(query)
     .project({ _id: 1, id: 1, legacy_id: 1, inward_id: 1, inwardId: 1, source_inward_id: 1, sourceInwardId: 1, outward_id: 1, outwardId: 1, qty: 1, quantity: 1, adjusted_qty: 1, adjustment_qty: 1, adjusted_quantity: 1, outward_date: 1, date: 1, created_at: 1, createdAt: 1 })
     .toArray();
+  const queryMs = Number(process.hrtime.bigint() - queryStartedAt) / 1e6;
+  const groupingStartedAt = process.hrtime.bigint();
   const m = new Map();
   rows.forEach(r => {
     const key = String(r.inward_id ?? r.inwardId ?? r.source_inward_id ?? r.sourceInwardId ?? '').trim();
     if (!key) return;
     if (!m.has(key)) m.set(key, []);
     m.get(key).push(r);
+  });
+  Object.defineProperty(m, '__serverTiming', {
+    value: {
+      adjustment_query: queryMs,
+      adjustment_grouping: Number(process.hrtime.bigint() - groupingStartedAt) / 1e6,
+    },
+    enumerable: false,
   });
   return m;
 }
@@ -386,8 +408,10 @@ router.get('/party-stock', async (req,res,next) => {
     };
 
     const rows = await buildInwardRows(req.query);
+    const inwardDetailedTimings = rows.__serverTiming || {};
     markPerfStage('inward');
     const adjMap = await adjustmentMap(rows.map(r => r.legacy_id ?? r.id));
+    const adjustmentDetailedTimings = adjMap.__serverTiming || {};
     markPerfStage('adjustments');
     const outwardIds = [];
     for (const list of adjMap.values()) for (const a of list) if (a.outward_id) outwardIds.push(a.outward_id);
@@ -479,6 +503,8 @@ router.get('/party-stock', async (req,res,next) => {
     markPerfStage('aggregation');
     const perfTotalMs = Number(process.hrtime.bigint() - perfStartedAt) / 1e6;
     const serverTiming = [
+      ...Object.entries(inwardDetailedTimings).map(([name, duration]) => `${name};dur=${duration.toFixed(1)}`),
+      ...Object.entries(adjustmentDetailedTimings).map(([name, duration]) => `${name};dur=${duration.toFixed(1)}`),
       ...Object.entries(perfStages).map(([name, duration]) => `${name};dur=${duration.toFixed(1)}`),
       `total;dur=${perfTotalMs.toFixed(1)}`,
     ].join(', ');
