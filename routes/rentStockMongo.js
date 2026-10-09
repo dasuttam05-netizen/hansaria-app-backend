@@ -374,8 +374,21 @@ router.get('/party-stock', async (req,res,next) => {
   if (!reportAccess(req,'report.partyStock')) return res.status(403).json({error:'Permission denied'});
   if (!mongoReady()) return next();
   try {
+    // Expose stage timings for this report without changing its data or calculations.
+    // These appear in DevTools Network -> Headers as the Server-Timing header.
+    const perfStartedAt = process.hrtime.bigint();
+    let perfLastAt = perfStartedAt;
+    const perfStages = {};
+    const markPerfStage = (name) => {
+      const now = process.hrtime.bigint();
+      perfStages[name] = Number(now - perfLastAt) / 1e6;
+      perfLastAt = now;
+    };
+
     const rows = await buildInwardRows(req.query);
+    markPerfStage('inward');
     const adjMap = await adjustmentMap(rows.map(r => r.legacy_id ?? r.id));
+    markPerfStage('adjustments');
     const outwardIds = [];
     for (const list of adjMap.values()) for (const a of list) if (a.outward_id) outwardIds.push(a.outward_id);
     const uniqueOutwardIds = queryValues(outwardIds);
@@ -387,6 +400,7 @@ router.get('/party-stock', async (req,res,next) => {
         flexibleRefs(['outward_id','outwardId','outward_no'], uniqueOutwardIds)
       ).project({ _id: 1, outward_id: 1, outwardId: 1, outward_date: 1, unloading_date: 1, date: 1, qty: 1, quantity: 1, weight: 1 }).toArray() : [],
     ]);
+    markPerfStage('outward_buyer_lookup');
     const outById = new Map();
     outwards.forEach(o => {
       [o._id, o.id, o.legacy_id, o.sl_no, o.outward_id].filter(v => v !== undefined && v !== null && v !== '').forEach(v => outById.set(String(v), o));
@@ -462,6 +476,13 @@ router.get('/party-stock', async (req,res,next) => {
       party:s.party_name,
       stock:Number(s.available_balance_qty.toFixed(4)),
     }));
+    markPerfStage('aggregation');
+    const perfTotalMs = Number(process.hrtime.bigint() - perfStartedAt) / 1e6;
+    const serverTiming = [
+      ...Object.entries(perfStages).map(([name, duration]) => `${name};dur=${duration.toFixed(1)}`),
+      `total;dur=${perfTotalMs.toFixed(1)}`,
+    ].join(', ');
+    res.set('Server-Timing', serverTiming);
     res.json({ summary, details });
   } catch(e){ console.error('Mongo party stock failed:',e); return next(); }
 });
