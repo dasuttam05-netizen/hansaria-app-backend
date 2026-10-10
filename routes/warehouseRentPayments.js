@@ -229,18 +229,21 @@ router.post("/", async (req, res) => {
       if (allocation.adjusted_amount > currentBalance + 0.009) {
         throw new Error(`Rent bill ${allocation.bill_no} no longer has the expected balance`);
       }
-      updatedBookings.push({
+      const priorBooking = {
         id: booking._id,
         paid_amount: number(booking.paid_amount || 0),
         balance_amount: booking.balance_amount,
         status: booking.status,
         payment_mode: booking.payment_mode,
         reference_no: booking.reference_no,
-      });
+      };
       const nextPaid = round2(number(booking.paid_amount) + allocation.adjusted_amount);
       const nextBalance = round2(Math.max(number(booking.monthly_rent) - nextPaid, 0));
+      const balanceFilter = booking.balance_amount === undefined || booking.balance_amount === null
+        ? { $or: [{ balance_amount: null }, { balance_amount: { $exists: false } }] }
+        : { balance_amount: currentBalance };
       const update = await WarehouseRentBooking.updateOne(
-        { _id: booking._id, balance_amount: currentBalance },
+        { _id: booking._id, ...balanceFilter },
         {
           $set: {
             paid_amount: nextPaid,
@@ -254,6 +257,7 @@ router.post("/", async (req, res) => {
       if (update.modifiedCount !== 1) {
         throw new Error(`Rent bill ${allocation.bill_no} was updated by another payment`);
       }
+      updatedBookings.push(priorBooking);
     }
 
     if (/^(cash|main\s*cash)$/i.test(paymentMethod)) {
