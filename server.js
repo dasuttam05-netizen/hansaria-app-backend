@@ -341,6 +341,9 @@ const warehouseRentBookingRoutes =
 const warehouseRentBillRoutes =
   require("./routes/warehouseRentBill");
 
+const warehouseRentPaymentRoutes =
+  require("./routes/warehouseRentPayments");
+
 const productsRoute =
   require("./routes/products");
 
@@ -650,6 +653,12 @@ app.use(
   authenticate,
   authorize(["warehouses.manage", "report.warehouseRentLedger", "report.warehouseRentMonthEnd"]),
   warehouseRentBillRoutes
+);
+
+app.use(
+  "/api/warehouse-rent-payments",
+  authenticate,
+  warehouseRentPaymentRoutes
 );
 
 app.use(
@@ -2657,4 +2666,3 @@ function startServer(port) {
 }
 
 startServer(PORT);
-
