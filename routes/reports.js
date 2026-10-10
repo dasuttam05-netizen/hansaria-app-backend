@@ -87,25 +87,27 @@ function buildOutwardIdConditions(ids) {
   for (const raw of ids || []) {
     const value = String(raw ?? '').trim();
     if (!value) continue;
-    conditions.push({ id: value }, { legacy_id: value }, { sl_no: value });
+    conditions.push({ id: value });
     if (mongoose.Types.ObjectId.isValid(value)) conditions.push({ _id: new mongoose.Types.ObjectId(value) });
     const numeric = Number(value);
-    if (Number.isFinite(numeric)) conditions.push({ id: numeric }, { legacy_id: numeric }, { sl_no: numeric });
-  }
-
-  function buildReferenceConditions(field, ids) {
-    const conditions = [];
-    for (const raw of ids || []) {
-      const value = String(raw ?? "").trim();
-      if (!value) continue;
-      conditions.push({ [field]: value });
-      if (mongoose.Types.ObjectId.isValid(value)) {
-        conditions.push({ [field]: new mongoose.Types.ObjectId(value) });
-      }
-      const numeric = Number(value);
-      if (Number.isFinite(numeric)) conditions.push({ [field]: numeric });
+    if (Number.isFinite(numeric)) {
+      conditions.push({ id: numeric }, { legacy_id: numeric }, { sl_no: numeric });
     }
-    return conditions;
+  }
+  return conditions;
+}
+
+function buildReferenceConditions(field, ids) {
+  const conditions = [];
+  for (const raw of ids || []) {
+    const value = String(raw ?? "").trim();
+    if (!value) continue;
+    conditions.push({ [field]: value });
+    if (mongoose.Types.ObjectId.isValid(value)) {
+      conditions.push({ [field]: new mongoose.Types.ObjectId(value) });
+    }
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) conditions.push({ [field]: numeric });
   }
   return conditions;
 }
