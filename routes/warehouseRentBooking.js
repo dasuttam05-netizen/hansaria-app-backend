@@ -53,8 +53,8 @@ router.post("/", async (req, res) => {
     const monthlyRent = Number(warehouse.monthly_rent || 0);
     if (monthlyRent <= 0) return res.status(400).json({ error: "Monthly warehouse rent must be greater than 0" });
     const flow = normalizeFlow(rent_flow || warehouse.rent_flow);
-    if (flow === "receivable" && !warehouse.company_id?._id) {
-      return res.status(400).json({ error: "Company is required for a receivable warehouse rent" });
+    if (!warehouse.company_id?._id) {
+      return res.status(400).json({ error: "Company / rent payee is required for warehouse rent" });
     }
     const existing = await WarehouseRentBooking.findOne({ warehouse_id, rent_month });
     if (existing) return res.status(409).json({ error: "This warehouse is already booked for this month" });
@@ -88,9 +88,17 @@ router.post("/bulk", async (req, res) => {
     const rentMonth = String(req.body.rent_month || "").trim();
     const bookingDate = String(req.body.booking_date || istToday()).trim();
     const selectedIds = Array.isArray(req.body.warehouse_ids) ? req.body.warehouse_ids.filter(Boolean).map(String) : [];
+    const rentFlow = req.body.rent_flow
+      ? normalizeFlow(req.body.rent_flow)
+      : "receivable";
     if (!/^\d{4}-\d{2}$/.test(rentMonth)) return res.status(400).json({ error: "Valid rent month is required (YYYY-MM)" });
+    if (rentFlow === "payable" && !selectedIds.length) {
+      return res.status(400).json({ error: "Select at least one warehouse to generate payable rent bills" });
+    }
 
-    const filter = { rent_flow: "receivable" };
+    const filter = rentFlow === "receivable"
+      ? { rent_flow: "receivable" }
+      : { rent_flow: { $ne: "receivable" } };
     if (selectedIds.length) filter._id = { $in: selectedIds };
     const warehouses = await Warehouse.find(filter).populate("company_id", "name").sort({ name: 1 });
     const existing = await WarehouseRentBooking.find({ rent_month: rentMonth }).select("warehouse_id").lean();
@@ -122,22 +130,30 @@ router.post("/bulk", async (req, res) => {
           warehouse_id: warehouse._id,
           company_id: warehouse.company_id._id,
           monthly_rent: rent,
-          rent_flow: "receivable",
+          rent_flow: rentFlow,
           auto_booked: false,
-          billing_status: "pending",
+          billing_status: rentFlow === "receivable" ? "pending" : "not_applicable",
           status: "unpaid",
           paid_amount: 0,
           balance_amount: rent,
-          remarks: String(req.body.remarks || "Bulk company rent booking"),
+          remarks: String(req.body.remarks || (rentFlow === "receivable" ? "Bulk company rent booking" : "Monthly warehouse rent bill")),
         });
         existingIds.add(wid);
-        created.push({ id: String(booking._id), warehouse_id: wid, warehouse_name: warehouse.name, company_name: warehouse.company_id?.name || "", monthly_rent: rent });
+        created.push({
+          id: String(booking._id),
+          booking_no: booking.booking_no,
+          warehouse_id: wid,
+          warehouse_name: warehouse.name,
+          company_name: warehouse.company_id?.name || "",
+          monthly_rent: rent,
+          rent_flow: rentFlow,
+        });
       } catch (err) {
         if (err?.code === 11000) skipped.push({ warehouse_id: wid, warehouse_name: warehouse.name, reason: "Already booked" });
         else errors.push({ warehouse_id: wid, warehouse_name: warehouse.name, reason: err.message });
       }
     }
-    return res.json({ ok: true, rent_month: rentMonth, created, skipped, errors, created_count: created.length, skipped_count: skipped.length, error_count: errors.length });
+    return res.json({ ok: true, rent_month: rentMonth, rent_flow: rentFlow, created, skipped, errors, created_count: created.length, skipped_count: skipped.length, error_count: errors.length });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e.message });
