@@ -252,23 +252,51 @@ router.get("/party-stock/adjustment-details", authorizeReport("report.partyStock
     const outwardConditions = buildOutwardIdConditions(outwardIds);
     const outwards = outwardConditions.length
       ? await Outward.find({ $or: outwardConditions })
-          .select({ _id: 1, legacy_id: 1, id: 1, sl_no: 1, voucher_no: 1, date: 1, outward_date: 1, warehouse_name: 1, product_name: 1, lorry_no: 1, company_name: 1, buyer_name: 1, consignee_name: 1 })
+          .select({
+            _id: 1, legacy_id: 1, id: 1, sl_no: 1, voucher_no: 1,
+            date: 1, outward_date: 1, warehouse_id: 1, warehouse_name: 1,
+            location_id: 1, location_name: 1, location: 1,
+            product_id: 1, product_name: 1, lorry_no: 1,
+            company_name: 1, company_account_id: 1, company_account_name: 1,
+            buyer_name: 1, buyer: 1, consignee_name: 1, quantity: 1, weight: 1,
+          })
           .lean()
       : [];
-    const outwardMap = buildAliasMap(outwards);
+    const accessibleOutwards = outwards.filter(
+      (row) => !row.warehouse_id || canAccessWarehouse(req.user, row.warehouse_id)
+    );
+    const outwardMap = buildAliasMap(accessibleOutwards);
+    const accountIds = Array.from(new Set(
+      accessibleOutwards
+        .map((row) => String(row?.company_account_id ?? "").trim())
+        .filter(Boolean)
+    ));
+    const accountConditions = buildOutwardIdConditions(accountIds);
+    const accounts = accountConditions.length
+      ? await CompanyAccount.find({ $or: accountConditions })
+          .select({ _id: 1, id: 1, legacy_id: 1, sl_no: 1, account_name: 1 })
+          .lean()
+      : [];
+    const accountMap = buildAliasMap(accounts);
 
     const adjustmentEntries = adjustments.map((row) => {
       const outward = outwardMap.get(String(row?.outward_id ?? "").trim());
+      const account = outward
+        ? accountMap.get(String(outward.company_account_id ?? "").trim())
+        : null;
       return {
         id: row?._id ? String(row._id) : "",
         type: "Adjustment",
         quantity: Number(row?.qty ?? row?.quantity ?? 0) || 0,
-        date: outward?.date || outward?.outward_date || row?.created_at || null,
+        date: outward?.date || outward?.outward_date || null,
         reference: outward?.voucher_no || row?.outward_id || "-",
-        party: outward?.company_name || outward?.buyer_name || outward?.consignee_name || "",
-        warehouse: outward?.warehouse_name || inward.warehouse_name || "",
-        product: outward?.product_name || inward.product_name || "",
-        lorry: outward?.lorry_no || inward.lorry_no || "",
+        account: outward?.company_account_name || account?.account_name || "-",
+        party: outward?.buyer_name || outward?.buyer || outward?.consignee_name || outward?.company_name || "",
+        warehouse: outward?.warehouse_name || "",
+        product: outward?.product_name || "",
+        lorry: outward?.lorry_no || "",
+        location: outward?.location_name || outward?.location || "",
+        outward_quantity: Number(outward?.quantity ?? outward?.weight ?? 0) || 0,
         source_type: row?.source_type || "inward",
       };
     });
@@ -288,10 +316,13 @@ router.get("/party-stock/adjustment-details", authorizeReport("report.partyStock
         quantity: Number(row?.qty || 0) || 0,
         date: row?.date || row?.created_at || null,
         reference: row?.journal_no || row?.outward_voucher_no || row?.outward_id || "-",
+        account: row?.to_party_name || "-",
         party: row?.to_party_name || row?.from_party_name || "",
         warehouse: row?.warehouse_name || inward.warehouse_name || "",
         product: row?.product_name || inward.product_name || "",
         lorry: row?.lorry_no || inward.lorry_no || "",
+        location: row?.location_name || "",
+        outward_quantity: 0,
         source_type: "journal",
       }));
 
