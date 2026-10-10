@@ -100,12 +100,28 @@ function dedupeAdjustments(rows) {
 async function hydrateBuyerAdjustment(row) {
   if (!row) return null;
 
-  const outward = row.outward_id ? await Outward.findOne({ id: Number(row.outward_id) }).lean().catch(() => null) : null;
-  const buyer = row.buyer_id ? await BuyerName.findOne({ id: Number(row.buyer_id) }).lean().catch(() => null) : null;
-  const warehouse = outward?.warehouse_id ? await Warehouse.findOne({ id: Number(outward.warehouse_id) }).lean().catch(() => null) : null;
-  const product = outward?.product_id ? await Product.findOne({ id: Number(outward.product_id) }).lean().catch(() => null) : null;
-  const company = outward?.company_id ? await Company.findOne({ id: Number(outward.company_id) }).lean().catch(() => null) : null;
-  const account = outward?.company_account_id ? await CompanyAccount.findOne({ id: Number(outward.company_account_id) }).lean().catch(() => null) : null;
+  const [outward, buyer] = await Promise.all([
+    row.outward_id
+      ? Outward.findOne({ id: Number(row.outward_id) }).lean().catch(() => null)
+      : null,
+    row.buyer_id
+      ? BuyerName.findOne({ id: Number(row.buyer_id) }).lean().catch(() => null)
+      : null,
+  ]);
+  const [warehouse, product, company, account] = await Promise.all([
+    outward?.warehouse_id
+      ? Warehouse.findOne({ id: Number(outward.warehouse_id) }).lean().catch(() => null)
+      : null,
+    outward?.product_id
+      ? Product.findOne({ id: Number(outward.product_id) }).lean().catch(() => null)
+      : null,
+    outward?.company_id
+      ? Company.findOne({ id: Number(outward.company_id) }).lean().catch(() => null)
+      : null,
+    outward?.company_account_id
+      ? CompanyAccount.findOne({ id: Number(outward.company_account_id) }).lean().catch(() => null)
+      : null,
+  ]);
 
   const buyerName = row.buyer_name || buyer?.name || "";
   const consigneeName = row.consignee_name || outward?.consignee_name || "";
