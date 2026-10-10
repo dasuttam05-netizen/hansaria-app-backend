@@ -17,6 +17,7 @@ const {
   ConsigneeName,
   isMongoMirrorReady,
 } = require("../db-mongodb");
+const { canAccessWarehouse } = require("../helpers/access");
 
 function authorizeReport(permission) {
   return (req, res, next) => userHasPermission(req.user, permission)
@@ -90,6 +91,21 @@ function buildOutwardIdConditions(ids) {
     if (mongoose.Types.ObjectId.isValid(value)) conditions.push({ _id: new mongoose.Types.ObjectId(value) });
     const numeric = Number(value);
     if (Number.isFinite(numeric)) conditions.push({ id: numeric }, { legacy_id: numeric }, { sl_no: numeric });
+  }
+
+  function buildReferenceConditions(field, ids) {
+    const conditions = [];
+    for (const raw of ids || []) {
+      const value = String(raw ?? "").trim();
+      if (!value) continue;
+      conditions.push({ [field]: value });
+      if (mongoose.Types.ObjectId.isValid(value)) {
+        conditions.push({ [field]: new mongoose.Types.ObjectId(value) });
+      }
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) conditions.push({ [field]: numeric });
+    }
+    return conditions;
   }
   return conditions;
 }
@@ -192,6 +208,98 @@ router.get("/party-stock", authorizeReport("report.partyStock"), async (req, res
     }
     return res.json(response);
   } catch (error) { console.error("Party stock report failed:", error); return res.status(500).json({ error: error.message }); }
+});
+
+router.get("/party-stock/adjustment-details", authorizeReport("report.partyStock"), async (req, res) => {
+  try {
+    if (!isMongoMirrorReady() || !mongoose.connection.db) {
+      return res.status(503).json({ error: "MongoDB is not connected" });
+    }
+
+    const inwardId = String(req.query.inward_id || "").trim();
+    if (!inwardId) return res.status(400).json({ error: "inward_id is required" });
+
+    const inwardConditions = buildOutwardIdConditions([inwardId]);
+    const inward = inwardConditions.length
+      ? await Inward.findOne({ $or: inwardConditions }).lean()
+      : null;
+    if (!inward) return res.status(404).json({ error: "Inward entry not found" });
+    if (inward.warehouse_id && !canAccessWarehouse(req.user, inward.warehouse_id)) {
+      return res.status(403).json({ error: "You do not have access to this inward entry" });
+    }
+
+    const inwardIds = idAliases(inward);
+    const adjustmentConditions = buildReferenceConditions("inward_id", inwardIds);
+    const inwardSourceFilter = {
+      $or: [
+        { source_type: { $regex: /^inward$/i } },
+        { source_type: { $exists: false } },
+        { source_type: null },
+        { source_type: "" },
+      ],
+    };
+    const db = mongoose.connection.db;
+    const adjustments = adjustmentConditions.length
+      ? await db.collection("adjustments")
+          .find({ $and: [inwardSourceFilter, { $or: adjustmentConditions }] })
+          .sort({ created_at: 1, _id: 1 })
+          .toArray()
+      : [];
+
+    const outwardIds = Array.from(new Set(
+      adjustments.map((row) => String(row?.outward_id ?? "").trim()).filter(Boolean)
+    ));
+    const outwardConditions = buildOutwardIdConditions(outwardIds);
+    const outwards = outwardConditions.length
+      ? await Outward.find({ $or: outwardConditions })
+          .select({ _id: 1, legacy_id: 1, id: 1, sl_no: 1, voucher_no: 1, date: 1, outward_date: 1, warehouse_name: 1, product_name: 1, lorry_no: 1, company_name: 1, buyer_name: 1, consignee_name: 1 })
+          .lean()
+      : [];
+    const outwardMap = buildAliasMap(outwards);
+
+    const adjustmentEntries = adjustments.map((row) => {
+      const outward = outwardMap.get(String(row?.outward_id ?? "").trim());
+      return {
+        id: row?._id ? String(row._id) : "",
+        type: "Adjustment",
+        quantity: Number(row?.qty ?? row?.quantity ?? 0) || 0,
+        date: outward?.date || outward?.outward_date || row?.created_at || null,
+        reference: outward?.voucher_no || row?.outward_id || "-",
+        party: outward?.company_name || outward?.buyer_name || outward?.consignee_name || "",
+        warehouse: outward?.warehouse_name || inward.warehouse_name || "",
+        product: outward?.product_name || inward.product_name || "",
+        lorry: outward?.lorry_no || inward.lorry_no || "",
+        source_type: row?.source_type || "inward",
+      };
+    });
+
+    const journalConditions = buildReferenceConditions("inward_id", inwardIds);
+    const journalRows = journalConditions.length
+      ? await db.collection("stock_journals")
+          .find({ $or: journalConditions })
+          .sort({ date: 1, created_at: 1, _id: 1 })
+          .toArray()
+      : [];
+    const journalEntries = journalRows
+      .filter((row) => !row.warehouse_id || canAccessWarehouse(req.user, row.warehouse_id))
+      .map((row) => ({
+        id: row?._id ? String(row._id) : "",
+        type: "Stock Journal",
+        quantity: Number(row?.qty || 0) || 0,
+        date: row?.date || row?.created_at || null,
+        reference: row?.journal_no || row?.outward_voucher_no || row?.outward_id || "-",
+        party: row?.to_party_name || row?.from_party_name || "",
+        warehouse: row?.warehouse_name || inward.warehouse_name || "",
+        product: row?.product_name || inward.product_name || "",
+        lorry: row?.lorry_no || inward.lorry_no || "",
+        source_type: "journal",
+      }));
+
+    return res.json({ entries: [...adjustmentEntries, ...journalEntries] });
+  } catch (error) {
+    console.error("Party stock adjustment details failed:", error);
+    return res.status(500).json({ error: error.message || "Failed to load adjustment details" });
+  }
 });
 
 router.get("/warehouse-stock", authorizeReport("report.partyStock"), async (req, res) => {
