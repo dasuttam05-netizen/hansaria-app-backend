@@ -2345,16 +2345,75 @@ router.get(
         }
       }
 
-      const outwardRows =
-        await MongoOutward.find(
-          filter
-        )
-          .sort({
-            date: -1,
-            legacy_id: -1,
-            _id: -1,
-          })
-          .lean();
+      const summaryOnly = String(req.query.summary_only || "") === "1";
+      const outwardQuery = MongoOutward.find(
+        filter,
+        summaryOnly
+          ? { _id: 1, legacy_id: 1, id: 1, sl_no: 1 }
+          : undefined
+      )
+        .sort({
+          date: -1,
+          legacy_id: -1,
+          _id: -1,
+        });
+      const outwardRows = await outwardQuery.lean();
+
+      if (summaryOnly) {
+        const validOutwards = outwardRows
+          .map((outward) => ({
+            outward,
+            outwardId: Number(outward.legacy_id ?? outward.id ?? outward.sl_no),
+            candidates: buildOutwardIdCandidates(outward),
+          }))
+          .filter((entry) => Number.isFinite(entry.outwardId));
+        const outwardIds = Array.from(
+          new Set(validOutwards.map((entry) => entry.outwardId))
+        );
+        const settlementIds = Array.from(
+          new Set(validOutwards.flatMap((entry) => entry.candidates))
+        );
+
+        const [settlements, adjustmentRows] = await Promise.all([
+          settlementIds.length
+            ? settlementCollection()
+                .find({ outward_id: { $in: settlementIds } })
+                .project({ outward_id: 1 })
+                .toArray()
+            : [],
+          outwardIds.length
+            ? adjustmentCollection()
+                .find({ outward_id: { $in: outwardIds } })
+                .sort({ created_at: 1, _id: 1 })
+                .project({ outward_id: 1, qty: 1, settlement_weight: 1 })
+                .toArray()
+            : [],
+        ]);
+
+        const settledOutwardIds = new Set(
+          settlements.map((settlement) => String(settlement.outward_id))
+        );
+        const settlementWeightByOutward = new Map();
+        adjustmentRows.forEach((row) => {
+          const key = String(row.outward_id);
+          settlementWeightByOutward.set(
+            key,
+            (settlementWeightByOutward.get(key) || 0) +
+              num(row.qty ?? row.settlement_weight)
+          );
+        });
+
+        return res.json(
+          validOutwards
+            .filter((entry) =>
+              entry.candidates.some((id) => settledOutwardIds.has(String(id)))
+            )
+            .map(({ outwardId }) => ({
+              outward_id: outwardId,
+              settlement_weight: settlementWeightByOutward.get(String(outwardId)) || 0,
+            }))
+        );
+      }
 
       const result =
         [];
