@@ -856,8 +856,8 @@ router.get(
 
       const inwardFilter = inwardAnd.length === 1 ? inwardAnd[0] : { $and: inwardAnd };
 
-      const inwardRows =
-        await MongoInward.find(inwardFilter)
+      const inwardRowsPromise =
+        MongoInward.find(inwardFilter)
           .select({
             company_id: 1,
           })
@@ -890,8 +890,8 @@ router.get(
 
       const paltiFilter = paltiAnd.length === 1 ? paltiAnd[0] : (paltiAnd.length ? { $and: paltiAnd } : {});
 
-      const paltiRows =
-        await paltiCollection
+      const paltiRowsPromise =
+        paltiCollection
           .find(
             paltiFilter,
             {
@@ -928,9 +928,14 @@ router.get(
         if (filter) expensePaltiAnd.push(filter);
       }
       const expensePaltiFilter = expensePaltiAnd.length === 1 ? expensePaltiAnd[0] : { $and: expensePaltiAnd };
-      const expensePaltiRows = await MongoExpense.collection.find(expensePaltiFilter, {
+      const expensePaltiRowsPromise = MongoExpense.collection.find(expensePaltiFilter, {
         projection: { company_id: 1, id: 1, legacy_id: 1, balance: 1, new_weight: 1, _id: 1, product_id: 1, location_id: 1, warehouse_id: 1, send_to_kind: 1, work_description: 1, voucher_no: 1, lorry_no: 1 },
       }).toArray();
+      const [inwardRows, paltiRows, expensePaltiRows] = await Promise.all([
+        inwardRowsPromise,
+        paltiRowsPromise,
+        expensePaltiRowsPromise,
+      ]);
 
       const inwardCompanyIds = Array.from(new Set(
         (inwardRows || [])
@@ -2690,53 +2695,43 @@ router.get(
           })
           .toArray();
 
-      const result = [];
-
-      for (const row of rows) {
+      const result = await Promise.all(rows.map(async (row) => {
         try {
-          let inward = null;
-          let palti = null;
-          let company = null;
-          let warehouse = null;
-
-          if (row.inward_id != null) {
-            inward = await MongoInward.findOne(
-              buildFlexibleIdFilter(row.inward_id)
-            ).lean();
-          }
-
-          if (row.palti_lorry_id != null) {
-            palti = await findPaltiSourceRow(
-              row.palti_lorry_id,
-              row.palti_source
-            );
-          }
+          const [inward, palti] = await Promise.all([
+            row.inward_id != null
+              ? MongoInward.findOne(
+                  buildFlexibleIdFilter(row.inward_id)
+                ).lean()
+              : null,
+            row.palti_lorry_id != null
+              ? findPaltiSourceRow(row.palti_lorry_id, row.palti_source)
+              : null,
+          ]);
 
           const companyId =
             inward?.company_id ??
             palti?.company_id;
-
-          if (companyId != null) {
-            company = await MongoCompany.findOne(
-              buildFlexibleIdFilter(companyId)
-            )
-              .select({ name: 1 })
-              .lean();
-          }
-
           const warehouseId =
             inward?.warehouse_id ??
             palti?.warehouse_id;
+          const [company, warehouse] = await Promise.all([
+            companyId != null
+              ? MongoCompany.findOne(
+                  buildFlexibleIdFilter(companyId)
+                )
+                  .select({ name: 1 })
+                  .lean()
+              : null,
+            warehouseId != null
+              ? MongoWarehouse.findOne(
+                  buildFlexibleIdFilter(warehouseId)
+                )
+                  .select({ name: 1 })
+                  .lean()
+              : null,
+          ]);
 
-          if (warehouseId != null) {
-            warehouse = await MongoWarehouse.findOne(
-              buildFlexibleIdFilter(warehouseId)
-            )
-              .select({ name: 1 })
-              .lean();
-          }
-
-          result.push({
+          return {
             id: row._id ? String(row._id) : null,
             qty: normalizeQty(row.qty),
             inward_voucher:
@@ -2786,7 +2781,7 @@ router.get(
             updated_at:
               row.updated_at ||
               null,
-          });
+          };
         } catch (rowError) {
           console.error(
             "[adjustment log] row enrichment error:",
@@ -2795,7 +2790,7 @@ router.get(
 
           // One broken historical row must not make the entire adjustment log
           // return HTTP 500. Keep the saved adjustment visible with its basic data.
-          result.push({
+          return {
             id: row._id ? String(row._id) : null,
             qty: normalizeQty(row.qty),
             inward_voucher:
@@ -2815,9 +2810,9 @@ router.get(
             outward_id: row.outward_id ?? outwardAdjustmentId,
             created_at: row.created_at || null,
             updated_at: row.updated_at || null,
-          });
+          };
         }
-      }
+      }));
 
       return res.json(result);
     } catch (err) {
