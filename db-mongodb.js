@@ -947,6 +947,11 @@ outwardSchema.index({
   legacy_id: -1,
 });
 
+outwardSchema.index(
+  { created_at: -1, date: -1, legacy_id: -1, _id: -1 },
+  { name: "outward_list_created_date_legacy" }
+);
+
 outwardSchema.index({
   voucher_no: 1,
 });
@@ -2204,5 +2209,4 @@ module.exports = {
       mirrorRowSchema
     ),
 };
-
 
