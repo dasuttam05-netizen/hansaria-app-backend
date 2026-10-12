@@ -97,6 +97,17 @@ function buildOutwardIdConditions(ids) {
   return conditions;
 }
 
+function inwardAdjustmentSourceFilter() {
+  return {
+    $or: [
+      { source_type: { $regex: /^inward$/i } },
+      { source_type: { $exists: false } },
+      { source_type: null },
+      { source_type: "" },
+    ],
+  };
+}
+
 function buildReferenceConditions(field, ids) {
   const conditions = [];
   for (const raw of ids || []) {
@@ -112,23 +123,12 @@ function buildReferenceConditions(field, ids) {
   return conditions;
 }
 
-async function buildPartyStockRows(query, loadedInwards = null) {
+async function buildPartyStockRows(query, loadedInwards = null, loadedAdjustments = null) {
   const inwards = loadedInwards || await loadInwards(query);
   if (!inwards.length) return [];
   const db = mongoose.connection.db;
-
-  // Only inward adjustments can affect this report. Keep legacy rows whose
-  // source_type is missing/blank because the old code treated those as inward.
-  const inwardAdjustmentFilter = {
-    $or: [
-      { source_type: { $regex: /^inward$/i } },
-      { source_type: { $exists: false } },
-      { source_type: null },
-      { source_type: "" },
-    ],
-  };
-  const adjustments = await db.collection('adjustments')
-    .find(inwardAdjustmentFilter, { projection: { inward_id: 1, qty: 1, quantity: 1, outward_id: 1 } })
+  const adjustments = loadedAdjustments || await db.collection('adjustments')
+    .find(inwardAdjustmentSourceFilter(), { projection: { inward_id: 1, qty: 1, quantity: 1, outward_id: 1 } })
     .toArray();
 
   const outwardIds = Array.from(new Set(
@@ -166,6 +166,113 @@ async function buildPartyStockRows(query, loadedInwards = null) {
   });
 }
 
+async function buildPartyStockOutwardDetails(rows, adjustments, user, query = {}) {
+  const sourceByAlias = new Map();
+  (rows || [])
+    .filter((row) => !row.warehouse_id || canAccessWarehouse(user, row.warehouse_id))
+    .forEach((row) => idAliases(row).forEach((id) => sourceByAlias.set(id, row)));
+
+  const linkedAdjustments = (adjustments || []).filter((row) =>
+    sourceByAlias.has(String(row?.inward_id ?? "").trim())
+  );
+  const outwardIds = Array.from(new Set(
+    linkedAdjustments.map((row) => String(row?.outward_id ?? "").trim()).filter(Boolean)
+  ));
+  const outwardConditions = buildOutwardIdConditions(outwardIds);
+  const outwards = outwardConditions.length
+    ? await Outward.find({ $or: outwardConditions })
+        .select({
+          _id: 1, legacy_id: 1, id: 1, sl_no: 1, voucher_no: 1,
+          date: 1, outward_date: 1, warehouse_id: 1, warehouse_name: 1,
+          location_id: 1, location_name: 1, location: 1,
+          product_id: 1, product_name: 1, lorry_no: 1,
+          company_account_id: 1, company_account_name: 1,
+          consignee_id: 1, consignee_name: 1, quantity: 1, weight: 1,
+        })
+        .lean()
+    : [];
+  const outwardMap = buildAliasMap(outwards.filter(
+    (row) => !row.warehouse_id || canAccessWarehouse(user, row.warehouse_id)
+  ));
+  const accountIds = Array.from(new Set(
+    outwards.map((row) => String(row?.company_account_id ?? "").trim()).filter(Boolean)
+  ));
+  const accountConditions = buildOutwardIdConditions(accountIds);
+  const accounts = accountConditions.length
+    ? await CompanyAccount.find({ $or: accountConditions })
+        .select({ _id: 1, id: 1, legacy_id: 1, sl_no: 1, account_name: 1 })
+        .lean()
+    : [];
+  const accountMap = buildAliasMap(accounts);
+  const grouped = new Map();
+  const fromDate = query.from_date ? new Date(query.from_date) : null;
+  const toDate = query.to_date ? new Date(query.to_date) : null;
+  if (toDate) toDate.setUTCHours(23, 59, 59, 999);
+
+  linkedAdjustments.forEach((adjustment) => {
+    const source = sourceByAlias.get(String(adjustment?.inward_id ?? "").trim());
+    if (!source) return;
+    const outwardId = String(adjustment?.outward_id ?? "").trim();
+    const outward = outwardMap.get(outwardId);
+    if (outward?.warehouse_id && !canAccessWarehouse(user, outward.warehouse_id)) return;
+    const outwardDate = outward?.date || outward?.outward_date;
+    if (fromDate || toDate) {
+      const dateValue = outwardDate ? new Date(outwardDate) : null;
+      if (!dateValue || Number.isNaN(dateValue.getTime())) return;
+      if (fromDate && dateValue < fromDate) return;
+      if (toDate && dateValue > toDate) return;
+    }
+
+    const companyId = String(source.company_id || source.company_name || source.party_name || "Unknown");
+    const outwardKey = String(outward?._id || outward?.legacy_id || outward?.id || outwardId);
+    const key = `${companyId}::${outwardKey}`;
+    if (!grouped.has(key)) {
+      const account = outward
+        ? accountMap.get(String(outward.company_account_id ?? ""))
+        : null;
+      grouped.set(key, {
+        id: key,
+        company_name: source.company_name || source.party_name || "Unknown Party",
+        outward_date: outwardDate || "",
+        voucher_no: outward?.voucher_no || outwardId || "-",
+        account_name: outward?.company_account_name || account?.account_name || "-",
+        consignee_name: outward?.consignee_name || "-",
+        lorry_no: outward?.lorry_no || "-",
+        warehouse_name: outward?.warehouse_name || source.warehouse_name || "-",
+        location_name: outward?.location_name || outward?.location || source.location_name || "-",
+        product_name: outward?.product_name || source.product_name || "-",
+        outward_quantity: Number(outward?.quantity ?? outward?.weight ?? 0) || 0,
+        adjusted_quantity: 0,
+        allocations: new Map(),
+      });
+    }
+
+    const reportRow = grouped.get(key);
+    const quantity = Number(adjustment?.qty ?? adjustment?.quantity ?? 0) || 0;
+    reportRow.adjusted_quantity += quantity;
+    const inwardKey = idAliases(source)[0] || String(adjustment?.inward_id ?? "");
+    if (!reportRow.allocations.has(inwardKey)) {
+      reportRow.allocations.set(inwardKey, {
+        id: inwardKey,
+        inward_date: source.date || source.inward_date || "",
+        voucher_no: source.voucher_no || source.inward_no || source.inward_voucher_no || "-",
+        company_name: source.company_name || source.party_name || "Unknown Party",
+        lorry_no: source.lorry_no || "-",
+        warehouse_name: source.warehouse_name || "-",
+        location_name: source.location_name || "-",
+        product_name: source.product_name || "-",
+        inward_quantity: Number(source.gross_qty ?? source.weight ?? source.quantity ?? 0) || 0,
+        adjusted_quantity: 0,
+      });
+    }
+    reportRow.allocations.get(inwardKey).adjusted_quantity += quantity;
+  });
+
+  return Array.from(grouped.values())
+    .map((row) => ({ ...row, allocations: Array.from(row.allocations.values()) }))
+    .sort((left, right) => String(right.outward_date).localeCompare(String(left.outward_date)));
+}
+
 function summaryBy(rows, keyFn, create) {
   const map = new Map();
   rows.forEach((row) => {
@@ -196,12 +303,31 @@ router.get("/party-ledger", authorizeReport("report.partyLedger"), async (req, r
 router.get("/party-stock", authorizeReport("report.partyStock"), async (req, res) => {
   try {
     const includeDashboardSummaries = String(req.query.dashboard_summaries || "") === "1";
-    const inwardRows = includeDashboardSummaries ? await loadInwards(req.query) : null;
-    const rows = await buildPartyStockRows(req.query, inwardRows);
+    const inwardRows = await loadInwards(req.query);
+    const adjustments = await mongoose.connection.db.collection("adjustments")
+      .find(inwardAdjustmentSourceFilter(), {
+        projection: { inward_id: 1, qty: 1, quantity: 1, outward_id: 1 },
+      })
+      .toArray();
+    const rows = await buildPartyStockRows(req.query, inwardRows, adjustments);
     const summary = summaryBy(rows, row => `${row.company_name || "Unknown"}::${row.warehouse_name || row.warehouse_id || "Unknown"}`, row => ({
       party_name: row.company_name || "Unknown Party", company_address: row.company_address || "", warehouse_name: row.warehouse_name || "Unknown", gross_qty: Number(row.gross_qty||0), shortage_qty: Number(row.shortage_qty||0), net_opening_qty: Number(row.net_opening_qty||0), already_adjusted_qty: Number(row.already_adjusted_qty||0), available_balance_qty: Number(row.available_balance_qty||0),
     }));
-    const response = { summary, details: rows };
+    let outwardStockRows = rows;
+    if (req.query.from_date || req.query.to_date) {
+      const outwardSourceQuery = { ...req.query };
+      delete outwardSourceQuery.from_date;
+      delete outwardSourceQuery.to_date;
+      const outwardInwards = await loadInwards(outwardSourceQuery);
+      outwardStockRows = await buildPartyStockRows(outwardSourceQuery, outwardInwards, adjustments);
+    }
+    const outwardDetails = await buildPartyStockOutwardDetails(
+      outwardStockRows,
+      adjustments,
+      req.user,
+      req.query
+    );
+    const response = { summary, details: rows, outwardDetails };
     if (includeDashboardSummaries) {
       response.dashboardSummaries = {
         warehouseStock: buildWarehouseStockSummary(inwardRows, availableQty),
