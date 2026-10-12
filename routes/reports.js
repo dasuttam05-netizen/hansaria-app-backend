@@ -193,28 +193,29 @@ async function buildPartyStockOutwardDetails(rows, adjustments, user, query = {}
     .filter((row) => !row.warehouse_id || canAccessWarehouse(user, row.warehouse_id))
     .forEach((row) => idAliases(row).forEach((id) => sourceByAlias.set(id, row)));
 
-  const linkedAdjustments = (adjustments || []).filter((row) =>
-    sourceByAlias.has(String(row?.inward_id ?? "").trim())
-  );
-  const outwardIds = Array.from(new Set(
-    linkedAdjustments.map((row) => String(row?.outward_id ?? "").trim()).filter(Boolean)
-  ));
-  const outwardConditions = buildOutwardIdConditions(outwardIds);
-  const outwards = outwardConditions.length
-    ? await Outward.find({ $or: outwardConditions })
-        .select({
-          _id: 1, legacy_id: 1, id: 1, sl_no: 1, voucher_no: 1,
-          date: 1, outward_date: 1, warehouse_id: 1, warehouse_name: 1,
-          location_id: 1, location_name: 1, location: 1,
-          product_id: 1, product_name: 1, lorry_no: 1,
-          company_account_id: 1, company_account_name: 1,
-          consignee_id: 1, consignee_name: 1, quantity: 1, weight: 1,
-        })
-        .lean()
-    : [];
+  const outwardFilter = dateFilter(query);
+  ["company_id", "warehouse_id", "product_id", "location_id", "employee_id", "company_account_id"].forEach((field) => {
+    addIdFilter(outwardFilter, field, query[field] || query[`${field}s`]);
+  });
+  const outwards = await Outward.find(outwardFilter)
+    .sort({ date: -1, _id: -1 })
+    .select({
+      _id: 1, legacy_id: 1, id: 1, sl_no: 1, voucher_no: 1,
+      date: 1, outward_date: 1, warehouse_id: 1, warehouse_name: 1,
+      location_id: 1, location_name: 1, location: 1,
+      product_id: 1, product_name: 1, lorry_no: 1,
+      company_id: 1, company_name: 1, party_name: 1, buyer_name: 1,
+      company_account_id: 1, company_account_name: 1,
+      consignee_id: 1, consignee_name: 1, quantity: 1, weight: 1,
+    })
+    .lean();
   const outwardMap = buildAliasMap(outwards.filter(
     (row) => !row.warehouse_id || canAccessWarehouse(user, row.warehouse_id)
   ));
+  const linkedAdjustments = (adjustments || []).filter((row) =>
+    sourceByAlias.has(String(row?.inward_id ?? "").trim()) &&
+    outwardMap.has(String(row?.outward_id ?? "").trim())
+  );
   const accountIds = Array.from(new Set(
     outwards.map((row) => String(row?.company_account_id ?? "").trim()).filter(Boolean)
   ));
@@ -226,6 +227,7 @@ async function buildPartyStockOutwardDetails(rows, adjustments, user, query = {}
     : [];
   const accountMap = buildAliasMap(accounts);
   const grouped = new Map();
+  const outwardKeysWithAllocations = new Set();
   const fromDate = query.from_date ? new Date(query.from_date) : null;
   const toDate = query.to_date ? new Date(query.to_date) : null;
   if (toDate) toDate.setUTCHours(23, 59, 59, 999);
@@ -246,6 +248,7 @@ async function buildPartyStockOutwardDetails(rows, adjustments, user, query = {}
 
     const companyId = String(source.company_id || source.company_name || source.party_name || "Unknown");
     const outwardKey = String(outward?._id || outward?.legacy_id || outward?.id || outwardId);
+    outwardKeysWithAllocations.add(outwardKey);
     const key = `${companyId}::${outwardKey}`;
     if (!grouped.has(key)) {
       const account = outward
@@ -287,6 +290,32 @@ async function buildPartyStockOutwardDetails(rows, adjustments, user, query = {}
       });
     }
     reportRow.allocations.get(inwardKey).adjusted_quantity += quantity;
+  });
+
+  outwards.forEach((outward) => {
+    if (outward.warehouse_id && !canAccessWarehouse(user, outward.warehouse_id)) return;
+    const outwardKey = String(outward._id || outward.legacy_id || outward.id || outward.sl_no || "");
+    if (!outwardKey || outwardKeysWithAllocations.has(outwardKey)) return;
+
+    const companyId = String(outward.company_id || outward.company_name || outward.party_name || "Unknown");
+    const key = `${companyId}::${outwardKey}`;
+    if (grouped.has(key)) return;
+    const account = accountMap.get(String(outward.company_account_id ?? ""));
+    grouped.set(key, {
+      id: key,
+      company_name: outward.company_name || outward.party_name || outward.buyer_name || "Unknown Party",
+      outward_date: outward.date || outward.outward_date || "",
+      voucher_no: outward.voucher_no || outward.outward_no || outwardKey,
+      account_name: outward.company_account_name || account?.account_name || "-",
+      consignee_name: outward.consignee_name || "-",
+      lorry_no: outward.lorry_no || "-",
+      warehouse_name: outward.warehouse_name || "-",
+      location_name: outward.location_name || outward.location || "-",
+      product_name: outward.product_name || "-",
+      outward_quantity: Number(outward.quantity ?? outward.weight ?? 0) || 0,
+      adjusted_quantity: 0,
+      allocations: new Map(),
+    });
   });
 
   return Array.from(grouped.values())
