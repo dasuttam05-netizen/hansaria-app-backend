@@ -15,6 +15,7 @@ const {
   Company,
   CompanyAccount,
   ConsigneeName,
+  MirrorRow,
   isMongoMirrorReady,
 } = require("../db-mongodb");
 const { canAccessWarehouse } = require("../helpers/access");
@@ -108,6 +109,28 @@ function inwardAdjustmentSourceFilter() {
   };
 }
 
+async function loadPartyStockAdjustments(db) {
+  const [nativeRows, mirrorRows] = await Promise.all([
+    db.collection("adjustments")
+      .find(inwardAdjustmentSourceFilter(), {
+        projection: { inward_id: 1, qty: 1, quantity: 1, outward_id: 1, source_type: 1 },
+      })
+      .toArray(),
+    MirrorRow.find({ table: "adjustment" })
+      .select({ row_id: 1, data: 1 })
+      .lean(),
+  ]);
+  const legacyRows = (mirrorRows || [])
+    .map((row) => ({ ...row.data, _id: String(row.row_id) }))
+    .filter((row) =>
+      String(row.source_type || "inward").trim().toLowerCase() === "inward" &&
+      row.inward_id !== undefined && row.inward_id !== null &&
+      row.outward_id !== undefined && row.outward_id !== null
+    );
+
+  return [...nativeRows, ...legacyRows];
+}
+
 function buildReferenceConditions(field, ids) {
   const conditions = [];
   for (const raw of ids || []) {
@@ -127,9 +150,7 @@ async function buildPartyStockRows(query, loadedInwards = null, loadedAdjustment
   const inwards = loadedInwards || await loadInwards(query);
   if (!inwards.length) return [];
   const db = mongoose.connection.db;
-  const adjustments = loadedAdjustments || await db.collection('adjustments')
-    .find(inwardAdjustmentSourceFilter(), { projection: { inward_id: 1, qty: 1, quantity: 1, outward_id: 1 } })
-    .toArray();
+  const adjustments = loadedAdjustments || await loadPartyStockAdjustments(db);
 
   const outwardIds = Array.from(new Set(
     adjustments.map((row) => String(row?.outward_id ?? '').trim()).filter(Boolean)
@@ -304,11 +325,7 @@ router.get("/party-stock", authorizeReport("report.partyStock"), async (req, res
   try {
     const includeDashboardSummaries = String(req.query.dashboard_summaries || "") === "1";
     const inwardRows = await loadInwards(req.query);
-    const adjustments = await mongoose.connection.db.collection("adjustments")
-      .find(inwardAdjustmentSourceFilter(), {
-        projection: { inward_id: 1, qty: 1, quantity: 1, outward_id: 1 },
-      })
-      .toArray();
+    const adjustments = await loadPartyStockAdjustments(mongoose.connection.db);
     const rows = await buildPartyStockRows(req.query, inwardRows, adjustments);
     const summary = summaryBy(rows, row => `${row.company_name || "Unknown"}::${row.warehouse_name || row.warehouse_id || "Unknown"}`, row => ({
       party_name: row.company_name || "Unknown Party", company_address: row.company_address || "", warehouse_name: row.warehouse_name || "Unknown", gross_qty: Number(row.gross_qty||0), shortage_qty: Number(row.shortage_qty||0), net_opening_qty: Number(row.net_opening_qty||0), already_adjusted_qty: Number(row.already_adjusted_qty||0), available_balance_qty: Number(row.available_balance_qty||0),
