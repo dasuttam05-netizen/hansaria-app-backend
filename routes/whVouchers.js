@@ -7843,6 +7843,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const totalGrossAmount = rows.reduce((sum, row) => sum + Number(row.gross_amount || row.sale_amount || 0), 0);
   const totalAdd = rows.reduce((sum, row) => sum + Number(row.additional_amount || 0), 0);
   const totalLess = rows.reduce((sum, row) => sum + Number(row.total_less || 0), 0);
+  const totalFreight = rows.reduce((sum, row) => sum + Number(row.freight_amount || 0), 0);
   const totalStaffExpense = rows.reduce((sum, row) => sum + Number(row.staff_expense || 0), 0);
   const totalRent = rows.reduce((sum, row) => sum + Number(row.rent_amount || 0), 0);
   const totalManualIncome = rows.reduce((sum, row) => sum + Number(row.manual_income || 0), 0);
@@ -7893,7 +7894,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     ["P/L", 52],
   ];
   const warehouseCols = [
-    ["Warehouse", 170], ["P.Amount", 75], ["S.Amount", 75], ["Add", 55], ["Less", 55],
+    ["Warehouse", 150], ["P.Amount", 72], ["S.Amount", 72], ["Add", 48], ["Less", 52], ["Freight", 52],
     ["Staff Exp", 65], ["Rent", 55], ["Manual Add", 60], ["Manual Less", 60], ["P/L", 70],
   ];
   const cols = isWarehouse ? warehouseCols : directCols;
@@ -7941,7 +7942,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     let x = left;
     values.forEach((value, index) => {
       const width = widths[index][1];
-      const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 9);
+      const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 10);
       const numericValue = Number(value);
 
       if (isProfitColumn && Number.isFinite(numericValue)) {
@@ -7983,6 +7984,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           fmt(row.gross_amount || row.sale_amount),
           fmt(row.additional_amount),
           fmt(row.total_less),
+          fmt(row.freight_amount),
           fmt(row.staff_expense),
           fmt(row.rent_amount),
           fmt(row.manual_income),
@@ -8021,6 +8023,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           ["Total S.Amount", fmt(totalGrossAmount)],
           ["Total Add", fmt(totalAdd)],
           ["Total Less", fmt(totalLess)],
+          ["Total Freight", fmt(totalFreight)],
           ["Total Staff Expense", fmt(totalStaffExpense)],
           ["Total Warehouse Rent", fmt(totalRent)],
           ["Total Manual Add", fmt(totalManualIncome)],
@@ -8134,6 +8137,7 @@ router.get("/report/profit-loss", async (req, res) => {
             gross_amount: 0,
             additional_amount: 0,
             total_less: 0,
+            freight_amount: 0,
             profit_loss: 0,
           });
         }
@@ -8165,6 +8169,7 @@ router.get("/report/profit-loss", async (req, res) => {
         item.gross_amount += gross;
         item.additional_amount += Number(row.additional_amount || 0);
         item.total_less += Math.max(reportedLess, impliedLess, 0);
+        item.freight_amount += Number(row.transport_charge || 0);
         if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
         item.purchase_amount += purchaseAmount;
       });
@@ -8214,6 +8219,7 @@ router.get("/report/profit-loss", async (req, res) => {
         gross_amount: Number(row.gross_amount.toFixed(2)),
         additional_amount: Number(row.additional_amount.toFixed(2)),
         total_less: Number(row.total_less.toFixed(2)),
+        freight_amount: Number(row.freight_amount.toFixed(2)),
         staff_expense: Number(Number(row.staff_expense || 0).toFixed(2)),
         rent_amount: Number(Number(row.rent_amount || 0).toFixed(2)),
         manual_income: Number(Number(row.manual_income || 0).toFixed(2)),
@@ -8233,6 +8239,7 @@ router.get("/report/profit-loss", async (req, res) => {
           "Gross Amount": row.gross_amount,
           "Total Add": row.additional_amount,
           "Total Less": row.total_less,
+          Freight: row.freight_amount,
           "Staff Expense": row.staff_expense,
           "Warehouse Rent": row.rent_amount,
           "Manual Add": row.manual_income,
@@ -8249,6 +8256,7 @@ router.get("/report/profit-loss", async (req, res) => {
           "Gross Amount": Number(output.reduce((s, r) => s + Number(r.gross_amount || 0), 0).toFixed(2)),
           "Total Add": Number(output.reduce((s, r) => s + Number(r.additional_amount || 0), 0).toFixed(2)),
           "Total Less": Number(output.reduce((s, r) => s + Number(r.total_less || 0), 0).toFixed(2)),
+          Freight: Number(output.reduce((s, r) => s + Number(r.freight_amount || 0), 0).toFixed(2)),
           "Staff Expense": Number(output.reduce((s, r) => s + Number(r.staff_expense || 0), 0).toFixed(2)),
           "Warehouse Rent": Number(output.reduce((s, r) => s + Number(r.rent_amount || 0), 0).toFixed(2)),
           "Manual Add": Number(output.reduce((s, r) => s + Number(r.manual_income || 0), 0).toFixed(2)),
