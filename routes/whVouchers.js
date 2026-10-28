@@ -1214,6 +1214,90 @@ async function getTransportBiltiMatch({ saleId, voucherNo = "", lorryNo = "" }) 
   return null;
 }
 
+async function getTransportBiltiNetAmounts(sales) {
+  const rows = Array.isArray(sales) ? sales : [];
+  if (!rows.length) return new Map();
+
+  const normalize = (value) => String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  const ids = [...new Set(rows.map((row) => String(row?._id || row?.id || "").trim()).filter(Boolean))];
+  const voucherNos = [...new Set(rows.map((row) => String(row?.voucher_no || row?.bill_no || "").trim()).filter(Boolean))];
+  const lorryNos = [...new Set(rows.map((row) => String(row?.lorry_no || "").trim()).filter(Boolean))];
+  const clauses = [];
+  if (ids.length) clauses.push({ sale_id: { $in: ids.flatMap((id) => /^\d+$/.test(id) ? [id, Number(id)] : [id]) } });
+  if (voucherNos.length) clauses.push({ voucher_no: { $in: voucherNos } }, { bill_no: { $in: voucherNos } });
+  if (lorryNos.length) clauses.push({ lorry_no: { $in: lorryNos } });
+
+  let biltiRows = [];
+  if (TransportBiltiOperational && clauses.length) {
+    try {
+      biltiRows = await TransportBiltiOperational.find({ $or: clauses })
+        .sort({ updated_at: -1, _id: -1 })
+        .lean();
+    } catch (error) {
+      console.warn("Bulk transport lookup skipped:", error.message);
+    }
+  }
+
+  const bySaleId = new Map();
+  const byVoucherNo = new Map();
+  const byLorryNo = new Map();
+  const byVoucherAndLorry = new Map();
+  const setFirst = (map, key, row) => {
+    if (key && !map.has(key)) map.set(key, row);
+  };
+  (biltiRows || []).forEach((row) => {
+    const saleId = normalize(row.sale_id);
+    const voucherNo = normalize(row.voucher_no);
+    const billNo = normalize(row.bill_no);
+    const lorryNo = normalize(row.lorry_no);
+    setFirst(bySaleId, saleId, row);
+    setFirst(byVoucherNo, voucherNo, row);
+    setFirst(byVoucherNo, billNo, row);
+    setFirst(byLorryNo, lorryNo, row);
+    setFirst(byVoucherAndLorry, `${voucherNo}::${lorryNo}`, row);
+    setFirst(byVoucherAndLorry, `${billNo}::${lorryNo}`, row);
+  });
+
+  const matchForSale = (sale) => {
+    const saleId = normalize(sale?._id || sale?.id);
+    const voucherNo = normalize(sale?.voucher_no || sale?.bill_no);
+    const lorryNo = normalize(sale?.lorry_no);
+    return (voucherNo && lorryNo && byVoucherAndLorry.get(`${voucherNo}::${lorryNo}`))
+      || bySaleId.get(saleId)
+      || byVoucherNo.get(voucherNo)
+      || byLorryNo.get(lorryNo)
+      || null;
+  };
+  const netAmountFrom = (row) => {
+    const netAmount = Number(row?.net_amount);
+    return Number.isFinite(netAmount) ? netAmount : 0;
+  };
+
+  const amounts = new Map();
+  const unmatched = [];
+  rows.forEach((sale) => {
+    const saleId = String(sale?._id || sale?.id || "");
+    const match = matchForSale(sale);
+    if (match) amounts.set(saleId, netAmountFrom(match));
+    else unmatched.push(sale);
+  });
+
+  for (let index = 0; index < unmatched.length; index += 10) {
+    const batch = unmatched.slice(index, index + 10);
+    const fallbackMatches = await Promise.all(batch.map((sale) => getTransportBiltiMatch({
+      saleId: sale?._id || sale?.id,
+      voucherNo: sale?.voucher_no || sale?.bill_no || "",
+      lorryNo: sale?.lorry_no || "",
+    }).catch(() => null)));
+    fallbackMatches.forEach((match, offset) => {
+      const sale = batch[offset];
+      if (match) amounts.set(String(sale?._id || sale?.id || ""), netAmountFrom(match));
+    });
+  }
+
+  return amounts;
+}
+
 function createVoucherNoPromise(type, voucherNo = "") {
   return new Promise((resolve, reject) => {
     createVoucherNoIfMissing(type, voucherNo, (err, generatedVoucherNo) => {
@@ -8118,6 +8202,7 @@ router.get("/report/profit-loss", async (req, res) => {
         getPurchaseReportRowsForUser(req.user, { fromDate, toDate }),
         getSaleReportRowsForUser(req.user, { fromDate, toDate }),
       ]);
+      const freightBySale = await getTransportBiltiNetAmounts(sales);
       const rows = new Map();
       const ensure = (row) => {
         const key = String(row.warehouse_id || "");
@@ -8169,7 +8254,7 @@ router.get("/report/profit-loss", async (req, res) => {
         item.gross_amount += gross;
         item.additional_amount += Number(row.additional_amount || 0);
         item.total_less += Math.max(reportedLess, impliedLess, 0);
-        item.freight_amount += Number(row.transport_charge || 0);
+        item.freight_amount += Number(freightBySale.get(String(row._id || row.id || "")) || 0);
         if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
         item.purchase_amount += purchaseAmount;
       });
@@ -8519,7 +8604,16 @@ router.get("/report/profit-loss-details", async (req, res) => {
     const rows = type === "sale"
       ? await getSaleReportRowsForUser(req.user, options)
       : await getPurchaseReportRowsForUser(req.user, options);
-    return res.json({ rows: rows || [], total: (rows || []).length });
+    const outputRows = type === "sale"
+      ? (rows || []).map((row) => ({ ...row, transport_charge: 0 }))
+      : (rows || []);
+    if (type === "sale") {
+      const freightBySale = await getTransportBiltiNetAmounts(rows);
+      outputRows.forEach((row) => {
+        row.transport_charge = Number(freightBySale.get(String(row._id || row.id || "")) || 0);
+      });
+    }
+    return res.json({ rows: outputRows, total: outputRows.length });
   } catch (error) {
     console.error("Warehouse trading profit/loss drill-down failed:", error);
     return res.status(500).json({ error: error.message || "Failed to load voucher details" });
