@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const router = express.Router();
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
+const { WarehouseRentBooking } = require("../mongo");
 
 const warehouseTradingEntrySchema = new mongoose.Schema(
   {
@@ -24,6 +25,23 @@ const warehouseTradingEntrySchema = new mongoose.Schema(
 const WarehouseTradingEntry =
   mongoose.models.WarehouseTradingEntry ||
   mongoose.model("WarehouseTradingEntry", warehouseTradingEntrySchema);
+
+const warehouseTradingProfitLossAdjustmentSchema = new mongoose.Schema(
+  {
+    date: { type: String, required: true },
+    warehouse_id: { type: String, required: true },
+    warehouse_name: { type: String, default: "" },
+    entry_type: { type: String, enum: ["income", "expense"], required: true },
+    amount: { type: Number, required: true },
+    description: { type: String, default: "" },
+    created_by: { type: String, default: "" },
+  },
+  { timestamps: true, collection: "warehouse_trading_profit_loss_adjustments" }
+);
+
+const WarehouseTradingProfitLossAdjustment =
+  mongoose.models.WarehouseTradingProfitLossAdjustment ||
+  mongoose.model("WarehouseTradingProfitLossAdjustment", warehouseTradingProfitLossAdjustmentSchema);
 
 function getVoucherPrefix(type) {
   return {
@@ -110,6 +128,141 @@ function canViewWarehouseTrading(user) {
     userHasPermission(user, "warehouse.trading.report.profitLoss")
   );
 }
+
+function canViewWarehouseTradingProfitLoss(user) {
+  return userHasPermission(user, "warehouse.trading.report.profitLoss");
+}
+
+function normalizeText(value) {
+  return String(value ?? "").trim();
+}
+
+function inDateRange(value, fromDate, toDate) {
+  const date = normalizeText(value).slice(0, 10);
+  return Boolean(date) && (!fromDate || date >= fromDate) && (!toDate || date <= toDate);
+}
+
+function getUserLabel(user) {
+  return normalizeText(user?.name || user?.employee_name || user?.username || user?.email);
+}
+
+router.get("/profit-loss-overheads", async (req, res) => {
+  if (!canViewWarehouseTradingProfitLoss(req.user)) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const fromDate = normalizeText(req.query.from_date);
+    const toDate = normalizeText(req.query.to_date);
+    const expenseCollection = mongoose.connection.db.collection("expenses");
+    const expenseRows = await expenseCollection.find({}).toArray();
+    const expenses = expenseRows
+      .filter((row) => {
+        const warehouseId = normalizeText(row.warehouse_id);
+        const date = row.expense_date || row.date;
+        return warehouseId && canAccessWarehouse(req.user, warehouseId) && inDateRange(date, fromDate, toDate);
+      })
+      .map((row) => ({
+        id: String(row._id || row.id || row.legacy_id || ""),
+        date: normalizeText(row.expense_date || row.date).slice(0, 10),
+        warehouse_id: normalizeText(row.warehouse_id),
+        employee_name: normalizeText(row.employee_name || row.employee?.name || row.employee_id) || "Staff",
+        description: normalizeText(row.work_description || row.narration || row.voucher_no),
+        amount: Number(row.total_expense_amount ?? row.grand_total ?? row.amount ?? 0) || 0,
+      }))
+      .filter((row) => row.amount > 0);
+
+    const rentBookings = await WarehouseRentBooking.find({}).populate("warehouse_id", "name").lean();
+    const rents = (rentBookings || [])
+      .filter((row) => {
+        const warehouseId = normalizeText(row.warehouse_id?._id || row.warehouse_id);
+        const rentMonth = normalizeText(row.rent_month || row.booking_date).slice(0, 7);
+        const fromMonth = fromDate.slice(0, 7);
+        const toMonth = toDate.slice(0, 7);
+        return row.rent_flow !== "receivable" && warehouseId && canAccessWarehouse(req.user, warehouseId)
+          && (!fromMonth || rentMonth >= fromMonth) && (!toMonth || rentMonth <= toMonth);
+      })
+      .map((row) => ({
+        id: String(row._id || ""),
+        date: normalizeText(row.rent_month || row.booking_date),
+        warehouse_id: normalizeText(row.warehouse_id?._id || row.warehouse_id),
+        warehouse_name: normalizeText(row.warehouse_id?.name),
+        description: normalizeText(row.booking_no || row.remarks) || "Warehouse rent",
+        amount: Number(row.monthly_rent || 0),
+      }))
+      .filter((row) => row.amount > 0);
+
+    const adjustmentFilter = {};
+    if (fromDate || toDate) {
+      adjustmentFilter.date = {};
+      if (fromDate) adjustmentFilter.date.$gte = fromDate;
+      if (toDate) adjustmentFilter.date.$lte = toDate;
+    }
+    const adjustmentRows = await WarehouseTradingProfitLossAdjustment.find(adjustmentFilter).sort({ date: -1, createdAt: -1 }).lean();
+    const adjustments = (adjustmentRows || [])
+      .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
+      .map((row) => ({ ...row, id: String(row._id), warehouse_id: normalizeText(row.warehouse_id) }));
+
+    return res.json({ expenses, rents, adjustments });
+  } catch (error) {
+    console.error("Warehouse trading profit/loss overhead load failed:", error);
+    return res.status(500).json({ error: error.message || "Failed to load warehouse expenses" });
+  }
+});
+
+router.post("/profit-loss-adjustments", async (req, res) => {
+  if (!canManageWarehouseTrading(req.user)) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  const date = normalizeText(req.body?.date);
+  const warehouseId = normalizeText(req.body?.warehouse_id);
+  const entryType = normalizeText(req.body?.entry_type).toLowerCase();
+  const amount = Number(req.body?.amount);
+  const description = normalizeText(req.body?.description);
+
+  if (!date || !warehouseId || !["income", "expense"].includes(entryType) || !Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: "Date, warehouse, entry type, and positive amount are required" });
+  }
+  if (!canAccessWarehouse(req.user, warehouseId)) {
+    return res.status(403).json({ error: "You do not have access to this warehouse" });
+  }
+
+  try {
+    const created = await WarehouseTradingProfitLossAdjustment.create({
+      date,
+      warehouse_id: warehouseId,
+      warehouse_name: normalizeText(req.body?.warehouse_name),
+      entry_type: entryType,
+      amount,
+      description,
+      created_by: getUserLabel(req.user),
+    });
+    return res.status(201).json({ id: String(created._id) });
+  } catch (error) {
+    console.error("Warehouse trading profit/loss adjustment save failed:", error);
+    return res.status(500).json({ error: error.message || "Failed to save manual entry" });
+  }
+});
+
+router.delete("/profit-loss-adjustments/:id", async (req, res) => {
+  if (!canManageWarehouseTrading(req.user)) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const entry = await WarehouseTradingProfitLossAdjustment.findById(req.params.id);
+    if (!entry) return res.status(404).json({ error: "Manual entry not found" });
+    if (!canAccessWarehouse(req.user, entry.warehouse_id)) {
+      return res.status(403).json({ error: "You do not have access to this warehouse" });
+    }
+    await entry.deleteOne();
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Warehouse trading profit/loss adjustment delete failed:", error);
+    return res.status(500).json({ error: error.message || "Failed to delete manual entry" });
+  }
+});
 
 router.get("/next-voucher-no", async (req, res) => {
   if (!req.query.type) {
