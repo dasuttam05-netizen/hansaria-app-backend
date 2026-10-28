@@ -1219,25 +1219,6 @@ async function getTransportBiltiNetAmounts(sales) {
   if (!rows.length) return new Map();
 
   const normalize = (value) => String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
-  const ids = [...new Set(rows.map((row) => String(row?._id || row?.id || "").trim()).filter(Boolean))];
-  const voucherNos = [...new Set(rows.map((row) => String(row?.voucher_no || row?.bill_no || "").trim()).filter(Boolean))];
-  const lorryNos = [...new Set(rows.map((row) => String(row?.lorry_no || "").trim()).filter(Boolean))];
-  const clauses = [];
-  if (ids.length) clauses.push({ sale_id: { $in: ids.flatMap((id) => /^\d+$/.test(id) ? [id, Number(id)] : [id]) } });
-  if (voucherNos.length) clauses.push({ voucher_no: { $in: voucherNos } }, { bill_no: { $in: voucherNos } });
-  if (lorryNos.length) clauses.push({ lorry_no: { $in: lorryNos } });
-
-  let biltiRows = [];
-  if (TransportBiltiOperational && clauses.length) {
-    try {
-      biltiRows = await TransportBiltiOperational.find({ $or: clauses })
-        .sort({ updated_at: -1, _id: -1 })
-        .lean();
-    } catch (error) {
-      console.warn("Bulk transport lookup skipped:", error.message);
-    }
-  }
-
   const bySaleId = new Map();
   const byVoucherNo = new Map();
   const byLorryNo = new Map();
@@ -1245,9 +1226,10 @@ async function getTransportBiltiNetAmounts(sales) {
   const setFirst = (map, key, row) => {
     if (key && !map.has(key)) map.set(key, row);
   };
-  (biltiRows || []).forEach((row) => {
+  const indexRows = (documents) => (documents || []).forEach((document) => {
+    const row = document?.data && typeof document.data === "object" ? document.data : document;
     const saleId = normalize(row.sale_id);
-    const voucherNo = normalize(row.voucher_no);
+    const voucherNo = normalize(row.voucher_no || row.bill_no);
     const billNo = normalize(row.bill_no);
     const lorryNo = normalize(row.lorry_no);
     setFirst(bySaleId, saleId, row);
@@ -1257,7 +1239,6 @@ async function getTransportBiltiNetAmounts(sales) {
     setFirst(byVoucherAndLorry, `${voucherNo}::${lorryNo}`, row);
     setFirst(byVoucherAndLorry, `${billNo}::${lorryNo}`, row);
   });
-
   const matchForSale = (sale) => {
     const saleId = normalize(sale?._id || sale?.id);
     const voucherNo = normalize(sale?.voucher_no || sale?.bill_no);
@@ -1268,33 +1249,69 @@ async function getTransportBiltiNetAmounts(sales) {
       || byLorryNo.get(lorryNo)
       || null;
   };
+  const filtersForSales = (saleRows) => {
+    const ids = [...new Set(saleRows.map((row) => String(row?._id || row?.id || "").trim()).filter(Boolean))];
+    const voucherNos = [...new Set(saleRows.map((row) => String(row?.voucher_no || row?.bill_no || "").trim()).filter(Boolean))];
+    const lorryNos = [...new Set(saleRows.map((row) => String(row?.lorry_no || "").trim()).filter(Boolean))];
+    const clauses = [];
+    if (ids.length) clauses.push({ sale_id: { $in: ids.flatMap((id) => /^\d+$/.test(id) ? [id, Number(id)] : [id]) } });
+    if (voucherNos.length) clauses.push({ voucher_no: { $in: voucherNos } }, { bill_no: { $in: voucherNos } });
+    if (lorryNos.length) clauses.push({ lorry_no: { $in: lorryNos } });
+    return clauses;
+  };
   const netAmountFrom = (row) => {
     const netAmount = Number(row?.net_amount);
     return Number.isFinite(netAmount) ? netAmount : 0;
   };
 
+  const operationalClauses = filtersForSales(rows);
+  if (TransportBiltiOperational && operationalClauses.length) {
+    try {
+      const documents = await TransportBiltiOperational.find({ $or: operationalClauses })
+        .sort({ updated_at: -1, _id: -1 })
+        .lean();
+      indexRows(documents);
+    } catch (error) {
+      console.warn("Bulk operational transport lookup skipped:", error.message);
+    }
+  }
+
+  const unmatched = rows.filter((sale) => !matchForSale(sale));
+  const fallbackClauses = filtersForSales(unmatched);
+  if (fallbackClauses.length && mongoose.connection?.db) {
+    for (const collectionName of ["transport_bilti", "transport_biltis"]) {
+      try {
+        const exists = await mongoose.connection.db.listCollections({ name: collectionName }).hasNext();
+        if (!exists) continue;
+        const documents = await mongoose.connection.db.collection(collectionName)
+          .find({ $or: fallbackClauses })
+          .sort({ updated_at: -1, _id: -1 })
+          .toArray();
+        indexRows(documents);
+      } catch (error) {
+        console.warn(`Bulk transport collection lookup skipped (${collectionName}):`, error.message);
+      }
+    }
+
+    if (MirrorRow) {
+      try {
+        const mirrorClauses = fallbackClauses.flatMap((clause) => Object.entries(clause).map(([field, value]) => ({ [`data.${field}`]: value })));
+        const documents = await MirrorRow.find({ table: "transport_bilti", $or: mirrorClauses })
+          .sort({ updated_at: -1, row_id: -1 })
+          .lean();
+        indexRows(documents);
+      } catch (error) {
+        console.warn("Bulk transport mirror lookup skipped:", error.message);
+      }
+    }
+  }
+
   const amounts = new Map();
-  const unmatched = [];
   rows.forEach((sale) => {
     const saleId = String(sale?._id || sale?.id || "");
     const match = matchForSale(sale);
-    if (match) amounts.set(saleId, netAmountFrom(match));
-    else unmatched.push(sale);
+    amounts.set(saleId, netAmountFrom(match));
   });
-
-  for (let index = 0; index < unmatched.length; index += 10) {
-    const batch = unmatched.slice(index, index + 10);
-    const fallbackMatches = await Promise.all(batch.map((sale) => getTransportBiltiMatch({
-      saleId: sale?._id || sale?.id,
-      voucherNo: sale?.voucher_no || sale?.bill_no || "",
-      lorryNo: sale?.lorry_no || "",
-    }).catch(() => null)));
-    fallbackMatches.forEach((match, offset) => {
-      const sale = batch[offset];
-      if (match) amounts.set(String(sale?._id || sale?.id || ""), netAmountFrom(match));
-    });
-  }
-
   return amounts;
 }
 
