@@ -50,6 +50,7 @@ const {
   Consignee,
   Employee,
   Location,
+  WarehouseRentBooking,
 } = require("../mongo");
 const {
   MirrorRow,
@@ -7842,6 +7843,10 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const totalGrossAmount = rows.reduce((sum, row) => sum + Number(row.gross_amount || row.sale_amount || 0), 0);
   const totalAdd = rows.reduce((sum, row) => sum + Number(row.additional_amount || 0), 0);
   const totalLess = rows.reduce((sum, row) => sum + Number(row.total_less || 0), 0);
+  const totalStaffExpense = rows.reduce((sum, row) => sum + Number(row.staff_expense || 0), 0);
+  const totalRent = rows.reduce((sum, row) => sum + Number(row.rent_amount || 0), 0);
+  const totalManualIncome = rows.reduce((sum, row) => sum + Number(row.manual_income || 0), 0);
+  const totalManualExpense = rows.reduce((sum, row) => sum + Number(row.manual_expense || 0), 0);
   const totalNetSale = rows.reduce((sum, row) => sum + Number(row.sale_amount || 0), 0);
   const totalProfitLoss = rows.reduce((sum, row) => sum + Number(row.profit_loss || 0), 0);
 
@@ -7888,7 +7893,8 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     ["P/L", 52],
   ];
   const warehouseCols = [
-    ["Warehouse", 170], ["P.Amount", 92], ["S.Amount", 92], ["Add", 72], ["Less", 86], ["P/L", 88],
+    ["Warehouse", 170], ["P.Amount", 75], ["S.Amount", 75], ["Add", 55], ["Less", 55],
+    ["Staff Exp", 65], ["Rent", 55], ["Manual Add", 60], ["Manual Less", 60], ["P/L", 70],
   ];
   const cols = isWarehouse ? warehouseCols : directCols;
   const rawWidthTotal = cols.reduce((sum, [, width]) => sum + width, 0);
@@ -7935,7 +7941,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     let x = left;
     values.forEach((value, index) => {
       const width = widths[index][1];
-      const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 5);
+      const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 9);
       const numericValue = Number(value);
 
       if (isProfitColumn && Number.isFinite(numericValue)) {
@@ -7977,6 +7983,10 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           fmt(row.gross_amount || row.sale_amount),
           fmt(row.additional_amount),
           fmt(row.total_less),
+          fmt(row.staff_expense),
+          fmt(row.rent_amount),
+          fmt(row.manual_income),
+          fmt(row.manual_expense),
           fmt(row.profit_loss),
         ]);
       } else {
@@ -8011,6 +8021,10 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           ["Total S.Amount", fmt(totalGrossAmount)],
           ["Total Add", fmt(totalAdd)],
           ["Total Less", fmt(totalLess)],
+          ["Total Staff Expense", fmt(totalStaffExpense)],
+          ["Total Warehouse Rent", fmt(totalRent)],
+          ["Total Manual Add", fmt(totalManualIncome)],
+          ["Total Manual Less", fmt(totalManualExpense)],
           ["Total Profit / Loss", fmt(totalProfitLoss)],
         ]
       : [
@@ -8098,8 +8112,8 @@ router.get("/report/profit-loss", async (req, res) => {
 
     if (mode === "warehouse") {
       const [purchases, sales] = await Promise.all([
-        getPurchaseReportRowsForUser(req.user),
-        getSaleReportRowsForUser(req.user),
+        getPurchaseReportRowsForUser(req.user, { fromDate, toDate }),
+        getSaleReportRowsForUser(req.user, { fromDate, toDate }),
       ]);
       const rows = new Map();
       const ensure = (row) => {
@@ -8110,9 +8124,11 @@ router.get("/report/profit-loss", async (req, res) => {
             warehouse_id: row.warehouse_id,
             warehouse_name: row.warehouse_name || "",
             purchase_qty: 0,
+            purchase_count: 0,
             purchase_amount: 0,
             purchase_rate: 0,
             sale_qty: 0,
+            sale_count: 0,
             sale_amount: 0,
             sale_rate: 0,
             gross_amount: 0,
@@ -8127,6 +8143,7 @@ router.get("/report/profit-loss", async (req, res) => {
       };
       purchases.forEach((row) => {
         const item = ensure(row);
+        item.purchase_count += 1;
         const qty = Number(row.total_qty || row.net_weight || row.quantity || 0);
         const amount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
         item.purchase_qty += qty;
@@ -8135,6 +8152,7 @@ router.get("/report/profit-loss", async (req, res) => {
       });
       sales.forEach((row) => {
         const item = ensure(row);
+        item.sale_count += 1;
         const qty = Number(row.quantity || row.total_quantity || row.unloading_qty || 0);
         const gross = Number(row.amount || row.total_amount || 0);
         const purchaseLinks = Array.isArray(row.against_purchase_links) ? row.against_purchase_links : [];
@@ -8147,40 +8165,91 @@ router.get("/report/profit-loss", async (req, res) => {
         if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
         item.purchase_amount += purchaseAmount;
       });
+
+      const getWarehouseSummaryRow = (warehouseId) => {
+        const key = String(warehouseId || "");
+        const item = rows.get(key);
+        return item && canAccessWarehouse(req.user, key) ? item : null;
+      };
+      const dateInRange = (value) => {
+        const raw = value instanceof Date ? value.toISOString().slice(0, 10) : String(value || "").slice(0, 10);
+        return Boolean(raw) && (!fromDate || raw >= fromDate) && (!toDate || raw <= toDate);
+      };
+      const [expenseRows, rentRows, manualRows] = await Promise.all([
+        mongoose.connection.db.collection("expenses").find({}).toArray(),
+        WarehouseRentBooking.find({}).lean(),
+        mongoose.connection.db.collection("warehouse_trading_profit_loss_adjustments").find({}).toArray(),
+      ]);
+      (expenseRows || []).forEach((expense) => {
+        const row = getWarehouseSummaryRow(expense.warehouse_id);
+        if (!row || !dateInRange(expense.expense_date || expense.date)) return;
+        row.staff_expense = Number(row.staff_expense || 0) + Number(expense.total_expense_amount ?? expense.grand_total ?? expense.amount ?? 0);
+      });
+      (rentRows || []).forEach((rent) => {
+        const warehouseId = String(rent.warehouse_id || "");
+        const row = getWarehouseSummaryRow(warehouseId);
+        const month = String(rent.rent_month || rent.booking_date || "").slice(0, 7);
+        if (!row || rent.rent_flow === "receivable" || !month || (fromDate && month < fromDate.slice(0, 7)) || (toDate && month > toDate.slice(0, 7))) return;
+        row.rent_amount = Number(row.rent_amount || 0) + Number(rent.monthly_rent || 0);
+      });
+      (manualRows || []).forEach((entry) => {
+        const row = getWarehouseSummaryRow(entry.warehouse_id);
+        if (!row || !dateInRange(entry.date)) return;
+        if (entry.entry_type === "income") row.manual_income = Number(row.manual_income || 0) + Number(entry.amount || 0);
+        if (entry.entry_type === "expense") row.manual_expense = Number(row.manual_expense || 0) + Number(entry.amount || 0);
+      });
       const output = Array.from(rows.values()).map((row) => ({
         ...row,
         purchase_qty: Number(row.purchase_qty.toFixed(4)),
+        purchase_count: row.purchase_count,
         purchase_rate: Number((row.purchase_rate || 0).toFixed(2)),
         purchase_amount: Number(row.purchase_amount.toFixed(2)),
         sale_qty: Number(row.sale_qty.toFixed(4)),
+        sale_count: row.sale_count,
         sale_rate: Number((row.sale_rate || 0).toFixed(2)),
         sale_amount: Number(row.sale_amount.toFixed(2)),
         gross_amount: Number(row.gross_amount.toFixed(2)),
         additional_amount: Number(row.additional_amount.toFixed(2)),
         total_less: Number(row.total_less.toFixed(2)),
-        profit_loss: Number((row.sale_amount - row.purchase_amount).toFixed(2)),
+        staff_expense: Number(Number(row.staff_expense || 0).toFixed(2)),
+        rent_amount: Number(Number(row.rent_amount || 0).toFixed(2)),
+        manual_income: Number(Number(row.manual_income || 0).toFixed(2)),
+        manual_expense: Number(Number(row.manual_expense || 0).toFixed(2)),
+        profit_loss: Number((row.sale_amount - row.purchase_amount - Number(row.staff_expense || 0) - Number(row.rent_amount || 0) - Number(row.manual_expense || 0) + Number(row.manual_income || 0)).toFixed(2)),
       }));
       if (String(req.query.export || "").toLowerCase() === "xlsx") {
         const exportRows = output.map((row) => ({
           Warehouse: row.warehouse_name,
+          "Purchase Bills": row.purchase_count,
           "Purchase Qty": row.purchase_qty,
           "Purchase Rate": row.purchase_rate,
           "Purchase Amount": row.purchase_amount,
+          "Sale Bills": row.sale_count,
           "Sale Qty": row.sale_qty,
           "Sale Rate": row.sale_rate,
           "Gross Amount": row.gross_amount,
           "Total Add": row.additional_amount,
           "Total Less": row.total_less,
+          "Staff Expense": row.staff_expense,
+          "Warehouse Rent": row.rent_amount,
+          "Manual Add": row.manual_income,
+          "Manual Less": row.manual_expense,
           "Profit_Loss": row.profit_loss,
         }));
         const totalRow = {
           Warehouse: "TOTAL",
+          "Purchase Bills": output.reduce((sum, row) => sum + Number(row.purchase_count || 0), 0),
           "Purchase Qty": Number(output.reduce((s, r) => s + Number(r.purchase_qty || 0), 0).toFixed(4)),
           "Purchase Amount": Number(output.reduce((s, r) => s + Number(r.purchase_amount || 0), 0).toFixed(2)),
+          "Sale Bills": output.reduce((sum, row) => sum + Number(row.sale_count || 0), 0),
           "Sale Qty": Number(output.reduce((s, r) => s + Number(r.sale_qty || 0), 0).toFixed(4)),
           "Gross Amount": Number(output.reduce((s, r) => s + Number(r.gross_amount || 0), 0).toFixed(2)),
           "Total Add": Number(output.reduce((s, r) => s + Number(r.additional_amount || 0), 0).toFixed(2)),
           "Total Less": Number(output.reduce((s, r) => s + Number(r.total_less || 0), 0).toFixed(2)),
+          "Staff Expense": Number(output.reduce((s, r) => s + Number(r.staff_expense || 0), 0).toFixed(2)),
+          "Warehouse Rent": Number(output.reduce((s, r) => s + Number(r.rent_amount || 0), 0).toFixed(2)),
+          "Manual Add": Number(output.reduce((s, r) => s + Number(r.manual_income || 0), 0).toFixed(2)),
+          "Manual Less": Number(output.reduce((s, r) => s + Number(r.manual_expense || 0), 0).toFixed(2)),
           "Profit_Loss": Number(output.reduce((s, r) => s + Number(r.profit_loss || 0), 0).toFixed(2)),
         };
         exportRows.push(totalRow);
@@ -8413,6 +8482,36 @@ router.get("/report/profit-loss", async (req, res) => {
   } catch (err) {
     console.error("Profit/Loss report failed:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/report/profit-loss-details", async (req, res) => {
+  const type = String(req.query.type || "").trim().toLowerCase();
+  const permission = type === "sale"
+    ? "warehouse.trading.report.sale"
+    : type === "purchase"
+      ? "warehouse.trading.report.purchase"
+      : "";
+  if (!permission || (
+    !userHasPermission(req.user, permission) &&
+    !userHasPermission(req.user, "warehouse.trading.report.profitLoss")
+  )) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+
+  try {
+    const options = {
+      warehouseId: String(req.query.warehouse_id || "").trim(),
+      fromDate: String(req.query.from_date || "").trim(),
+      toDate: String(req.query.to_date || "").trim(),
+    };
+    const rows = type === "sale"
+      ? await getSaleReportRowsForUser(req.user, options)
+      : await getPurchaseReportRowsForUser(req.user, options);
+    return res.json({ rows: rows || [], total: (rows || []).length });
+  } catch (error) {
+    console.error("Warehouse trading profit/loss drill-down failed:", error);
+    return res.status(500).json({ error: error.message || "Failed to load voucher details" });
   }
 });
 
