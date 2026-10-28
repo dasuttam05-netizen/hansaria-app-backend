@@ -8220,6 +8220,7 @@ router.get("/report/profit-loss", async (req, res) => {
         getSaleReportRowsForUser(req.user, { fromDate, toDate }),
       ]);
       const freightBySale = await getTransportBiltiNetAmounts(sales);
+      const purchaseIdsInReport = new Set(purchases.map((row) => String(row._id || row.id || "")));
       const rows = new Map();
       const ensure = (row) => {
         const key = String(row.warehouse_id || "");
@@ -8273,7 +8274,14 @@ router.get("/report/profit-loss", async (req, res) => {
         item.total_less += Math.max(reportedLess, impliedLess, 0);
         item.freight_amount += Number(freightBySale.get(String(row._id || row.id || "")) || 0);
         if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
-        item.purchase_amount += purchaseAmount;
+        const unreportedLinkedPurchases = purchaseLinks.filter((link) =>
+          !purchaseIdsInReport.has(String(link?.purchase_id || link?.id || link?._id || ""))
+        );
+        if (purchaseLinks.length) {
+          item.purchase_amount += unreportedLinkedPurchases.reduce((sum, link) => sum + Number(link?.amount || 0), 0);
+        } else {
+          item.purchase_amount += purchaseAmount;
+        }
       });
 
       const getWarehouseSummaryRow = (warehouseId) => {
@@ -8326,7 +8334,7 @@ router.get("/report/profit-loss", async (req, res) => {
         rent_amount: Number(Number(row.rent_amount || 0).toFixed(2)),
         manual_income: Number(Number(row.manual_income || 0).toFixed(2)),
         manual_expense: Number(Number(row.manual_expense || 0).toFixed(2)),
-        profit_loss: Number((row.sale_amount - row.purchase_amount - Number(row.staff_expense || 0) - Number(row.rent_amount || 0) - Number(row.manual_expense || 0) + Number(row.manual_income || 0)).toFixed(2)),
+        profit_loss: Number((row.sale_amount - row.purchase_amount - row.freight_amount - Number(row.staff_expense || 0) - Number(row.rent_amount || 0) - Number(row.manual_expense || 0) + Number(row.manual_income || 0)).toFixed(2)),
       }));
       if (String(req.query.export || "").toLowerCase() === "xlsx") {
         const exportRows = output.map((row) => ({
