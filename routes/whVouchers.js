@@ -8155,13 +8155,16 @@ router.get("/report/profit-loss", async (req, res) => {
         item.sale_count += 1;
         const qty = Number(row.quantity || row.total_quantity || row.unloading_qty || 0);
         const gross = Number(row.amount || row.total_amount || 0);
+        const saleAmount = Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || gross || 0);
+        const reportedLess = Number(row.total_deduction || 0);
+        const impliedLess = gross + Number(row.additional_amount || 0) - Number(row.round_off || 0) - saleAmount;
         const purchaseLinks = Array.isArray(row.against_purchase_links) ? row.against_purchase_links : [];
         const purchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, link) => sum + Number(link?.amount || 0), 0) || 0);
         item.sale_qty += qty;
-        item.sale_amount += Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || gross || 0);
+        item.sale_amount += saleAmount;
         item.gross_amount += gross;
         item.additional_amount += Number(row.additional_amount || 0);
-        item.total_less += Number(row.total_deduction || 0);
+        item.total_less += Math.max(reportedLess, impliedLess, 0);
         if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
         item.purchase_amount += purchaseAmount;
       });
