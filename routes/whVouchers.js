@@ -7315,7 +7315,7 @@ function buildLedgerRows(rows, getPartyId, getPartyName) {
     .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
 }
 
-function groupStock(purchases, sales) {
+function groupStock(purchases, sales, { includeDetails = true } = {}) {
   const groups = new Map();
   const keyOf = (row) => `${row.warehouse_id || ""}::${row.company_account_id || ""}::${row.product_id || ""}`;
   const ensure = (row) => {
@@ -7332,8 +7332,7 @@ function groupStock(purchases, sales) {
         sale_qty: 0,
         purchase_amount: 0,
         sale_amount: 0,
-        purchase_details: [],
-        sale_details: [],
+        ...(includeDetails ? { purchase_details: [], sale_details: [] } : {}),
       });
     }
     const item = groups.get(key);
@@ -7351,14 +7350,16 @@ function groupStock(purchases, sales) {
     const amount = Number(row.total_amount || row.net_amount_payable || row.amount || 0);
     item.purchase_qty += qty;
     item.purchase_amount += amount;
-    item.purchase_details.push({
-      date: row.date || "",
-      voucher_no: row.voucher_no || "",
-      party_name: row.farmer_name || row.party_name || "",
-      qty: Number(qty.toFixed(4)),
-      rate: Number(row.rate || 0),
-      amount,
-    });
+    if (includeDetails) {
+      item.purchase_details.push({
+        date: row.date || "",
+        voucher_no: row.voucher_no || "",
+        party_name: row.farmer_name || row.party_name || "",
+        qty: Number(qty.toFixed(4)),
+        rate: Number(row.rate || 0),
+        amount,
+      });
+    }
   });
 
   sales.forEach((row) => {
@@ -7367,14 +7368,16 @@ function groupStock(purchases, sales) {
     const amount = Number(row.amount || row.total_amount || 0);
     item.sale_qty += qty;
     item.sale_amount += amount;
-    item.sale_details.push({
-      date: row.date || "",
-      voucher_no: row.voucher_no || "",
-      party_name: row.company_name || row.consignee_name || row.party_name || "",
-      qty: Number(qty.toFixed(4)),
-      rate: Number(row.rate || 0),
-      amount,
-    });
+    if (includeDetails) {
+      item.sale_details.push({
+        date: row.date || "",
+        voucher_no: row.voucher_no || "",
+        party_name: row.company_name || row.consignee_name || row.party_name || "",
+        qty: Number(qty.toFixed(4)),
+        rate: Number(row.rate || 0),
+        amount,
+      });
+    }
   });
 
   return Array.from(groups.values()).map((item) => {
@@ -7389,8 +7392,10 @@ function groupStock(purchases, sales) {
       stock_amount: Number((stockQty * avgRate).toFixed(2)),
       purchase_amount: Number(item.purchase_amount.toFixed(2)),
       sale_amount: Number(item.sale_amount.toFixed(2)),
-      purchase_details: item.purchase_details.sort((a, b) => String(a.date || "").localeCompare(String(b.date || ""))),
-      sale_details: item.sale_details.sort((a, b) => String(a.date || "").localeCompare(String(b.date || ""))),
+      ...(includeDetails ? {
+        purchase_details: item.purchase_details.sort((a, b) => String(a.date || "").localeCompare(String(b.date || ""))),
+        sale_details: item.sale_details.sort((a, b) => String(a.date || "").localeCompare(String(b.date || ""))),
+      } : {}),
     };
   });
 }
@@ -9285,19 +9290,45 @@ router.get("/report/warehouse-stock", async (req, res) => {
 
   try {
     const view = String(req.query.view || "").toLowerCase();
+    const warehouseId = String(req.query.warehouse_id || "").trim();
+    const companyAccountId = String(req.query.company_account_id || "").trim();
+    const productId = String(req.query.product_id || "").trim();
     if (view === "details") {
+      if (!warehouseId || !productId) {
+        return res.status(400).json({ error: "warehouse_id and product_id are required" });
+      }
       const [purchases, sales] = await Promise.all([
-        getPurchaseReportRowsForUser(req.user),
-        getSaleReportRowsForUser(req.user),
+        getPurchaseReportRowsForUser(req.user, { warehouseId, companyAccountId, productId }),
+        getSaleReportRowsForUser(req.user, { warehouseId, companyAccountId, productId }),
       ]);
-      return res.json(groupStock(purchases, sales));
+      const rows = groupStock(purchases, sales);
+      const row = rows.find((item) =>
+        String(item.warehouse_id || "") === warehouseId &&
+        String(item.company_account_id || "") === companyAccountId &&
+        String(item.product_id || "") === productId
+      );
+      return res.json(row || null);
     }
 
     const [purchases, sales] = await Promise.all([
       getPurchaseReportRowsForUser(req.user),
       getSaleReportRowsForUser(req.user),
     ]);
-    return res.json(groupStock(purchases, sales));
+    const rows = groupStock(purchases, sales, { includeDetails: false });
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
+    const total = rows.length;
+    const data = rows.slice((page - 1) * pageSize, page * pageSize);
+    return res.json({
+      data,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / pageSize)),
+        hasMore: page * pageSize < total,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
