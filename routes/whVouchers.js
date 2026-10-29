@@ -466,6 +466,31 @@ async function getPurchaseVoucherPage(req) {
 async function getSaleVoucherPage(req) {
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "sale");
+  if (String(req.query.pending_unloading || "") === "1") {
+    const numericField = (field) => ({
+      $convert: { input: `$${field}`, to: "double", onError: 0, onNull: 0 },
+    });
+    const dispatchQty = {
+      $cond: [
+        { $gt: [numericField("dispatch_qty"), 0] },
+        numericField("dispatch_qty"),
+        {
+          $cond: [
+            { $gt: [numericField("quantity"), 0] },
+            numericField("quantity"),
+            {
+              $cond: [
+                { $gt: [numericField("total_quantity"), 0] },
+                numericField("total_quantity"),
+                numericField("unloading_qty"),
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    filter.$expr = { $gt: [dispatchQty, numericField("unloading_qty")] };
+  }
   const [total, docs] = await Promise.all([
     SaleVoucher.countDocuments(filter),
     SaleVoucher.find(filter)
