@@ -8584,7 +8584,7 @@ router.get("/report/profit-loss", async (req, res) => {
         manual_income: Number(Number(row.manual_income || 0).toFixed(2)),
         manual_expense: Number(Number(row.manual_expense || 0).toFixed(2)),
         profit_loss: Number((row.sale_amount + row.additional_amount + row.round_off - row.total_less - row.purchase_amount - row.freight_amount - Number(row.staff_expense || 0) - Number(row.rent_amount || 0) - Number(row.manual_expense || 0) + Number(row.manual_income || 0)).toFixed(2)),
-      }));
+      })).filter((row) => !search || String(row.warehouse_name || "").toLowerCase().includes(search.toLowerCase()));
       if (String(req.query.export || "").toLowerCase() === "xlsx") {
         const exportRows = output.map((row) => ({
           Warehouse: row.warehouse_name,
