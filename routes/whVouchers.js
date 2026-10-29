@@ -63,6 +63,11 @@ const {
   JournalVoucher: MongoJournalVoucher,
 } = require("../db-mongodb");
 
+const WarehouseLoading = mongoose.models.WarehouseLoading || mongoose.model(
+  "WarehouseLoading",
+  new mongoose.Schema({}, { strict: false, timestamps: true, collection: "warehouseloadings" })
+);
+
 // Transport Report is maintained outside Warehouse Trading. In the deployed
 // backend its saved Bilti rows are available through the operational model.
 // Keep this optional so Warehouse Trading still starts if that module is not
@@ -1027,15 +1032,17 @@ async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = n
     if (excludeSaleId && mongoose.Types.ObjectId.isValid(String(excludeSaleId))) {
       saleFilter._id = { $ne: String(excludeSaleId) };
     }
-    const [purchaseRows, saleRows] = await Promise.all([
+    const [purchaseRows, saleRows, loadingRows] = await Promise.all([
       PurchaseVoucher.find(purchaseFilter).lean(),
-      SaleVoucher.find(saleFilter).lean(),
+      SaleVoucher.find({ ...saleFilter, $or: [{ warehouse_loading_id: { $exists: false } }, { warehouse_loading_id: "" }, { warehouse_loading_id: null }] }).lean(),
+      WarehouseLoading.find({ warehouse_id: wId, product_id: pId }).lean(),
     ]);
     const purchaseQty = (purchaseRows || []).reduce(
       (sum, row) => sum + Number(row.total_qty || row.net_weight || row.quantity || 0),
       0
     );
-    const saleQty = (saleRows || []).reduce((sum, row) => sum + Number(row.quantity || 0), 0);
+    const saleQty = (saleRows || []).reduce((sum, row) => sum + Number(row.quantity || 0), 0)
+      + (loadingRows || []).reduce((sum, row) => sum + Number(row.loading_qty || row.quantity || 0), 0);
     return Number((purchaseQty - saleQty).toFixed(4));
   }
 
@@ -1052,7 +1059,7 @@ async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = n
     }
   }
 
-  const [purchaseRows, saleRows] = await Promise.all([
+  const [purchaseRows, saleRows, loadingRows] = await Promise.all([
     PurchaseVoucher.aggregate([
       { $match: purchaseFilter },
       {
@@ -1070,7 +1077,7 @@ async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = n
       },
     ]),
     SaleVoucher.aggregate([
-      { $match: saleFilter },
+      { $match: { ...saleFilter, $or: [{ warehouse_loading_id: { $exists: false } }, { warehouse_loading_id: "" }, { warehouse_loading_id: null }] } },
       {
         $group: {
           _id: null,
@@ -1078,11 +1085,26 @@ async function getAvailableSaleStock({ warehouseId, productId, excludeSaleId = n
         },
       },
     ]),
+    WarehouseLoading.find({ warehouse_id: wId, product_id: pId }).lean(),
   ]);
 
   const purchaseQty = Number(purchaseRows?.[0]?.purchase_qty || 0);
-  const saleQty = Number(saleRows?.[0]?.sale_qty || 0);
+  const saleQty = Number(saleRows?.[0]?.sale_qty || 0)
+    + (loadingRows || []).reduce((sum, row) => sum + Number(row.loading_qty || row.quantity || 0), 0);
   return Number((purchaseQty - saleQty).toFixed(4));
+}
+
+async function getWarehouseLoadingRowsForUser(user, filters = {}) {
+  const query = {};
+  if (filters.warehouseId) query.warehouse_id = String(filters.warehouseId);
+  if (filters.productId) query.product_id = String(filters.productId);
+  if (filters.companyAccountId) query.company_account_id = String(filters.companyAccountId);
+  if (user && user.role !== "admin" && !userHasPermission(user, "warehouses.manage")) {
+    const ids = assignedWarehouseIdsForMongo(user);
+    if (!ids.length) return [];
+    query.warehouse_id = filters.warehouseId ? { $in: ids, $eq: String(filters.warehouseId) } : { $in: ids };
+  }
+  return WarehouseLoading.find(query).sort({ date: -1, _id: -1 }).lean();
 }
 
 router.get("/available-sale-stock", async (req, res) => {
@@ -1105,6 +1127,90 @@ router.get("/available-sale-stock", async (req, res) => {
     res.json({ stock_qty: stockQty });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/warehouse-loading", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.create") && !userHasPermission(req.user, "warehouse.trading.sale.edit")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) return res.status(503).json({ error: "MongoDB is not connected" });
+
+  try {
+    const warehouseId = String(req.body?.warehouse_id || "").trim();
+    const productId = String(req.body?.product_id || "").trim();
+    const loadingQty = Number(req.body?.loading_qty || 0);
+    const allocations = Array.isArray(req.body?.allocations) ? req.body.allocations : [];
+    if (!warehouseId || !productId || loadingQty <= 0 || !allocations.length) {
+      return res.status(400).json({ error: "Warehouse, product, loading quantity and tagged Sale Bills are required" });
+    }
+    const normalized = allocations.map((item) => ({
+      sale_id: String(item?.sale_id || "").trim(),
+      quantity: Number(item?.quantity || 0),
+    }));
+    if (normalized.some((item) => !mongoose.Types.ObjectId.isValid(item.sale_id) || item.quantity <= 0)) {
+      return res.status(400).json({ error: "Each tagged Sale Bill needs a valid bill and quantity" });
+    }
+    const allocatedQty = normalized.reduce((sum, item) => sum + item.quantity, 0);
+    if (Math.abs(allocatedQty - loadingQty) > 0.0001) {
+      return res.status(400).json({ error: `Tagged bill quantities must total ${loadingQty.toFixed(4)}` });
+    }
+    const saleIds = normalized.map((item) => item.sale_id);
+    if (new Set(saleIds).size !== saleIds.length) return res.status(400).json({ error: "A Sale Bill can only be tagged once" });
+    const sales = await SaleVoucher.find({ _id: { $in: saleIds }, ...mongoSaleScope(req.user) }).lean();
+    if (sales.length !== saleIds.length) return res.status(400).json({ error: "One or more Sale Bills were not found or are not accessible" });
+    const saleMap = new Map(sales.map((row) => [String(row._id), row]));
+    const companyAccountIds = new Set(sales.map((row) => String(row.company_account_id || "")));
+    if (companyAccountIds.size > 1) return res.status(400).json({ error: "All Sale Bills in one loading must use the same Account" });
+    for (const allocation of normalized) {
+      const sale = saleMap.get(allocation.sale_id);
+      if (String(sale.warehouse_id || "") !== warehouseId || String(sale.product_id || "") !== productId) {
+        return res.status(400).json({ error: `Sale Bill ${sale.voucher_no || ""} must match the selected warehouse and product` });
+      }
+      if (sale.warehouse_loading_id) return res.status(400).json({ error: `Sale Bill ${sale.voucher_no || ""} is already tagged to a loading entry` });
+      const saleBillQty = Number(sale.quantity || sale.total_quantity || 0);
+      if (Math.abs(allocation.quantity - saleBillQty) > 0.0001) {
+        return res.status(400).json({ error: `Tag the full quantity (${saleBillQty.toFixed(4)}) of Sale Bill ${sale.voucher_no || ""}` });
+      }
+    }
+    const date = String(req.body?.date || new Date().toISOString().slice(0, 10));
+    const loadingNo = String(req.body?.voucher_no || `WL-${date.replace(/-/g, "")}-${Date.now().toString().slice(-6)}`);
+    const loading = await WarehouseLoading.create({
+      voucher_no: loadingNo,
+      date,
+      warehouse_id: warehouseId,
+      product_id: productId,
+      company_account_id: String(sales[0]?.company_account_id || ""),
+      lorry_no: String(req.body?.lorry_no || "").trim(),
+      loading_qty: Number(loadingQty.toFixed(4)),
+      allocations: normalized.map((item) => {
+        const sale = saleMap.get(item.sale_id);
+        return {
+          sale_id: item.sale_id,
+          voucher_no: sale.voucher_no || sale.bill_no || "",
+          buyer_id: String(sale.buyer_id || sale.company_id || ""),
+          buyer_name: String(sale.buyer_name || sale.company_name || ""),
+          company_account_id: String(sale.company_account_id || ""),
+          consignee_id: String(sale.consignee_id || ""),
+          consignee_name: String(sale.consignee_name || ""),
+          quantity: Number(item.quantity.toFixed(4)),
+        };
+      }),
+      description: String(req.body?.description || "").trim(),
+      created_by: String(req.user?._id || req.user?.id || ""),
+    });
+    const linked = await SaleVoucher.updateMany(
+      { _id: { $in: saleIds }, $or: [{ warehouse_loading_id: { $exists: false } }, { warehouse_loading_id: "" }, { warehouse_loading_id: null }] },
+      { $set: { warehouse_loading_id: String(loading._id), warehouse_loading_no: loadingNo } }
+    );
+    if (Number(linked.matchedCount ?? linked.n ?? 0) !== saleIds.length) {
+      await SaleVoucher.updateMany({ _id: { $in: saleIds }, warehouse_loading_id: String(loading._id) }, { $unset: { warehouse_loading_id: "", warehouse_loading_no: "" } });
+      await WarehouseLoading.deleteOne({ _id: loading._id });
+      return res.status(409).json({ error: "A Sale Bill was tagged to another loading at the same time. Refresh and try again." });
+    }
+    return res.status(201).json({ id: String(loading._id), voucher_no: loadingNo, loading_qty: loading.loading_qty, tagged_bills: normalized.length });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || "Failed to save warehouse loading" });
   }
 });
 
@@ -4858,7 +4964,7 @@ router.put("/sale/:id", async (req, res) => {
     if (!mongoSale) return res.status(404).json({ error: "Sale voucher not found" });
 
     const rateValue = Number(req.body.rate !== undefined ? req.body.rate : mongoSale.rate) || 0;
-    const saleQty = Number(mongoSale.quantity || 0);
+    const saleQty = Number(mongoSale.dispatch_qty || mongoSale.quantity || 0);
     const grossAmount = Number(mongoSale.amount || 0);
     const unloadingQtyValue = Number(req.body.unloading_qty !== undefined ? req.body.unloading_qty : mongoSale.unloading_qty || req.body.quantity || mongoSale.quantity) || 0;
     const shortageQty = Math.max(0, saleQty - unloadingQtyValue);
@@ -7375,7 +7481,7 @@ function buildLedgerRows(rows, getPartyId, getPartyName) {
     .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
 }
 
-function groupStock(purchases, sales, { includeDetails = true } = {}) {
+function groupStock(purchases, sales, { includeDetails = true, loadings = [] } = {}) {
   const groups = new Map();
   const keyOf = (row) => `${row.warehouse_id || ""}::${row.company_account_id || ""}::${row.product_id || ""}`;
   const ensure = (row) => {
@@ -7424,7 +7530,7 @@ function groupStock(purchases, sales, { includeDetails = true } = {}) {
 
   sales.forEach((row) => {
     const item = ensure(row);
-    const qty = Number(row.quantity || row.total_quantity || 0);
+    const qty = row.warehouse_loading_id ? 0 : Number(row.quantity || row.total_quantity || 0);
     const amount = Number(row.amount || row.total_amount || 0);
     item.sale_qty += qty;
     item.sale_amount += amount;
@@ -7436,6 +7542,23 @@ function groupStock(purchases, sales, { includeDetails = true } = {}) {
         qty: Number(qty.toFixed(4)),
         rate: Number(row.rate || 0),
         amount,
+      });
+    }
+  });
+
+  (loadings || []).forEach((row) => {
+    const item = ensure(row);
+    const qty = Number(row.loading_qty || row.quantity || 0);
+    item.sale_qty += qty;
+    if (includeDetails) {
+      item.sale_details.push({
+        date: row.date || "",
+        voucher_no: row.voucher_no || "",
+        party_name: `Warehouse Loading${row.lorry_no ? ` · ${row.lorry_no}` : ""}`,
+        qty: Number(qty.toFixed(4)),
+        rate: 0,
+        amount: 0,
+        movement_type: "Loading",
       });
     }
   });
@@ -7460,7 +7583,7 @@ function groupStock(purchases, sales, { includeDetails = true } = {}) {
   });
 }
 
-function buildFifoStock(purchases, sales) {
+function buildFifoStock(purchases, sales, loadings = []) {
   const lotsByKey = new Map();
   const keyOf = (row) => `${row.warehouse_id || ""}::${row.product_id || ""}`;
 
@@ -7482,12 +7605,13 @@ function buildFifoStock(purchases, sales) {
       });
     });
 
-  sales
-    .slice()
-    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
-    .forEach((row) => {
+  const issues = [
+    ...sales.filter((row) => !row.warehouse_loading_id).map((row) => ({ ...row, stock_issue_qty: Number(row.quantity || row.total_quantity || 0) })),
+    ...(loadings || []).map((row) => ({ ...row, stock_issue_qty: Number(row.loading_qty || row.quantity || 0) })),
+  ].sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
+  issues.forEach((row) => {
       const lots = lotsByKey.get(keyOf(row)) || [];
-      let saleQty = Number(row.quantity || row.total_quantity || 0);
+      let saleQty = Number(row.stock_issue_qty || 0);
       for (const lot of lots) {
         if (saleQty <= 0) break;
         const used = Math.min(lot.remaining_qty, saleQty);
@@ -9391,11 +9515,12 @@ router.get("/report/warehouse-stock", async (req, res) => {
       if (!warehouseId || !productId) {
         return res.status(400).json({ error: "warehouse_id and product_id are required" });
       }
-      const [purchases, sales] = await Promise.all([
+      const [purchases, sales, loadings] = await Promise.all([
         getPurchaseReportRowsForUser(req.user, { warehouseId, companyAccountId, productId }),
         getSaleReportRowsForUser(req.user, { warehouseId, companyAccountId, productId }),
+        getWarehouseLoadingRowsForUser(req.user, { warehouseId, productId, companyAccountId }),
       ]);
-      const rows = groupStock(purchases, sales);
+      const rows = groupStock(purchases, sales, { loadings });
       const row = rows.find((item) =>
         String(item.warehouse_id || "") === warehouseId &&
         String(item.company_account_id || "") === companyAccountId &&
@@ -9404,11 +9529,12 @@ router.get("/report/warehouse-stock", async (req, res) => {
       return res.json(row || null);
     }
 
-    const [purchases, sales] = await Promise.all([
+    const [purchases, sales, loadings] = await Promise.all([
       getPurchaseReportRowsForUser(req.user),
       getSaleReportRowsForUser(req.user),
+      getWarehouseLoadingRowsForUser(req.user),
     ]);
-    const rows = groupStock(purchases, sales, { includeDetails: false });
+    const rows = groupStock(purchases, sales, { includeDetails: false, loadings });
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
     const total = rows.length;
@@ -9434,11 +9560,12 @@ router.get("/report/fifo-stock", async (req, res) => {
   }
 
   try {
-    const [purchases, sales] = await Promise.all([
+    const [purchases, sales, loadings] = await Promise.all([
       getPurchaseReportRowsForUser(req.user),
       getSaleReportRowsForUser(req.user),
+      getWarehouseLoadingRowsForUser(req.user),
     ]);
-    const rows = buildFifoStock(purchases, sales);
+    const rows = buildFifoStock(purchases, sales, loadings);
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
     const total = rows.length;
