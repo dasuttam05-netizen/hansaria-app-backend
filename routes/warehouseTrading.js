@@ -4,6 +4,7 @@ const router = express.Router();
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
 const { WarehouseRentBooking } = require("../mongo");
+const XLSX = require("xlsx");
 
 const warehouseTradingEntrySchema = new mongoose.Schema(
   {
@@ -185,6 +186,9 @@ router.get("/profit-loss-overheads", async (req, res) => {
       .map((row) => ({
         id: String(row._id || ""),
         date: normalizeText(row.rent_month || row.booking_date),
+        rent_month: normalizeText(row.rent_month),
+        booking_date: normalizeText(row.booking_date),
+        remarks: normalizeText(row.remarks),
         warehouse_id: normalizeText(row.warehouse_id?._id || row.warehouse_id),
         warehouse_name: normalizeText(row.warehouse_id?.name),
         description: normalizeText(row.booking_no || row.remarks) || "Warehouse rent",
@@ -203,7 +207,33 @@ router.get("/profit-loss-overheads", async (req, res) => {
       .filter((row) => canAccessWarehouse(req.user, row.warehouse_id))
       .map((row) => ({ ...row, id: String(row._id), warehouse_id: normalizeText(row.warehouse_id) }));
 
-    return res.json({ expenses, rents, adjustments });
+    const payload = { expenses, rents, adjustments };
+    if (String(req.query.export || "").trim().toLowerCase() === "xlsx") {
+      const type = String(req.query.type || "").trim().toLowerCase();
+      const source = type === "expenses" ? expenses : type === "rents" ? rents : type === "adjustments" ? adjustments : null;
+      if (!source) return res.status(400).json({ error: "A valid overhead type is required for export" });
+      const warehouseId = normalizeText(req.query.warehouse_id);
+      const entryType = normalizeText(req.query.entry_type).toLowerCase();
+      const filteredSource = source.filter((row) =>
+        (!warehouseId || String(row.warehouse_id || "") === warehouseId) &&
+        (type !== "adjustments" || !entryType || row.entry_type === entryType)
+      );
+      const rows = filteredSource.map((row) => ({
+        Date: row.date || "",
+        Warehouse: row.warehouse_name || "",
+        Particulars: row.description || row.employee_name || "",
+        ...(type === "adjustments" ? { Type: row.entry_type === "income" ? "Add" : "Less" } : {}),
+        Amount: Number(row.amount || 0),
+      }));
+      rows.push({ Date: "TOTAL", Amount: Number(filteredSource.reduce((sum, row) => sum + Number(row.amount || 0), 0).toFixed(2)) });
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), type);
+      const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="profit_loss_${type}_details.xlsx"`);
+      return res.end(buffer);
+    }
+    return res.json(payload);
   } catch (error) {
     console.error("Warehouse trading profit/loss overhead load failed:", error);
     return res.status(500).json({ error: error.message || "Failed to load warehouse expenses" });
@@ -242,6 +272,41 @@ router.post("/profit-loss-adjustments", async (req, res) => {
   } catch (error) {
     console.error("Warehouse trading profit/loss adjustment save failed:", error);
     return res.status(500).json({ error: error.message || "Failed to save manual entry" });
+  }
+});
+
+router.put("/profit-loss-adjustments/:id", async (req, res) => {
+  if (!canManageWarehouseTrading(req.user)) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  const date = normalizeText(req.body?.date);
+  const warehouseId = normalizeText(req.body?.warehouse_id);
+  const entryType = normalizeText(req.body?.entry_type).toLowerCase();
+  const amount = Number(req.body?.amount);
+  const description = normalizeText(req.body?.description);
+  if (!date || !warehouseId || !["income", "expense"].includes(entryType) || !Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: "Date, warehouse, entry type, and positive amount are required" });
+  }
+  if (!canAccessWarehouse(req.user, warehouseId)) {
+    return res.status(403).json({ error: "You do not have access to this warehouse" });
+  }
+  try {
+    const entry = await WarehouseTradingProfitLossAdjustment.findById(req.params.id);
+    if (!entry) return res.status(404).json({ error: "Manual entry not found" });
+    if (!canAccessWarehouse(req.user, entry.warehouse_id)) {
+      return res.status(403).json({ error: "You do not have access to this warehouse" });
+    }
+    entry.date = date;
+    entry.warehouse_id = warehouseId;
+    entry.warehouse_name = normalizeText(req.body?.warehouse_name);
+    entry.entry_type = entryType;
+    entry.amount = amount;
+    entry.description = description;
+    await entry.save();
+    return res.json({ id: String(entry._id), success: true });
+  } catch (error) {
+    console.error("Warehouse trading profit/loss adjustment update failed:", error);
+    return res.status(500).json({ error: error.message || "Failed to update manual entry" });
   }
 });
 
