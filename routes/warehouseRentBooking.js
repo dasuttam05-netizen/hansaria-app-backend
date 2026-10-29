@@ -82,6 +82,36 @@ router.post("/", async (req, res) => {
   }
 });
 
+router.put("/:id", async (req, res) => {
+  try {
+    if (!canManage(req)) return res.status(403).json({ error: "Permission denied" });
+    const booking = await WarehouseRentBooking.findById(req.params.id);
+    if (!booking) return res.status(404).json({ error: "Warehouse rent booking not found" });
+    const rentMonth = String(req.body?.rent_month || "").trim();
+    const bookingDate = String(req.body?.booking_date || "").trim();
+    const monthlyRent = Number(req.body?.monthly_rent);
+    if (!/^[0-9]{4}-[0-9]{2}$/.test(rentMonth) || !bookingDate || !Number.isFinite(monthlyRent) || monthlyRent < 0) {
+      return res.status(400).json({ error: "Valid rent month, booking date, and non-negative rent amount are required" });
+    }
+    if (rentMonth !== booking.rent_month) {
+      const duplicate = await WarehouseRentBooking.findOne({ warehouse_id: booking.warehouse_id, rent_month: rentMonth, _id: { $ne: booking._id } }).select("_id").lean();
+      if (duplicate) return res.status(409).json({ error: "This warehouse already has a rent booking for that month" });
+    }
+    booking.rent_month = rentMonth;
+    booking.booking_date = bookingDate;
+    booking.monthly_rent = monthlyRent;
+    booking.remarks = String(req.body?.remarks || "").trim();
+    const paidAmount = Number(booking.paid_amount || 0);
+    booking.balance_amount = Math.max(monthlyRent - paidAmount, 0);
+    booking.status = booking.balance_amount <= 0 ? "paid" : paidAmount > 0 ? "partial" : "unpaid";
+    await booking.save();
+    return res.json({ success: true, id: String(booking._id), monthly_rent: monthlyRent, balance_amount: booking.balance_amount });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: error.message || "Failed to update warehouse rent booking" });
+  }
+});
+
 router.post("/bulk", async (req, res) => {
   try {
     if (!canManage(req)) return res.status(403).json({ error: "Permission denied" });
