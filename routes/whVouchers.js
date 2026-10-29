@@ -8216,6 +8216,15 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   doc.end();
 }
 
+function getProfitLossSaleTotalLess(row = {}) {
+  const shortageAmount = Number(row.shortage_amount || (Number(row.shortage_quantity || 0) * Number(row.rate || 0)) || 0);
+  const claimAmount = Number(row.claim_amount ?? row.bags_claim ?? 0) || 0;
+  const otherDeduction = Number(row.other_deduction || 0) || 0;
+  const cdAmount = Number(row.cd_amount || 0) || 0;
+  const adjustment = Number(row.adjustment_amount || 0) || 0;
+  return shortageAmount + claimAmount + otherDeduction + cdAmount + adjustment;
+}
+
 router.get("/report/profit-loss", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.report.profitLoss")) {
     return res.status(403).json({ error: "Permission denied" });
@@ -8283,15 +8292,14 @@ router.get("/report/profit-loss", async (req, res) => {
         const qty = Number(row.quantity || row.total_quantity || row.unloading_qty || 0);
         const gross = Number(row.amount || row.total_amount || 0);
         const saleAmount = Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || gross || 0);
-        const reportedLess = Number(row.total_deduction || 0);
-        const impliedLess = gross + Number(row.additional_amount || 0) - Number(row.round_off || 0) - saleAmount;
+        const reportedLess = getProfitLossSaleTotalLess(row);
         const purchaseLinks = Array.isArray(row.against_purchase_links) ? row.against_purchase_links : [];
         const purchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, link) => sum + Number(link?.amount || 0), 0) || 0);
         item.sale_qty += qty;
         item.sale_amount += saleAmount;
         item.gross_amount += gross;
         item.additional_amount += Number(row.additional_amount || 0);
-        item.total_less += Math.max(reportedLess, impliedLess, 0);
+        item.total_less += Math.max(reportedLess, 0);
         item.freight_amount += Number(freightBySale.get(String(row._id || row.id || "")) || 0);
         if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
         const unreportedLinkedPurchases = purchaseLinks.filter((link) =>
@@ -8536,7 +8544,7 @@ router.get("/report/profit-loss", async (req, res) => {
       const purchaseAmount = Number(row.direct_purchase_amount || linkedPurchaseAmount || (Number(row.direct_purchase_rate || 0) * purchaseQty) || 0);
       const purchaseRate = purchaseQty > 0 ? purchaseAmount / purchaseQty : Number(row.direct_purchase_rate || 0);
       const saleQty = Number(row.quantity || row.total_quantity || row.unloading_qty || 0);
-      const totalLess = Number(row.total_deduction || (grossAmount + Number(row.additional_amount || 0) - Number(row.round_off || 0) - netPayable) || 0);
+      const totalLess = getProfitLossSaleTotalLess(row);
       return {
         ...row,
         date: row.date || "",
