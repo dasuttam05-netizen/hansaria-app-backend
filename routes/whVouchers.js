@@ -1214,107 +1214,6 @@ async function getTransportBiltiMatch({ saleId, voucherNo = "", lorryNo = "" }) 
   return null;
 }
 
-async function getTransportBiltiNetAmounts(sales) {
-  const rows = Array.isArray(sales) ? sales : [];
-  if (!rows.length) return new Map();
-
-  const normalize = (value) => String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
-  const bySaleId = new Map();
-  const byVoucherNo = new Map();
-  const byLorryNo = new Map();
-  const byVoucherAndLorry = new Map();
-  const setFirst = (map, key, row) => {
-    if (key && !map.has(key)) map.set(key, row);
-  };
-  const indexRows = (documents) => (documents || []).forEach((document) => {
-    const row = document?.data && typeof document.data === "object" ? document.data : document;
-    const saleId = normalize(row.sale_id);
-    const voucherNo = normalize(row.voucher_no || row.bill_no);
-    const billNo = normalize(row.bill_no);
-    const lorryNo = normalize(row.lorry_no);
-    setFirst(bySaleId, saleId, row);
-    setFirst(byVoucherNo, voucherNo, row);
-    setFirst(byVoucherNo, billNo, row);
-    setFirst(byLorryNo, lorryNo, row);
-    setFirst(byVoucherAndLorry, `${voucherNo}::${lorryNo}`, row);
-    setFirst(byVoucherAndLorry, `${billNo}::${lorryNo}`, row);
-  });
-  const matchForSale = (sale) => {
-    const saleId = normalize(sale?._id || sale?.id);
-    const voucherNo = normalize(sale?.voucher_no || sale?.bill_no);
-    const lorryNo = normalize(sale?.lorry_no);
-    return (voucherNo && lorryNo && byVoucherAndLorry.get(`${voucherNo}::${lorryNo}`))
-      || bySaleId.get(saleId)
-      || byVoucherNo.get(voucherNo)
-      || byLorryNo.get(lorryNo)
-      || null;
-  };
-  const filtersForSales = (saleRows) => {
-    const ids = [...new Set(saleRows.map((row) => String(row?._id || row?.id || "").trim()).filter(Boolean))];
-    const voucherNos = [...new Set(saleRows.map((row) => String(row?.voucher_no || row?.bill_no || "").trim()).filter(Boolean))];
-    const lorryNos = [...new Set(saleRows.map((row) => String(row?.lorry_no || "").trim()).filter(Boolean))];
-    const clauses = [];
-    if (ids.length) clauses.push({ sale_id: { $in: ids.flatMap((id) => /^\d+$/.test(id) ? [id, Number(id)] : [id]) } });
-    if (voucherNos.length) clauses.push({ voucher_no: { $in: voucherNos } }, { bill_no: { $in: voucherNos } });
-    if (lorryNos.length) clauses.push({ lorry_no: { $in: lorryNos } });
-    return clauses;
-  };
-  const netAmountFrom = (row) => {
-    const netAmount = Number(row?.net_amount);
-    return Number.isFinite(netAmount) ? netAmount : 0;
-  };
-
-  const operationalClauses = filtersForSales(rows);
-  if (TransportBiltiOperational && operationalClauses.length) {
-    try {
-      const documents = await TransportBiltiOperational.find({ $or: operationalClauses })
-        .sort({ updated_at: -1, _id: -1 })
-        .lean();
-      indexRows(documents);
-    } catch (error) {
-      console.warn("Bulk operational transport lookup skipped:", error.message);
-    }
-  }
-
-  const unmatched = rows.filter((sale) => !matchForSale(sale));
-  const fallbackClauses = filtersForSales(unmatched);
-  if (fallbackClauses.length && mongoose.connection?.db) {
-    for (const collectionName of ["transport_bilti", "transport_biltis"]) {
-      try {
-        const exists = await mongoose.connection.db.listCollections({ name: collectionName }).hasNext();
-        if (!exists) continue;
-        const documents = await mongoose.connection.db.collection(collectionName)
-          .find({ $or: fallbackClauses })
-          .sort({ updated_at: -1, _id: -1 })
-          .toArray();
-        indexRows(documents);
-      } catch (error) {
-        console.warn(`Bulk transport collection lookup skipped (${collectionName}):`, error.message);
-      }
-    }
-
-    if (MirrorRow) {
-      try {
-        const mirrorClauses = fallbackClauses.flatMap((clause) => Object.entries(clause).map(([field, value]) => ({ [`data.${field}`]: value })));
-        const documents = await MirrorRow.find({ table: "transport_bilti", $or: mirrorClauses })
-          .sort({ updated_at: -1, row_id: -1 })
-          .lean();
-        indexRows(documents);
-      } catch (error) {
-        console.warn("Bulk transport mirror lookup skipped:", error.message);
-      }
-    }
-  }
-
-  const amounts = new Map();
-  rows.forEach((sale) => {
-    const saleId = String(sale?._id || sale?.id || "");
-    const match = matchForSale(sale);
-    amounts.set(saleId, netAmountFrom(match));
-  });
-  return amounts;
-}
-
 function createVoucherNoPromise(type, voucherNo = "") {
   return new Promise((resolve, reject) => {
     createVoucherNoIfMissing(type, voucherNo, (err, generatedVoucherNo) => {
@@ -7944,7 +7843,6 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const totalGrossAmount = rows.reduce((sum, row) => sum + Number(row.gross_amount || row.sale_amount || 0), 0);
   const totalAdd = rows.reduce((sum, row) => sum + Number(row.additional_amount || 0), 0);
   const totalLess = rows.reduce((sum, row) => sum + Number(row.total_less || 0), 0);
-  const totalFreight = rows.reduce((sum, row) => sum + Number(row.freight_amount || 0), 0);
   const totalStaffExpense = rows.reduce((sum, row) => sum + Number(row.staff_expense || 0), 0);
   const totalRent = rows.reduce((sum, row) => sum + Number(row.rent_amount || 0), 0);
   const totalManualIncome = rows.reduce((sum, row) => sum + Number(row.manual_income || 0), 0);
@@ -7995,7 +7893,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     ["P/L", 52],
   ];
   const warehouseCols = [
-    ["Warehouse", 150], ["P.Amount", 72], ["S.Amount", 72], ["Add", 48], ["Less", 52], ["Freight", 52],
+    ["Warehouse", 170], ["P.Amount", 75], ["S.Amount", 75], ["Add", 55], ["Less", 55],
     ["Staff Exp", 65], ["Rent", 55], ["Manual Add", 60], ["Manual Less", 60], ["P/L", 70],
   ];
   const cols = isWarehouse ? warehouseCols : directCols;
@@ -8043,7 +7941,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     let x = left;
     values.forEach((value, index) => {
       const width = widths[index][1];
-      const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 10);
+      const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 9);
       const numericValue = Number(value);
 
       if (isProfitColumn && Number.isFinite(numericValue)) {
@@ -8085,7 +7983,6 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           fmt(row.gross_amount || row.sale_amount),
           fmt(row.additional_amount),
           fmt(row.total_less),
-          fmt(row.freight_amount),
           fmt(row.staff_expense),
           fmt(row.rent_amount),
           fmt(row.manual_income),
@@ -8124,7 +8021,6 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           ["Total S.Amount", fmt(totalGrossAmount)],
           ["Total Add", fmt(totalAdd)],
           ["Total Less", fmt(totalLess)],
-          ["Total Freight", fmt(totalFreight)],
           ["Total Staff Expense", fmt(totalStaffExpense)],
           ["Total Warehouse Rent", fmt(totalRent)],
           ["Total Manual Add", fmt(totalManualIncome)],
@@ -8219,8 +8115,6 @@ router.get("/report/profit-loss", async (req, res) => {
         getPurchaseReportRowsForUser(req.user, { fromDate, toDate }),
         getSaleReportRowsForUser(req.user, { fromDate, toDate }),
       ]);
-      const freightBySale = await getTransportBiltiNetAmounts(sales);
-      const purchaseIdsInReport = new Set(purchases.map((row) => String(row._id || row.id || "")));
       const rows = new Map();
       const ensure = (row) => {
         const key = String(row.warehouse_id || "");
@@ -8240,7 +8134,6 @@ router.get("/report/profit-loss", async (req, res) => {
             gross_amount: 0,
             additional_amount: 0,
             total_less: 0,
-            freight_amount: 0,
             profit_loss: 0,
           });
         }
@@ -8262,26 +8155,15 @@ router.get("/report/profit-loss", async (req, res) => {
         item.sale_count += 1;
         const qty = Number(row.quantity || row.total_quantity || row.unloading_qty || 0);
         const gross = Number(row.amount || row.total_amount || 0);
-        const saleAmount = Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || gross || 0);
-        const reportedLess = Number(row.total_deduction || 0);
-        const impliedLess = gross + Number(row.additional_amount || 0) - Number(row.round_off || 0) - saleAmount;
         const purchaseLinks = Array.isArray(row.against_purchase_links) ? row.against_purchase_links : [];
         const purchaseAmount = Number(row.direct_purchase_amount || purchaseLinks.reduce((sum, link) => sum + Number(link?.amount || 0), 0) || 0);
         item.sale_qty += qty;
-        item.sale_amount += saleAmount;
+        item.sale_amount += Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || gross || 0);
         item.gross_amount += gross;
         item.additional_amount += Number(row.additional_amount || 0);
-        item.total_less += Math.max(reportedLess, impliedLess, 0);
-        item.freight_amount += Number(freightBySale.get(String(row._id || row.id || "")) || 0);
+        item.total_less += Number(row.total_deduction || 0);
         if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
-        const unreportedLinkedPurchases = purchaseLinks.filter((link) =>
-          !purchaseIdsInReport.has(String(link?.purchase_id || link?.id || link?._id || ""))
-        );
-        if (purchaseLinks.length) {
-          item.purchase_amount += unreportedLinkedPurchases.reduce((sum, link) => sum + Number(link?.amount || 0), 0);
-        } else {
-          item.purchase_amount += purchaseAmount;
-        }
+        item.purchase_amount += purchaseAmount;
       });
 
       const getWarehouseSummaryRow = (warehouseId) => {
@@ -8329,12 +8211,11 @@ router.get("/report/profit-loss", async (req, res) => {
         gross_amount: Number(row.gross_amount.toFixed(2)),
         additional_amount: Number(row.additional_amount.toFixed(2)),
         total_less: Number(row.total_less.toFixed(2)),
-        freight_amount: Number(row.freight_amount.toFixed(2)),
         staff_expense: Number(Number(row.staff_expense || 0).toFixed(2)),
         rent_amount: Number(Number(row.rent_amount || 0).toFixed(2)),
         manual_income: Number(Number(row.manual_income || 0).toFixed(2)),
         manual_expense: Number(Number(row.manual_expense || 0).toFixed(2)),
-        profit_loss: Number((row.sale_amount - row.purchase_amount - row.freight_amount - Number(row.staff_expense || 0) - Number(row.rent_amount || 0) - Number(row.manual_expense || 0) + Number(row.manual_income || 0)).toFixed(2)),
+        profit_loss: Number((row.sale_amount - row.purchase_amount - Number(row.staff_expense || 0) - Number(row.rent_amount || 0) - Number(row.manual_expense || 0) + Number(row.manual_income || 0)).toFixed(2)),
       }));
       if (String(req.query.export || "").toLowerCase() === "xlsx") {
         const exportRows = output.map((row) => ({
@@ -8349,7 +8230,6 @@ router.get("/report/profit-loss", async (req, res) => {
           "Gross Amount": row.gross_amount,
           "Total Add": row.additional_amount,
           "Total Less": row.total_less,
-          Freight: row.freight_amount,
           "Staff Expense": row.staff_expense,
           "Warehouse Rent": row.rent_amount,
           "Manual Add": row.manual_income,
@@ -8366,7 +8246,6 @@ router.get("/report/profit-loss", async (req, res) => {
           "Gross Amount": Number(output.reduce((s, r) => s + Number(r.gross_amount || 0), 0).toFixed(2)),
           "Total Add": Number(output.reduce((s, r) => s + Number(r.additional_amount || 0), 0).toFixed(2)),
           "Total Less": Number(output.reduce((s, r) => s + Number(r.total_less || 0), 0).toFixed(2)),
-          Freight: Number(output.reduce((s, r) => s + Number(r.freight_amount || 0), 0).toFixed(2)),
           "Staff Expense": Number(output.reduce((s, r) => s + Number(r.staff_expense || 0), 0).toFixed(2)),
           "Warehouse Rent": Number(output.reduce((s, r) => s + Number(r.rent_amount || 0), 0).toFixed(2)),
           "Manual Add": Number(output.reduce((s, r) => s + Number(r.manual_income || 0), 0).toFixed(2)),
@@ -8629,16 +8508,7 @@ router.get("/report/profit-loss-details", async (req, res) => {
     const rows = type === "sale"
       ? await getSaleReportRowsForUser(req.user, options)
       : await getPurchaseReportRowsForUser(req.user, options);
-    const outputRows = type === "sale"
-      ? (rows || []).map((row) => ({ ...row, transport_charge: 0 }))
-      : (rows || []);
-    if (type === "sale") {
-      const freightBySale = await getTransportBiltiNetAmounts(rows);
-      outputRows.forEach((row) => {
-        row.transport_charge = Number(freightBySale.get(String(row._id || row.id || "")) || 0);
-      });
-    }
-    return res.json({ rows: outputRows, total: outputRows.length });
+    return res.json({ rows: rows || [], total: (rows || []).length });
   } catch (error) {
     console.error("Warehouse trading profit/loss drill-down failed:", error);
     return res.status(500).json({ error: error.message || "Failed to load voucher details" });
