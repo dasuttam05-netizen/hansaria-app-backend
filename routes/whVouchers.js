@@ -4793,6 +4793,41 @@ router.put("/sale/:id", async (req, res) => {
             return res.status(400).json({ error: `Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}` });
           }
         }
+        if (payload.sale_type === "direct" && Array.isArray(payload.against_purchase_links)) {
+          const directQty = Number(payload.unloading_qty || payload.quantity || 0);
+          const directRate = Number(payload.direct_purchase_rate || 0);
+          const directAmount = Number((directQty * directRate).toFixed(2));
+          const syncedLinks = [];
+          for (const link of payload.against_purchase_links) {
+            const purchaseId = String(link?.purchase_id || link?.id || "").trim();
+            if (!mongoose.Types.ObjectId.isValid(purchaseId)) {
+              syncedLinks.push(link);
+              continue;
+            }
+            const purchase = await PurchaseVoucher.findById(purchaseId).select("is_direct_loading description");
+            const isAutoDirectPurchase = Boolean(purchase?.is_direct_loading)
+              || /^Auto direct sale purchase against\b/i.test(String(purchase?.description || ""));
+            if (!isAutoDirectPurchase) {
+              syncedLinks.push(link);
+              continue;
+            }
+            const rate = directRate > 0 ? directRate : Number(link.rate || 0);
+            const amount = Number((directQty * rate).toFixed(2));
+            await PurchaseVoucher.updateOne({ _id: purchase._id }, { $set: {
+              quantity: directQty,
+              total_qty: directQty,
+              net_weight: directQty,
+              rate,
+              amount,
+              total_amount: amount,
+              net_amount: amount,
+              net_amount_payable: amount,
+            } });
+            syncedLinks.push({ ...link, quantity: directQty, weight: directQty, purchase_total_qty: directQty, rate, amount });
+          }
+          payload.against_purchase_links = syncedLinks;
+          if (directRate > 0) payload.direct_purchase_amount = directAmount;
+        }
         const doc = await SaleVoucher.findByIdAndUpdate(id, payload, { new: true });
         if (!doc) return res.status(404).json({ error: "Sale voucher not found" });
         return res.json({ id: String(doc._id), updated: 1, voucher_no: doc.voucher_no, saved_to: "mongodb" });
