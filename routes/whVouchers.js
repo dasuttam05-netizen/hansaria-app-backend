@@ -8658,7 +8658,11 @@ router.get("/report/profit-loss-details", async (req, res) => {
       ? await getSaleReportRowsForUser(req.user, options)
       : await getPurchaseReportRowsForUser(req.user, options);
     const outputRows = type === "sale"
-      ? (rows || []).map((row) => ({ ...row, transport_charge: 0 }))
+      ? (rows || []).map((row) => ({
+          ...row,
+          total_less: Number(getProfitLossSaleTotalLess(row).toFixed(2)),
+          transport_charge: 0,
+        }))
       : (rows || []);
     if (type === "sale") {
       const freightBySale = await getTransportBiltiNetAmounts(rows);
