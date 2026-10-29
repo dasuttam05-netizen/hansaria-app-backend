@@ -1358,7 +1358,9 @@ async function getTransportBiltiNetAmounts(sales) {
     if (key && !map.has(key)) map.set(key, row);
   };
   const indexRows = (documents) => (documents || []).forEach((document) => {
-    const row = document?.data && typeof document.data === "object" ? document.data : document;
+    const row = document?.data && typeof document.data === "object"
+      ? { ...document.data, _transport_doc_id: String(document._id || document.id || "") }
+      : document;
     const saleId = normalize(row.sale_id);
     const voucherNo = normalize(row.voucher_no || row.bill_no);
     const billNo = normalize(row.bill_no);
@@ -1370,16 +1372,18 @@ async function getTransportBiltiNetAmounts(sales) {
     setFirst(byVoucherAndLorry, `${voucherNo}::${lorryNo}`, row);
     setFirst(byVoucherAndLorry, `${billNo}::${lorryNo}`, row);
   });
-  const matchForSale = (sale) => {
+  const exactMatchForSale = (sale) => {
     const saleId = normalize(sale?._id || sale?.id);
     const voucherNo = normalize(sale?.voucher_no || sale?.bill_no);
     const lorryNo = normalize(sale?.lorry_no);
     return (voucherNo && lorryNo && byVoucherAndLorry.get(`${voucherNo}::${lorryNo}`))
       || bySaleId.get(saleId)
       || byVoucherNo.get(voucherNo)
-      || (!sale?.warehouse_loading_id ? byLorryNo.get(lorryNo) : null)
       || null;
   };
+  const matchForSale = (sale) => exactMatchForSale(sale)
+    || (!sale?.warehouse_loading_id ? byLorryNo.get(normalize(sale?.lorry_no)) : null)
+    || null;
   const filtersForSales = (saleRows) => {
     const ids = [...new Set(saleRows.map((row) => String(row?._id || row?.id || "").trim()).filter(Boolean))];
     const voucherNos = [...new Set(saleRows.map((row) => String(row?.voucher_no || row?.bill_no || "").trim()).filter(Boolean))];
@@ -1438,10 +1442,36 @@ async function getTransportBiltiNetAmounts(sales) {
   }
 
   const amounts = new Map();
+  const usedTransportBills = new Set();
+  const exactMatches = new Map();
   rows.forEach((sale) => {
     const saleId = String(sale?._id || sale?.id || "");
-    const match = matchForSale(sale);
-    amounts.set(saleId, netAmountFrom(match));
+    const exactMatch = exactMatchForSale(sale);
+    if (!exactMatch) return;
+    const transportBillId = String(exactMatch?._transport_doc_id || exactMatch?._id || exactMatch?.id || "");
+    if (transportBillId && usedTransportBills.has(transportBillId)) {
+      exactMatches.set(saleId, null);
+      return;
+    }
+    exactMatches.set(saleId, exactMatch);
+    if (transportBillId) usedTransportBills.add(transportBillId);
+  });
+  rows.forEach((sale) => {
+    const saleId = String(sale?._id || sale?.id || "");
+    const hasExactMatch = exactMatches.has(saleId);
+    const match = hasExactMatch ? exactMatches.get(saleId) : matchForSale(sale);
+    const amount = netAmountFrom(match);
+    const transportBillId = String(match?._transport_doc_id || match?._id || match?.id || "");
+    if (amount > 0 && transportBillId && !hasExactMatch && usedTransportBills.has(transportBillId)) {
+      amounts.set(saleId, 0);
+      return;
+    }
+    if (amount > 0 && transportBillId && !hasExactMatch) usedTransportBills.add(transportBillId);
+    amounts.set(saleId, {
+      amount,
+      transport_id: transportBillId,
+      bilti_no: String(match?.bilti_no || match?.voucher_no || match?.bill_no || ""),
+    });
   });
   return amounts;
 }
@@ -8147,6 +8177,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const totalPurchaseAmount = rows.reduce((sum, row) => sum + Number(row.purchase_amount || 0), 0);
   const totalGrossAmount = rows.reduce((sum, row) => sum + Number(row.gross_amount || row.sale_amount || 0), 0);
   const totalAdd = rows.reduce((sum, row) => sum + Number(row.additional_amount || 0), 0);
+  const totalRoundOff = rows.reduce((sum, row) => sum + Number(row.round_off || 0), 0);
   const totalLess = rows.reduce((sum, row) => sum + Number(row.total_less || 0), 0);
   const totalFreight = rows.reduce((sum, row) => sum + Number(row.freight_amount || 0), 0);
   const totalStaffExpense = rows.reduce((sum, row) => sum + Number(row.staff_expense || 0), 0);
@@ -8199,7 +8230,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     ["P/L", 52],
   ];
   const warehouseCols = [
-    ["Warehouse", 150], ["P.Amount", 72], ["S.Amount", 72], ["Add", 48], ["Less", 52], ["Freight", 52],
+    ["Warehouse", 140], ["P.Amount", 68], ["S.Amount", 68], ["Add", 44], ["Round Off", 50], ["Less", 50], ["Freight", 50],
     ["Staff Exp", 65], ["Rent", 55], ["Manual Add", 60], ["Manual Less", 60], ["P/L", 70],
   ];
   const cols = isWarehouse ? warehouseCols : directCols;
@@ -8288,6 +8319,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           fmt(row.purchase_amount),
           fmt(row.gross_amount || row.sale_amount),
           fmt(row.additional_amount),
+          fmt(row.round_off),
           fmt(row.total_less),
           fmt(row.freight_amount),
           fmt(row.staff_expense),
@@ -8327,6 +8359,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           ["Total Purchase Amount", fmt(totalPurchaseAmount)],
           ["Total S.Amount", fmt(totalGrossAmount)],
           ["Total Add", fmt(totalAdd)],
+          ["Total Round Off", fmt(totalRoundOff)],
           ["Total Less", fmt(totalLess)],
           ["Total Freight", fmt(totalFreight)],
           ["Total Staff Expense", fmt(totalStaffExpense)],
@@ -8452,6 +8485,7 @@ router.get("/report/profit-loss", async (req, res) => {
             sale_rate: 0,
             gross_amount: 0,
             additional_amount: 0,
+            round_off: 0,
             total_less: 0,
             freight_amount: 0,
             profit_loss: 0,
@@ -8484,8 +8518,9 @@ router.get("/report/profit-loss", async (req, res) => {
         item.sale_amount += gross;
         item.gross_amount += gross;
         item.additional_amount += Number(row.additional_amount || 0);
+        item.round_off += Number(row.round_off || 0);
         item.total_less += Math.max(reportedLess, 0);
-        item.freight_amount += Number(freightBySale.get(String(row._id || row.id || "")) || 0);
+        item.freight_amount += Number(freightBySale.get(String(row._id || row.id || ""))?.amount || 0);
         if (qty > 0) item.sale_rate = ((item.sale_rate * Math.max(item.sale_qty - qty, 0)) + gross) / item.sale_qty;
         const unreportedLinkedPurchases = purchaseLinks.filter((link) =>
           !purchaseIdsInReport.has(String(link?.purchase_id || link?.id || link?._id || ""))
@@ -8541,13 +8576,14 @@ router.get("/report/profit-loss", async (req, res) => {
         sale_amount: Number(row.sale_amount.toFixed(2)),
         gross_amount: Number(row.gross_amount.toFixed(2)),
         additional_amount: Number(row.additional_amount.toFixed(2)),
+        round_off: Number(row.round_off.toFixed(2)),
         total_less: Number(row.total_less.toFixed(2)),
         freight_amount: Number(row.freight_amount.toFixed(2)),
         staff_expense: Number(Number(row.staff_expense || 0).toFixed(2)),
         rent_amount: Number(Number(row.rent_amount || 0).toFixed(2)),
         manual_income: Number(Number(row.manual_income || 0).toFixed(2)),
         manual_expense: Number(Number(row.manual_expense || 0).toFixed(2)),
-        profit_loss: Number((row.sale_amount + row.additional_amount - row.total_less - row.purchase_amount - row.freight_amount - Number(row.staff_expense || 0) - Number(row.rent_amount || 0) - Number(row.manual_expense || 0) + Number(row.manual_income || 0)).toFixed(2)),
+        profit_loss: Number((row.sale_amount + row.additional_amount + row.round_off - row.total_less - row.purchase_amount - row.freight_amount - Number(row.staff_expense || 0) - Number(row.rent_amount || 0) - Number(row.manual_expense || 0) + Number(row.manual_income || 0)).toFixed(2)),
       }));
       if (String(req.query.export || "").toLowerCase() === "xlsx") {
         const exportRows = output.map((row) => ({
@@ -8561,6 +8597,7 @@ router.get("/report/profit-loss", async (req, res) => {
           "Sale Rate": row.sale_rate,
           "Gross Amount": row.gross_amount,
           "Total Add": row.additional_amount,
+          "Round Off": row.round_off,
           "Total Less": row.total_less,
           Freight: row.freight_amount,
           "Staff Expense": row.staff_expense,
@@ -8578,6 +8615,7 @@ router.get("/report/profit-loss", async (req, res) => {
           "Sale Qty": Number(output.reduce((s, r) => s + Number(r.sale_qty || 0), 0).toFixed(4)),
           "Gross Amount": Number(output.reduce((s, r) => s + Number(r.gross_amount || 0), 0).toFixed(2)),
           "Total Add": Number(output.reduce((s, r) => s + Number(r.additional_amount || 0), 0).toFixed(2)),
+          "Round Off": Number(output.reduce((s, r) => s + Number(r.round_off || 0), 0).toFixed(2)),
           "Total Less": Number(output.reduce((s, r) => s + Number(r.total_less || 0), 0).toFixed(2)),
           Freight: Number(output.reduce((s, r) => s + Number(r.freight_amount || 0), 0).toFixed(2)),
           "Staff Expense": Number(output.reduce((s, r) => s + Number(r.staff_expense || 0), 0).toFixed(2)),
@@ -8852,8 +8890,47 @@ router.get("/report/profit-loss-details", async (req, res) => {
     if (type === "sale") {
       const freightBySale = await getTransportBiltiNetAmounts(rows);
       outputRows.forEach((row) => {
-        row.transport_charge = Number(freightBySale.get(String(row._id || row.id || "")) || 0);
+        const matchedFreight = freightBySale.get(String(row._id || row.id || "")) || {};
+        row.transport_charge = Number(matchedFreight.amount || 0);
+        row.transport_bilti_id = String(matchedFreight.transport_id || "");
+        row.transport_bilti_no = String(matchedFreight.bilti_no || "");
       });
+    }
+    if (String(req.query.export || "").trim().toLowerCase() === "xlsx") {
+      const exportRows = outputRows.map((row) => type === "sale" ? ({
+        Date: row.date || "",
+        "Sale Bill": row.voucher_no || row.bill_no || "",
+        Buyer: row.buyer_name || row.company_name || "",
+        Product: row.product_name || "",
+        Quantity: Number(row.quantity || row.total_quantity || 0),
+        "Sale Amount": Number(row.amount || row.total_amount || 0),
+        "Total Add": Number(row.additional_amount || 0),
+        "Round Off": Number(row.round_off || 0),
+        "Total Less": Number(row.total_less || 0),
+        Freight: Number(row.transport_charge || 0),
+      }) : ({
+        Date: row.date || "",
+        "Purchase Bill": row.voucher_no || row.bill_no || "",
+        Farmer: row.farmer_name || "",
+        Product: row.product_name || "",
+        Quantity: Number(row.total_qty || row.net_weight || row.quantity || 0),
+        "Purchase Amount": Number(row.total_amount || row.net_amount_payable || row.amount || 0),
+      }));
+      const totalRow = { [type === "sale" ? "Sale Bill" : "Purchase Bill"]: "TOTAL" };
+      if (type === "sale") {
+        for (const key of ["Sale Amount", "Total Add", "Round Off", "Total Less", "Freight"]) {
+          totalRow[key] = Number(exportRows.reduce((sum, row) => sum + Number(row[key] || 0), 0).toFixed(2));
+        }
+      } else {
+        totalRow["Purchase Amount"] = Number(outputRows.reduce((sum, row) => sum + Number(row.total_amount || row.net_amount_payable || row.amount || 0), 0).toFixed(2));
+      }
+      exportRows.push(totalRow);
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportRows), type === "sale" ? "Sale Details" : "Purchase Details");
+      const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="profit_loss_${type}_details.xlsx"`);
+      return res.end(buffer);
     }
     return res.json({ rows: outputRows, total: outputRows.length });
   } catch (error) {
