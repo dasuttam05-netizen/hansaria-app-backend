@@ -7468,8 +7468,23 @@ router.get("/report/payment", (req, res) => {
     });
   }
 
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
   getMongoPaymentRowsForUser(req)
-    .then((rows) => res.json(rows))
+    .then((rows) => {
+      const allRows = Array.isArray(rows) ? rows : [];
+      const total = allRows.length;
+      res.json({
+        data: allRows.slice((page - 1) * pageSize, page * pageSize),
+        pagination: {
+          page,
+          pageSize,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / pageSize)),
+          hasMore: page * pageSize < total,
+        },
+      });
+    })
     .catch((err) => {
       console.error("Mongo payment report error:", err.message);
       res.status(500).json({ error: err.message });
@@ -9247,6 +9262,10 @@ router.get("/report/sale-journey", async (req, res) => {
     const lorryNo = String(req.query.lorry_no || "").trim().toLowerCase();
     const billNo = String(req.query.bill_no || req.query.voucher_no || "").trim().toLowerCase();
 
+    if (!journeyToken && !lorryNo && !billNo) {
+      return res.json([]);
+    }
+
     let rows = await getSaleReportRowsForUser(req.user);
     rows = rows.filter((row) => {
       const rowJourney = String(row.journey_token || row.journey_id || row.journey_group_no || "").trim();
@@ -9258,24 +9277,27 @@ router.get("/report/sale-journey", async (req, res) => {
       return false;
     });
 
-    rows = rows
-      .sort((a, b) => {
+    rows = rows.sort((a, b) => {
         const dateSort = String(a.date || "").localeCompare(String(b.date || ""));
         if (dateSort) return dateSort;
         return Number(a.id || 0) - Number(b.id || 0);
-      })
-      .map((row, index, arr) => {
-        const dispatchQty = Number(row.dispatch_qty || row.quantity || row.total_quantity || row.unloading_qty || 0);
-        const unloadQty = Number(row.unloading_qty || 0);
-        const remainAfter = Math.max(dispatchQty - unloadQty, 0);
-        return {
-          ...row,
-          journey_leg: index + 1,
-          journey_running_total: arr.slice(0, index + 1).reduce((sum, item) => sum + Number(item.dispatch_qty || item.quantity || item.total_quantity || item.unloading_qty || 0), 0),
-          journey_running_unloaded: arr.slice(0, index + 1).reduce((sum, item) => sum + Number(item.unloading_qty || 0), 0),
-          journey_remain_after_leg: remainAfter,
-        };
       });
+
+    let runningTotal = 0;
+    let runningUnloaded = 0;
+    rows = rows.map((row, index) => {
+      const dispatchQty = Number(row.dispatch_qty || row.quantity || row.total_quantity || row.unloading_qty || 0);
+      const unloadQty = Number(row.unloading_qty || 0);
+      runningTotal += dispatchQty;
+      runningUnloaded += unloadQty;
+      return {
+        ...row,
+        journey_leg: index + 1,
+        journey_running_total: runningTotal,
+        journey_running_unloaded: runningUnloaded,
+        journey_remain_after_leg: Math.max(dispatchQty - unloadQty, 0),
+      };
+    });
 
     res.json(rows);
   } catch (err) {
@@ -9344,7 +9366,20 @@ router.get("/report/fifo-stock", async (req, res) => {
       getPurchaseReportRowsForUser(req.user),
       getSaleReportRowsForUser(req.user),
     ]);
-    res.json(buildFifoStock(purchases, sales));
+    const rows = buildFifoStock(purchases, sales);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.page_size, 10) || 15, 1), 100);
+    const total = rows.length;
+    res.json({
+      data: rows.slice((page - 1) * pageSize, page * pageSize),
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / pageSize)),
+        hasMore: page * pageSize < total,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
