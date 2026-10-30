@@ -3125,6 +3125,33 @@ router.post(
           expense.total_expense_amount
         );
 
+      const mainCashDoc = {
+        id: await nextCashEntryId(),
+        voucher_no: expense.voucher_no ? `${expense.voucher_no}-CASH` : null,
+        journal_group_no: null,
+        entry_date: expense.expense_date ? new Date(expense.expense_date) : now,
+        entry_type: "expense",
+        warehouse_id: expense.warehouse_id ?? null,
+        company_id: null,
+        company_account_id: null,
+        description: baseDescription || "Expense",
+        amount: totalAmount,
+        payment_method: "Cash",
+        reference_no: expense.voucher_no || null,
+        narration: expense.narration || null,
+        created_by: req.user?.id ?? null,
+        employee_id: null,
+        fund_source: "main_cash",
+        status: "pending",
+        source_expense_id: expenseId,
+        linked_entry_id: null,
+        created_at: now,
+        updated_at: now,
+      };
+
+      await collection("cashentries").insertOne(mainCashDoc);
+      createdCashEntries.push(mainCashDoc);
+
       if (
         expense.employee_id
       ) {
@@ -3361,9 +3388,13 @@ router.post(
           ),
 
         cash_entry_id:
+          mainCashDoc.id ||
           employeeCash?.id ||
           partyCash?.id ||
           null,
+
+        main_cash_entry_id:
+          mainCashDoc.id,
 
         employee_cash_entry_id:
           employeeCash?.id ||
@@ -3395,7 +3426,7 @@ router.post(
           false,
 
         message:
-          "Expense approved and moved to Employee/Party Cash Book pending list",
+          "Expense approved and moved to Cash Bank Book and linked employee/party pending ledgers",
       });
     } catch (err) {
       console.error(
