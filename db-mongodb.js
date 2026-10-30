@@ -1373,6 +1373,12 @@ const cashEntrySchema =
 
     source_expense_id: mongoose.Schema.Types.Mixed,
 
+    allocate_warehouse_pl: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
     linked_entry_id: mongoose.Schema.Types.Mixed,
 
     adjustments: [
