@@ -8552,8 +8552,40 @@ router.get("/report/profit-loss", async (req, res) => {
         mongoose.connection.db.collection("warehouse_trading_profit_loss_adjustments").find({}).toArray(),
         CashEntry.find({ $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }], entry_type: "expense", source_expense_id: { $in: [null, ""] }, status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] } }).lean(),
       ]);
+      const normalizeWarehouseName = (value) => String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const reportWarehouseKeys = [...rows.keys()].filter(Boolean);
+      const cashWarehouseIds = [...new Set((allocatedCashRows || []).map((entry) => String(entry.warehouse_id || "")).filter(Boolean))];
+      const expenseWarehouseIds = [...new Set((expenseRows || []).map((entry) => String(entry.warehouse_id || "")).filter(Boolean))];
+      const allWarehouseAliases = [...reportWarehouseKeys, ...cashWarehouseIds, ...expenseWarehouseIds];
+      const objectIdWarehouseIds = [...new Set(allWarehouseAliases.filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+      const numericWarehouseIds = [...new Set(allWarehouseAliases.filter((id) => /^\d+$/.test(id)).map(Number))];
+      const warehouseIdentityClauses = [];
+      if (objectIdWarehouseIds.length) warehouseIdentityClauses.push({ _id: { $in: objectIdWarehouseIds } });
+      if (numericWarehouseIds.length) {
+        warehouseIdentityClauses.push({ id: { $in: numericWarehouseIds } }, { legacy_id: { $in: numericWarehouseIds } });
+      }
+      const identityWarehouses = warehouseIdentityClauses.length
+        ? await Warehouse.find({ $or: warehouseIdentityClauses }).select("_id id legacy_id name location_id").lean()
+        : [];
+      const warehouseByAlias = new Map();
+      (identityWarehouses || []).forEach((warehouse) => {
+        [warehouse._id, warehouse.id, warehouse.legacy_id].filter((id) => id !== undefined && id !== null && String(id)).forEach((id) => warehouseByAlias.set(String(id), warehouse));
+      });
+      const rowKeyByWarehouseName = new Map();
+      (rows || new Map()).forEach((row, key) => {
+        const normalizedName = normalizeWarehouseName(row.warehouse_name);
+        if (normalizedName && !rowKeyByWarehouseName.has(normalizedName)) rowKeyByWarehouseName.set(normalizedName, String(key));
+      });
+      const getCashEntrySummaryRow = (entry) => {
+        const warehouseId = String(entry.warehouse_id || "");
+        const exactRow = getWarehouseSummaryRow(warehouseId);
+        if (exactRow) return exactRow;
+        const warehouse = warehouseByAlias.get(warehouseId);
+        const matchedRowKey = rowKeyByWarehouseName.get(normalizeWarehouseName(warehouse?.name));
+        return matchedRowKey ? rows.get(matchedRowKey) || null : null;
+      };
       (expenseRows || []).forEach((expense) => {
-        const row = getWarehouseSummaryRow(expense.warehouse_id);
+        const row = getWarehouseSummaryRow(expense.warehouse_id) || getCashEntrySummaryRow(expense);
         if (!row || !dateInRange(expense.expense_date || expense.date)) return;
         row.staff_expense = Number(row.staff_expense || 0) + Number(expense.total_expense_amount ?? expense.grand_total ?? expense.amount ?? 0);
       });
@@ -8562,8 +8594,7 @@ router.get("/report/profit-loss", async (req, res) => {
       // separate location/month quantity allocation below.
       (allocatedCashRows || []).forEach((entry) => {
         const entryDate = entry.entry_date instanceof Date ? entry.entry_date.toISOString().slice(0, 10) : String(entry.entry_date || "").slice(0, 10);
-        const warehouseId = String(entry.warehouse_id || "");
-        const row = getWarehouseSummaryRow(warehouseId);
+        const row = getCashEntrySummaryRow(entry);
         if (!row || !dateInRange(entryDate)) return;
         row.staff_expense = Number(row.staff_expense || 0) + Number(entry.amount || 0);
       });
