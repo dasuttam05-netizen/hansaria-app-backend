@@ -2160,6 +2160,7 @@ router.post(
       fund_source,
       source_expense_id,
       allocate_warehouse_pl,
+      warehouse_expense_mode,
       adjustments,
       auto_staff_entry,
     } = body;
@@ -2396,6 +2397,17 @@ router.post(
             ).toLowerCase()
           : "main_cash";
 
+      const requestedExpenseMode = String(warehouse_expense_mode || "").trim().toLowerCase();
+      const normalizedExpenseMode = effectiveType !== "expense"
+        ? "none"
+        : requestedExpenseMode === "fixed_warehouse"
+          ? "fixed_warehouse"
+          : requestedExpenseMode === "location_quantity" ||
+            [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl) ||
+            Boolean(normalizedEmployee && normalizedWarehouse)
+            ? "location_quantity"
+            : "none";
+
       const now =
         new Date();
 
@@ -2447,14 +2459,8 @@ router.post(
           normalizeMixedId(
             source_expense_id
           ),
-        // Employee salary/expense paid from Main Cash is a warehouse overhead
-        // by default when both employee and warehouse are selected. Other
-        // cash expenses still use the explicit allocation checkbox.
-        allocate_warehouse_pl:
-          effectiveType === "expense" && (
-            [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl) ||
-            Boolean(normalizedEmployee && normalizedWarehouse)
-          ),
+        allocate_warehouse_pl: normalizedExpenseMode !== "none",
+        warehouse_expense_mode: normalizedExpenseMode,
         linked_entry_id:
           null,
         adjustments:
@@ -2686,6 +2692,7 @@ router.put(
         status,
         fund_source,
         allocate_warehouse_pl,
+        warehouse_expense_mode,
         adjustments,
       } = body;
 
@@ -2737,6 +2744,18 @@ router.put(
           Employee,
           employee_id
         );
+
+      const requestedExpenseMode = String(warehouse_expense_mode || "").trim().toLowerCase();
+      const normalizedExpenseMode = String(entry_type || "").toLowerCase() !== "expense"
+        ? "none"
+        : requestedExpenseMode === "fixed_warehouse"
+          ? "fixed_warehouse"
+          : requestedExpenseMode === "location_quantity" ||
+            (requestedExpenseMode !== "none" && allocate_warehouse_pl === undefined && Boolean(old.allocate_warehouse_pl)) ||
+            [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl) ||
+            (allocate_warehouse_pl === undefined && Boolean(normalizedEmployee && normalizedWarehouse))
+            ? "location_quantity"
+            : "none";
 
       const allExisting =
         await CashEntry.find({})
@@ -2886,11 +2905,9 @@ router.put(
               status:
                 status || "pending",
               allocate_warehouse_pl:
-                String(entry_type || "").toLowerCase() === "expense" && (
-                  [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl) ||
-                  (allocate_warehouse_pl === undefined && Boolean(old.allocate_warehouse_pl)) ||
-                  Boolean(normalizedEmployee && normalizedWarehouse)
-                ),
+                normalizedExpenseMode !== "none",
+              warehouse_expense_mode:
+                normalizedExpenseMode,
               adjustments:
                 clean,
               updated_at:

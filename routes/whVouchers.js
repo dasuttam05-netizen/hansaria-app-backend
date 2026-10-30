@@ -8633,6 +8633,11 @@ router.get("/report/profit-loss", async (req, res) => {
         if (!dateInRange(entryDate)) return;
         const sourceExpenseId = String(entry.source_expense_id || "").trim();
         if (sourceExpenseId && countedExpenseRefs.has(sourceExpenseId)) return;
+        if (String(entry.warehouse_expense_mode || "").toLowerCase() === "fixed_warehouse") {
+          const fixedRow = getCashEntrySummaryRow(entry);
+          if (fixedRow) fixedRow.staff_expense = Number(fixedRow.staff_expense || 0) + Number(entry.amount || 0);
+          return;
+        }
         const sourceWarehouse = warehouseByAlias.get(String(entry.warehouse_id || ""));
         const locationKey = canonicalLocationKey(sourceWarehouse?.location_id);
         const bucket = locationKey ? directQtyByLocationMonth.get(`${locationKey}|${entryDate.slice(0, 7)}`) : null;
@@ -8971,6 +8976,7 @@ router.get("/report/profit-loss", async (req, res) => {
         CashEntry.find({
           $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }],
           entry_type: "expense",
+          warehouse_expense_mode: { $ne: "fixed_warehouse" },
           status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] },
           warehouse_id: { $in: scopeWarehouseIds },
           entry_date: { $gte: rangeStart, $lt: rangeEnd },
