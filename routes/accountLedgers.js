@@ -6,8 +6,8 @@ const { userHasPermission } = require("../middleware/auth");
 const defaults = [
   ["Direct Expenses", "expense", ["Loading Expense", "Transport Expense"]],
   ["Indirect Expenses", "expense", ["Salary", "Office Expense", "Other Expense", "Bank Charges"]],
-  ["Current Assets", "asset", ["Loan Given"]],
-  ["Current Liabilities", "liability", ["Loan Payable"]],
+  ["Current Assets", "asset", ["Cash", "Bank", "Loan Given"]],
+  ["Current Liabilities", "liability", ["Loan Payable", "Salary Payable"]],
   ["Indirect Income", "income", ["Other Income"]],
   ["Capital Account", "equity", []],
 ];
@@ -30,7 +30,7 @@ async function seedDefaults() {
 }
 
 function canRead(req, res) {
-  const allowed = ["cash.view", "cash.mainBook.view", "cash.mainBook.create", "cash.mainBook.edit", "all"]
+  const allowed = ["cash.view", "cash.create", "cash.edit", "cash.mainBook.view", "cash.mainBook.create", "cash.mainBook.edit", "all"]
     .some((permission) => userHasPermission(req.user, permission));
   if (!allowed) {
     res.status(403).json({ error: "You do not have permission to view accounting ledgers" });
@@ -96,7 +96,7 @@ router.get("/report/:ledgerId", async (req, res) => {
   try {
     const ledger = await AccountLedger.findById(req.params.ledgerId).populate("group_id", "name nature").lean();
     if (!ledger) return res.status(404).json({ error: "Ledger not found" });
-    const query = { account_ledger_id: String(ledger._id), fund_source: "main_cash", status: { $nin: ["cancelled", "deleted"] } };
+    const query = { account_ledger_id: String(ledger._id), fund_source: { $in: ["main_cash", "ledger"] }, status: { $nin: ["pending", "cancelled", "deleted"] } };
     const admin = req.user?.role === "admin" || req.user?.permissions?.includes?.("all") || req.user?.permissions?.includes?.("warehouses.manage");
     if (!admin) {
       const warehouseIds = Array.isArray(req.user?.assigned_warehouse_ids) ? req.user.assigned_warehouse_ids.map(String) : [];
@@ -109,8 +109,10 @@ router.get("/report/:ledgerId", async (req, res) => {
       if (req.query.to_date) query.entry_date.$lte = new Date(`${req.query.to_date}T23:59:59.999Z`);
     }
     const entries = await CashEntry.find(query).sort({ entry_date: 1, id: 1 }).lean();
+    const debitTotal = entries.reduce((sum, row) => sum + (row.ledger_side === "debit" ? Number(row.amount || 0) : 0), 0);
+    const creditTotal = entries.reduce((sum, row) => sum + (row.ledger_side === "credit" ? Number(row.amount || 0) : 0), 0);
     const total = entries.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-    res.json({ ledger, entries, total: Number(total.toFixed(2)), count: entries.length });
+    res.json({ ledger, entries, total: Number(total.toFixed(2)), debit_total: Number(debitTotal.toFixed(2)), credit_total: Number(creditTotal.toFixed(2)), count: entries.length });
   } catch (error) {
     res.status(500).json({ error: error.message || "Failed to load ledger report" });
   }

@@ -2152,6 +2152,7 @@ router.post(
       account_ledger_name,
       account_group_id,
       account_group_name,
+      ledger_side,
       description,
       amount,
       payment_method,
@@ -2436,6 +2437,9 @@ router.post(
         account_ledger_name: account_ledger_name || null,
         account_group_id: account_group_id || null,
         account_group_name: account_group_name || null,
+        ledger_side: ["debit", "credit"].includes(String(ledger_side || "").toLowerCase())
+          ? String(ledger_side).toLowerCase()
+          : normalizedMode === "payment" || effectiveType === "expense" ? "debit" : "credit",
         description:
           String(
             description || ""
@@ -2539,6 +2543,7 @@ router.post(
           account_ledger_name: account_ledger_name || null,
           account_group_id: account_group_id || null,
           account_group_name: account_group_name || null,
+          ledger_side: mainDoc.ledger_side,
           description:
             String(
               description || ""
@@ -2699,6 +2704,7 @@ router.put(
         account_ledger_name,
         account_group_id,
         account_group_name,
+        ledger_side,
         description,
         amount,
         payment_method,
@@ -2900,6 +2906,9 @@ router.put(
               account_ledger_name: account_ledger_name || null,
               account_group_id: account_group_id || null,
               account_group_name: account_group_name || null,
+              ledger_side: ["debit", "credit"].includes(String(ledger_side || "").toLowerCase())
+                ? String(ledger_side).toLowerCase()
+                : String(entry_type || "").toLowerCase() === "expense" ? "debit" : "credit",
               description:
                 String(
                   description || ""
