@@ -108,6 +108,7 @@ router.get("/report/:ledgerId", async (req, res) => {
       if (req.query.from_date) query.entry_date.$gte = new Date(`${req.query.from_date}T00:00:00.000Z`);
       if (req.query.to_date) query.entry_date.$lte = new Date(`${req.query.to_date}T23:59:59.999Z`);
     }
+    if (req.query.employee_id) query.employee_id = String(req.query.employee_id);
     const entries = await CashEntry.find(query).sort({ entry_date: 1, id: 1 }).lean();
     const debitTotal = entries.reduce((sum, row) => sum + (row.ledger_side === "debit" ? Number(row.amount || 0) : 0), 0);
     const creditTotal = entries.reduce((sum, row) => sum + (row.ledger_side === "credit" ? Number(row.amount || 0) : 0), 0);
