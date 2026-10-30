@@ -3,7 +3,7 @@ const mongoose = require("mongoose");
 const router = express.Router();
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
-const { WarehouseRentBooking } = require("../mongo");
+const { WarehouseRentBooking, Warehouse } = require("../mongo");
 const { CashEntry } = require("../db-mongodb");
 const XLSX = require("xlsx");
 
@@ -158,37 +158,62 @@ router.get("/profit-loss-overheads", async (req, res) => {
     const toDate = normalizeText(req.query.to_date);
     const expenseCollection = mongoose.connection.db.collection("expenses");
     const expenseRows = await expenseCollection.find({}).toArray();
-    const expenses = expenseRows
+    const eligibleExpenseRows = expenseRows
       .filter((row) => {
         const warehouseId = normalizeText(row.warehouse_id);
         const date = row.expense_date || row.date;
         return warehouseId && canAccessWarehouse(req.user, warehouseId) && inDateRange(date, fromDate, toDate);
-      })
-      .map((row) => ({
+      });
+    const countedExpenseRefs = new Set();
+    const expenses = eligibleExpenseRows
+      .map((row) => {
+        [row._id, row.id, row.legacy_id].filter((id) => id !== undefined && id !== null && String(id)).forEach((id) => countedExpenseRefs.add(String(id)));
+        return {
         id: String(row._id || row.id || row.legacy_id || ""),
         date: normalizeText(row.expense_date || row.date).slice(0, 10),
         warehouse_id: normalizeText(row.warehouse_id),
         employee_name: normalizeText(row.employee_name || row.employee?.name || row.employee_id) || "Staff",
         description: normalizeText(row.work_description || row.narration || row.voucher_no),
         amount: Number(row.total_expense_amount ?? row.grand_total ?? row.amount ?? 0) || 0,
-      }))
+      };
+      })
       .filter((row) => row.amount > 0);
 
     const allocatedCashRows = await CashEntry.find({
       $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }],
       entry_type: "expense",
-      source_expense_id: { $in: [null, ""] },
       status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] },
     }).lean();
+    const cashWarehouseIds = [...new Set((allocatedCashRows || []).map((row) => normalizeText(row.warehouse_id)).filter(Boolean))];
+    const validCashWarehouseObjectIds = cashWarehouseIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+    const numericCashWarehouseIds = cashWarehouseIds.filter((id) => /^\d+$/.test(id)).map(Number);
+    const warehouseIdentityClauses = [];
+    if (validCashWarehouseObjectIds.length) warehouseIdentityClauses.push({ _id: { $in: validCashWarehouseObjectIds } });
+    if (numericCashWarehouseIds.length) warehouseIdentityClauses.push({ id: { $in: numericCashWarehouseIds } }, { legacy_id: { $in: numericCashWarehouseIds } });
+    const cashWarehouseDocs = warehouseIdentityClauses.length
+      ? await Warehouse.find({ $or: warehouseIdentityClauses }).select("_id id legacy_id name").lean()
+      : [];
+    const warehouseNameByAlias = new Map();
+    const warehouseAliasesById = new Map();
+    (cashWarehouseDocs || []).forEach((warehouse) => {
+      const aliases = [warehouse._id, warehouse.id, warehouse.legacy_id].filter((id) => id !== undefined && id !== null && String(id)).map(String);
+      aliases.forEach((id) => warehouseNameByAlias.set(id, normalizeText(warehouse.name)));
+      aliases.forEach((id) => warehouseAliasesById.set(id, aliases));
+    });
     (allocatedCashRows || []).forEach((row) => {
       const warehouseId = normalizeText(row.warehouse_id);
       const date = row.entry_date instanceof Date ? row.entry_date.toISOString().slice(0, 10) : normalizeText(row.entry_date).slice(0, 10);
       const amount = Number(row.amount || 0);
-      if (!warehouseId || !canAccessWarehouse(req.user, warehouseId) || !inDateRange(date, fromDate, toDate) || amount <= 0) return;
+      const hasWarehouseAccess = canAccessWarehouse(req.user, warehouseId) ||
+        (warehouseAliasesById.get(warehouseId) || []).some((alias) => canAccessWarehouse(req.user, alias));
+      if (!warehouseId || !hasWarehouseAccess || !inDateRange(date, fromDate, toDate) || amount <= 0) return;
+      const sourceExpenseId = normalizeText(row.source_expense_id);
+      if (sourceExpenseId && countedExpenseRefs.has(sourceExpenseId)) return;
       expenses.push({
         id: String(row.id || row._id || ""),
         date,
         warehouse_id: warehouseId,
+        warehouse_name: warehouseNameByAlias.get(warehouseId) || "",
         employee_name: normalizeText(row.employee_name) || "Cash Book Expense",
         description: normalizeText(row.description || row.narration || row.voucher_no) || "Cash Book Expense",
         amount,
