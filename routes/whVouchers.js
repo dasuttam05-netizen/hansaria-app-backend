@@ -8567,7 +8567,9 @@ router.get("/report/profit-loss", async (req, res) => {
       // This keeps the cash/employee ledger posting unchanged and avoids
       // attaching the whole cost to a warehouse row with a different ID.
       const cashWarehouseIds = [...new Set((allocatedCashRows || []).map((entry) => String(entry.warehouse_id || "")).filter(Boolean))];
-      const directSales = (sales || []).filter((sale) => String(sale.sale_type || "").toLowerCase() === "direct");
+      const directSales = (sales || []).filter((sale) =>
+        String(sale.sale_type || "").toLowerCase() === "direct" || Boolean(String(sale.location_id || ""))
+      );
       const idsToResolve = [...new Set([
         ...cashWarehouseIds,
         ...directSales.map((sale) => String(sale.warehouse_id || "")).filter(Boolean),
@@ -8585,9 +8587,8 @@ router.get("/report/profit-loss", async (req, res) => {
         const quantity = Number(sale.quantity || sale.total_quantity || sale.unloading_qty || 0);
         if (!locationId || !month || quantity <= 0 || !dateInRange(date)) return;
         const key = `${locationId}|${month}`;
-        const bucket = directQtyByLocationMonth.get(key) || { total: 0, byWarehouse: new Map() };
+        const bucket = directQtyByLocationMonth.get(key) || { total: 0 };
         bucket.total += quantity;
-        bucket.byWarehouse.set(warehouseId, Number(bucket.byWarehouse.get(warehouseId) || 0) + quantity);
         directQtyByLocationMonth.set(key, bucket);
       });
       (allocatedCashRows || []).forEach((entry) => {
@@ -8596,12 +8597,12 @@ router.get("/report/profit-loss", async (req, res) => {
         const locationId = String(locationByWarehouse.get(warehouseId) || "");
         const bucket = directQtyByLocationMonth.get(`${locationId}|${entryDate.slice(0, 7)}`);
         if (!bucket || bucket.total <= 0) return;
-        const amount = Number(entry.amount || 0);
-        bucket.byWarehouse.forEach((quantity, targetWarehouseId) => {
-          const row = getWarehouseSummaryRow(targetWarehouseId);
-          if (!row) return;
-          row.staff_expense = Number(row.staff_expense || 0) + amount * quantity / bucket.total;
-        });
+        // At warehouse summary level the loading quantity is the eligibility
+        // basis; show the overhead against the Warehouse selected on the Cash
+        // Book entry. Direct sale drill-down separately apportions this amount
+        // across bills by their loading quantity.
+        const row = getWarehouseSummaryRow(warehouseId);
+        if (row) row.staff_expense = Number(row.staff_expense || 0) + Number(entry.amount || 0);
       });
       (rentRows || []).forEach((rent) => {
         const warehouseId = String(rent.warehouse_id || "");
