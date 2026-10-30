@@ -1379,6 +1379,12 @@ const cashEntrySchema =
       index: true,
     },
 
+    warehouse_expense_mode: {
+      type: String,
+      enum: ["location_quantity", "fixed_warehouse", "none"],
+      default: "none",
+    },
+
     linked_entry_id: mongoose.Schema.Types.Mixed,
 
     adjustments: [
