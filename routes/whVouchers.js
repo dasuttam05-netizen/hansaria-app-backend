@@ -934,7 +934,8 @@ async function buildSalePayload(body, voucherNo) {
   payload.fifo_amount = grossAmount;
   payload.fifo_rate = qtyForFifo > 0 ? grossAmount / qtyForFifo : 0;
   if (payload.sale_type === "direct") {
-    payload.direct_purchase_amount = Number((qtyForFifo * payload.direct_purchase_rate).toFixed(2));
+    const purchaseQty = Math.max(Number(payload.gross_weight || 0) - Number(payload.tare_weight || 0), 0) || qtyForFifo;
+    payload.direct_purchase_amount = Number((purchaseQty * payload.direct_purchase_rate).toFixed(2));
   }
 
   const gst = await resolveWarehouseTradingGst({
@@ -958,7 +959,7 @@ async function createDirectSalePurchaseVoucher(salePayload) {
   }
 
   const purchaseVoucherNo = await nextMongoVoucherNo("purchase");
-  const qty = Number(salePayload.unloading_qty || salePayload.quantity || 0);
+  const qty = Math.max(Number(salePayload.gross_weight || 0) - Number(salePayload.tare_weight || 0), 0) || Number(salePayload.unloading_qty || salePayload.quantity || 0);
   const amount = Number((qty * Number(salePayload.direct_purchase_rate || 0)).toFixed(2));
   let farmerName = "";
   if (mongoose.Types.ObjectId.isValid(farmerId)) {
@@ -4931,7 +4932,7 @@ router.put("/sale/:id", async (req, res) => {
           }
         }
         if (payload.sale_type === "direct" && Array.isArray(payload.against_purchase_links)) {
-          const directQty = Number(payload.unloading_qty || payload.quantity || 0);
+          const directQty = Math.max(Number(payload.gross_weight || 0) - Number(payload.tare_weight || 0), 0) || Number(payload.unloading_qty || payload.quantity || 0);
           const directRate = Number(payload.direct_purchase_rate || 0);
           const directAmount = Number((directQty * directRate).toFixed(2));
           const syncedLinks = [];
