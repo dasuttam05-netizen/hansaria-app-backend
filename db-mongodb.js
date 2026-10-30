@@ -1379,6 +1379,7 @@ const cashEntrySchema =
     account_ledger_name: String,
     account_group_id: mongoose.Schema.Types.Mixed,
     account_group_name: String,
+    ledger_side: { type: String, enum: ["debit", "credit", ""], default: "" },
 
     description: String,
 
