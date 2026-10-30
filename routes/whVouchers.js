@@ -8550,7 +8550,7 @@ router.get("/report/profit-loss", async (req, res) => {
         mongoose.connection.db.collection("expenses").find({}).toArray(),
         WarehouseRentBooking.find({}).lean(),
         mongoose.connection.db.collection("warehouse_trading_profit_loss_adjustments").find({}).toArray(),
-        CashEntry.find({ $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }], entry_type: "expense", source_expense_id: { $in: [null, ""] }, status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] } }).lean(),
+        CashEntry.find({ $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }], entry_type: "expense", status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] } }).lean(),
       ]);
       const normalizeWarehouseName = (value) => String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
       const reportWarehouseKeys = [...rows.keys()].filter(Boolean);
@@ -8584,10 +8584,12 @@ router.get("/report/profit-loss", async (req, res) => {
         const matchedRowKey = rowKeyByWarehouseName.get(normalizeWarehouseName(warehouse?.name));
         return matchedRowKey ? rows.get(matchedRowKey) || null : null;
       };
+      const countedExpenseRefs = new Set();
       (expenseRows || []).forEach((expense) => {
         const row = getWarehouseSummaryRow(expense.warehouse_id) || getCashEntrySummaryRow(expense);
         if (!row || !dateInRange(expense.expense_date || expense.date)) return;
         row.staff_expense = Number(row.staff_expense || 0) + Number(expense.total_expense_amount ?? expense.grand_total ?? expense.amount ?? 0);
+        [expense._id, expense.id, expense.legacy_id].filter((id) => id !== undefined && id !== null && String(id)).forEach((id) => countedExpenseRefs.add(String(id)));
       });
       // Warehouse Wise P/L shows Cash Book overhead against the Warehouse
       // selected on that entry. Direct Loading bill-level reports perform the
@@ -8596,6 +8598,8 @@ router.get("/report/profit-loss", async (req, res) => {
         const entryDate = entry.entry_date instanceof Date ? entry.entry_date.toISOString().slice(0, 10) : String(entry.entry_date || "").slice(0, 10);
         const row = getCashEntrySummaryRow(entry);
         if (!row || !dateInRange(entryDate)) return;
+        const sourceExpenseId = String(entry.source_expense_id || "").trim();
+        if (sourceExpenseId && countedExpenseRefs.has(sourceExpenseId)) return;
         row.staff_expense = Number(row.staff_expense || 0) + Number(entry.amount || 0);
       });
       (rentRows || []).forEach((rent) => {
