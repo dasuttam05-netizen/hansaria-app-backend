@@ -124,10 +124,11 @@ router.get("/report/:ledgerId", async (req, res) => {
     const debitTotal = entries.reduce((sum, row) => sum + (row.ledger_side === "debit" ? Number(row.amount || 0) : 0), 0);
     const creditTotal = entries.reduce((sum, row) => sum + (row.ledger_side === "credit" ? Number(row.amount || 0) : 0), 0);
     const total = entries.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-    res.json({ ledger, entries, total: Number(total.toFixed(2)), debit_total: Number(debitTotal.toFixed(2)), credit_total: Number(creditTotal.toFixed(2)), count: entries.length });
-    res.json({ ledger, entries, total: Number(total.toFixed(2)), debit_total: Number(debitTotal.toFixed(2)), credit_total: Number(creditTotal.toFixed(2)), opening_debit: Number(openingDebit.toFixed(2)), opening_credit: Number(openingCredit.toFixed(2)), count: entries.length });
+    return res.json({ ledger, entries, total: Number(total.toFixed(2)), debit_total: Number(debitTotal.toFixed(2)), credit_total: Number(creditTotal.toFixed(2)), opening_debit: Number(openingDebit.toFixed(2)), opening_credit: Number(openingCredit.toFixed(2)), count: entries.length });
   } catch (error) {
-    res.status(500).json({ error: error.message || "Failed to load ledger report" });
+    console.error("GET /api/account-ledgers/report/:ledgerId failed:", error);
+    if (res.headersSent) return;
+    return res.status(500).json({ error: error.message || "Failed to load ledger report" });
   }
 });
 
