@@ -109,11 +109,23 @@ router.get("/report/:ledgerId", async (req, res) => {
       if (req.query.to_date) query.entry_date.$lte = new Date(`${req.query.to_date}T23:59:59.999Z`);
     }
     if (req.query.employee_id) query.employee_id = String(req.query.employee_id);
+    let openingDebit = 0;
+    let openingCredit = 0;
+    if (req.query.from_date) {
+      const openingQuery = { ...query, entry_date: { $lt: new Date(`${req.query.from_date}T00:00:00.000Z`) } };
+      const openingRows = await CashEntry.aggregate([
+        { $match: openingQuery },
+        { $group: { _id: "$ledger_side", amount: { $sum: "$amount" } } },
+      ]);
+      openingDebit = Number(openingRows.find((row) => row._id === "debit")?.amount || 0);
+      openingCredit = Number(openingRows.find((row) => row._id === "credit")?.amount || 0);
+    }
     const entries = await CashEntry.find(query).sort({ entry_date: 1, id: 1 }).lean();
     const debitTotal = entries.reduce((sum, row) => sum + (row.ledger_side === "debit" ? Number(row.amount || 0) : 0), 0);
     const creditTotal = entries.reduce((sum, row) => sum + (row.ledger_side === "credit" ? Number(row.amount || 0) : 0), 0);
     const total = entries.reduce((sum, row) => sum + Number(row.amount || 0), 0);
     res.json({ ledger, entries, total: Number(total.toFixed(2)), debit_total: Number(debitTotal.toFixed(2)), credit_total: Number(creditTotal.toFixed(2)), count: entries.length });
+    res.json({ ledger, entries, total: Number(total.toFixed(2)), debit_total: Number(debitTotal.toFixed(2)), credit_total: Number(creditTotal.toFixed(2)), opening_debit: Number(openingDebit.toFixed(2)), opening_credit: Number(openingCredit.toFixed(2)), count: entries.length });
   } catch (error) {
     res.status(500).json({ error: error.message || "Failed to load ledger report" });
   }
