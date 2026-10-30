@@ -8557,52 +8557,15 @@ router.get("/report/profit-loss", async (req, res) => {
         if (!row || !dateInRange(expense.expense_date || expense.date)) return;
         row.staff_expense = Number(row.staff_expense || 0) + Number(expense.total_expense_amount ?? expense.grand_total ?? expense.amount ?? 0);
       });
-      (allocatedCashRows || []).forEach((entry) => {
-        const entryDate = entry.entry_date instanceof Date ? entry.entry_date.toISOString().slice(0, 10) : String(entry.entry_date || "").slice(0, 10);
-        if (!dateInRange(entryDate)) return;
-      });
-
-      // Cash Book expenses selected against a Warehouse are allocated to the
-      // Direct Loading summary row(s) for that Warehouse's Location and month.
-      // This keeps the cash/employee ledger posting unchanged and avoids
-      // attaching the whole cost to a warehouse row with a different ID.
-      const cashWarehouseIds = [...new Set((allocatedCashRows || []).map((entry) => String(entry.warehouse_id || "")).filter(Boolean))];
-      const directSales = (sales || []).filter((sale) =>
-        String(sale.sale_type || "").toLowerCase() === "direct" || Boolean(String(sale.location_id || ""))
-      );
-      const idsToResolve = [...new Set([
-        ...cashWarehouseIds,
-        ...directSales.map((sale) => String(sale.warehouse_id || "")).filter(Boolean),
-      ])].filter((id) => mongoose.Types.ObjectId.isValid(id));
-      const resolvedWarehouses = idsToResolve.length
-        ? await Warehouse.find({ _id: { $in: idsToResolve } }).select("_id location_id").lean()
-        : [];
-      const locationByWarehouse = new Map((resolvedWarehouses || []).map((warehouse) => [String(warehouse._id), String(warehouse.location_id || "")]));
-      const directQtyByLocationMonth = new Map();
-      (directSales || []).forEach((sale) => {
-        const date = String(sale.date || "").slice(0, 10);
-        const month = date.slice(0, 7);
-        const warehouseId = String(sale.warehouse_id || "");
-        const locationId = String(sale.location_id || locationByWarehouse.get(warehouseId) || "");
-        const quantity = Number(sale.quantity || sale.total_quantity || sale.unloading_qty || 0);
-        if (!locationId || !month || quantity <= 0 || !dateInRange(date)) return;
-        const key = `${locationId}|${month}`;
-        const bucket = directQtyByLocationMonth.get(key) || { total: 0 };
-        bucket.total += quantity;
-        directQtyByLocationMonth.set(key, bucket);
-      });
+      // Warehouse Wise P/L shows Cash Book overhead against the Warehouse
+      // selected on that entry. Direct Loading bill-level reports perform the
+      // separate location/month quantity allocation below.
       (allocatedCashRows || []).forEach((entry) => {
         const entryDate = entry.entry_date instanceof Date ? entry.entry_date.toISOString().slice(0, 10) : String(entry.entry_date || "").slice(0, 10);
         const warehouseId = String(entry.warehouse_id || "");
-        const locationId = String(locationByWarehouse.get(warehouseId) || "");
-        const bucket = directQtyByLocationMonth.get(`${locationId}|${entryDate.slice(0, 7)}`);
-        if (!bucket || bucket.total <= 0) return;
-        // At warehouse summary level the loading quantity is the eligibility
-        // basis; show the overhead against the Warehouse selected on the Cash
-        // Book entry. Direct sale drill-down separately apportions this amount
-        // across bills by their loading quantity.
         const row = getWarehouseSummaryRow(warehouseId);
-        if (row) row.staff_expense = Number(row.staff_expense || 0) + Number(entry.amount || 0);
+        if (!row || !dateInRange(entryDate)) return;
+        row.staff_expense = Number(row.staff_expense || 0) + Number(entry.amount || 0);
       });
       (rentRows || []).forEach((rent) => {
         const warehouseId = String(rent.warehouse_id || "");
