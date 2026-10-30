@@ -8546,17 +8546,25 @@ router.get("/report/profit-loss", async (req, res) => {
         const raw = value instanceof Date ? value.toISOString().slice(0, 10) : String(value || "").slice(0, 10);
         return Boolean(raw) && (!fromDate || raw >= fromDate) && (!toDate || raw <= toDate);
       };
-      const [expenseRows, rentRows, manualRows, allocatedCashRows] = await Promise.all([
+      const loadingDateFilter = {};
+      if (fromDate || toDate) {
+        loadingDateFilter.date = {};
+        if (fromDate) loadingDateFilter.date.$gte = fromDate;
+        if (toDate) loadingDateFilter.date.$lte = toDate;
+      }
+      const [expenseRows, rentRows, manualRows, allocatedCashRows, warehouseLoadingRows] = await Promise.all([
         mongoose.connection.db.collection("expenses").find({}).toArray(),
         WarehouseRentBooking.find({}).lean(),
         mongoose.connection.db.collection("warehouse_trading_profit_loss_adjustments").find({}).toArray(),
         CashEntry.find({ $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }], entry_type: "expense", status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] } }).lean(),
+        WarehouseLoading.find(loadingDateFilter).lean(),
       ]);
       const normalizeWarehouseName = (value) => String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
       const reportWarehouseKeys = [...rows.keys()].filter(Boolean);
       const cashWarehouseIds = [...new Set((allocatedCashRows || []).map((entry) => String(entry.warehouse_id || "")).filter(Boolean))];
       const expenseWarehouseIds = [...new Set((expenseRows || []).map((entry) => String(entry.warehouse_id || "")).filter(Boolean))];
-      const allWarehouseAliases = [...reportWarehouseKeys, ...cashWarehouseIds, ...expenseWarehouseIds];
+      const loadingWarehouseIds = [...new Set((warehouseLoadingRows || []).map((entry) => String(entry.warehouse_id || "")).filter(Boolean))];
+      const allWarehouseAliases = [...reportWarehouseKeys, ...cashWarehouseIds, ...expenseWarehouseIds, ...loadingWarehouseIds];
       const objectIdWarehouseIds = [...new Set(allWarehouseAliases.filter((id) => mongoose.Types.ObjectId.isValid(id)))];
       const numericWarehouseIds = [...new Set(allWarehouseAliases.filter((id) => /^\d+$/.test(id)).map(Number))];
       const warehouseIdentityClauses = [];
@@ -8616,6 +8624,25 @@ router.get("/report/profit-loss", async (req, res) => {
         const bucket = directQtyByLocationMonth.get(key) || { total: 0, byRow: new Map() };
         bucket.total += quantity;
         bucket.byRow.set(targetRowKey, Number(bucket.byRow.get(targetRowKey) || 0) + quantity);
+        directQtyByLocationMonth.set(key, bucket);
+      });
+      (warehouseLoadingRows || []).forEach((loading) => {
+        const loadingDate = String(loading.date || "").slice(0, 10);
+        if (!dateInRange(loadingDate)) return;
+        const warehouseId = String(loading.warehouse_id || "");
+        if (!canAccessWarehouse(req.user, warehouseId)) return;
+        const warehouse = warehouseByAlias.get(warehouseId);
+        const locationKey = canonicalLocationKey(warehouse?.location_id);
+        const quantity = Number(loading.loading_qty || loading.quantity || 0);
+        if (!locationKey || quantity <= 0) return;
+        const key = `${locationKey}|${loadingDate.slice(0, 7)}`;
+        const matchedRowByName = rowKeyByWarehouseName.get(normalizeWarehouseName(warehouse?.name));
+        const targetRowKey = rows.has(warehouseId)
+          ? warehouseId
+          : matchedRowByName || warehouseId;
+        const bucket = directQtyByLocationMonth.get(key) || { total: 0, byRow: new Map() };
+        bucket.total += quantity;
+        bucket.byRow.set(String(targetRowKey), Number(bucket.byRow.get(String(targetRowKey)) || 0) + quantity);
         directQtyByLocationMonth.set(key, bucket);
       });
       const countedExpenseRefs = new Set();
@@ -8962,7 +8989,7 @@ router.get("/report/profit-loss", async (req, res) => {
           ...(scopeWarehouseIds.length ? [{ warehouse_id: { $in: scopeWarehouseIds } }] : []),
         ],
       };
-      const [monthlyLoadingRows, cashAllocationRows, expenseAllocationRows] = await Promise.all([
+      const [monthlyLoadingRows, warehouseLoadingRows, cashAllocationRows, expenseAllocationRows] = await Promise.all([
         SaleVoucher.aggregate([
           { $match: allocationFilter },
           { $project: {
@@ -8973,6 +9000,10 @@ router.get("/report/profit-loss", async (req, res) => {
           } },
           { $group: { _id: { warehouse_id: { $toString: "$warehouse_id" }, location_id: "$location_id", month: "$month" }, quantity: { $sum: "$quantity" } } },
         ]),
+        WarehouseLoading.find({
+          warehouse_id: { $in: scopeWarehouseIds },
+          date: { $gte: firstMonth, $lte: `${lastMonth}-31` },
+        }).lean(),
         CashEntry.find({
           $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }],
           entry_type: "expense",
@@ -8998,6 +9029,15 @@ router.get("/report/profit-loss", async (req, res) => {
         const locationKey = locationKeyFor(item._id.location_id, item._id.warehouse_id);
         const key = `${locationKey}|${item._id.month}`;
         quantityByLocationMonth.set(key, Number(quantityByLocationMonth.get(key) || 0) + Number(item.quantity || 0));
+      });
+      (warehouseLoadingRows || []).forEach((loading) => {
+        if (!canAccessWarehouse(req.user, loading.warehouse_id)) return;
+        const date = String(loading.date || "").slice(0, 10);
+        const month = date.slice(0, 7);
+        if (!month) return;
+        const locationKey = locationKeyFor("", loading.warehouse_id);
+        const key = `${locationKey}|${month}`;
+        quantityByLocationMonth.set(key, Number(quantityByLocationMonth.get(key) || 0) + Number(loading.loading_qty || loading.quantity || 0));
       });
       const expenseByLocationMonth = new Map();
       (cashAllocationRows || []).forEach((entry) => {
