@@ -1325,6 +1325,28 @@ const cashEntryAdjustmentSchema =
     adjusted_amount: Number,
   });
 
+const accountGroupSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  nature: { type: String, enum: ["asset", "liability", "income", "expense", "equity"], required: true },
+  parent_group_id: mongoose.Schema.Types.ObjectId,
+  is_system: { type: Boolean, default: false },
+  created_at: { type: Date, default: Date.now },
+  updated_at: { type: Date, default: Date.now },
+});
+accountGroupSchema.index({ name: 1 }, { unique: true });
+
+const accountLedgerSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  group_id: { type: mongoose.Schema.Types.ObjectId, ref: "AccountGroup", required: true },
+  opening_balance: { type: Number, default: 0, min: 0 },
+  opening_balance_type: { type: String, enum: ["dr", "cr"], default: "dr" },
+  is_system: { type: Boolean, default: false },
+  is_active: { type: Boolean, default: true },
+  created_at: { type: Date, default: Date.now },
+  updated_at: { type: Date, default: Date.now },
+});
+accountLedgerSchema.index({ name: 1, group_id: 1 }, { unique: true });
+
 const cashEntrySchema =
   new mongoose.Schema({
     id: {
@@ -1352,6 +1374,11 @@ const cashEntrySchema =
     company_id: mongoose.Schema.Types.Mixed,
 
     company_account_id: mongoose.Schema.Types.Mixed,
+
+    account_ledger_id: mongoose.Schema.Types.Mixed,
+    account_ledger_name: String,
+    account_group_id: mongoose.Schema.Types.Mixed,
+    account_group_name: String,
 
     description: String,
 
@@ -2150,6 +2177,14 @@ module.exports = {
       "CashEntry",
       cashEntrySchema
     ),
+
+  AccountGroup:
+    mongoose.models.AccountGroup ||
+    mongoose.model("AccountGroup", accountGroupSchema),
+
+  AccountLedger:
+    mongoose.models.AccountLedger ||
+    mongoose.model("AccountLedger", accountLedgerSchema),
 
   CashBookSettings:
     mongoose.models.CashBookSettings ||

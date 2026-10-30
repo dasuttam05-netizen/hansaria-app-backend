@@ -418,6 +418,9 @@ const whVouchersRoutes =
 const cashEntriesRoutes =
   require("./routes/cashEntries");
 
+const accountLedgersRoutes =
+  require("./routes/accountLedgers");
+
 const transportPaymentsRoutes =
   require("./routes/transportPayments");
 
@@ -2515,6 +2518,12 @@ app.use(
   authenticate,
   authorizeCashEntries,
   cashEntriesRoutes
+);
+
+app.use(
+  "/api/account-ledgers",
+  authenticate,
+  accountLedgersRoutes
 );
 
 app.use(
