@@ -8571,6 +8571,20 @@ router.get("/report/profit-loss", async (req, res) => {
       (identityWarehouses || []).forEach((warehouse) => {
         [warehouse._id, warehouse.id, warehouse.legacy_id].filter((id) => id !== undefined && id !== null && String(id)).forEach((id) => warehouseByAlias.set(String(id), warehouse));
       });
+      const locationObjectIds = [...new Set([
+        ...(identityWarehouses || []).map((warehouse) => String(warehouse.location_id || "")),
+        ...(sales || []).map((sale) => String(sale.location_id || "")),
+      ].filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+      const locationDocs = locationObjectIds.length
+        ? await Location.find({ _id: { $in: locationObjectIds } }).select("_id name").lean()
+        : [];
+      const locationNameToId = new Map((locationDocs || []).map((location) => [normalizeWarehouseName(location.name), String(location._id)]));
+      const canonicalLocationKey = (value) => {
+        const raw = String(value || "").trim();
+        if (!raw) return "";
+        if (mongoose.Types.ObjectId.isValid(raw)) return raw;
+        return locationNameToId.get(normalizeWarehouseName(raw)) || `location-name:${normalizeWarehouseName(raw)}`;
+      };
       const rowKeyByWarehouseName = new Map();
       (rows || new Map()).forEach((row, key) => {
         const normalizedName = normalizeWarehouseName(row.warehouse_name);
@@ -8584,6 +8598,26 @@ router.get("/report/profit-loss", async (req, res) => {
         const matchedRowKey = rowKeyByWarehouseName.get(normalizeWarehouseName(warehouse?.name));
         return matchedRowKey ? rows.get(matchedRowKey) || null : null;
       };
+      const directLoadingRowKey = [...rows.entries()].find(([, row]) => /direct\s*loading/i.test(String(row.warehouse_name || "")))?.[0] || null;
+      const directQtyByLocationMonth = new Map();
+      (sales || []).forEach((sale) => {
+        if (String(sale.sale_type || "").toLowerCase() !== "direct" && !sale.location_id) return;
+        const saleDate = String(sale.date || "").slice(0, 10);
+        if (!dateInRange(saleDate)) return;
+        const saleWarehouseId = String(sale.warehouse_id || "");
+        const saleWarehouse = warehouseByAlias.get(saleWarehouseId);
+        const locationKey = canonicalLocationKey(sale.location_id || saleWarehouse?.location_id);
+        const quantity = Number(sale.loading_qty || sale.quantity || sale.total_quantity || sale.unloading_qty || 0);
+        if (!locationKey || quantity <= 0) return;
+        const key = `${locationKey}|${saleDate.slice(0, 7)}`;
+        const targetRowKey = rows.has(saleWarehouseId)
+          ? saleWarehouseId
+          : directLoadingRowKey !== null ? String(directLoadingRowKey) : saleWarehouseId;
+        const bucket = directQtyByLocationMonth.get(key) || { total: 0, byRow: new Map() };
+        bucket.total += quantity;
+        bucket.byRow.set(targetRowKey, Number(bucket.byRow.get(targetRowKey) || 0) + quantity);
+        directQtyByLocationMonth.set(key, bucket);
+      });
       const countedExpenseRefs = new Set();
       (expenseRows || []).forEach((expense) => {
         const row = getWarehouseSummaryRow(expense.warehouse_id) || getCashEntrySummaryRow(expense);
@@ -8591,16 +8625,27 @@ router.get("/report/profit-loss", async (req, res) => {
         row.staff_expense = Number(row.staff_expense || 0) + Number(expense.total_expense_amount ?? expense.grand_total ?? expense.amount ?? 0);
         [expense._id, expense.id, expense.legacy_id].filter((id) => id !== undefined && id !== null && String(id)).forEach((id) => countedExpenseRefs.add(String(id)));
       });
-      // Warehouse Wise P/L shows Cash Book overhead against the Warehouse
-      // selected on that entry. Direct Loading bill-level reports perform the
-      // separate location/month quantity allocation below.
+      // Allocate each Cash Book expense to same-location Direct Loading report
+      // rows by monthly quantity. Keep it on the selected Warehouse if that
+      // month has no matching Direct Loading quantity.
       (allocatedCashRows || []).forEach((entry) => {
         const entryDate = entry.entry_date instanceof Date ? entry.entry_date.toISOString().slice(0, 10) : String(entry.entry_date || "").slice(0, 10);
-        const row = getCashEntrySummaryRow(entry);
-        if (!row || !dateInRange(entryDate)) return;
+        if (!dateInRange(entryDate)) return;
         const sourceExpenseId = String(entry.source_expense_id || "").trim();
         if (sourceExpenseId && countedExpenseRefs.has(sourceExpenseId)) return;
-        row.staff_expense = Number(row.staff_expense || 0) + Number(entry.amount || 0);
+        const sourceWarehouse = warehouseByAlias.get(String(entry.warehouse_id || ""));
+        const locationKey = canonicalLocationKey(sourceWarehouse?.location_id);
+        const bucket = locationKey ? directQtyByLocationMonth.get(`${locationKey}|${entryDate.slice(0, 7)}`) : null;
+        const amount = Number(entry.amount || 0);
+        if (bucket?.total > 0) {
+          bucket.byRow.forEach((quantity, targetRowKey) => {
+            const row = rows.get(String(targetRowKey));
+            if (row) row.staff_expense = Number(row.staff_expense || 0) + amount * quantity / bucket.total;
+          });
+          return;
+        }
+        const fallbackRow = getCashEntrySummaryRow(entry);
+        if (fallbackRow) fallbackRow.staff_expense = Number(fallbackRow.staff_expense || 0) + amount;
       });
       (rentRows || []).forEach((rent) => {
         const warehouseId = String(rent.warehouse_id || "");
@@ -8850,33 +8895,52 @@ router.get("/report/profit-loss", async (req, res) => {
     const allocationMonths = [...new Set(allocationRows.map((row) => String(row.date).slice(0, 7)))].sort();
     if (allocationRows.length && allocationMonths.length) {
       const validWarehouseObjectIds = allocationWarehouseIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
-      const warehouseLookups = validWarehouseObjectIds.length
-        ? await Warehouse.find({ _id: { $in: validWarehouseObjectIds } }).select("_id location_id").lean()
-        : [];
+        const numericWarehouseIds = allocationWarehouseIds.filter((id) => /^\d+$/.test(id)).map(Number);
+        const warehouseIdentityClauses = [];
+        if (validWarehouseObjectIds.length) warehouseIdentityClauses.push({ _id: { $in: validWarehouseObjectIds } });
+        if (numericWarehouseIds.length) warehouseIdentityClauses.push({ id: { $in: numericWarehouseIds } }, { legacy_id: { $in: numericWarehouseIds } });
+        const warehouseLookups = warehouseIdentityClauses.length
+          ? await Warehouse.find({ $or: warehouseIdentityClauses }).select("_id id legacy_id location_id").lean()
+          : [];
       const locationByWarehouse = new Map();
       (warehouseLookups || []).forEach((warehouse) => {
         const locationId = String(warehouse.location_id || "");
-        [warehouse._id].forEach((id) => {
+        [warehouse._id, warehouse.id, warehouse.legacy_id].forEach((id) => {
           if (id !== undefined && id !== null && locationId) locationByWarehouse.set(String(id), locationId);
         });
       });
+      const rawLocationAliases = new Set(allocationRows.map((row) => String(row.location_id || "")).filter(Boolean));
+      (warehouseLookups || []).forEach((warehouse) => {
+        if (warehouse.location_id) rawLocationAliases.add(String(warehouse.location_id));
+      });
+      const locationObjectIds = [...new Set([...rawLocationAliases].filter((id) => mongoose.Types.ObjectId.isValid(id)))];
+      const locationDocs = locationObjectIds.length
+        ? await Location.find({ _id: { $in: locationObjectIds } }).select("_id name").lean()
+        : [];
+      const locationNameToId = new Map((locationDocs || []).map((location) => [String(location.name || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, ""), String(location._id)]));
+      const canonicalLocation = (value) => {
+        const raw = String(value || "").trim();
+        if (!raw) return "";
+        if (mongoose.Types.ObjectId.isValid(raw)) return raw;
+        const normalizedName = raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+        return locationNameToId.get(normalizedName) || `location-name:${normalizedName}`;
+      };
       const locationKeyFor = (locationId, warehouseId) => {
         const explicitLocationId = String(locationId || "");
-        if (explicitLocationId) return explicitLocationId;
+        if (explicitLocationId) return canonicalLocation(explicitLocationId);
         const warehouseKey = String(warehouseId || "");
-        return locationByWarehouse.get(warehouseKey) || `warehouse:${warehouseKey}`;
+        return canonicalLocation(locationByWarehouse.get(warehouseKey)) || `warehouse:${warehouseKey}`;
       };
-      const allocationLocationIds = [...new Set(allocationRows.map((row) => locationKeyFor(row.location_id, row.warehouse_id)).filter((id) => !String(id).startsWith("warehouse:")))];
-      const relatedWarehouses = allocationLocationIds.length
-        ? await Warehouse.find({ location_id: { $in: allocationLocationIds } }).select("_id location_id").lean()
+      const relatedWarehouses = locationObjectIds.length
+        ? await Warehouse.find({ location_id: { $in: locationObjectIds } }).select("_id id legacy_id location_id").lean()
         : [];
       const allocationScopeWarehouseIds = new Set(allocationWarehouseIds);
       (relatedWarehouses || []).forEach((warehouse) => {
         const id = String(warehouse._id || "");
-        if (id) {
-          allocationScopeWarehouseIds.add(id);
-          locationByWarehouse.set(id, String(warehouse.location_id || ""));
-        }
+        [warehouse._id, warehouse.id, warehouse.legacy_id].forEach((alias) => {
+          if (alias !== undefined && alias !== null && String(alias)) allocationScopeWarehouseIds.add(String(alias));
+        });
+        if (id) locationByWarehouse.set(id, String(warehouse.location_id || ""));
       });
       const scopeWarehouseIds = [...allocationScopeWarehouseIds];
       const firstMonth = allocationMonths[0];
@@ -8889,7 +8953,7 @@ router.get("/report/profit-loss", async (req, res) => {
         sale_type: "direct",
         date: { $gte: firstMonth, $lte: `${lastMonth}-31` },
         $or: [
-          ...(allocationLocationIds.length ? [{ location_id: { $in: allocationLocationIds } }] : []),
+          ...(rawLocationAliases.size ? [{ location_id: { $in: [...rawLocationAliases] } }] : []),
           ...(scopeWarehouseIds.length ? [{ warehouse_id: { $in: scopeWarehouseIds } }] : []),
         ],
       };
@@ -8907,20 +8971,22 @@ router.get("/report/profit-loss", async (req, res) => {
         CashEntry.find({
           $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }],
           entry_type: "expense",
-          source_expense_id: { $in: [null, ""] },
           status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] },
           warehouse_id: { $in: scopeWarehouseIds },
           entry_date: { $gte: rangeStart, $lt: rangeEnd },
-        }).select("warehouse_id entry_date amount").lean(),
+        }).select("warehouse_id entry_date amount source_expense_id").lean(),
         mongoose.connection.db.collection("expenses").find({
           allocate_warehouse_pl: true,
           $or: [
             ...(scopeWarehouseIds.length ? [{ warehouse_id: { $in: scopeWarehouseIds } }] : []),
-            ...(allocationLocationIds.length ? [{ location_id: { $in: allocationLocationIds } }] : []),
+            ...(rawLocationAliases.size ? [{ location_id: { $in: [...rawLocationAliases] } }] : []),
           ],
           expense_date: { $gte: firstMonth, $lte: `${lastMonth}-31` },
         }).project({ warehouse_id: 1, location_id: 1, expense_date: 1, amount: 1, total_expense_amount: 1, grand_total: 1 }).toArray(),
       ]);
+      const expenseAllocationRefs = new Set((expenseAllocationRows || []).flatMap((entry) =>
+        [entry._id, entry.id, entry.legacy_id].filter((id) => id !== undefined && id !== null && String(id)).map(String)
+      ));
       const quantityByLocationMonth = new Map();
       (monthlyLoadingRows || []).forEach((item) => {
         const locationKey = locationKeyFor(item._id.location_id, item._id.warehouse_id);
@@ -8929,6 +8995,8 @@ router.get("/report/profit-loss", async (req, res) => {
       });
       const expenseByLocationMonth = new Map();
       (cashAllocationRows || []).forEach((entry) => {
+        const sourceExpenseId = String(entry.source_expense_id || "").trim();
+        if (sourceExpenseId && expenseAllocationRefs.has(sourceExpenseId)) return;
         const entryDate = entry.entry_date instanceof Date ? entry.entry_date : new Date(entry.entry_date);
         if (Number.isNaN(entryDate.getTime())) return;
         const key = `${locationKeyFor("", entry.warehouse_id)}|${entryDate.toISOString().slice(0, 7)}`;
