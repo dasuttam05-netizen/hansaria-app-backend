@@ -2148,6 +2148,10 @@ router.post(
       warehouse_id,
       company_id,
       company_account_id,
+      account_ledger_id,
+      account_ledger_name,
+      account_group_id,
+      account_group_name,
       description,
       amount,
       payment_method,
@@ -2428,6 +2432,10 @@ router.post(
           normalizedCompany,
         company_account_id:
           normalizedAccount,
+        account_ledger_id: account_ledger_id || null,
+        account_ledger_name: account_ledger_name || null,
+        account_group_id: account_group_id || null,
+        account_group_name: account_group_name || null,
         description:
           String(
             description || ""
@@ -2527,6 +2535,10 @@ router.post(
             null,
           company_account_id:
             null,
+          account_ledger_id: account_ledger_id || null,
+          account_ledger_name: account_ledger_name || null,
+          account_group_id: account_group_id || null,
+          account_group_name: account_group_name || null,
           description:
             String(
               description || ""
@@ -2683,6 +2695,10 @@ router.put(
         warehouse_id,
         company_id,
         company_account_id,
+        account_ledger_id,
+        account_ledger_name,
+        account_group_id,
+        account_group_name,
         description,
         amount,
         payment_method,
@@ -2880,6 +2896,10 @@ router.put(
                 normalizedCompany,
               company_account_id:
                 normalizedAccount,
+              account_ledger_id: account_ledger_id || null,
+              account_ledger_name: account_ledger_name || null,
+              account_group_id: account_group_id || null,
+              account_group_name: account_group_name || null,
               description:
                 String(
                   description || ""
