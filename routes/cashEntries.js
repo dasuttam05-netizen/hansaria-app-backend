@@ -2447,8 +2447,14 @@ router.post(
           normalizeMixedId(
             source_expense_id
           ),
+        // Employee salary/expense paid from Main Cash is a warehouse overhead
+        // by default when both employee and warehouse are selected. Other
+        // cash expenses still use the explicit allocation checkbox.
         allocate_warehouse_pl:
-          effectiveType === "expense" && [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl),
+          effectiveType === "expense" && (
+            [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl) ||
+            Boolean(normalizedEmployee && normalizedWarehouse)
+          ),
         linked_entry_id:
           null,
         adjustments:
@@ -2880,9 +2886,11 @@ router.put(
               status:
                 status || "pending",
               allocate_warehouse_pl:
-                String(entry_type || "").toLowerCase() === "expense" && (allocate_warehouse_pl === undefined
-                  ? Boolean(old.allocate_warehouse_pl)
-                  : [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl)),
+                String(entry_type || "").toLowerCase() === "expense" && (
+                  [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl) ||
+                  (allocate_warehouse_pl === undefined && Boolean(old.allocate_warehouse_pl)) ||
+                  Boolean(normalizedEmployee && normalizedWarehouse)
+                ),
               adjustments:
                 clean,
               updated_at:

@@ -175,7 +175,7 @@ router.get("/profit-loss-overheads", async (req, res) => {
       .filter((row) => row.amount > 0);
 
     const allocatedCashRows = await CashEntry.find({
-      allocate_warehouse_pl: true,
+      $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }],
       entry_type: "expense",
       source_expense_id: { $in: [null, ""] },
       status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] },

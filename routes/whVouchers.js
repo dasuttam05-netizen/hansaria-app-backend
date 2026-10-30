@@ -8550,7 +8550,7 @@ router.get("/report/profit-loss", async (req, res) => {
         mongoose.connection.db.collection("expenses").find({}).toArray(),
         WarehouseRentBooking.find({}).lean(),
         mongoose.connection.db.collection("warehouse_trading_profit_loss_adjustments").find({}).toArray(),
-        CashEntry.find({ allocate_warehouse_pl: true, entry_type: "expense", source_expense_id: { $in: [null, ""] }, status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] } }).lean(),
+        CashEntry.find({ $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }], entry_type: "expense", source_expense_id: { $in: [null, ""] }, status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] } }).lean(),
       ]);
       (expenseRows || []).forEach((expense) => {
         const row = getWarehouseSummaryRow(expense.warehouse_id);
@@ -8558,10 +8558,50 @@ router.get("/report/profit-loss", async (req, res) => {
         row.staff_expense = Number(row.staff_expense || 0) + Number(expense.total_expense_amount ?? expense.grand_total ?? expense.amount ?? 0);
       });
       (allocatedCashRows || []).forEach((entry) => {
-        const row = getWarehouseSummaryRow(entry.warehouse_id);
         const entryDate = entry.entry_date instanceof Date ? entry.entry_date.toISOString().slice(0, 10) : String(entry.entry_date || "").slice(0, 10);
-        if (!row || !dateInRange(entryDate)) return;
-        row.staff_expense = Number(row.staff_expense || 0) + Number(entry.amount || 0);
+        if (!dateInRange(entryDate)) return;
+      });
+
+      // Cash Book expenses selected against a Warehouse are allocated to the
+      // Direct Loading summary row(s) for that Warehouse's Location and month.
+      // This keeps the cash/employee ledger posting unchanged and avoids
+      // attaching the whole cost to a warehouse row with a different ID.
+      const cashWarehouseIds = [...new Set((allocatedCashRows || []).map((entry) => String(entry.warehouse_id || "")).filter(Boolean))];
+      const directSales = (sales || []).filter((sale) => String(sale.sale_type || "").toLowerCase() === "direct");
+      const idsToResolve = [...new Set([
+        ...cashWarehouseIds,
+        ...directSales.map((sale) => String(sale.warehouse_id || "")).filter(Boolean),
+      ])].filter((id) => mongoose.Types.ObjectId.isValid(id));
+      const resolvedWarehouses = idsToResolve.length
+        ? await Warehouse.find({ _id: { $in: idsToResolve } }).select("_id location_id").lean()
+        : [];
+      const locationByWarehouse = new Map((resolvedWarehouses || []).map((warehouse) => [String(warehouse._id), String(warehouse.location_id || "")]));
+      const directQtyByLocationMonth = new Map();
+      (directSales || []).forEach((sale) => {
+        const date = String(sale.date || "").slice(0, 10);
+        const month = date.slice(0, 7);
+        const warehouseId = String(sale.warehouse_id || "");
+        const locationId = String(sale.location_id || locationByWarehouse.get(warehouseId) || "");
+        const quantity = Number(sale.quantity || sale.total_quantity || sale.unloading_qty || 0);
+        if (!locationId || !month || quantity <= 0 || !dateInRange(date)) return;
+        const key = `${locationId}|${month}`;
+        const bucket = directQtyByLocationMonth.get(key) || { total: 0, byWarehouse: new Map() };
+        bucket.total += quantity;
+        bucket.byWarehouse.set(warehouseId, Number(bucket.byWarehouse.get(warehouseId) || 0) + quantity);
+        directQtyByLocationMonth.set(key, bucket);
+      });
+      (allocatedCashRows || []).forEach((entry) => {
+        const entryDate = entry.entry_date instanceof Date ? entry.entry_date.toISOString().slice(0, 10) : String(entry.entry_date || "").slice(0, 10);
+        const warehouseId = String(entry.warehouse_id || "");
+        const locationId = String(locationByWarehouse.get(warehouseId) || "");
+        const bucket = directQtyByLocationMonth.get(`${locationId}|${entryDate.slice(0, 7)}`);
+        if (!bucket || bucket.total <= 0) return;
+        const amount = Number(entry.amount || 0);
+        bucket.byWarehouse.forEach((quantity, targetWarehouseId) => {
+          const row = getWarehouseSummaryRow(targetWarehouseId);
+          if (!row) return;
+          row.staff_expense = Number(row.staff_expense || 0) + amount * quantity / bucket.total;
+        });
       });
       (rentRows || []).forEach((rent) => {
         const warehouseId = String(rent.warehouse_id || "");
@@ -8866,7 +8906,7 @@ router.get("/report/profit-loss", async (req, res) => {
           { $group: { _id: { warehouse_id: { $toString: "$warehouse_id" }, location_id: "$location_id", month: "$month" }, quantity: { $sum: "$quantity" } } },
         ]),
         CashEntry.find({
-          allocate_warehouse_pl: true,
+          $or: [{ allocate_warehouse_pl: true }, { employee_id: { $nin: [null, ""] } }],
           entry_type: "expense",
           source_expense_id: { $in: [null, ""] },
           status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] },
