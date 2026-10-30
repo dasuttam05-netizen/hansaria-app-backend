@@ -4,6 +4,7 @@ const router = express.Router();
 const { userHasPermission } = require("../middleware/auth");
 const { assignedWarehouseFilter, canAccessWarehouse } = require("../helpers/access");
 const { WarehouseRentBooking } = require("../mongo");
+const { CashEntry } = require("../db-mongodb");
 const XLSX = require("xlsx");
 
 const warehouseTradingEntrySchema = new mongoose.Schema(
@@ -172,6 +173,28 @@ router.get("/profit-loss-overheads", async (req, res) => {
         amount: Number(row.total_expense_amount ?? row.grand_total ?? row.amount ?? 0) || 0,
       }))
       .filter((row) => row.amount > 0);
+
+    const allocatedCashRows = await CashEntry.find({
+      allocate_warehouse_pl: true,
+      entry_type: "expense",
+      source_expense_id: { $in: [null, ""] },
+      status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] },
+    }).lean();
+    (allocatedCashRows || []).forEach((row) => {
+      const warehouseId = normalizeText(row.warehouse_id);
+      const date = row.entry_date instanceof Date ? row.entry_date.toISOString().slice(0, 10) : normalizeText(row.entry_date).slice(0, 10);
+      const amount = Number(row.amount || 0);
+      if (!warehouseId || !canAccessWarehouse(req.user, warehouseId) || !inDateRange(date, fromDate, toDate) || amount <= 0) return;
+      expenses.push({
+        id: String(row.id || row._id || ""),
+        date,
+        warehouse_id: warehouseId,
+        employee_name: normalizeText(row.employee_name) || "Cash Book Expense",
+        description: normalizeText(row.description || row.narration || row.voucher_no) || "Cash Book Expense",
+        amount,
+        source_type: "cashbook",
+      });
+    });
 
     const rentBookings = await WarehouseRentBooking.find({}).populate("warehouse_id", "name").lean();
     const rents = (rentBookings || [])

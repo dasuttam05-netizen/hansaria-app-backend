@@ -61,6 +61,7 @@ const {
   ReceiptVoucher: MongoReceiptVoucher,
   ReceiptAdjustment: MongoReceiptAdjustment,
   JournalVoucher: MongoJournalVoucher,
+  CashEntry,
 } = require("../db-mongodb");
 
 const WarehouseLoading = mongoose.models.WarehouseLoading || mongoose.model(
@@ -8184,6 +8185,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
   const totalRent = rows.reduce((sum, row) => sum + Number(row.rent_amount || 0), 0);
   const totalManualIncome = rows.reduce((sum, row) => sum + Number(row.manual_income || 0), 0);
   const totalManualExpense = rows.reduce((sum, row) => sum + Number(row.manual_expense || 0), 0);
+  const totalAllocatedWarehouseExpense = rows.reduce((sum, row) => sum + Number(row.allocated_warehouse_expense || 0), 0);
   const totalNetSale = rows.reduce((sum, row) => sum + Number(row.sale_amount || 0), 0);
   const totalProfitLoss = rows.reduce((sum, row) => sum + Number(row.profit_loss || 0), 0);
 
@@ -8227,6 +8229,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     ["S.Amount", 72],
     ["Add", 50],
     ["Less", 52],
+    ["Allocated Exp", 70],
     ["P/L", 52],
   ];
   const warehouseCols = [
@@ -8278,7 +8281,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
     let x = left;
     values.forEach((value, index) => {
       const width = widths[index][1];
-      const isProfitColumn = (!isWarehouse && index === 9) || (isWarehouse && index === 10);
+      const isProfitColumn = (!isWarehouse && index === 10) || (isWarehouse && index === 11);
       const numericValue = Number(value);
 
       if (isProfitColumn && Number.isFinite(numericValue)) {
@@ -8339,6 +8342,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           fmt(row.gross_amount),
           fmt(row.additional_amount),
           fmt(row.total_less),
+          fmt(row.allocated_warehouse_expense),
           fmt(row.profit_loss),
         ]);
       }
@@ -8376,6 +8380,7 @@ async function sendProfitLossPdf(res, { mode, rows, fromDate, toDate, buyerId, c
           ["Total Add", fmt(totalAdd)],
           ["Total Less", fmt(totalLess)],
           ["Total Net Sale", fmt(totalNetSale)],
+          ["Total Allocated Warehouse Expense", fmt(totalAllocatedWarehouseExpense)],
           ["Total Profit / Loss", fmt(totalProfitLoss)],
         ];
 
@@ -8541,15 +8546,22 @@ router.get("/report/profit-loss", async (req, res) => {
         const raw = value instanceof Date ? value.toISOString().slice(0, 10) : String(value || "").slice(0, 10);
         return Boolean(raw) && (!fromDate || raw >= fromDate) && (!toDate || raw <= toDate);
       };
-      const [expenseRows, rentRows, manualRows] = await Promise.all([
+      const [expenseRows, rentRows, manualRows, allocatedCashRows] = await Promise.all([
         mongoose.connection.db.collection("expenses").find({}).toArray(),
         WarehouseRentBooking.find({}).lean(),
         mongoose.connection.db.collection("warehouse_trading_profit_loss_adjustments").find({}).toArray(),
+        CashEntry.find({ allocate_warehouse_pl: true, entry_type: "expense", source_expense_id: { $in: [null, ""] }, status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] } }).lean(),
       ]);
       (expenseRows || []).forEach((expense) => {
         const row = getWarehouseSummaryRow(expense.warehouse_id);
         if (!row || !dateInRange(expense.expense_date || expense.date)) return;
         row.staff_expense = Number(row.staff_expense || 0) + Number(expense.total_expense_amount ?? expense.grand_total ?? expense.amount ?? 0);
+      });
+      (allocatedCashRows || []).forEach((entry) => {
+        const row = getWarehouseSummaryRow(entry.warehouse_id);
+        const entryDate = entry.entry_date instanceof Date ? entry.entry_date.toISOString().slice(0, 10) : String(entry.entry_date || "").slice(0, 10);
+        if (!row || !dateInRange(entryDate)) return;
+        row.staff_expense = Number(row.staff_expense || 0) + Number(entry.amount || 0);
       });
       (rentRows || []).forEach((rent) => {
         const warehouseId = String(rent.warehouse_id || "");
@@ -8758,7 +8770,7 @@ router.get("/report/profit-loss", async (req, res) => {
     const baseQuery = SaleVoucher.find(filter).sort({ date: -1, createdAt: -1, _id: -1 });
     const rows = exportMode ? await baseQuery.lean() : await baseQuery.skip((page - 1) * pageSize).limit(pageSize).lean();
     const decorated = await decorateSaleRows(rows);
-    const reportRows = decorated.map((row) => {
+    let reportRows = decorated.map((row) => {
       const grossAmount = Number(row.amount || row.total_amount || 0);
       const netPayable = Number(row.net_amount_payable || row.net_receivable_amount || row.net_amount || grossAmount || 0);
       const purchaseLinks = Array.isArray(row.against_purchase_links) ? row.against_purchase_links : [];
@@ -8789,6 +8801,83 @@ router.get("/report/profit-loss", async (req, res) => {
       };
     });
 
+    // Cash-book overheads marked for allocation are distributed only in the
+    // Direct Loading bill view. The original Cash Book amount and bank ledger
+    // posting remain untouched; Warehouse Wise P/L continues to count the full
+    // monthly expense once.
+    const allocationRows = reportRows.filter((row) => row.warehouse_id && String(row.date || "").length >= 7);
+    const allocationWarehouseIds = [...new Set(allocationRows.map((row) => String(row.warehouse_id)))];
+    const allocationMonths = [...new Set(allocationRows.map((row) => String(row.date).slice(0, 7)))].sort();
+    if (allocationWarehouseIds.length && allocationMonths.length) {
+      const firstMonth = allocationMonths[0];
+      const lastMonth = allocationMonths[allocationMonths.length - 1];
+      const rangeStart = new Date(`${firstMonth}-01T00:00:00.000Z`);
+      const [year, month] = lastMonth.split("-").map(Number);
+      const rangeEnd = new Date(Date.UTC(year, month, 1));
+      const allocationFilter = {
+        ...mongoSaleScope(req.user),
+        sale_type: "direct",
+        warehouse_id: { $in: allocationWarehouseIds },
+        date: { $gte: firstMonth, $lte: `${lastMonth}-31` },
+      };
+      const [monthlyLoadingRows, cashAllocationRows, expenseAllocationRows] = await Promise.all([
+        SaleVoucher.aggregate([
+          { $match: allocationFilter },
+          { $project: {
+            warehouse_id: 1,
+            month: { $substrBytes: [{ $ifNull: ["$date", ""] }, 0, 7] },
+            quantity: { $convert: { input: { $ifNull: ["$quantity", { $ifNull: ["$total_quantity", "$unloading_qty"] }] }, to: "double", onError: 0, onNull: 0 } },
+          } },
+          { $group: { _id: { warehouse_id: { $toString: "$warehouse_id" }, month: "$month" }, quantity: { $sum: "$quantity" } } },
+        ]),
+        CashEntry.find({
+          allocate_warehouse_pl: true,
+          entry_type: "expense",
+          source_expense_id: { $in: [null, ""] },
+          status: { $nin: ["pending", "cancelled", "canceled", "void", "deleted"] },
+          warehouse_id: { $in: allocationWarehouseIds },
+          entry_date: { $gte: rangeStart, $lt: rangeEnd },
+        }).select("warehouse_id entry_date amount").lean(),
+        mongoose.connection.db.collection("expenses").find({
+          allocate_warehouse_pl: true,
+          warehouse_id: { $in: allocationWarehouseIds },
+          expense_date: { $gte: firstMonth, $lte: `${lastMonth}-31` },
+        }).project({ warehouse_id: 1, expense_date: 1, amount: 1, total_expense_amount: 1, grand_total: 1 }).toArray(),
+      ]);
+      const quantityByWarehouseMonth = new Map((monthlyLoadingRows || []).map((item) => [`${item._id.warehouse_id}|${item._id.month}`, Number(item.quantity || 0)]));
+      const expenseByWarehouseMonth = new Map();
+      (cashAllocationRows || []).forEach((entry) => {
+        const entryDate = entry.entry_date instanceof Date ? entry.entry_date : new Date(entry.entry_date);
+        if (Number.isNaN(entryDate.getTime())) return;
+        const key = `${String(entry.warehouse_id || "")}|${entryDate.toISOString().slice(0, 7)}`;
+        expenseByWarehouseMonth.set(key, Number(expenseByWarehouseMonth.get(key) || 0) + Number(entry.amount || 0));
+      });
+      (expenseAllocationRows || []).forEach((entry) => {
+        const expenseDate = entry.expense_date instanceof Date ? entry.expense_date : new Date(String(entry.expense_date || entry.date || ""));
+        const month = entry.expense_date instanceof Date || !/^\d{4}-\d{2}/.test(String(entry.expense_date || ""))
+          ? (Number.isNaN(expenseDate.getTime()) ? "" : expenseDate.toISOString().slice(0, 7))
+          : String(entry.expense_date).slice(0, 7);
+        if (!month) return;
+        const key = `${String(entry.warehouse_id || "")}|${month}`;
+        const amount = Number(entry.total_expense_amount ?? entry.grand_total ?? entry.amount ?? 0);
+        expenseByWarehouseMonth.set(key, Number(expenseByWarehouseMonth.get(key) || 0) + amount);
+      });
+      reportRows = reportRows.map((row) => {
+        const key = `${String(row.warehouse_id || "")}|${String(row.date || "").slice(0, 7)}`;
+        const denominator = Number(quantityByWarehouseMonth.get(key) || 0);
+        const quantity = Number(row.quantity || 0);
+        const expenseTotal = Number(expenseByWarehouseMonth.get(key) || 0);
+        const allocatedExpense = denominator > 0 && quantity > 0 ? Number((expenseTotal * quantity / denominator).toFixed(2)) : 0;
+        return {
+          ...row,
+          allocated_warehouse_expense: allocatedExpense,
+          profit_loss: Number((Number(row.profit_loss || 0) - allocatedExpense).toFixed(2)),
+        };
+      });
+    } else {
+      reportRows = reportRows.map((row) => ({ ...row, allocated_warehouse_expense: 0 }));
+    }
+
     if (exportMode) {
       const exportRows = reportRows.map((row) => ({
         Date: row.date,
@@ -8818,6 +8907,7 @@ router.get("/report/profit-loss", async (req, res) => {
         "Total Less": row.total_less,
         "Round Off": Number(row.round_off || 0),
         "Net Sale Amount": row.sale_amount,
+        "Allocated Warehouse Expense": row.allocated_warehouse_expense,
         "Profit / Loss": row.profit_loss,
       }));
       exportRows.push({
@@ -8829,6 +8919,7 @@ router.get("/report/profit-loss", async (req, res) => {
         "Total Add": Number(reportRows.reduce((s, r) => s + Number(r.additional_amount || 0), 0).toFixed(2)),
         "Total Less": Number(reportRows.reduce((s, r) => s + Number(r.total_less || 0), 0).toFixed(2)),
         "Net Sale Amount": Number(reportRows.reduce((s, r) => s + Number(r.sale_amount || 0), 0).toFixed(2)),
+        "Allocated Warehouse Expense": Number(reportRows.reduce((s, r) => s + Number(r.allocated_warehouse_expense || 0), 0).toFixed(2)),
         "Profit / Loss": Number(reportRows.reduce((s, r) => s + Number(r.profit_loss || 0), 0).toFixed(2)),
       });
       const workbook = XLSX.utils.book_new();

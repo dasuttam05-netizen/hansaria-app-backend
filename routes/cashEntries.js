@@ -2159,6 +2159,7 @@ router.post(
       status,
       fund_source,
       source_expense_id,
+      allocate_warehouse_pl,
       adjustments,
       auto_staff_entry,
     } = body;
@@ -2446,6 +2447,8 @@ router.post(
           normalizeMixedId(
             source_expense_id
           ),
+        allocate_warehouse_pl:
+          effectiveType === "expense" && [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl),
         linked_entry_id:
           null,
         adjustments:
@@ -2676,6 +2679,7 @@ router.put(
         employee_id,
         status,
         fund_source,
+        allocate_warehouse_pl,
         adjustments,
       } = body;
 
@@ -2875,6 +2879,10 @@ router.put(
                 ),
               status:
                 status || "pending",
+              allocate_warehouse_pl:
+                String(entry_type || "").toLowerCase() === "expense" && (allocate_warehouse_pl === undefined
+                  ? Boolean(old.allocate_warehouse_pl)
+                  : [true, 1, "1", "true", "yes"].includes(typeof allocate_warehouse_pl === "string" ? allocate_warehouse_pl.toLowerCase() : allocate_warehouse_pl)),
               adjustments:
                 clean,
               updated_at:

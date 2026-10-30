@@ -3498,6 +3498,7 @@ router.post(
         receive_cash_from_driver,
         grand_total,
         total_expense_amount,
+        allocate_warehouse_pl,
         narration,
         items,
       } =
@@ -3818,6 +3819,9 @@ router.post(
             total_expense_amount
           ),
 
+        allocate_warehouse_pl:
+          allocate_warehouse_pl === true || String(allocate_warehouse_pl || "").toLowerCase() === "true" || String(allocate_warehouse_pl || "") === "1",
+
         narration:
           text(
             narration
@@ -3982,6 +3986,7 @@ router.put(
         receive_cash_from_driver,
         grand_total,
         total_expense_amount,
+        allocate_warehouse_pl,
         narration,
         items,
       } =
@@ -4329,6 +4334,11 @@ router.put(
 
         total_expense_amount:
           totalExpenseAmountForUpdate,
+
+        allocate_warehouse_pl:
+          allocate_warehouse_pl === undefined
+            ? Boolean(expense.allocate_warehouse_pl)
+            : (allocate_warehouse_pl === true || String(allocate_warehouse_pl || "").toLowerCase() === "true" || String(allocate_warehouse_pl || "") === "1"),
 
         narration:
           text(
