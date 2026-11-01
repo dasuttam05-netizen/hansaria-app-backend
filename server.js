@@ -192,7 +192,8 @@ app.use((req, res, next) => {
   return next();
 });
 
-app.use(express.json());
+// 100-bill Warehouse Trading Excel import sends a reviewed row batch as JSON.
+app.use(express.json({ limit: "5mb" }));
 
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
