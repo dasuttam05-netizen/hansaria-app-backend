@@ -54,6 +54,8 @@ const {
 } = require("../mongo");
 const {
   MirrorRow,
+  BuyerName,
+  ConsigneeName,
   PaymentVoucher: MongoPaymentVoucher,
   PaymentAdjustment: MongoPaymentAdjustment,
   PaymentVoucherNative,
@@ -868,6 +870,7 @@ async function buildSalePayload(body, voucherNo) {
     employee_id: body.employee_id ? String(body.employee_id) : "",
     location_id: body.location_id ? String(body.location_id) : "",
     description: body.description || "",
+    import_source_data: body.import_source_data && typeof body.import_source_data === "object" ? body.import_source_data : undefined,
     reject_qty: Number(body.reject_qty) || 0,
   };
 
@@ -2538,7 +2541,36 @@ function firstValue(row, keys) {
       return row[key];
     }
   }
+  const normalizeHeader = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const wanted = new Set(keys.map(normalizeHeader));
+  for (const [header, value] of Object.entries(row || {})) {
+    if (wanted.has(normalizeHeader(header)) && value !== undefined && value !== null && String(value).trim() !== "") {
+      return value;
+    }
+  }
   return "";
+}
+
+function parseTallyAmount(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  const text = String(value).replace(/,/g, "").trim();
+  const match = text.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return 0;
+  const number = Number(match[0]);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function parseTallyQuantity(value) {
+  return parseTallyAmount(value);
+}
+
+function getTallyHandlingColumn(row) {
+  const entry = Object.entries(row || {}).find(([header]) => /^\s*HANDLING\s+CHARGES\s+.+$/i.test(String(header)));
+  if (!entry) return { productName: "", amount: 0, header: "" };
+  const [header, value] = entry;
+  const productName = String(header).replace(/^\s*HANDLING\s+CHARGES\s+/i, "").trim();
+  return { productName, amount: parseTallyAmount(value), header };
 }
 
 function excelDateToIso(value) {
@@ -2603,24 +2635,44 @@ function paymentImportRowsFromSheet(buffer) {
 
 function saleImportTemplateBuffer() {
   const headers = [
-    "Date", "Voucher No", "Sale Type", "Warehouse", "Buyer", "Account",
-    "Farmer", "Consignee", "Product", "Employee", "Location", "Lorry No",
-    "P.O No", "Quantity", "Unloading Qty", "Rate", "Amount", "Packet",
-    "Gross Wt", "Tare Wt", "Net Wt", "Shortage Qty", "Moistur", "Dunki",
-    "Fungas", "Disclour", "Others", "Bags Claim", "Other Deduction",
-    "Transport Charge", "CD %", "CD Amount", "Adjustment Amount", "TDS Amount",
-    "Round Off", "Additional Amount", "Unloading Date", "Due Days", "Narration"
+    "Date", "Particulars", "Buyer", "Buyer Address", "Consignee",
+    "Consignee Address", "Voucher Type", "Voucher No.", "Voucher Ref. No.",
+    "GSTIN/UIN", "Sales Tax No.", "Service Tax No.", "PAN No.", "CST No.",
+    "Narration", "Order No. & Date", "Terms of Payment", "Other References",
+    "Terms of Delivery", "Delivery Note No. & Date", "Despatch Doc. No",
+    "Despatch Through", "Destination", "Place of Receipt by Shipper",
+    "Vessel/Flight No.", "Port of Loading", "Port of Discharge", "Country To",
+    "Shipping No.", "Shipping Date", "Port Code", "Quantity", "Value",
+    "Gross Total", "SALES ACCOUNT", "HANDLING CHARGES Maize",
+    "Warehouse Name", "Employee Name", "Location Name"
   ];
-  const sample = [
-    new Date().toISOString().slice(0, 10), "", "warehouse", "Hemtobat Warehouse",
-    "Hemtobat Pvt Ltd", "Agri Rise Pvt Ltd", "", "", "Maize", "Subrajyoti Mondal",
-    "Hemtobat Hub", "WB00A0000", "", 30, 30, 19900, 597000, 0, 0, 0, 30, 0,
-    0, 0, 0, 0, 0, 245, 0, 0, 0, 0, 0, 0, 0, 0, "", "", ""
-  ];
-  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
-  ws["!cols"] = headers.map(() => ({ wch: 18 }));
+  const ws = XLSX.utils.aoa_to_sheet([headers, headers.map(() => "")]);
+  ws["!cols"] = headers.map((header, index) => ({
+    wch: index === 3 || index === 5 || index === 14 || index === 15 ? 36 :
+      index >= 36 ? 22 : Math.max(14, Math.min(30, String(header).length + 3))
+  }));
+  ws["!autofilter"] = { ref: `A1:${XLSX.utils.encode_col(headers.length - 1)}2` };
+  ws["!freeze"] = { xSplit: 0, ySplit: 1 };
+
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Sale Import");
+  const notes = [
+    ["HANSARIA — SALE EXCEL IMPORT INSTRUCTIONS"],
+    ["Keep the original 36 Tally columns in the same order. The final 3 columns are mandatory: Warehouse Name, Employee Name and Location Name."],
+    ["Each Excel data row represents one Sale Bill. You can upload up to 500 bills in one batch; 100 bills are supported."],
+    ["Warehouse Name, Employee Name and Location Name must be filled on every row and must match existing Hansaria master names."],
+    ["Buyer is matched to the existing Company master. The related Company Account is auto-selected if only one account is linked; otherwise select the account in Preview."],
+    ["Product is inferred from the text after the HANDLING CHARGES header (for example, HANDLING CHARGES Maize -> Maize). If it cannot be matched, select Product in Preview."],
+    ["Value is imported as the Sale Amount. Quantity accepts units such as '38.240 MTS'. Rate is derived from Value / Quantity."],
+    ["Additional amount is derived from Gross Total minus Value (or from the HANDLING CHARGES amount if Gross Total is blank)."],
+    ["Sale Type is selected per bill after Upload: Warehouse Loading or Direct Loading."],
+    ["For Direct Loading, select Farmer and enter Direct Purchase Rate in Preview. Consignee is read from the Consignee column or can be selected in Preview."],
+    ["Other original Tally columns are retained in the voucher's import source details for reference; they are not treated as app master fields."],
+    ["Do not rename or remove the final three mandatory columns. Use one row for each bill and leave unused source columns blank."]
+  ];
+  const noteSheet = XLSX.utils.aoa_to_sheet(notes);
+  noteSheet["!cols"] = [{ wch: 150 }];
+  XLSX.utils.book_append_sheet(wb, noteSheet, "Instructions");
   return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 }
 
@@ -3796,6 +3848,288 @@ router.get("/sale/import-template", (req, res) => {
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", 'attachment; filename="sale_voucher_import_format.xlsx"');
   res.send(buffer);
+});
+
+router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is not connected. Sale import saves data in MongoDB." });
+  }
+  if (!req.file?.buffer) {
+    return res.status(400).json({ error: "Please upload an Excel file" });
+  }
+
+  try {
+    const rows = purchaseImportRowsFromSheet(req.file.buffer);
+    if (!rows.length) return res.status(400).json({ error: "No rows found in Excel file" });
+    if (rows.length > 500) {
+      return res.status(400).json({ error: "A maximum of 500 sale rows can be imported at one time." });
+    }
+
+    const [warehouses, buyers, farmers, products, accounts, employees, locations, consignees] = await Promise.all([
+      Warehouse.find({}).lean(),
+      BuyerName.find({}).lean(),
+      Farmer.find({}).lean(),
+      Product.find({}).lean(),
+      CompanyAccount.find({}).lean(),
+      Employee.find({}).lean(),
+      Location.find({}).lean(),
+      ConsigneeName.find({}).lean(),
+    ]);
+
+    const warehouseMap = buildImportMap(warehouses, ["name"]);
+    const buyerMap = buildImportMap(buyers, ["name"]);
+    const buyerCompanyMap = buildImportMap(await Company.find({}).lean(), ["name"]);
+    const farmerMap = buildImportMap(farmers, ["name", "mobile", "phone", "farmer_no", "farmer_number"]);
+    const productMap = buildImportMap(products, ["name"]);
+    const accountMap = buildImportMap(accounts, ["account_name", "name"]);
+    const employeeMap = buildImportMap(employees, ["name", "mobile", "phone"]);
+    const locationMap = buildImportMap(locations, ["name"]);
+    const consigneeMap = buildImportMap(consignees, ["name"]);
+
+    const preview = [];
+    const errors = [];
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const rowNo = index + 2;
+      try {
+        const date = excelDateToIso(firstValue(row, ["Date", "date"]));
+        const buyerValue = firstValue(row, ["Buyer", "Buyer Name", "Particulars", "Company", "buyer", "buyer_id", "company_id"]);
+        const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse Name", "Warehouse", "warehouse", "warehouse_id"]));
+        const buyer = resolveByNameOrId(buyerMap, buyerValue);
+        const matchedCompany = buyer ? resolveByNameOrId(buyerCompanyMap, buyer.name) : null;
+        const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Farmer Name", "Party", "farmer", "farmer_id"]));
+        const handling = getTallyHandlingColumn(row);
+        const productValue = firstValue(row, ["Product", "Product Name", "product", "product_id"]) || handling.productName;
+        const product = resolveByNameOrId(productMap, productValue);
+        // The Tally SALES ACCOUNT column contains the credit amount, not a Company Account name.
+        // For this format, select the Company Account linked to the Buyer when it is unambiguous.
+        const explicitAccountValue = firstValue(row, ["Account", "Account Name", "Company Account", "company_account", "company_account_id"]);
+        const explicitAccount = explicitAccountValue ? resolveByNameOrId(accountMap, explicitAccountValue) : null;
+        const linkedBuyerAccounts = matchedCompany
+          ? accounts.filter((account) => String(account.company_id || "") === String(matchedCompany._id || matchedCompany.id || ""))
+          : [];
+        const buyerAccounts = linkedBuyerAccounts.length ? linkedBuyerAccounts : accounts;
+        const account = explicitAccount || (buyerAccounts.length === 1 ? buyerAccounts[0] : null);
+        const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee Name", "Employee", "employee_name", "employee", "employee_id"]));
+        const location = resolveByNameOrId(locationMap, firstValue(row, ["Location Name", "Location", "location_name", "location", "location_id"]));
+        const consignee = resolveByNameOrId(consigneeMap, firstValue(row, ["Consignee", "Consignee Name", "consignee", "consignee_id"]));
+
+        const quantity = parseTallyQuantity(firstValue(row, ["Quantity", "quantity"]));
+        const valueAmount = parseTallyAmount(firstValue(row, ["Value", "Amount", "amount"]));
+        const grossTotal = parseTallyAmount(firstValue(row, ["Gross Total", "Gross Amount", "gross_total"]));
+        const handlingAmount = handling.amount;
+        const additionalAmount = Math.max(0, Number((grossTotal - valueAmount).toFixed(2))) || handlingAmount;
+
+        const missing = [];
+        if (!date) missing.push("Date");
+        if (!warehouse) missing.push("Warehouse Name");
+        if (!employee) missing.push("Employee Name");
+        if (!location) missing.push("Location Name");
+        if (!buyer) missing.push("Buyer / Particulars (existing Buyer master name)");
+        if (!(quantity > 0)) missing.push("Quantity");
+        if (!(valueAmount > 0)) missing.push("Value");
+        if (missing.length) {
+          errors.push({ row: rowNo, error: `Missing/invalid: ${missing.join(", ")}` });
+          continue;
+        }
+        if (!canAccessWarehouse(req.user, warehouse._id)) {
+          errors.push({ row: rowNo, error: `No access to warehouse: ${warehouse.name || warehouse._id}` });
+          continue;
+        }
+
+        const rate = Number((valueAmount / quantity).toFixed(4));
+        const data = {
+          voucher_no: String(firstValue(row, ["Voucher No.", "Voucher No", "Voucher", "voucher_no"]) || firstValue(row, ["Voucher Ref. No.", "Voucher Ref No"]) || "").trim(),
+          date,
+          unloading_date: "",
+          sale_type: "",
+          warehouse_id: String(warehouse._id),
+          buyer_id: String(buyer._id || buyer.id),
+          company_id: String(buyer._id || buyer.id),
+          farmer_id: farmer ? String(farmer._id) : "",
+          company_account_id: account ? String(account._id || account.id) : "",
+          consignee_id: consignee ? String(consignee._id || consignee.id) : "",
+          po_no: String(firstValue(row, ["Order No. & Date", "Order No & Date", "P.O No", "PO No", "po_no"]) || ""),
+          lorry_no: String(firstValue(row, ["Lorry No", "Despatch Doc. No", "Vessel/Flight No.", "Vessel/Flight No", "lorry_no"]) || ""),
+          product_id: product ? String(product._id || product.id) : "",
+          employee_id: String(employee._id || employee.id),
+          location_id: String(location._id || location.id),
+          quantity,
+          unloading_qty: quantity,
+          rate,
+          direct_purchase_rate: parseTallyAmount(firstValue(row, ["Direct Purchase Rate", "Purchase Rate", "direct_purchase_rate"])),
+          amount: valueAmount,
+          packet: parseTallyAmount(firstValue(row, ["Packet", "packet"])),
+          gross_weight: 0,
+          tare_weight: 0,
+          net_weight: quantity,
+          shortage_quantity: 0,
+          moisture: 0,
+          dunki: 0,
+          fungus: 0,
+          discolour: 0,
+          others: 0,
+          bags_claim: 0,
+          claim_amount: 0,
+          other_deduction: 0,
+          transport_charge: 0,
+          cd_percent: 0,
+          cd_amount: 0,
+          adjustment_amount: 0,
+          tds_amount: 0,
+          round_off: 0,
+          additional_amount: additionalAmount,
+          due_days: 0,
+          due_date: "",
+          description: String(firstValue(row, ["Narration", "Description", "description"]) || ""),
+          // Preserve every populated original field (including address, GSTIN, PAN and shipping fields)
+          // because the Sale Voucher's normal columns do not represent every Tally export field.
+          import_source_data: Object.fromEntries(
+            Object.entries(row || {}).filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
+          ),
+        };
+        preview.push({
+          row: rowNo,
+          data,
+          sale_type: "",
+          display: {
+            date: data.date,
+            voucher_no: data.voucher_no,
+            warehouse_name: warehouse.name || "",
+            employee_name: employee.name || "",
+            location_name: location.name || "",
+            buyer_name: buyer.name || "",
+            account_name: account?.account_name || account?.name || "",
+            account_options: buyerAccounts.map((item) => ({ id: String(item._id || item.id), name: item.account_name || item.name || "" })),
+            product_name: product?.name || "",
+            product_guess: handling.productName || "",
+            farmer_name: farmer?.name || "",
+            consignee_name: consignee?.name || String(firstValue(row, ["Consignee", "Consignee Name"]) || ""),
+            quantity,
+            amount: valueAmount,
+            additional_amount: additionalAmount,
+          },
+        });
+      } catch (err) {
+        errors.push({ row: rowNo, error: err?.message || "Sale row validation failed" });
+      }
+    }
+
+    return res.json({
+      total: rows.length,
+      valid: preview.length,
+      failed: errors.length,
+      preview,
+      errors,
+      options: {
+        products: products.map((item) => ({ id: String(item._id || item.id), name: item.name || "" })),
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/sale/import-confirm", async (req, res) => {
+  if (!userHasPermission(req.user, "warehouse.trading.sale.create")) {
+    return res.status(403).json({ error: "Permission denied" });
+  }
+  if (!mongoReady()) {
+    return res.status(503).json({ error: "MongoDB is not connected. Sale import saves data in MongoDB." });
+  }
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (!rows.length) return res.status(400).json({ error: "There are no valid preview rows to save." });
+  if (rows.length > 500) return res.status(400).json({ error: "A maximum of 500 sale rows can be saved at one time." });
+
+  try {
+    const [warehouses, buyers, farmers, products, accounts, employees, locations, consignees] = await Promise.all([
+      Warehouse.find({}).lean(), BuyerName.find({}).lean(), Farmer.find({}).lean(), Product.find({}).lean(),
+      CompanyAccount.find({}).lean(), Employee.find({}).lean(), Location.find({}).lean(), ConsigneeName.find({}).lean(),
+    ]);
+    const byId = (docs) => new Map(docs.map((doc) => [String(doc._id), doc]));
+    const warehouseById = byId(warehouses);
+    const buyerById = byId(buyers);
+    const farmerById = byId(farmers);
+    const productById = byId(products);
+    const accountById = byId(accounts);
+    const employeeById = byId(employees);
+    const locationById = byId(locations);
+    const consigneeById = byId(consignees);
+
+    const imported = [];
+    const errors = [];
+    for (let index = 0; index < rows.length; index += 1) {
+      const input = rows[index] || {};
+      const rowNo = Number(input.row) || index + 2;
+      try {
+        const row = input.data && typeof input.data === "object" ? input.data : input;
+        const saleType = String(row.sale_type || "").trim().toLowerCase();
+        if (!["warehouse", "direct"].includes(saleType)) {
+          throw new Error("Please select Warehouse Loading or Direct Loading");
+        }
+        const warehouse = warehouseById.get(String(row.warehouse_id || ""));
+        const buyer = buyerById.get(String(row.buyer_id || row.company_id || ""));
+        const account = accountById.get(String(row.company_account_id || ""));
+        const product = productById.get(String(row.product_id || ""));
+        const employee = employeeById.get(String(row.employee_id || ""));
+        const location = locationById.get(String(row.location_id || ""));
+        const farmer = farmerById.get(String(row.farmer_id || ""));
+        const consignee = consigneeById.get(String(row.consignee_id || ""));
+        const missing = [];
+        if (!row.date) missing.push("Date");
+        if (!warehouse) missing.push("Warehouse Name");
+        if (!employee) missing.push("Employee Name");
+        if (!location) missing.push("Location Name");
+        if (!buyer) missing.push("Buyer");
+        if (!account) missing.push("Account");
+        if (!product) missing.push("Product");
+        if (saleType === "direct") {
+          if (!farmer) missing.push("Farmer");
+          if (!consignee) missing.push("Consignee");
+          if (!(Number(row.direct_purchase_rate) > 0)) missing.push("Direct Purchase Rate");
+        }
+        if (missing.length) throw new Error(`Missing/invalid: ${missing.join(", ")}`);
+        if (!canAccessWarehouse(req.user, warehouse._id)) {
+          throw new Error(`No access to warehouse: ${warehouse.name || warehouse._id}`);
+        }
+
+        const data = { ...row, sale_type: saleType };
+        const existingVoucherNo = String(data.voucher_no || "").trim();
+        const generatedVoucherNo = await new Promise((resolve, reject) => {
+          createVoucherNoIfMissing("sale", existingVoucherNo, (err, generated) => {
+            if (err) return reject(err);
+            resolve(generated);
+          });
+        });
+        const payload = await buildSalePayload(data, generatedVoucherNo);
+        if (saleType !== "direct") {
+          const availableQty = await getAvailableSaleStock({
+            warehouseId: payload.warehouse_id,
+            productId: payload.product_id,
+          });
+          const saleQty = Number(payload.unloading_qty || payload.quantity || 0);
+          if (saleQty > availableQty + 0.0001) {
+            throw new Error(`Negative stock not allowed. Available stock: ${availableQty.toFixed(4)}`);
+          }
+        } else {
+          const directPurchase = await createDirectSalePurchaseVoucher(payload);
+          payload.against_purchase_enabled = Boolean(directPurchase);
+          payload.against_purchase_farmer_id = directPurchase?.farmer_id || payload.against_purchase_farmer_id || "";
+          payload.against_purchase_links = directPurchase ? [directPurchase] : [];
+        }
+        const doc = await SaleVoucher.create(payload);
+        imported.push({ row: rowNo, id: String(doc._id), voucher_no: doc.voucher_no });
+      } catch (err) {
+        errors.push({ row: rowNo, error: err?.message || "Sale import failed" });
+      }
+    }
+    return res.json({ imported: imported.length, failed: errors.length, rows: imported, errors });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 router.post("/sale/import-xlsx", upload.single("file"), async (req, res) => {
