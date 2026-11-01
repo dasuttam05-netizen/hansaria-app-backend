@@ -865,6 +865,11 @@ const saleVoucherSchema =
       location_id: String,
 
       description: String,
+
+      // Original Tally/Excel import row, retained for audit when source columns
+      // (Buyer Address, GSTIN, PAN, shipping details, etc.) do not have dedicated
+      // Warehouse Trading fields. Existing vouchers remain unchanged.
+      import_source_data: mongoose.Schema.Types.Mixed,
     },
     {
       timestamps: true,
