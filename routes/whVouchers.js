@@ -3948,7 +3948,9 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           sale_type: "",
           warehouse_id: String(warehouse._id),
           buyer_id: String(buyer._id || buyer.id),
-          company_id: String(buyer._id || buyer.id),
+          // buyer_id references the dedicated Buyer Name master. company_id must
+          // reference the Company master when the same party exists there.
+          company_id: matchedCompany ? String(matchedCompany._id || matchedCompany.id) : String(buyer._id || buyer.id),
           farmer_id: farmer ? String(farmer._id) : "",
           company_account_id: account ? String(account._id || account.id) : "",
           consignee_id: consignee ? String(consignee._id || consignee.id) : "",
@@ -4126,7 +4128,27 @@ router.post("/sale/import-confirm", async (req, res) => {
         errors.push({ row: rowNo, error: err?.message || "Sale import failed" });
       }
     }
-    return res.json({ imported: imported.length, failed: errors.length, rows: imported, errors });
+    // Do not report an all-failed batch as a successful HTTP response. The
+    // frontend can now display the exact row-level reasons instead of a
+    // misleading "Import complete" notification.
+    if (imported.length === 0 && errors.length > 0) {
+      return res.status(422).json({
+        success: false,
+        message: "No Sale Voucher was saved. Please correct the row errors and try again.",
+        imported: 0,
+        failed: errors.length,
+        rows: [],
+        errors,
+      });
+    }
+    return res.json({
+      success: errors.length === 0,
+      imported: imported.length,
+      failed: errors.length,
+      rows: imported,
+      errors,
+      message: errors.length ? "Some rows were not saved. Review the failed rows." : "All Sale Vouchers were saved.",
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
