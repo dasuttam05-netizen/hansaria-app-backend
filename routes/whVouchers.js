@@ -2644,7 +2644,8 @@ function saleImportTemplateBuffer() {
     "Vessel/Flight No.", "Port of Loading", "Port of Discharge", "Country To",
     "Shipping No.", "Shipping Date", "Port Code", "Quantity", "Value",
     "Gross Total", "SALES ACCOUNT", "HANDLING CHARGES Maize",
-    "Warehouse Name", "Employee Name", "Location Name"
+    "Warehouse Name *", "Employee Name *", "Location Name *", "Company Account *",
+    "Product Name *", "Farmer (Direct)", "Consignee (Direct)", "Direct Purchase Rate"
   ];
   const ws = XLSX.utils.aoa_to_sheet([headers, headers.map(() => "")]);
   ws["!cols"] = headers.map((header, index) => ({
@@ -2658,17 +2659,17 @@ function saleImportTemplateBuffer() {
   XLSX.utils.book_append_sheet(wb, ws, "Sale Import");
   const notes = [
     ["HANSARIA — SALE EXCEL IMPORT INSTRUCTIONS"],
-    ["Keep the original 36 Tally columns in the same order. The final 3 columns are mandatory: Warehouse Name, Employee Name and Location Name."],
+    ["Keep the original Tally columns in the same order. The additional columns are added at the end; do not rename the headers."],
     ["Each Excel data row represents one Sale Bill. You can upload up to 500 bills in one batch; 100 bills are supported."],
-    ["Warehouse Name, Employee Name and Location Name must be filled on every row and must match existing Hansaria master names."],
-    ["Buyer is matched to the existing Company master. The related Company Account is auto-selected if only one account is linked; otherwise select the account in Preview."],
-    ["Product is inferred from the text after the HANDLING CHARGES header (for example, HANDLING CHARGES Maize -> Maize). If it cannot be matched, select Product in Preview."],
+    ["Warehouse Name and Employee Name must match existing Hansaria masters. Location Name may be supplied in Excel; if the Employee has one assigned Location it is selected automatically. If the Employee has multiple assigned Locations, choose one of that Employee's assigned Locations in the Preview dropdown."],
+    ["Company Account must match an existing Company Account master. It is selected automatically from this column. If it is blank, the linked account is auto-selected only when exactly one account is linked to the Buyer; otherwise complete it in Preview."],
+    ["Product Name should match an existing Product master. If blank, the product is inferred from a Tally column such as HANDLING CHARGES Maize. If it cannot be matched, select Product in Preview."],
+    ["For Direct Loading rows, Farmer (Direct), Consignee (Direct), and Direct Purchase Rate are read from these Excel columns and prefilled in Preview. They are mandatory for Direct Loading."],
+    ["Sale Type is selected per bill after Upload: Warehouse Loading or Direct Loading. Leave Sale Type out of the Excel file; select it in Preview."],
     ["Value is imported as the Sale Amount. Quantity accepts units such as '38.240 MTS'. Rate is derived from Value / Quantity."],
     ["Additional amount is derived from Gross Total minus Value (or from the HANDLING CHARGES amount if Gross Total is blank)."],
-    ["Sale Type is selected per bill after Upload: Warehouse Loading or Direct Loading."],
-    ["For Direct Loading, select Farmer and enter Direct Purchase Rate in Preview. Consignee is read from the Consignee column or can be selected in Preview."],
     ["Other original Tally columns are retained in the voucher's import source details for reference; they are not treated as app master fields."],
-    ["Do not rename or remove the final three mandatory columns. Use one row for each bill and leave unused source columns blank."]
+    ["Use one row for each bill. Warehouse Name, Employee Name, Company Account and Product Name should not be left blank. Direct-only fields are required when you choose Direct Loading."]
   ];
   const noteSheet = XLSX.utils.aoa_to_sheet(notes);
   noteSheet["!cols"] = [{ wch: 150 }];
@@ -3900,13 +3901,13 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
         const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse Name", "Warehouse", "warehouse", "warehouse_id"]));
         const buyer = resolveByNameOrId(buyerMap, buyerValue);
         const matchedCompany = buyer ? resolveByNameOrId(buyerCompanyMap, buyer.name) : null;
-        const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer", "Farmer Name", "Party", "farmer", "farmer_id"]));
+        const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer (Direct)", "Farmer", "Farmer Name", "Party", "farmer", "farmer_id"]));
         const handling = getTallyHandlingColumn(row);
-        const productValue = firstValue(row, ["Product", "Product Name", "product", "product_id"]) || handling.productName;
+        const productValue = firstValue(row, ["Product Name", "Product", "product_name", "product", "product_id"]) || handling.productName;
         const product = resolveByNameOrId(productMap, productValue);
-        // The Tally SALES ACCOUNT column contains the credit amount, not a Company Account name.
-        // For this format, select the Company Account linked to the Buyer when it is unambiguous.
-        const explicitAccountValue = firstValue(row, ["Account", "Account Name", "Company Account", "company_account", "company_account_id"]);
+        // Tally SALES ACCOUNT is an amount column, not a Company Account master name.
+        // Read the separate Company Account column first, then infer only if the Buyer has one linked account.
+        const explicitAccountValue = firstValue(row, ["Company Account", "Company Account Name", "Account", "Account Name", "company_account", "company_account_id"]);
         const explicitAccount = explicitAccountValue ? resolveByNameOrId(accountMap, explicitAccountValue) : null;
         const linkedBuyerAccounts = matchedCompany
           ? accounts.filter((account) => String(account.company_id || "") === String(matchedCompany._id || matchedCompany.id || ""))
@@ -3914,8 +3915,25 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
         const buyerAccounts = linkedBuyerAccounts.length ? linkedBuyerAccounts : accounts;
         const account = explicitAccount || (buyerAccounts.length === 1 ? buyerAccounts[0] : null);
         const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee Name", "Employee", "employee_name", "employee", "employee_id"]));
-        const location = resolveByNameOrId(locationMap, firstValue(row, ["Location Name", "Location", "location_name", "location", "location_id"]));
-        const consignee = resolveByNameOrId(consigneeMap, firstValue(row, ["Consignee", "Consignee Name", "consignee", "consignee_id"]));
+        const excelLocation = resolveByNameOrId(locationMap, firstValue(row, ["Location Name", "Location", "location_name", "location", "location_id"]));
+        const employeeLocationIds = employee
+          ? (Array.isArray(employee.location_ids) && employee.location_ids.length
+            ? employee.location_ids
+            : (employee.location_id ? [employee.location_id] : []))
+              .map((id) => String(id?._id || id || ""))
+              .filter(Boolean)
+          : [];
+        const employeeLocationOptions = employeeLocationIds
+          .map((id) => locationMap.get(normalizeImportKey(id)))
+          .filter(Boolean);
+        const employeeLocationIdSet = new Set(employeeLocationOptions.map((item) => String(item._id || item.id || "")));
+        const excelLocationId = excelLocation ? String(excelLocation._id || excelLocation.id || "") : "";
+        const location = employeeLocationOptions.length
+          ? (excelLocationId && employeeLocationIdSet.has(excelLocationId)
+            ? excelLocation
+            : employeeLocationOptions.length === 1 ? employeeLocationOptions[0] : null)
+          : excelLocation;
+        const consignee = resolveByNameOrId(consigneeMap, firstValue(row, ["Consignee (Direct)", "Consignee", "Consignee Name", "consignee_direct", "consignee", "consignee_id"]));
 
         const quantity = parseTallyQuantity(firstValue(row, ["Quantity", "quantity"]));
         const valueAmount = parseTallyAmount(firstValue(row, ["Value", "Amount", "amount"]));
@@ -3927,7 +3945,7 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
         if (!date) missing.push("Date");
         if (!warehouse) missing.push("Warehouse Name");
         if (!employee) missing.push("Employee Name");
-        if (!location) missing.push("Location Name");
+        if (!location && employeeLocationOptions.length === 0) missing.push("Location Name");
         if (!buyer) missing.push("Buyer / Particulars (existing Buyer master name)");
         if (!(quantity > 0)) missing.push("Quantity");
         if (!(valueAmount > 0)) missing.push("Value");
@@ -3958,7 +3976,7 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           lorry_no: String(firstValue(row, ["Lorry No", "Despatch Doc. No", "Vessel/Flight No.", "Vessel/Flight No", "lorry_no"]) || ""),
           product_id: product ? String(product._id || product.id) : "",
           employee_id: String(employee._id || employee.id),
-          location_id: String(location._id || location.id),
+          location_id: location ? String(location._id || location.id) : "",
           quantity,
           unloading_qty: quantity,
           rate,
@@ -4002,14 +4020,15 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
             voucher_no: data.voucher_no,
             warehouse_name: warehouse.name || "",
             employee_name: employee.name || "",
-            location_name: location.name || "",
+            location_name: location?.name || "",
             buyer_name: buyer.name || "",
             account_name: account?.account_name || account?.name || "",
-            account_options: buyerAccounts.map((item) => ({ id: String(item._id || item.id), name: item.account_name || item.name || "" })),
+            account_options: [...new Map([...(explicitAccount ? [explicitAccount] : []), ...buyerAccounts].map((item) => [String(item._id || item.id), { id: String(item._id || item.id), name: item.account_name || item.name || "" }])).values()],
             product_name: product?.name || "",
             product_guess: handling.productName || "",
             farmer_name: farmer?.name || "",
-            consignee_name: consignee?.name || String(firstValue(row, ["Consignee", "Consignee Name"]) || ""),
+            consignee_name: consignee?.name || String(firstValue(row, ["Consignee (Direct)", "Consignee", "Consignee Name"]) || ""),
+            location_options: employeeLocationOptions.map((item) => ({ id: String(item._id || item.id), name: item.name || "" })),
             quantity,
             amount: valueAmount,
             additional_amount: additionalAmount,
@@ -4094,6 +4113,20 @@ router.post("/sale/import-confirm", async (req, res) => {
           if (!(Number(row.direct_purchase_rate) > 0)) missing.push("Direct Purchase Rate");
         }
         if (missing.length) throw new Error(`Missing/invalid: ${missing.join(", ")}`);
+        const employeeLocationIds = employee
+          ? (Array.isArray(employee.location_ids) && employee.location_ids.length
+            ? employee.location_ids
+            : (employee.location_id ? [employee.location_id] : []))
+              .map((id) => String(id?._id || id || ""))
+              .filter(Boolean)
+          : [];
+        if (
+          employeeLocationIds.length > 0 &&
+          !employee.all_location_access &&
+          !employeeLocationIds.includes(String(location._id || location.id || ""))
+        ) {
+          throw new Error(`Location ${location.name || "selected"} is not assigned to Employee ${employee.name || "selected"}.`);
+        }
         if (!canAccessWarehouse(req.user, warehouse._id)) {
           throw new Error(`No access to warehouse: ${warehouse.name || warehouse._id}`);
         }
