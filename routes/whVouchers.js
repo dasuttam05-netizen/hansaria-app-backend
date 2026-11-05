@@ -2644,8 +2644,8 @@ function saleImportTemplateBuffer() {
     "Vessel/Flight No.", "Port of Loading", "Port of Discharge", "Country To",
     "Shipping No.", "Shipping Date", "Port Code", "Quantity", "Value",
     "Gross Total", "SALES ACCOUNT", "HANDLING CHARGES Maize",
-    "Warehouse Name *", "Employee Name *", "Location Name *", "Company Account *",
-    "Product Name *", "Sale Type *", "Farmer (Direct)", "Direct Purchase Rate"
+    "Warehouse Name *", "Company Account *", "Product Name *", "Sale Type *",
+    "Farmer (Direct)", "Direct Purchase Rate"
   ];
   const ws = XLSX.utils.aoa_to_sheet([headers, headers.map(() => "")]);
   ws["!cols"] = headers.map((header, index) => ({
@@ -2661,7 +2661,7 @@ function saleImportTemplateBuffer() {
     ["HANSARIA — SALE EXCEL IMPORT INSTRUCTIONS"],
     ["Keep the original Tally columns in the same order. The additional columns are added at the end; do not rename the headers."],
     ["Each Excel data row represents one Sale Bill. You can upload up to 500 bills in one batch; 100 bills are supported."],
-    ["Warehouse Name and Employee Name must match existing Hansaria masters. Warehouse Name must be the actual warehouse master name, not a Sale Type. Location Name may be supplied in Excel; if the Employee has one assigned Location it is selected automatically. If the Employee has multiple assigned Locations, choose one of that Employee's assigned Locations in the Preview dropdown."],
+    ["Warehouse Name must match an existing Hansaria warehouse master. Employee Name and Location Name are not required in Excel. Select an Employee for every bill in the Preview; the assigned Location is filled automatically when there is one, or choose one of that Employee's assigned Locations from the Preview dropdown."],
     ["Company Account must match an existing Company Account master. It is selected automatically from this column. If it is blank, the linked account is auto-selected only when exactly one account is linked to the Buyer; otherwise complete it in Preview."],
     ["Product Name should match an existing Product master. If blank, the product is inferred from a Tally column such as HANDLING CHARGES Maize. If it cannot be matched, select Product in Preview."],
     ["Sale Type is read from Sale Type * and is automatically selected in Preview. Enter Warehouse / Warehouse Loading or Direct / Direct Loading for each bill."],
@@ -2670,7 +2670,7 @@ function saleImportTemplateBuffer() {
     ["Value is imported as the Sale Amount. Quantity accepts units such as '38.240 MTS'. Rate is derived from Value / Quantity."],
     ["Additional amount is derived from Gross Total minus Value (or from the HANDLING CHARGES amount if Gross Total is blank)."],
     ["Other original Tally columns are retained in the voucher's import source details for reference; they are not treated as app master fields."],
-    ["Use one row for each bill. Warehouse Name, Employee Name, Company Account, Product Name and Sale Type are required. Farmer (Direct) and Direct Purchase Rate are required only for Direct Loading."]
+    ["Use one row for each bill. Warehouse Name, Company Account, Product Name and Sale Type are required in Excel. Employee and Location are selected in Preview. Farmer (Direct) and Direct Purchase Rate are required only for Direct Loading."]
   ];
   const noteSheet = XLSX.utils.aoa_to_sheet(notes);
   noteSheet["!cols"] = [{ wch: 150 }];
@@ -3922,6 +3922,8 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           : [];
         const buyerAccounts = linkedBuyerAccounts.length ? linkedBuyerAccounts : accounts;
         const account = explicitAccount || (buyerAccounts.length === 1 ? buyerAccounts[0] : null);
+        // Employee and Location are selected in the Preview, not required in Excel.
+        // If older sheets already contain them, use them as a helpful preselection.
         const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee Name", "Employee", "employee_name", "employee", "employee_id"]));
         const excelLocation = resolveByNameOrId(locationMap, firstValue(row, ["Location Name", "Location", "location_name", "location", "location_id"]));
         const employeeLocationIds = employee
@@ -3931,16 +3933,18 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
               .map((id) => String(id?._id || id || ""))
               .filter(Boolean)
           : [];
-        const employeeLocationOptions = employeeLocationIds
-          .map((id) => locationMap.get(normalizeImportKey(id)))
-          .filter(Boolean);
+        const employeeLocationOptions = employee
+          ? (employee.all_location_access
+            ? locations
+            : employeeLocationIds.map((id) => locationMap.get(normalizeImportKey(id))).filter(Boolean))
+          : [];
         const employeeLocationIdSet = new Set(employeeLocationOptions.map((item) => String(item._id || item.id || "")));
         const excelLocationId = excelLocation ? String(excelLocation._id || excelLocation.id || "") : "";
         const location = employeeLocationOptions.length
           ? (excelLocationId && employeeLocationIdSet.has(excelLocationId)
             ? excelLocation
             : employeeLocationOptions.length === 1 ? employeeLocationOptions[0] : null)
-          : excelLocation;
+          : null;
         // The original Tally Consignee is preserved as-is; do not override it
         // from a separate direct-only field when Sale Type changes.
         const consignee = resolveByNameOrId(consigneeMap, firstValue(row, ["Consignee", "Consignee Name", "consignee", "consignee_id"]));
@@ -3957,8 +3961,6 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
         const missing = [];
         if (!date) missing.push("Date");
         if (!warehouse) missing.push("Warehouse Name (actual warehouse master name)");
-        if (!employee) missing.push("Employee Name");
-        if (!location && employeeLocationOptions.length === 0) missing.push("Location Name");
         if (!buyer) missing.push("Buyer / Particulars (existing Buyer master name)");
         if (!saleType) missing.push("Sale Type (Warehouse / Direct Loading)");
         if (!(quantity > 0)) missing.push("Quantity");
@@ -3989,7 +3991,7 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           po_no: String(firstValue(row, ["Order No. & Date", "Order No & Date", "P.O No", "PO No", "po_no"]) || ""),
           lorry_no: String(firstValue(row, ["Lorry No", "Despatch Doc. No", "Vessel/Flight No.", "Vessel/Flight No", "lorry_no"]) || ""),
           product_id: product ? String(product._id || product.id) : "",
-          employee_id: String(employee._id || employee.id),
+          employee_id: employee ? String(employee._id || employee.id) : "",
           location_id: location ? String(location._id || location.id) : "",
           quantity,
           unloading_qty: quantity,
@@ -4033,7 +4035,7 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
             date: data.date,
             voucher_no: data.voucher_no,
             warehouse_name: warehouse.name || "",
-            employee_name: employee.name || "",
+            employee_name: employee?.name || "",
             location_name: location?.name || "",
             buyer_name: buyer.name || "",
             account_name: account?.account_name || account?.name || "",
@@ -4062,6 +4064,21 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
       errors,
       options: {
         products: products.map((item) => ({ id: String(item._id || item.id), name: item.name || "" })),
+        employees: employees.map((employee) => {
+          const assignedIds = (Array.isArray(employee.location_ids) && employee.location_ids.length
+            ? employee.location_ids
+            : (employee.location_id ? [employee.location_id] : []))
+            .map((id) => String(id?._id || id || ""))
+            .filter(Boolean);
+          const employeeLocations = employee.all_location_access
+            ? locations
+            : assignedIds.map((id) => locationMap.get(normalizeImportKey(id))).filter(Boolean);
+          return {
+            id: String(employee._id || employee.id),
+            name: employee.name || "",
+            location_options: employeeLocations.map((item) => ({ id: String(item._id || item.id), name: item.name || "" })),
+          };
+        }).sort((a, b) => a.name.localeCompare(b.name)),
       },
     });
   } catch (err) {
@@ -4134,6 +4151,9 @@ router.post("/sale/import-confirm", async (req, res) => {
               .map((id) => String(id?._id || id || ""))
               .filter(Boolean)
           : [];
+        if (!employee.all_location_access && employeeLocationIds.length === 0) {
+          throw new Error(`No Location is assigned to Employee ${employee.name || "selected"}. Assign a Location to this Employee before importing.`);
+        }
         if (
           employeeLocationIds.length > 0 &&
           !employee.all_location_access &&
