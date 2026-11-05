@@ -2645,7 +2645,7 @@ function saleImportTemplateBuffer() {
     "Shipping No.", "Shipping Date", "Port Code", "Quantity", "Value",
     "Gross Total", "SALES ACCOUNT", "HANDLING CHARGES Maize",
     "Warehouse Name *", "Employee Name *", "Location Name *", "Company Account *",
-    "Product Name *", "Farmer (Direct)", "Consignee (Direct)", "Direct Purchase Rate"
+    "Product Name *", "Sale Type *", "Farmer (Direct)", "Direct Purchase Rate"
   ];
   const ws = XLSX.utils.aoa_to_sheet([headers, headers.map(() => "")]);
   ws["!cols"] = headers.map((header, index) => ({
@@ -2661,15 +2661,16 @@ function saleImportTemplateBuffer() {
     ["HANSARIA — SALE EXCEL IMPORT INSTRUCTIONS"],
     ["Keep the original Tally columns in the same order. The additional columns are added at the end; do not rename the headers."],
     ["Each Excel data row represents one Sale Bill. You can upload up to 500 bills in one batch; 100 bills are supported."],
-    ["Warehouse Name and Employee Name must match existing Hansaria masters. Location Name may be supplied in Excel; if the Employee has one assigned Location it is selected automatically. If the Employee has multiple assigned Locations, choose one of that Employee's assigned Locations in the Preview dropdown."],
+    ["Warehouse Name and Employee Name must match existing Hansaria masters. Warehouse Name must be the actual warehouse master name, not a Sale Type. Location Name may be supplied in Excel; if the Employee has one assigned Location it is selected automatically. If the Employee has multiple assigned Locations, choose one of that Employee's assigned Locations in the Preview dropdown."],
     ["Company Account must match an existing Company Account master. It is selected automatically from this column. If it is blank, the linked account is auto-selected only when exactly one account is linked to the Buyer; otherwise complete it in Preview."],
     ["Product Name should match an existing Product master. If blank, the product is inferred from a Tally column such as HANDLING CHARGES Maize. If it cannot be matched, select Product in Preview."],
-    ["For Direct Loading rows, Farmer (Direct), Consignee (Direct), and Direct Purchase Rate are read from these Excel columns and prefilled in Preview. They are mandatory for Direct Loading."],
-    ["Sale Type is selected per bill after Upload: Warehouse Loading or Direct Loading. Leave Sale Type out of the Excel file; select it in Preview."],
+    ["Sale Type is read from Sale Type * and is automatically selected in Preview. Enter Warehouse / Warehouse Loading or Direct / Direct Loading for each bill."],
+    ["For Direct Loading only, Farmer (Direct) and Direct Purchase Rate are required. Consignee is always taken from the original Tally Consignee column and is not changed by Direct/Warehouse selection."],
+    ["For Warehouse Loading, leave Farmer (Direct) and Direct Purchase Rate blank. The existing Tally Consignee and other Tally fields remain unchanged."],
     ["Value is imported as the Sale Amount. Quantity accepts units such as '38.240 MTS'. Rate is derived from Value / Quantity."],
     ["Additional amount is derived from Gross Total minus Value (or from the HANDLING CHARGES amount if Gross Total is blank)."],
     ["Other original Tally columns are retained in the voucher's import source details for reference; they are not treated as app master fields."],
-    ["Use one row for each bill. Warehouse Name, Employee Name, Company Account and Product Name should not be left blank. Direct-only fields are required when you choose Direct Loading."]
+    ["Use one row for each bill. Warehouse Name, Employee Name, Company Account, Product Name and Sale Type are required. Farmer (Direct) and Direct Purchase Rate are required only for Direct Loading."]
   ];
   const noteSheet = XLSX.utils.aoa_to_sheet(notes);
   noteSheet["!cols"] = [{ wch: 150 }];
@@ -3899,9 +3900,16 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
         const date = excelDateToIso(firstValue(row, ["Date", "date"]));
         const buyerValue = firstValue(row, ["Buyer", "Buyer Name", "Particulars", "Company", "buyer", "buyer_id", "company_id"]);
         const warehouse = resolveByNameOrId(warehouseMap, firstValue(row, ["Warehouse Name", "Warehouse", "warehouse", "warehouse_id"]));
+        const saleTypeRaw = normalizeImportKey(firstValue(row, ["Sale Type *", "Sale Type", "sale_type"]));
+        const saleTypeKey = saleTypeRaw.replace(/[^a-z]/g, "");
+        const saleType = ["direct", "directloading", "directloadingsale", "directfarmerloadingsale", "directsale"].includes(saleTypeKey)
+          ? "direct"
+          : (["warehouse", "warehouseloading", "warehouseloadingsale", "warehousesale"].includes(saleTypeKey) ? "warehouse" : "");
         const buyer = resolveByNameOrId(buyerMap, buyerValue);
         const matchedCompany = buyer ? resolveByNameOrId(buyerCompanyMap, buyer.name) : null;
-        const farmer = resolveByNameOrId(farmerMap, firstValue(row, ["Farmer (Direct)", "Farmer", "Farmer Name", "Party", "farmer", "farmer_id"]));
+        const farmer = saleType === "direct"
+          ? resolveByNameOrId(farmerMap, firstValue(row, ["Farmer (Direct)", "Farmer", "Farmer Name", "Party", "farmer", "farmer_id"]))
+          : null;
         const handling = getTallyHandlingColumn(row);
         const productValue = firstValue(row, ["Product Name", "Product", "product_name", "product", "product_id"]) || handling.productName;
         const product = resolveByNameOrId(productMap, productValue);
@@ -3933,7 +3941,12 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
             ? excelLocation
             : employeeLocationOptions.length === 1 ? employeeLocationOptions[0] : null)
           : excelLocation;
-        const consignee = resolveByNameOrId(consigneeMap, firstValue(row, ["Consignee (Direct)", "Consignee", "Consignee Name", "consignee_direct", "consignee", "consignee_id"]));
+        // The original Tally Consignee is preserved as-is; do not override it
+        // from a separate direct-only field when Sale Type changes.
+        const consignee = resolveByNameOrId(consigneeMap, firstValue(row, ["Consignee", "Consignee Name", "consignee", "consignee_id"]));
+        const directPurchaseRate = saleType === "direct"
+          ? parseTallyAmount(firstValue(row, ["Direct Purchase Rate", "Purchase Rate", "direct_purchase_rate"]))
+          : 0;
 
         const quantity = parseTallyQuantity(firstValue(row, ["Quantity", "quantity"]));
         const valueAmount = parseTallyAmount(firstValue(row, ["Value", "Amount", "amount"]));
@@ -3943,10 +3956,11 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
 
         const missing = [];
         if (!date) missing.push("Date");
-        if (!warehouse) missing.push("Warehouse Name");
+        if (!warehouse) missing.push("Warehouse Name (actual warehouse master name)");
         if (!employee) missing.push("Employee Name");
         if (!location && employeeLocationOptions.length === 0) missing.push("Location Name");
         if (!buyer) missing.push("Buyer / Particulars (existing Buyer master name)");
+        if (!saleType) missing.push("Sale Type (Warehouse / Direct Loading)");
         if (!(quantity > 0)) missing.push("Quantity");
         if (!(valueAmount > 0)) missing.push("Value");
         if (missing.length) {
@@ -3963,13 +3977,13 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           voucher_no: String(firstValue(row, ["Voucher No.", "Voucher No", "Voucher", "voucher_no"]) || firstValue(row, ["Voucher Ref. No.", "Voucher Ref No"]) || "").trim(),
           date,
           unloading_date: "",
-          sale_type: "",
+          sale_type: saleType,
           warehouse_id: String(warehouse._id),
           buyer_id: String(buyer._id || buyer.id),
           // buyer_id references the dedicated Buyer Name master. company_id must
           // reference the Company master when the same party exists there.
           company_id: matchedCompany ? String(matchedCompany._id || matchedCompany.id) : String(buyer._id || buyer.id),
-          farmer_id: farmer ? String(farmer._id) : "",
+          farmer_id: saleType === "direct" && farmer ? String(farmer._id) : "",
           company_account_id: account ? String(account._id || account.id) : "",
           consignee_id: consignee ? String(consignee._id || consignee.id) : "",
           po_no: String(firstValue(row, ["Order No. & Date", "Order No & Date", "P.O No", "PO No", "po_no"]) || ""),
@@ -3980,7 +3994,7 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           quantity,
           unloading_qty: quantity,
           rate,
-          direct_purchase_rate: parseTallyAmount(firstValue(row, ["Direct Purchase Rate", "Purchase Rate", "direct_purchase_rate"])),
+          direct_purchase_rate: directPurchaseRate,
           amount: valueAmount,
           packet: parseTallyAmount(firstValue(row, ["Packet", "packet"])),
           gross_weight: 0,
@@ -4014,7 +4028,7 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
         preview.push({
           row: rowNo,
           data,
-          sale_type: "",
+          sale_type: saleType,
           display: {
             date: data.date,
             voucher_no: data.voucher_no,
@@ -4027,7 +4041,8 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
             product_name: product?.name || "",
             product_guess: handling.productName || "",
             farmer_name: farmer?.name || "",
-            consignee_name: consignee?.name || String(firstValue(row, ["Consignee (Direct)", "Consignee", "Consignee Name"]) || ""),
+            consignee_name: String(firstValue(row, ["Consignee", "Consignee Name"]) || consignee?.name || ""),
+            sale_type: saleType,
             location_options: employeeLocationOptions.map((item) => ({ id: String(item._id || item.id), name: item.name || "" })),
             quantity,
             amount: valueAmount,
@@ -4108,8 +4123,7 @@ router.post("/sale/import-confirm", async (req, res) => {
         if (!account) missing.push("Account");
         if (!product) missing.push("Product");
         if (saleType === "direct") {
-          if (!farmer) missing.push("Farmer");
-          if (!consignee) missing.push("Consignee");
+          if (!farmer) missing.push("Farmer (Direct)");
           if (!(Number(row.direct_purchase_rate) > 0)) missing.push("Direct Purchase Rate");
         }
         if (missing.length) throw new Error(`Missing/invalid: ${missing.join(", ")}`);
