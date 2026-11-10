@@ -422,6 +422,9 @@ const cashEntriesRoutes =
 const accountLedgersRoutes =
   require("./routes/accountLedgers");
 
+const bankFinancialReportsRoutes =
+  require("./routes/bankFinancialReports");
+
 const transportPaymentsRoutes =
   require("./routes/transportPayments");
 
@@ -2525,6 +2528,13 @@ app.use(
   "/api/account-ledgers",
   authenticate,
   accountLedgersRoutes
+);
+
+app.use(
+  "/api/bank-financial-reports",
+  authenticate,
+  authorize("cash.mainBook.view"),
+  bankFinancialReportsRoutes
 );
 
 app.use(
