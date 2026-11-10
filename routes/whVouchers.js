@@ -981,6 +981,9 @@ async function buildSalePayload(body, voucherNo) {
     company_id: body.company_id || body.buyer_id ? String(body.company_id || body.buyer_id) : "",
     farmer_id: body.farmer_id || body.against_purchase_farmer_id ? String(body.farmer_id || body.against_purchase_farmer_id) : "",
     company_account_id: body.company_account_id ? String(body.company_account_id) : "",
+    // This value is populated from the selected CompanyAccount document by the
+    // import-confirm route, so GST calculation uses that exact seller account.
+    company_account_gstin: String(body.company_account_gstin || body.company_account_gst || body.account_gst || "").trim(),
     consignee_id: body.consignee_id ? String(body.consignee_id) : "",
     po_no: body.po_no || "",
     direct_purchase_rate: Number(body.direct_purchase_rate) || 0,
@@ -4064,11 +4067,26 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
         // For this format, select the Company Account linked to the Buyer when it is unambiguous.
         const explicitAccountValue = firstValue(row, ["Account", "Account Name", "Company Account", "company_account", "company_account_id"]);
         const explicitAccount = explicitAccountValue ? resolveByNameOrId(accountMap, explicitAccountValue) : null;
-        const linkedBuyerAccounts = matchedCompany
-          ? accounts.filter((account) => String(account.company_id || "") === String(matchedCompany._id || matchedCompany.id || ""))
-          : [];
-        const buyerAccounts = linkedBuyerAccounts.length ? linkedBuyerAccounts : accounts;
-        const account = explicitAccount || (buyerAccounts.length === 1 ? buyerAccounts[0] : null);
+        // Sale GST seller registration belongs to the selected Seller Company Account,
+        // not to an account linked to the Buyer. Offer all Company Accounts in Preview
+        // and only auto-select when there is exactly one GST-ready seller account.
+        const sellerAccountOptions = accounts.map((item) => {
+          const gstNo = String(item?.gst_no || item?.gst || item?.gstin || item?.gst_number || "").trim();
+          const state = getIndianStateFromGstin(gstNo);
+          return {
+            id: String(item._id || item.id),
+            name: item.account_name || item.name || "",
+            gst_no: gstNo,
+            gst_state: state,
+            gst_valid: Boolean(state),
+          };
+        });
+        const gstReadyAccounts = accounts.filter((item) =>
+          Boolean(getIndianStateFromGstin(item?.gst_no || item?.gst || item?.gstin || item?.gst_number || ""))
+        );
+        const account = explicitAccount || (gstReadyAccounts.length === 1
+          ? gstReadyAccounts[0]
+          : (accounts.length === 1 ? accounts[0] : null));
         // Employee and Location are intentionally optional in Excel; the user
         // selects the Employee in Preview and the assigned Location is populated
         // there. Existing values are only used as optional pre-selections.
@@ -4126,6 +4144,7 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           company_id: matchedCompany ? String(matchedCompany._id || matchedCompany.id) : String(buyer._id || buyer.id),
           farmer_id: farmer ? String(farmer._id) : "",
           company_account_id: account ? String(account._id || account.id) : "",
+          company_account_gstin: account?.gst_no || account?.gst || account?.gstin || account?.gst_number || "",
           consignee_id: consignee ? String(consignee._id || consignee.id) : "",
           po_no: String(firstValue(row, ["Order No. & Date", "Order No & Date", "P.O No", "PO No", "po_no"]) || ""),
           lorry_no: String(firstValue(row, ["Lorry No", "Despatch Doc. No", "Vessel/Flight No.", "Vessel/Flight No", "lorry_no"]) || ""),
@@ -4186,7 +4205,8 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
             location_options: employeeLocationOptions,
             buyer_name: buyer.name || "",
             account_name: account?.account_name || account?.name || "",
-            account_options: buyerAccounts.map((item) => ({ id: String(item._id || item.id), name: item.account_name || item.name || "" })),
+            account_gstin: account?.gst_no || account?.gst || account?.gstin || account?.gst_number || "",
+            account_options: sellerAccountOptions,
             product_name: product?.name || "",
             product_guess: handling.productName || "",
             farmer_name: farmer?.name || "",
@@ -4296,7 +4316,13 @@ router.post("/sale/import-confirm", async (req, res) => {
           throw new Error(`No access to warehouse: ${warehouse.name || warehouse._id}`);
         }
 
-        const data = { ...row, sale_type: saleType };
+        const data = {
+          ...row,
+          sale_type: saleType,
+          // Read GSTIN from the exact account document fetched by its selected ID.
+          // This avoids relying on a Buyer-linked account or a stale preview value.
+          company_account_gstin: account?.gst_no || account?.gst || account?.gstin || account?.gst_number || "",
+        };
         const existingVoucherNo = String(data.voucher_no || "").trim();
         const generatedVoucherNo = await new Promise((resolve, reject) => {
           createVoucherNoIfMissing("sale", existingVoucherNo, (err, generated) => {
@@ -4317,8 +4343,9 @@ router.post("/sale/import-confirm", async (req, res) => {
           const buyerGstinValid = Boolean(getIndianStateFromGstin(buyerGstin));
           const missingGstin = [];
           if (!sellerGstinValid) {
-            const sellerStatus = payload.company_account_gstin ? "present but not a supported 15-character GSTIN" : "blank or not loaded";
-            missingGstin.push(`Selected Company Account GST No is ${sellerStatus}`);
+            const selectedAccountName = String(account?.account_name || account?.name || row.company_account_id || "Selected Account").trim();
+            const sellerStatus = payload.company_account_gstin ? "present but not a supported 15-character GSTIN" : "blank in the selected Company Account Master record";
+            missingGstin.push(`Selected Seller Company Account "${selectedAccountName}" GST No is ${sellerStatus}`);
           }
           if (!buyerGstinValid) {
             const buyerStatus = buyerGstin ? "present but not a supported 15-character GSTIN" : "blank or not read from the Tally row";
