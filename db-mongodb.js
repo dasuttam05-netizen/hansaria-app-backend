@@ -403,6 +403,9 @@ const companyAccountSchema =
 
     address: String,
 
+    // Persist the GSTIN entered on Company Account create/edit forms.
+    gst_no: String,
+
     company_id: {
       type:
         mongoose.Schema.Types.ObjectId,
