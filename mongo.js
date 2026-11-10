@@ -244,6 +244,9 @@ const companyAccountSchema =
 
     address: String,
 
+    // GST registration belongs to the selected Company Account, not the warehouse.
+    gst_no: String,
+
     company_id: {
       type:
         mongoose.Schema.Types.ObjectId,
