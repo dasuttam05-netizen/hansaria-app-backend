@@ -604,9 +604,20 @@ const GST_STATE_ALIASES = Object.freeze({
   an: "andaman and nicobar islands", jk: "jammu and kashmir", la: "ladakh",
 });
 
+function normalizeIndianGstin(value) {
+  // Company Account masters and Tally exports sometimes include labels or
+  // separators (for example "GSTIN: 19AAAAA0000A1Z5"). Extract the 15-character
+  // GSTIN rather than rejecting an otherwise valid registration.
+  const raw = String(value || "").toUpperCase().trim();
+  if (!raw) return "";
+  const compact = raw.replace(/[^A-Z0-9]/g, "");
+  const match = compact.match(/\d{2}[A-Z0-9]{13}/);
+  return match ? match[0] : "";
+}
+
 function getIndianStateFromGstin(value) {
-  const gstin = String(value || "").trim().toUpperCase().replace(/\s+/g, "");
-  if (!/^\d{2}[A-Z0-9]{13}$/.test(gstin)) return "";
+  const gstin = normalizeIndianGstin(value);
+  if (!gstin || gstin.length !== 15) return "";
   return INDIAN_GST_STATE_CODES[gstin.slice(0, 2)] || "";
 }
 
@@ -656,8 +667,10 @@ async function findWarehouseForGst(warehouseId) {
 async function findCompanyAccountForGst(companyAccountId) {
   const rawId = String(companyAccountId || "").trim();
   if (!rawId || !CompanyAccount) return null;
+  // Return the full plain document so legacy GST field aliases are also
+  // available. The canonical Company Account field remains gst_no.
   if (mongoose.Types.ObjectId.isValid(rawId)) {
-    return CompanyAccount.findById(rawId).select("gst_no gst state").lean();
+    return CompanyAccount.findById(rawId).lean();
   }
   if (Number.isFinite(Number(rawId))) {
     return CompanyAccount.findOne({
@@ -665,7 +678,7 @@ async function findCompanyAccountForGst(companyAccountId) {
         { id: Number(rawId) },
         { legacy_id: Number(rawId) },
       ],
-    }).select("gst_no gst state").lean();
+    }).lean();
   }
   return null;
 }
@@ -723,9 +736,11 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
   const companyAccount = type === "sale"
     ? await findCompanyAccountForGst(payload.company_account_id).catch(() => null)
     : null;
-  const companyAccountGstin = String(
-    companyAccount?.gst_no || companyAccount?.gst || payload.company_account_gst || payload.account_gst || ""
-  ).trim().toUpperCase().replace(/\s+/g, "");
+  const companyAccountGstin = normalizeIndianGstin(
+    companyAccount?.gst_no || companyAccount?.gst || companyAccount?.gstin ||
+    companyAccount?.gst_number || companyAccount?.gstin_no || companyAccount?.GSTIN ||
+    payload.company_account_gst || payload.account_gst || payload.company_account_gstin || ""
+  );
   const sellerState = type === "sale"
     ? getIndianStateFromGstin(companyAccountGstin)
     : warehouseState;
@@ -741,10 +756,14 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
   const importSource = payload?.import_source_data && typeof payload.import_source_data === "object"
     ? payload.import_source_data
     : {};
-  const importedGstin = firstValue(importSource, [
+  const importedGstin = normalizeIndianGstin(firstValue(importSource, [
     "GSTIN/UIN", "Buyer GSTIN/UIN", "Consignee GSTIN/UIN", "GSTIN", "UIN",
-  ]);
-  const gstinPartyState = getIndianStateFromGstin(importedGstin) || getIndianStateFromGstin(party?.gst_no);
+    "Buyer GST No", "Consignee GST No", "GST No",
+  ]) || payload.buyer_gstin || payload.consignee_gstin || payload.gstin || "");
+  const partyMasterGstin = normalizeIndianGstin(
+    party?.gst_no || party?.gst || party?.gstin || party?.gst_number || ""
+  );
+  const gstinPartyState = getIndianStateFromGstin(importedGstin) || getIndianStateFromGstin(partyMasterGstin);
   // Sale GST must compare the two GST registrations (account vs buyer/consignee).
   // Purchase GST retains the existing state/master fallback behavior.
   const partyState = type === "sale"
@@ -2763,14 +2782,15 @@ function saleImportTemplateBuffer() {
   XLSX.utils.book_append_sheet(wb, ws, "Sale Import");
   const notes = [
     ["HANSARIA — SALE EXCEL IMPORT INSTRUCTIONS"],
-    ["Keep the original 36 Tally columns in the same order. The final 3 columns are mandatory: Warehouse Name, Employee Name and Location Name."],
+    ["Keep the original 36 Tally columns in the same order. Warehouse Name is required. Employee and Location can be selected in the Import Preview and may be left blank in Excel."],
     ["Each Excel data row represents one Sale Bill. You can upload up to 500 bills in one batch; 100 bills are supported."],
-    ["Warehouse Name, Employee Name and Location Name must be filled on every row and must match existing Hansaria master names."],
+    ["Select Employee in Preview. Its assigned Location is auto-selected when only one is assigned; if several are assigned, choose one from that Employee's Location list."],
     ["Buyer is matched to the existing Company master. The related Company Account is auto-selected if only one account is linked; otherwise select the account in Preview."],
     ["Product is inferred from the text after the HANDLING CHARGES header (for example, HANDLING CHARGES Maize -> Maize). If it cannot be matched, select Product in Preview."],
     ["Value is imported as the taxable Sale Amount (with SALES ACCOUNT as a fallback when Value is blank). Quantity accepts units such as '38.240 MTS'. Rate is derived from Value / Quantity."],
-    ["Additional amount is derived from Gross Total minus Value (or from the HANDLING CHARGES amount if Gross Total is blank). GST is calculated from the selected Product Master GST %; the GSTIN/UIN state code is used to determine CGST+SGST or IGST against the Warehouse State."],
-    ["If Product GST % is greater than zero but Warehouse State and Buyer/Consignee GSTIN/State are not available, Final Save will stop with a row-specific GST validation error rather than silently saving zero GST."],
+    ["Additional amount is derived from Gross Total minus Value (or from the HANDLING CHARGES amount if Gross Total is blank). GST is calculated from the selected Product Master GST % and compares the selected Company Account's GST No with the Tally GSTIN/UIN."],
+    ["When Company Account GSTIN and Tally GSTIN/UIN have the same first-two-digit State Code, GST is split into CGST + SGST. When the State Codes differ, IGST applies. Warehouse State is not used for Sale GST."],
+    ["If either GSTIN is blank, malformed, or has an unsupported State Code, Final Save stops with a row-specific error that identifies which GSTIN needs correction."],
     ["Sale Type is selected per bill after Upload: Warehouse Loading or Direct Loading."],
     ["For Direct Loading, select Farmer and enter Direct Purchase Rate in Preview. Consignee is read from the Consignee column or can be selected in Preview."],
     ["Other original Tally columns are retained in the voucher's import source details for reference; they are not treated as app master fields."],
@@ -4286,7 +4306,25 @@ router.post("/sale/import-confirm", async (req, res) => {
         });
         const payload = await buildSalePayload(data, generatedVoucherNo);
         if (payload.gst_percent > 0 && payload.gst_type === "STATE NOT SET") {
-          throw new Error("GST could not be calculated. Please add a valid GSTIN to the selected Company Account and provide a valid Buyer/Consignee GSTIN/UIN in the Tally row.");
+          const sellerGstinValid = Boolean(getIndianStateFromGstin(payload.company_account_gstin));
+          const sourceData = payload.import_source_data && typeof payload.import_source_data === "object"
+            ? payload.import_source_data
+            : {};
+          const buyerGstin = normalizeIndianGstin(firstValue(sourceData, [
+            "GSTIN/UIN", "Buyer GSTIN/UIN", "Consignee GSTIN/UIN", "GSTIN", "UIN",
+            "Buyer GST No", "Consignee GST No", "GST No",
+          ]) || payload.buyer_gstin || payload.consignee_gstin || payload.gstin || "");
+          const buyerGstinValid = Boolean(getIndianStateFromGstin(buyerGstin));
+          const missingGstin = [];
+          if (!sellerGstinValid) {
+            const sellerStatus = payload.company_account_gstin ? "present but not a supported 15-character GSTIN" : "blank or not loaded";
+            missingGstin.push(`Selected Company Account GST No is ${sellerStatus}`);
+          }
+          if (!buyerGstinValid) {
+            const buyerStatus = buyerGstin ? "present but not a supported 15-character GSTIN" : "blank or not read from the Tally row";
+            missingGstin.push(`Tally GSTIN/UIN is ${buyerStatus}`);
+          }
+          throw new Error(`GST could not be calculated. ${missingGstin.join(". ")}. Check Company Account Master → GST No and the Excel GSTIN/UIN column. Sale GST compares these two GSTIN state codes; Warehouse State is not used.`);
         }
         if (saleType !== "direct") {
           const availableQty = await getAvailableSaleStock({
