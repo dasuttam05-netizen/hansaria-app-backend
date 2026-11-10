@@ -3957,6 +3957,36 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
     const locationMap = buildImportMap(locations, ["name"]);
     const consigneeMap = buildImportMap(consignees, ["name"]);
 
+    // Employee and Location are selected in the Preview screen, not required
+    // in the uploaded Tally Excel. Build each employee's assigned locations
+    // so the frontend can auto-select one location or show a filtered list.
+    const getImportId = (value) => {
+      if (value == null) return "";
+      if (typeof value === "object") {
+        if (value._id != null) return String(value._id).trim();
+        if (typeof value.toHexString === "function") return value.toHexString();
+        if (typeof value.id === "string" || typeof value.id === "number") return String(value.id).trim();
+      }
+      return String(value).trim();
+    };
+    const locationById = new Map(locations.map((item) => [getImportId(item), item]));
+    const employeeOptions = employees
+      .filter((item) => String(item?.name || "").trim())
+      .map((employee) => {
+        const assignedIds = Array.from(new Set([
+          getImportId(employee.location_id),
+          ...(Array.isArray(employee.location_ids) ? employee.location_ids.map(getImportId) : []),
+        ].filter(Boolean)));
+        const assignedLocations = employee.all_location_access
+          ? locations
+          : assignedIds.map((id) => locationById.get(id)).filter(Boolean);
+        return {
+          id: getImportId(employee),
+          name: String(employee.name || "").trim(),
+          location_options: assignedLocations.map((item) => ({ id: getImportId(item), name: item.name || "" })),
+        };
+      });
+
     const preview = [];
     const errors = [];
     for (let index = 0; index < rows.length; index += 1) {
@@ -3981,8 +4011,20 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           : [];
         const buyerAccounts = linkedBuyerAccounts.length ? linkedBuyerAccounts : accounts;
         const account = explicitAccount || (buyerAccounts.length === 1 ? buyerAccounts[0] : null);
+        // Employee and Location are intentionally optional in Excel; the user
+        // selects the Employee in Preview and the assigned Location is populated
+        // there. Existing values are only used as optional pre-selections.
         const employee = resolveByNameOrId(employeeMap, firstValue(row, ["Employee Name", "Employee", "employee_name", "employee", "employee_id"]));
         const location = resolveByNameOrId(locationMap, firstValue(row, ["Location Name", "Location", "location_name", "location", "location_id"]));
+        const employeeOption = employeeOptions.find((item) => item.id === getImportId(employee));
+        const employeeLocationOptions = employeeOption?.location_options || [];
+        const validPreselectedLocation = location && employeeLocationOptions.some((item) => item.id === getImportId(location))
+          ? location
+          : null;
+        const autoAssignedLocation = employeeLocationOptions.length === 1
+          ? locationById.get(employeeLocationOptions[0].id)
+          : null;
+        const selectedLocation = validPreselectedLocation || autoAssignedLocation;
         const consignee = resolveByNameOrId(consigneeMap, firstValue(row, ["Consignee", "Consignee Name", "consignee", "consignee_id"]));
 
         const quantity = parseTallyQuantity(firstValue(row, ["Quantity", "quantity"]));
@@ -3999,8 +4041,8 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
         const missing = [];
         if (!date) missing.push("Date");
         if (!warehouse) missing.push("Warehouse Name");
-        if (!employee) missing.push("Employee Name");
-        if (!location) missing.push("Location Name");
+        // Employee and Location are chosen in the Preview modal, so they must
+        // not make a row invalid before that modal is displayed.
         if (!buyer) missing.push("Buyer / Particulars (existing Buyer master name)");
         if (!(quantity > 0)) missing.push("Quantity");
         if (!(valueAmount > 0)) missing.push("Value");
@@ -4030,8 +4072,8 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
           po_no: String(firstValue(row, ["Order No. & Date", "Order No & Date", "P.O No", "PO No", "po_no"]) || ""),
           lorry_no: String(firstValue(row, ["Lorry No", "Despatch Doc. No", "Vessel/Flight No.", "Vessel/Flight No", "lorry_no"]) || ""),
           product_id: product ? String(product._id || product.id) : "",
-          employee_id: String(employee._id || employee.id),
-          location_id: String(location._id || location.id),
+          employee_id: employee ? getImportId(employee) : "",
+          location_id: selectedLocation ? getImportId(selectedLocation) : "",
           quantity,
           unloading_qty: quantity,
           rate,
@@ -4081,8 +4123,9 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
             date: data.date,
             voucher_no: data.voucher_no,
             warehouse_name: warehouse.name || "",
-            employee_name: employee.name || "",
-            location_name: location.name || "",
+            employee_name: employee?.name || "",
+            location_name: selectedLocation?.name || "",
+            location_options: employeeLocationOptions,
             buyer_name: buyer.name || "",
             account_name: account?.account_name || account?.name || "",
             account_options: buyerAccounts.map((item) => ({ id: String(item._id || item.id), name: item.account_name || item.name || "" })),
@@ -4108,6 +4151,7 @@ router.post("/sale/import-preview-xlsx", upload.single("file"), async (req, res)
       errors,
       options: {
         products: products.map((item) => ({ id: String(item._id || item.id), name: item.name || "" })),
+        employees: employeeOptions,
       },
     });
   } catch (err) {
@@ -4140,6 +4184,15 @@ router.post("/sale/import-confirm", async (req, res) => {
     const employeeById = byId(employees);
     const locationById = byId(locations);
     const consigneeById = byId(consignees);
+    const getImportId = (value) => {
+      if (value == null) return "";
+      if (typeof value === "object") {
+        if (value._id != null) return String(value._id).trim();
+        if (typeof value.toHexString === "function") return value.toHexString();
+        if (typeof value.id === "string" || typeof value.id === "number") return String(value.id).trim();
+      }
+      return String(value).trim();
+    };
 
     const imported = [];
     const errors = [];
@@ -4174,6 +4227,13 @@ router.post("/sale/import-confirm", async (req, res) => {
           if (!(Number(row.direct_purchase_rate) > 0)) missing.push("Direct Purchase Rate");
         }
         if (missing.length) throw new Error(`Missing/invalid: ${missing.join(", ")}`);
+        const assignedLocationIds = Array.from(new Set([
+          getImportId(employee.location_id),
+          ...(Array.isArray(employee.location_ids) ? employee.location_ids.map(getImportId) : []),
+        ].filter(Boolean)));
+        if (!employee.all_location_access && !assignedLocationIds.includes(getImportId(location))) {
+          throw new Error(`Location ${location.name || getImportId(location)} is not assigned to Employee ${employee.name || getImportId(employee)}`);
+        }
         if (!canAccessWarehouse(req.user, warehouse._id)) {
           throw new Error(`No access to warehouse: ${warehouse.name || warehouse._id}`);
         }
