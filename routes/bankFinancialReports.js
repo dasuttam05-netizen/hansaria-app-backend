@@ -55,11 +55,15 @@ const SubGroup = collectionModel("BankFinancialSubGroup", "bankfinancialsubgroup
 const LedgerMapping = collectionModel("BankFinancialLedgerMapping", "bankfinancialledgermappings", {
   company_id: { type: String, default: "default" },
   particulars_name: { type: String, required: true },
+  // User-defined ledger display name; raw bank Particulars remains unchanged for reconciliation.
+  ledger_name: { type: String, default: "" },
   normalized_name: { type: String, required: true },
   group_id: { type: String, required: true },
   group_name: { type: String, required: true },
   subgroup_id: { type: String, default: "" },
   subgroup_name: { type: String, default: "" },
+  // Separate reporting dimension for Group Company / business-unit reporting.
+  group_company: { type: String, default: "" },
   nature: { type: String, enum: NATURES, required: true },
   report_placement: { type: String, enum: PLACEMENTS, required: true },
   opening_balance: { type: Number, default: 0 },
@@ -84,6 +88,10 @@ const Transaction = collectionModel("BankFinancialTransaction", "bankfinancialtr
   tally_date: Date,
   particulars_name: String,
   normalized_particulars: String,
+  // Optional per-transaction aliases supplied in appended Excel columns Q/R.
+  // These override the saved Particulars mapping for display and Group Company reporting only.
+  ledger_name_override: String,
+  group_company_override: String,
   voucher_type: String,
   voucher_number: String,
   receipt_amount: { type: Number, default: 0 },
@@ -127,6 +135,39 @@ function text(value) {
 
 function keyText(value) {
   return text(value).toLowerCase();
+}
+
+function requestedGroupCompany(query) {
+  return keyText(query?.group_company);
+}
+
+function matchesGroupCompany(mapping, requested) {
+  const required = keyText(requested);
+  if (!required) return true;
+  const actual = keyText(mapping?.group_company);
+  if (required === "__unassigned__") return !actual;
+  return actual === required;
+}
+
+function transactionLedgerName(tx, mapping) {
+  return text(tx?.ledger_name_override) || text(mapping?.ledger_name) || text(mapping?.particulars_name) || text(tx?.particulars_name) || "Unmapped Ledger";
+}
+
+function transactionGroupCompany(tx, mapping) {
+  return text(tx?.group_company_override) || text(mapping?.group_company) || "";
+}
+
+function matchesTransactionGroupCompany(tx, mapping, requested) {
+  const required = keyText(requested);
+  if (!required) return true;
+  const actual = keyText(transactionGroupCompany(tx, mapping));
+  if (required === "__unassigned__") return !actual;
+  return actual === required;
+}
+
+function optionalHeaderIndex(headers, acceptedNames) {
+  const accepted = new Set(acceptedNames);
+  return headers.findIndex((header) => accepted.has(keyText(header).replace(/[^a-z0-9]/g, "")));
 }
 
 function buildTransactionSourceKey(companyId, row) {
@@ -266,19 +307,36 @@ async function loadReportContext(companyId, query) {
 }
 
 function mapTransaction(row, ctx) {
-  const mapping = ctx.mappingByName.get(row.normalized_particulars) || null;
-  const group = mapping ? ctx.groupById.get(String(mapping.group_id)) : null;
-  const subgroup = mapping?.subgroup_id ? ctx.subgroupById.get(String(mapping.subgroup_id)) : null;
+  const baseMapping = ctx.mappingByName.get(row.normalized_particulars) || null;
+  const group = baseMapping ? ctx.groupById.get(String(baseMapping.group_id)) : null;
+  const subgroup = baseMapping?.subgroup_id ? ctx.subgroupById.get(String(baseMapping.subgroup_id)) : null;
+  const ledgerName = transactionLedgerName(row, baseMapping);
+  const groupCompany = transactionGroupCompany(row, baseMapping);
+  const hasRowOverrides = Boolean(text(row.ledger_name_override) || text(row.group_company_override));
+  const mapping = baseMapping ? {
+    ...baseMapping,
+    ledger_name: ledgerName,
+    group_company: groupCompany,
+  } : (hasRowOverrides ? {
+    particulars_name: row.particulars_name,
+    ledger_name: ledgerName,
+    group_company: groupCompany,
+  } : null);
   return {
     ...row,
     id: String(row._id),
+    // Keep the original Excel L-column Particulars while displaying an optional Excel Q-column Ledger Name.
+    ledger_name: ledgerName,
     mapping: mapping ? {
-      group_id: mapping.group_id,
-      group_name: group?.name || mapping.group_name,
-      subgroup_id: mapping.subgroup_id || "",
-      subgroup_name: subgroup?.name || mapping.subgroup_name || "",
-      nature: group?.nature || mapping.nature,
-      report_placement: group?.report_placement || mapping.report_placement,
+      group_id: baseMapping?.group_id || "",
+      group_name: group?.name || baseMapping?.group_name || "",
+      ledger_name: ledgerName,
+      original_particulars_name: row.particulars_name,
+      subgroup_id: baseMapping?.subgroup_id || "",
+      subgroup_name: subgroup?.name || baseMapping?.subgroup_name || "",
+      group_company: groupCompany,
+      nature: group?.nature || baseMapping?.nature || "",
+      report_placement: group?.report_placement || baseMapping?.report_placement || "",
     } : null,
   };
 }
@@ -300,6 +358,10 @@ router.post("/import", upload.single("file"), async (req, res) => {
     if (!headers[0].includes("tran.date") || !headers[3].includes("inst.type") || !headers[11].includes("particulars") || !headers[12].includes("voucher type") || !headers[13].includes("voucher number")) {
       return res.status(400).json({ error: "Column headers do not match the expected A:P Bank Statement format. Keep the original headers unchanged." });
     }
+    // Optional user-defined transaction ledger alias and reporting company.
+    // Keep A:P intact; add these headers after the existing statement columns.
+    const ledgerNameColumn = optionalHeaderIndex(headers, ["ledgername", "reportledgername", "mappedledgername", "ledgernameforreport", "ledgernamereportname"]);
+    const groupCompanyColumn = optionalHeaderIndex(headers, ["groupcompany", "groupcompanyname", "companygroup", "businessunit", "groupcompanyreportsplit"]);
 
     const batchId = crypto.randomUUID();
     const records = [];
@@ -352,6 +414,8 @@ router.post("/import", upload.single("file"), async (req, res) => {
         tally_date: excelDate(row[10]),
         particulars_name: particulars,
         normalized_particulars: keyText(particulars),
+        ledger_name_override: ledgerNameColumn >= 0 ? text(row[ledgerNameColumn]) : "",
+        group_company_override: groupCompanyColumn >= 0 ? text(row[groupCompanyColumn]) : "",
         voucher_type: voucherType,
         voucher_number: voucherNo,
         receipt_amount: receiptAmount,
@@ -368,13 +432,25 @@ router.post("/import", upload.single("file"), async (req, res) => {
     if (!records.length) {
       return res.status(400).json({ error: "No valid transaction rows were found.", invalid_rows: invalidRows.slice(0, 30) });
     }
-    const operations = records.map((record) => ({
-      updateOne: {
-        filter: { company_id: companyId, source_key: record.source_key },
-        update: { $setOnInsert: record },
-        upsert: true,
-      },
-    }));
+    const operations = records.map((record) => {
+      const insertRecord = { ...record };
+      delete insertRecord.ledger_name_override;
+      delete insertRecord.group_company_override;
+      const overrideSet = {};
+      if (text(record.ledger_name_override)) overrideSet.ledger_name_override = text(record.ledger_name_override);
+      if (text(record.group_company_override)) overrideSet.group_company_override = text(record.group_company_override);
+      const update = { $setOnInsert: insertRecord };
+      // Re-importing the same statement with Q/R filled later updates only these aliases;
+      // bank amounts, dates, voucher identifiers and source particulars remain untouched.
+      if (Object.keys(overrideSet).length) update.$set = overrideSet;
+      return {
+        updateOne: {
+          filter: { company_id: companyId, source_key: record.source_key },
+          update,
+          upsert: true,
+        },
+      };
+    });
     const writeResult = await Transaction.bulkWrite(operations, { ordered: false });
     const importedRows = Number(writeResult.upsertedCount || 0);
     const duplicateRows = Math.max(0, records.length - importedRows);
@@ -410,6 +486,8 @@ router.post("/import", upload.single("file"), async (req, res) => {
       duplicate_rows: duplicateRows,
       auto_mapped_rows: autoMappedRows,
       unmapped_rows: unmappedRows,
+      excel_ledger_names: ledgerNameColumn >= 0 ? records.filter((row) => text(row.ledger_name_override)).length : 0,
+      excel_group_companies: groupCompanyColumn >= 0 ? records.filter((row) => text(row.group_company_override)).length : 0,
       invalid_rows: invalidRows.length,
       invalid_details: invalidRows.slice(0, 30),
       total_receipts: totalReceipts,
@@ -678,10 +756,12 @@ router.get("/ledger-mappings", async (req, res) => {
       const subgroup = mapping?.subgroup_id ? subMap.get(String(mapping.subgroup_id)) : null;
       return {
         ...item,
+        ledger_name: text(mapping?.ledger_name) || item.particulars_name,
         group_id: mapping?.group_id || "",
         group_name: group?.name || mapping?.group_name || "",
         subgroup_id: mapping?.subgroup_id || "",
         subgroup_name: subgroup?.name || mapping?.subgroup_name || "",
+        group_company: text(mapping?.group_company),
         nature: group?.nature || mapping?.nature || "",
         report_placement: group?.report_placement || mapping?.report_placement || "",
         opening_balance: mapping?.opening_balance || 0,
@@ -715,10 +795,12 @@ router.post("/ledger-mappings", async (req, res) => {
       { company_id: companyId, normalized_name: keyText(particularsName) },
       { $set: {
         particulars_name: particularsName,
+        ledger_name: text(req.body?.ledger_name) || particularsName,
         group_id: groupId,
         group_name: group.name,
         subgroup_id: subgroup ? String(subgroup._id) : "",
         subgroup_name: subgroup?.name || "",
+        group_company: text(req.body?.group_company),
         nature: group.nature,
         report_placement: group.report_placement,
         opening_balance: Math.abs(balance),
@@ -739,7 +821,9 @@ router.get("/transactions", async (req, res) => {
     const limit = Math.min(2000, Math.max(1, Number(req.query.limit || 500)));
     const rows = await Transaction.find(filter).sort({ bank_date: -1, _id: -1 }).limit(limit).lean();
     const ctx = await loadReportContext(companyId, req.query);
-    return res.json(rows.map((row) => mapTransaction(row, ctx)));
+    const mappedRows = rows.map((row) => mapTransaction(row, ctx));
+    const requested = requestedGroupCompany(req.query);
+    return res.json(requested ? mappedRows.filter((row) => matchesGroupCompany(row.mapping, requested)) : mappedRows);
   } catch (error) { return res.status(500).json({ error: error.message || "Could not load Bank Statement." }); }
 });
 
@@ -750,7 +834,7 @@ router.put("/transactions/:id", async (req, res) => {
     const current = await Transaction.findOne({ _id: req.params.id, company_id: companyId }).lean();
     if (!current) return res.status(404).json({ error: "Bank Statement transaction not found." });
     const update = {};
-    const allowedText = ["bank_name", "bank_time", "bank_remarks", "instrument_type", "instrument_no", "transaction_id", "bank_status", "particulars_name", "voucher_type", "voucher_number"];
+    const allowedText = ["bank_name", "bank_time", "bank_remarks", "instrument_type", "instrument_no", "transaction_id", "bank_status", "particulars_name", "ledger_name_override", "group_company_override", "voucher_type", "voucher_number"];
     allowedText.forEach((key) => {
       if (req.body?.[key] !== undefined) update[key] = text(req.body[key]);
     });
@@ -798,19 +882,24 @@ router.get("/reports/groupwise", async (req, res) => {
     const result = new Map();
     for (const tx of ctx.transactions) {
       const mapping = ctx.mappingByName.get(tx.normalized_particulars);
+      if (!matchesTransactionGroupCompany(tx, mapping, req.query.group_company)) continue;
       const group = mapping ? ctx.groupById.get(String(mapping.group_id)) : null;
       const subgroup = mapping?.subgroup_id ? ctx.subgroupById.get(String(mapping.subgroup_id)) : null;
-      const key = mapping && group ? `${group._id}|${subgroup?._id || ""}` : "unmapped";
+      const groupCompany = transactionGroupCompany(tx, mapping) || "Unassigned";
+      const ledgerName = transactionLedgerName(tx, mapping);
+      const key = mapping && group ? `${group._id}|${subgroup?._id || ""}|${keyText(groupCompany)}` : `unmapped|${keyText(groupCompany)}`;
       if (!result.has(key)) result.set(key, {
         group_id: group ? String(group._id) : "",
         group_name: group?.name || "Unmapped",
         subgroup_id: subgroup ? String(subgroup._id) : "",
         subgroup_name: subgroup?.name || (mapping ? "No Sub-group" : "Needs Mapping"),
+        group_company: groupCompany,
         nature: group?.nature || "",
         report_placement: group?.report_placement || "",
-        transactions: 0, receipts: 0, payments: 0, net_movement: 0,
+        transactions: 0, receipts: 0, payments: 0, net_movement: 0, ledger_names: new Set(),
       });
       const row = result.get(key);
+      if (ledgerName) row.ledger_names.add(ledgerName);
       row.transactions += 1;
       row.receipts += numberValue(tx.receipt_amount);
       row.payments += numberValue(tx.payment_amount);
@@ -818,8 +907,9 @@ router.get("/reports/groupwise", async (req, res) => {
       else if (["liability", "equity", "income"].includes(group?.nature)) row.net_movement += numberValue(tx.receipt_amount) - numberValue(tx.payment_amount);
       else if (group?.nature === "expense") row.net_movement += numberValue(tx.payment_amount) - numberValue(tx.receipt_amount);
     }
+    const groupCompanySelection = requestedGroupCompany(req.query);
     const sourceGroups = ctx.groups.filter((group) => ["warehouse_sale", "warehouse_purchase"].includes(group.source_type));
-    if (sourceGroups.length) {
+    if ((!groupCompanySelection || groupCompanySelection === "__unassigned__") && sourceGroups.length) {
       const dateFilterForVouchers = voucherDateFilter(req.query);
       const warehouseFilter = assignedWarehouseMongoFilter(req.user);
       const [sales, purchases] = await Promise.all([
@@ -834,15 +924,54 @@ router.get("/reports/groupwise", async (req, res) => {
         const totalAmount = sourceRows.reduce((sum, row) => sum + voucherAmount(row, kind), 0);
         const row = {
           group_id: String(group._id), group_name: group.name, subgroup_id: "", subgroup_name: "Warehouse Vouchers",
-          nature: group.nature, report_placement: group.report_placement, transactions: sourceRows.length,
+          group_company: "Unassigned", nature: group.nature, report_placement: group.report_placement, transactions: sourceRows.length,
           receipts: kind === "sale" ? totalAmount : 0, payments: kind === "purchase" ? totalAmount : 0,
           net_movement: kind === "sale" ? totalAmount : totalAmount * -1,
         };
         result.set(`${group._id}|warehouse-vouchers`, row);
       }
     }
-    return res.json([...result.values()].sort((a,b) => a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name)));
+    return res.json([...result.values()].map((row) => ({ ...row, ledger_names: [...(row.ledger_names || [])].sort((a, b) => a.localeCompare(b)) })).sort((a,b) => a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name)));
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Group-wise report." }); }
+});
+
+router.get("/reports/group-company", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const ctx = await loadReportContext(companyId, req.query);
+    const result = new Map();
+    for (const tx of ctx.transactions) {
+      const mapping = ctx.mappingByName.get(tx.normalized_particulars);
+      const groupCompany = transactionGroupCompany(tx, mapping) || "Unassigned";
+      if (!matchesTransactionGroupCompany(tx, mapping, req.query.group_company)) continue;
+      const ledgerName = transactionLedgerName(tx, mapping);
+      const key = keyText(groupCompany);
+      if (!result.has(key)) result.set(key, {
+        group_company: groupCompany, transactions: 0, ledgers: new Set(), receipts: 0, payments: 0,
+        income: 0, expenses: 0, asset_movement: 0, liability_movement: 0,
+      });
+      const row = result.get(key);
+      row.transactions += 1;
+      if (ledgerName) row.ledgers.add(ledgerName);
+      const receipt = numberValue(tx.receipt_amount);
+      const payment = numberValue(tx.payment_amount);
+      row.receipts += receipt;
+      row.payments += payment;
+      const group = mapping ? ctx.groupById.get(String(mapping.group_id)) : null;
+      if (!group || String(tx.voucher_type || "").toLowerCase() === "contra") continue;
+      if (group.nature === "income" && group.report_placement === "profit_loss") row.income += receipt - payment;
+      else if (group.nature === "expense" && group.report_placement === "profit_loss") row.expenses += payment - receipt;
+      else if (group.nature === "asset") row.asset_movement += payment - receipt;
+      else if (group.nature === "liability" || group.nature === "equity") row.liability_movement += receipt - payment;
+    }
+    return res.json([...result.values()].map((row) => ({
+      ...row,
+      ledger_names: [...row.ledgers].sort((a, b) => a.localeCompare(b)),
+      ledgers: row.ledgers.size,
+      net_profit: row.income - row.expenses,
+    })).sort((a, b) => a.group_company.localeCompare(b.group_company)));
+  } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Group Company report." }); }
 });
 
 router.get("/reports/profit-loss", async (req, res) => {
@@ -856,6 +985,7 @@ router.get("/reports/profit-loss", async (req, res) => {
     let excludedContra = 0;
     for (const tx of ctx.transactions) {
       const mapping = ctx.mappingByName.get(tx.normalized_particulars);
+      if (!matchesTransactionGroupCompany(tx, mapping, req.query.group_company)) continue;
       const group = mapping ? ctx.groupById.get(String(mapping.group_id)) : null;
       if (!group || group.report_placement !== "profit_loss") continue;
       if (String(tx.voucher_type || "").toLowerCase() === "contra") { excludedContra += 1; continue; }
@@ -865,12 +995,15 @@ router.get("/reports/profit-loss", async (req, res) => {
       else continue;
       const isIncome = group.nature === "income";
       if (isIncome) income += amount; else expense += amount;
-      const key = `${group._id}|${mapping.subgroup_id || ""}`;
-      if (!groups.has(key)) groups.set(key, { group_name: group.name, subgroup_name: mapping.subgroup_name || "", nature: group.nature, amount: 0 });
+      const groupCompany = transactionGroupCompany(tx, mapping) || "Unassigned";
+      const ledgerName = transactionLedgerName(tx, mapping);
+      const key = `${group._id}|${mapping.subgroup_id || ""}|${keyText(groupCompany)}|${keyText(ledgerName)}`;
+      if (!groups.has(key)) groups.set(key, { group_name: group.name, subgroup_name: mapping.subgroup_name || "", ledger_name: ledgerName, group_company: groupCompany, nature: group.nature, amount: 0 });
       groups.get(key).amount += amount;
     }
+    const groupCompanySelection = requestedGroupCompany(req.query);
     const sourceGroups = ctx.groups.filter((group) => ["warehouse_sale", "warehouse_purchase"].includes(group.source_type));
-    if (sourceGroups.length) {
+    if ((!groupCompanySelection || groupCompanySelection === "__unassigned__") && sourceGroups.length) {
       const dateFilterForVouchers = voucherDateFilter(req.query);
       const warehouseFilter = assignedWarehouseMongoFilter(req.user);
       const [sales, purchases] = await Promise.all([
@@ -885,10 +1018,10 @@ router.get("/reports/profit-loss", async (req, res) => {
         const amount = sourceRows.reduce((sum, row) => sum + voucherAmount(row, kind), 0);
         if (kind === "sale") income += amount; else expense += amount;
         const key = `${group._id}|warehouse-vouchers`;
-        groups.set(key, { group_name: group.name, subgroup_name: "Warehouse Vouchers", nature: group.nature, amount });
+        groups.set(key, { group_name: group.name, subgroup_name: "Warehouse Vouchers", group_company: "Unassigned", nature: group.nature, amount });
       }
     }
-    return res.json({ income, expense, net_profit: income - expense, excluded_contra_rows: excludedContra, rows: [...groups.values()].sort((a,b) => a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name)) });
+    return res.json({ income, expense, net_profit: income - expense, excluded_contra_rows: excludedContra, rows: [...groups.values()].sort((a,b) => a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name) || a.ledger_name.localeCompare(b.ledger_name)) });
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Profit & Loss." }); }
 });
 
@@ -910,35 +1043,66 @@ router.get("/reports/balance-sheet", async (req, res) => {
       const group = ctx.groupById.get(String(mapping.group_id));
       if (!group || group.report_placement !== "balance_sheet" || !["asset", "liability", "equity"].includes(group.nature)) continue;
       const normalSide = group.nature === "asset" ? "dr" : "cr";
-      let balance = signedOpening(mapping, normalSide);
-      for (const tx of ctx.transactions) {
-        if (tx.normalized_particulars !== mapping.normalized_name) continue;
-        if (group.nature === "asset") balance += numberValue(tx.payment_amount) - numberValue(tx.receipt_amount);
-        else balance += numberValue(tx.receipt_amount) - numberValue(tx.payment_amount);
-      }
-      const row = {
-        group_name: group.name,
-        subgroup_name: mapping.subgroup_name || "",
-        particulars_name: mapping.particulars_name,
-        nature: group.nature,
-        normal_balance: balance,
-        debit_balance: group.nature === "asset" ? Math.max(0, balance) : Math.max(0, -balance),
-        credit_balance: group.nature === "asset" ? Math.max(0, -balance) : Math.max(0, balance),
+      const ledgerTransactions = ctx.transactions.filter((tx) => tx.normalized_particulars === mapping.normalized_name);
+      const buckets = new Map();
+      const addBucket = (ledgerName, groupCompany) => {
+        const key = `${keyText(ledgerName)}|${keyText(groupCompany)}`;
+        if (!buckets.has(key)) buckets.set(key, { ledger_name: ledgerName, group_company: groupCompany || "Unassigned", transactions: [], opening: 0 });
+        return buckets.get(key);
       };
-      const key = `${group._id}|${mapping.subgroup_id || ""}`;
-      if (!groups.has(key)) groups.set(key, { group_name: group.name, subgroup_name: mapping.subgroup_name || "", nature: group.nature, balance: 0, ledgers: [] });
-      groups.get(key).balance += balance;
-      groups.get(key).ledgers.push(row);
-      if (group.nature === "asset") totalAssets += balance;
-      else if (group.nature === "liability") totalLiabilities += balance;
-      else totalEquity += balance;
+      const defaultLedgerName = text(mapping.ledger_name) || mapping.particulars_name;
+      const defaultGroupCompany = text(mapping.group_company);
+      for (const tx of ledgerTransactions) {
+        const groupCompanyValue = transactionGroupCompany(tx, mapping);
+        if (!matchesTransactionGroupCompany(tx, mapping, req.query.group_company)) continue;
+        const ledgerNameValue = transactionLedgerName(tx, mapping);
+        addBucket(ledgerNameValue, groupCompanyValue).transactions.push(tx);
+      }
+
+      const hasOpening = Math.abs(numberValue(mapping.opening_balance)) > 0;
+      const defaultMatchesFilter = matchesGroupCompany({ group_company: defaultGroupCompany }, req.query.group_company);
+      if ((!ledgerTransactions.length && defaultMatchesFilter) || (hasOpening && defaultMatchesFilter)) {
+        const defaultBucket = addBucket(defaultLedgerName, defaultGroupCompany);
+        defaultBucket.opening = signedOpening(mapping, normalSide);
+      }
+
+      for (const bucket of buckets.values()) {
+        let balance = bucket.opening;
+        for (const tx of bucket.transactions) {
+          if (group.nature === "asset") balance += numberValue(tx.payment_amount) - numberValue(tx.receipt_amount);
+          else balance += numberValue(tx.receipt_amount) - numberValue(tx.payment_amount);
+        }
+        const groupCompany = bucket.group_company || "Unassigned";
+        const row = {
+          group_name: group.name,
+          subgroup_name: mapping.subgroup_name || "",
+          particulars_name: bucket.ledger_name,
+          original_particulars_name: mapping.particulars_name,
+          group_company: groupCompany,
+          nature: group.nature,
+          normal_balance: balance,
+          debit_balance: group.nature === "asset" ? Math.max(0, balance) : Math.max(0, -balance),
+          credit_balance: group.nature === "asset" ? Math.max(0, -balance) : Math.max(0, balance),
+        };
+        const key = `${group._id}|${mapping.subgroup_id || ""}|${keyText(groupCompany)}`;
+        if (!groups.has(key)) groups.set(key, { group_name: group.name, subgroup_name: mapping.subgroup_name || "", group_company: groupCompany, nature: group.nature, balance: 0, ledgers: [] });
+        groups.get(key).balance += balance;
+        groups.get(key).ledgers.push(row);
+        groups.get(key).ledger_names = groups.get(key).ledgers.map((ledger) => ledger.particulars_name).filter(Boolean);
+        if (group.nature === "asset") totalAssets += balance;
+        else if (group.nature === "liability") totalLiabilities += balance;
+        else totalEquity += balance;
+      }
     }
 
     // Column D identifies the bank account and Column H contains its running balance.
     // Use the latest imported statement balance for each bank as a Balance Sheet asset;
     // a negative bank balance is shown as a Bank Overdraft liability.
     const latestBankRows = new Map();
-    for (const tx of ctx.transactions) {
+    const groupCompanySelectionForBalance = requestedGroupCompany(req.query);
+    // Bank accounts are not assigned to an L-column Particulars ledger. Hide them
+    // when a specific Group Company filter is used rather than misattribute balances.
+    for (const tx of (groupCompanySelectionForBalance ? [] : ctx.transactions)) {
       const bankName = text(tx.bank_name);
       if (!bankName) continue;
       const current = latestBankRows.get(bankName);
@@ -957,6 +1121,7 @@ router.get("/reports/balance-sheet", async (req, res) => {
         group_name: groupName,
         subgroup_name: bankName,
         particulars_name: bankName,
+        group_company: "Unassigned",
         nature,
         balance: amount,
         normal_balance: isOverdraft ? -amount : amount,
