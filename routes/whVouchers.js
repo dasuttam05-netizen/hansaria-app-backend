@@ -653,6 +653,23 @@ async function findWarehouseForGst(warehouseId) {
   return null;
 }
 
+async function findCompanyAccountForGst(companyAccountId) {
+  const rawId = String(companyAccountId || "").trim();
+  if (!rawId || !CompanyAccount) return null;
+  if (mongoose.Types.ObjectId.isValid(rawId)) {
+    return CompanyAccount.findById(rawId).select("gst_no gst state").lean();
+  }
+  if (Number.isFinite(Number(rawId))) {
+    return CompanyAccount.findOne({
+      $or: [
+        { id: Number(rawId) },
+        { legacy_id: Number(rawId) },
+      ],
+    }).select("gst_no gst state").lean();
+  }
+  return null;
+}
+
 async function findProductForGst(productId) {
   const rawId = String(productId || "").trim();
   if (!rawId) return null;
@@ -696,8 +713,22 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
     }
   }
 
+  // Purchase GST continues to use the warehouse/party states. For Sale GST,
+  // the seller registration is the selected Company Account GSTIN; warehouse
+  // state is deliberately not used as a GST source.
+  // Keep the warehouse state on the voucher as ordinary warehouse metadata,
+  // but never use it to determine Sale GST. Sale GST uses Company Account GSTIN.
   const warehouse = await findWarehouseForGst(payload.warehouse_id).catch(() => null);
   const warehouseState = normalizeGstState(warehouse?.state || payload.warehouse_state);
+  const companyAccount = type === "sale"
+    ? await findCompanyAccountForGst(payload.company_account_id).catch(() => null)
+    : null;
+  const companyAccountGstin = String(
+    companyAccount?.gst_no || companyAccount?.gst || payload.company_account_gst || payload.account_gst || ""
+  ).trim().toUpperCase().replace(/\s+/g, "");
+  const sellerState = type === "sale"
+    ? getIndianStateFromGstin(companyAccountGstin)
+    : warehouseState;
 
   let party = null;
   if (type === "purchase") {
@@ -705,19 +736,24 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
   } else {
     party = await findPartyForSaleGst(payload.buyer_id || payload.company_id, payload.consignee_id);
   }
-  // Tally exports carry the customer's GSTIN even when the Buyer/Consignee
-  // master does not yet have a State saved. Prefer the invoice GSTIN state for
-  // imported rows, then fall back to the master/state fields.
+  // Tally's GSTIN/UIN is the Buyer/Consignee registration for this invoice.
+  // Prefer it over the party master so a row's exported GSTIN is authoritative.
   const importSource = payload?.import_source_data && typeof payload.import_source_data === "object"
     ? payload.import_source_data
     : {};
-  const importedGstin = firstValue(importSource, ["GSTIN/UIN", "GSTIN", "UIN"]);
+  const importedGstin = firstValue(importSource, [
+    "GSTIN/UIN", "Buyer GSTIN/UIN", "Consignee GSTIN/UIN", "GSTIN", "UIN",
+  ]);
   const gstinPartyState = getIndianStateFromGstin(importedGstin) || getIndianStateFromGstin(party?.gst_no);
-  const partyState = normalizeGstState(gstinPartyState || party?.state || payload.party_state);
+  // Sale GST must compare the two GST registrations (account vs buyer/consignee).
+  // Purchase GST retains the existing state/master fallback behavior.
+  const partyState = type === "sale"
+    ? gstinPartyState
+    : normalizeGstState(gstinPartyState || party?.state || payload.party_state);
 
   const taxable = Number(taxableAmount) || 0;
-  const hasStates = Boolean(warehouseState && partyState);
-  const sameState = hasStates && warehouseState === partyState;
+  const hasStates = Boolean(sellerState && partyState);
+  const sameState = hasStates && sellerState === partyState;
   const gstType = !gstPercent ? "" : !hasStates ? "STATE NOT SET" : sameState ? "CGST + SGST" : "IGST";
   const cgstPercent = sameState ? gstPercent / 2 : 0;
   const sgstPercent = sameState ? gstPercent / 2 : 0;
@@ -740,6 +776,8 @@ async function resolveWarehouseTradingGst({ type, payload = {}, taxableAmount = 
     gst_amount: Number((cgstAmount + sgstAmount + igstAmount || gstAmount).toFixed(2)),
     grand_total: Number(((Number(netAmount) || 0) + (hasStates ? gstAmount : 0)).toFixed(2)),
     warehouse_state: warehouseState,
+    company_account_gstin: companyAccountGstin,
+    gst_seller_state: sellerState,
     party_state: partyState,
   };
 }
@@ -4248,7 +4286,7 @@ router.post("/sale/import-confirm", async (req, res) => {
         });
         const payload = await buildSalePayload(data, generatedVoucherNo);
         if (payload.gst_percent > 0 && payload.gst_type === "STATE NOT SET") {
-          throw new Error("GST could not be calculated. Please set the Warehouse State and provide a valid Buyer/Consignee State or GSTIN/UIN in the Tally row.");
+          throw new Error("GST could not be calculated. Please add a valid GSTIN to the selected Company Account and provide a valid Buyer/Consignee GSTIN/UIN in the Tally row.");
         }
         if (saleType !== "direct") {
           const availableQty = await getAvailableSaleStock({
