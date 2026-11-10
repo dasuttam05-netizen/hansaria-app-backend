@@ -95,6 +95,7 @@ const Transaction = collectionModel("BankFinancialTransaction", "bankfinancialtr
 
 const ImportBatch = collectionModel("BankFinancialImportBatch", "bankfinancialimportbatches", {
   company_id: { type: String, default: "default" },
+  batch_id: String,
   file_name: String,
   total_rows: Number,
   imported_rows: Number,
@@ -126,6 +127,44 @@ function text(value) {
 
 function keyText(value) {
   return text(value).toLowerCase();
+}
+
+function buildTransactionSourceKey(companyId, row) {
+  const bankDate = row.bank_date instanceof Date ? row.bank_date : excelDate(row.bank_date);
+  const dateKey = bankDate ? bankDate.toISOString().slice(0, 10) : "";
+  const transactionId = text(row.transaction_id);
+  const keySource = transactionId
+    ? `${companyId}|${keyText(row.bank_name)}|${transactionId}|${dateKey}`
+    : `${companyId}|${keyText(row.bank_name)}|${dateKey}|${keyText(row.particulars_name)}|${keyText(row.voucher_type)}|${text(row.voucher_number)}|${numberValue(row.receipt_amount)}|${numberValue(row.payment_amount)}`;
+  return crypto.createHash("sha256").update(keySource).digest("hex");
+}
+
+async function refreshImportBatch(companyId, batchId) {
+  if (!batchId) return;
+  const [summary] = await Transaction.aggregate([
+    { $match: { company_id: companyId, import_batch_id: batchId } },
+    { $group: {
+      _id: "$import_batch_id",
+      total_rows: { $sum: 1 },
+      total_receipts: { $sum: "$receipt_amount" },
+      total_payments: { $sum: "$payment_amount" },
+      date_from: { $min: "$bank_date" },
+      date_to: { $max: "$bank_date" },
+    } },
+  ]);
+  if (summary) {
+    await ImportBatch.updateOne(
+      { company_id: companyId, batch_id: batchId },
+      { $set: {
+        total_rows: summary.total_rows,
+        imported_rows: summary.total_rows,
+        total_receipts: summary.total_receipts,
+        total_payments: summary.total_payments,
+        date_from: summary.date_from,
+        date_to: summary.date_to,
+      } }
+    );
+  }
 }
 
 function numberValue(value) {
@@ -173,6 +212,7 @@ function dateFilter(query) {
   }
   if (text(query.bank_name)) filter.bank_name = text(query.bank_name);
   if (text(query.voucher_type)) filter.voucher_type = new RegExp(`^${text(query.voucher_type)}$`, "i");
+  if (text(query.import_batch_id)) filter.import_batch_id = text(query.import_batch_id);
   return filter;
 }
 
@@ -285,10 +325,16 @@ router.post("/import", upload.single("file"), async (req, res) => {
       const statementDebit = numberValue(row[5]);
       const statementCredit = numberValue(row[6]);
       const transactionId = text(row[8]);
-      const keySource = transactionId
-        ? `${companyId}|${keyText(bankName)}|${transactionId}|${bankDate.toISOString().slice(0, 10)}`
-        : `${companyId}|${keyText(bankName)}|${bankDate.toISOString().slice(0, 10)}|${keyText(particulars)}|${keyText(voucherType)}|${voucherNo}|${receiptAmount}|${paymentAmount}`;
-      const sourceKey = crypto.createHash("sha256").update(keySource).digest("hex");
+      const sourceKey = buildTransactionSourceKey(companyId, {
+        bank_date: bankDate,
+        bank_name: bankName,
+        transaction_id: transactionId,
+        particulars_name: particulars,
+        voucher_type: voucherType,
+        voucher_number: voucherNo,
+        receipt_amount: receiptAmount,
+        payment_amount: paymentAmount,
+      });
       records.push({
         company_id: companyId,
         source_key: sourceKey,
@@ -332,8 +378,17 @@ router.post("/import", upload.single("file"), async (req, res) => {
     const writeResult = await Transaction.bulkWrite(operations, { ordered: false });
     const importedRows = Number(writeResult.upsertedCount || 0);
     const duplicateRows = Math.max(0, records.length - importedRows);
+    const existingMappings = await LedgerMapping.find({
+      company_id: companyId,
+      active: true,
+      normalized_name: { $in: [...new Set(records.map((row) => row.normalized_particulars))] },
+    }).select("normalized_name").lean();
+    const mappedNameSet = new Set(existingMappings.map((row) => row.normalized_name));
+    const autoMappedRows = records.filter((row) => mappedNameSet.has(row.normalized_particulars)).length;
+    const unmappedRows = Math.max(0, records.length - autoMappedRows);
     const batch = await ImportBatch.create({
       company_id: companyId,
+      batch_id: batchId,
       file_name: req.file.originalname,
       total_rows: records.length + invalidRows.length,
       imported_rows: importedRows,
@@ -347,11 +402,14 @@ router.post("/import", upload.single("file"), async (req, res) => {
     });
     return res.json({
       success: true,
-      batch_id: String(batch._id),
+      batch_id: batchId,
+      batch_record_id: String(batch._id),
       file_name: req.file.originalname,
       total_rows: records.length + invalidRows.length,
       imported_rows: importedRows,
       duplicate_rows: duplicateRows,
+      auto_mapped_rows: autoMappedRows,
+      unmapped_rows: unmappedRows,
       invalid_rows: invalidRows.length,
       invalid_details: invalidRows.slice(0, 30),
       total_receipts: totalReceipts,
@@ -364,6 +422,40 @@ router.post("/import", upload.single("file"), async (req, res) => {
     console.error("Bank financial report import failed:", error);
     return res.status(500).json({ error: error.message || "Bank statement import failed." });
   }
+});
+
+router.get("/import-batches", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const rows = await Transaction.aggregate([
+      { $match: { company_id: companyId } },
+      { $group: {
+        _id: "$import_batch_id",
+        file_name: { $first: "$import_file_name" },
+        imported_by: { $first: "$imported_by" },
+        total_rows: { $sum: 1 },
+        total_receipts: { $sum: "$receipt_amount" },
+        total_payments: { $sum: "$payment_amount" },
+        date_from: { $min: "$bank_date" },
+        date_to: { $max: "$bank_date" },
+        last_updated: { $max: "$updatedAt" },
+      } },
+      { $sort: { date_to: -1, file_name: 1 } },
+      { $limit: 100 },
+    ]);
+    return res.json(rows.map((row) => ({
+      batch_id: row._id || "",
+      file_name: row.file_name || "Imported Bank Statement",
+      imported_by: row.imported_by || "",
+      total_rows: row.total_rows || 0,
+      total_receipts: row.total_receipts || 0,
+      total_payments: row.total_payments || 0,
+      date_from: row.date_from || null,
+      date_to: row.date_to || null,
+      last_updated: row.last_updated || null,
+    })));
+  } catch (error) { return res.status(500).json({ error: error.message || "Could not load import history." }); }
 });
 
 router.get("/summary", async (req, res) => {
@@ -437,10 +529,19 @@ router.put("/groups/:id", async (req, res) => {
   try {
     if (!mongoReady(res)) return;
     const companyId = companyIdFrom(req);
+    const currentGroup = await Group.findOne({ _id: req.params.id, company_id: companyId, active: true }).lean();
+    if (!currentGroup) return res.status(404).json({ error: "Group not found." });
     const update = {};
-    if (req.body?.name !== undefined) { update.name = text(req.body.name); update.normalized_name = keyText(req.body.name); }
+    if (req.body?.name !== undefined) {
+      update.name = text(req.body.name);
+      update.normalized_name = keyText(req.body.name);
+      if (!update.name) return res.status(400).json({ error: "Group Name is required." });
+      const duplicate = await Group.findOne({ company_id: companyId, normalized_name: update.normalized_name, _id: { $ne: currentGroup._id } }).lean();
+      if (duplicate) return res.status(409).json({ error: "This Group Name already exists." });
+    }
     if (req.body?.nature !== undefined) update.nature = text(req.body.nature).toLowerCase();
     if (req.body?.report_placement !== undefined) update.report_placement = text(req.body.report_placement).toLowerCase();
+    if (req.body?.sort_order !== undefined) update.sort_order = numberValue(req.body.sort_order);
     if (req.body?.source_type !== undefined) {
       const sourceType = text(req.body.source_type).toLowerCase();
       if (!["bank_statement", "warehouse_sale", "warehouse_purchase"].includes(sourceType)) return res.status(400).json({ error: "Invalid Group Source." });
@@ -452,12 +553,17 @@ router.put("/groups/:id", async (req, res) => {
       }
       update.source_type = sourceType;
     }
-    const effectiveSource = update.source_type;
-    if (effectiveSource === "warehouse_sale" && ((update.nature || "income") !== "income" || (update.report_placement || "profit_loss") !== "profit_loss")) return res.status(400).json({ error: "Warehouse Sale source must be an Income group shown in Profit & Loss." });
-    if (effectiveSource === "warehouse_purchase" && ((update.nature || "expense") !== "expense" || (update.report_placement || "profit_loss") !== "profit_loss")) return res.status(400).json({ error: "Warehouse Purchase source must be an Expense group shown in Profit & Loss." });
+    const effectiveSource = update.source_type || currentGroup.source_type || "bank_statement";
+    const effectiveNature = update.nature || currentGroup.nature;
+    const effectivePlacement = update.report_placement || currentGroup.report_placement;
+    if (effectiveSource === "warehouse_sale" && (effectiveNature !== "income" || effectivePlacement !== "profit_loss")) return res.status(400).json({ error: "Warehouse Sale source must be an Income group shown in Profit & Loss." });
+    if (effectiveSource === "warehouse_purchase" && (effectiveNature !== "expense" || effectivePlacement !== "profit_loss")) return res.status(400).json({ error: "Warehouse Purchase source must be an Expense group shown in Profit & Loss." });
     const row = await Group.findOneAndUpdate({ _id: req.params.id, company_id: companyId }, { $set: update }, { new: true, runValidators: true }).lean();
     if (!row) return res.status(404).json({ error: "Group not found." });
-    await Group.updateOne({ _id: row._id, company_id: companyId }, { $set: { updatedAt: new Date() } });
+    await Promise.all([
+      SubGroup.updateMany({ company_id: companyId, group_id: String(row._id), active: true }, { $set: { group_name: row.name } }),
+      LedgerMapping.updateMany({ company_id: companyId, group_id: String(row._id), active: true }, { $set: { group_name: row.name, nature: row.nature, report_placement: row.report_placement } }),
+    ]);
     return res.json({ ...row, id: String(row._id) });
   } catch (error) { return res.status(500).json({ error: error.message }); }
 });
@@ -487,32 +593,91 @@ router.post("/subgroups", async (req, res) => {
   } catch (error) { return res.status(500).json({ error: error.message }); }
 });
 
+router.put("/subgroups/:id", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const subgroup = await SubGroup.findOne({ _id: req.params.id, company_id: companyId, active: true }).lean();
+    if (!subgroup) return res.status(404).json({ error: "Sub-group not found." });
+    const update = {};
+    if (req.body?.name !== undefined) {
+      update.name = text(req.body.name);
+      update.normalized_name = keyText(req.body.name);
+      if (!update.name) return res.status(400).json({ error: "Sub-group Name is required." });
+    }
+    if (req.body?.sort_order !== undefined) update.sort_order = numberValue(req.body.sort_order);
+    if (req.body?.group_id !== undefined) {
+      const groupId = text(req.body.group_id);
+      const group = await Group.findOne({ _id: groupId, company_id: companyId, active: true }).lean();
+      if (!group || (group.source_type && group.source_type !== "bank_statement")) return res.status(400).json({ error: "Select a valid Bank Statement Group." });
+      update.group_id = String(group._id);
+      update.group_name = group.name;
+      const duplicate = await SubGroup.findOne({
+        _id: { $ne: subgroup._id }, company_id: companyId,
+        group_id: String(group._id), normalized_name: update.normalized_name || subgroup.normalized_name,
+        active: true,
+      }).lean();
+      if (duplicate) return res.status(409).json({ error: "This Sub-group already exists under the selected Group." });
+    }
+    const nextGroupId = String(update.group_id || subgroup.group_id);
+    const nextGroup = await Group.findOne({ _id: nextGroupId, company_id: companyId, active: true }).lean();
+    if (!nextGroup) return res.status(400).json({ error: "Parent Group was not found." });
+    const duplicate = await SubGroup.findOne({
+      _id: { $ne: subgroup._id }, company_id: companyId, group_id: nextGroupId,
+      normalized_name: update.normalized_name || subgroup.normalized_name, active: true,
+    }).lean();
+    if (duplicate) return res.status(409).json({ error: "This Sub-group already exists under the selected Group." });
+    const updated = await SubGroup.findOneAndUpdate(
+      { _id: subgroup._id, company_id: companyId },
+      { $set: update },
+      { new: true, runValidators: true }
+    ).lean();
+    // Keep existing saved Particulars mappings attached to this edited Sub-group.
+    await LedgerMapping.updateMany(
+      { company_id: companyId, subgroup_id: String(subgroup._id), active: true },
+      { $set: {
+        group_id: nextGroupId,
+        group_name: nextGroup.name,
+        subgroup_name: updated.name,
+        nature: nextGroup.nature,
+        report_placement: nextGroup.report_placement,
+      } }
+    );
+    return res.json({ ...updated, id: String(updated._id) });
+  } catch (error) { return res.status(500).json({ error: error.message || "Could not update Sub-group." }); }
+});
+
 router.get("/ledger-mappings", async (req, res) => {
   try {
     if (!mongoReady(res)) return;
     const companyId = companyIdFrom(req);
-    const [names, mappings, groups, subgroups] = await Promise.all([
-      Transaction.distinct("normalized_particulars", { company_id: companyId }),
+    const [mappings, groups, subgroups, rawNames] = await Promise.all([
       LedgerMapping.find({ company_id: companyId, active: true }).lean(),
       Group.find({ company_id: companyId, active: true }).lean(),
       SubGroup.find({ company_id: companyId, active: true }).lean(),
-    ]);
-    const rawNames = await Transaction.aggregate([
-      { $match: { company_id: companyId } },
-      { $group: { _id: "$normalized_particulars", name: { $first: "$particulars_name" }, count: { $sum: 1 } } },
-      { $sort: { name: 1 } },
+      Transaction.aggregate([
+        { $match: { company_id: companyId } },
+        { $group: { _id: "$normalized_particulars", name: { $first: "$particulars_name" }, count: { $sum: 1 } } },
+        { $sort: { name: 1 } },
+      ]),
     ]);
     const mappingMap = new Map(mappings.map((row) => [row.normalized_name, row]));
     const groupMap = new Map(groups.map((row) => [String(row._id), row]));
     const subMap = new Map(subgroups.map((row) => [String(row._id), row]));
-    return res.json(rawNames.map((item) => {
-      const mapping = mappingMap.get(item._id);
+    const namesMap = new Map();
+    rawNames.forEach((item) => namesMap.set(item._id, { normalized_name: item._id, particulars_name: item.name || item._id, transaction_count: item.count }));
+    // Keep saved mappings visible even when the current statement has no rows for that ledger.
+    mappings.forEach((mapping) => {
+      if (!namesMap.has(mapping.normalized_name)) {
+        namesMap.set(mapping.normalized_name, { normalized_name: mapping.normalized_name, particulars_name: mapping.particulars_name, transaction_count: 0 });
+      }
+    });
+    return res.json([...namesMap.values()].sort((a, b) => a.particulars_name.localeCompare(b.particulars_name)).map((item) => {
+      const mapping = mappingMap.get(item.normalized_name);
       const group = mapping ? groupMap.get(String(mapping.group_id)) : null;
       const subgroup = mapping?.subgroup_id ? subMap.get(String(mapping.subgroup_id)) : null;
       return {
-        particulars_name: item.name || item._id,
-        normalized_name: item._id,
-        transaction_count: item.count,
+        ...item,
         group_id: mapping?.group_id || "",
         group_name: group?.name || mapping?.group_name || "",
         subgroup_id: mapping?.subgroup_id || "",
@@ -522,6 +687,7 @@ router.get("/ledger-mappings", async (req, res) => {
         opening_balance: mapping?.opening_balance || 0,
         opening_balance_type: mapping?.opening_balance_type || "dr",
         mapped: Boolean(mapping && group),
+        mapping_id: mapping ? String(mapping._id) : "",
       };
     }));
   } catch (error) { return res.status(500).json({ error: error.message || "Could not load Particulars mapping." }); }
@@ -575,6 +741,53 @@ router.get("/transactions", async (req, res) => {
     const ctx = await loadReportContext(companyId, req.query);
     return res.json(rows.map((row) => mapTransaction(row, ctx)));
   } catch (error) { return res.status(500).json({ error: error.message || "Could not load Bank Statement." }); }
+});
+
+router.put("/transactions/:id", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const current = await Transaction.findOne({ _id: req.params.id, company_id: companyId }).lean();
+    if (!current) return res.status(404).json({ error: "Bank Statement transaction not found." });
+    const update = {};
+    const allowedText = ["bank_name", "bank_time", "bank_remarks", "instrument_type", "instrument_no", "transaction_id", "bank_status", "particulars_name", "voucher_type", "voucher_number"];
+    allowedText.forEach((key) => {
+      if (req.body?.[key] !== undefined) update[key] = text(req.body[key]);
+    });
+    if (req.body?.bank_date !== undefined) {
+      const parsedDate = excelDate(req.body.bank_date);
+      if (!parsedDate) return res.status(400).json({ error: "Please provide a valid Bank Date." });
+      update.bank_date = parsedDate;
+    }
+    if (req.body?.tally_date !== undefined) update.tally_date = req.body.tally_date ? excelDate(req.body.tally_date) : null;
+    ["bank_debit", "bank_credit", "bank_balance", "receipt_amount", "payment_amount"].forEach((key) => {
+      if (req.body?.[key] !== undefined) update[key] = numberValue(req.body[key]);
+    });
+    if (update.receipt_amount < 0 || update.payment_amount < 0 || update.bank_debit < 0 || update.bank_credit < 0) {
+      return res.status(400).json({ error: "Receipt, Payment, Debit and Credit amounts cannot be negative." });
+    }
+    const next = { ...current, ...update };
+    if (!text(next.bank_name) || !text(next.particulars_name) || !text(next.voucher_type) || !text(next.voucher_number) || !next.bank_date) {
+      return res.status(400).json({ error: "Date, Bank Name, Particulars, Voucher Type and Voucher Number are required." });
+    }
+    if (numberValue(next.receipt_amount) > 0 && numberValue(next.payment_amount) > 0) {
+      return res.status(400).json({ error: "A row cannot contain both Receipt and Payment amounts. Correct the row before saving." });
+    }
+    const nextSourceKey = buildTransactionSourceKey(companyId, next);
+    const duplicate = await Transaction.findOne({ company_id: companyId, source_key: nextSourceKey, _id: { $ne: current._id } }).select("_id").lean();
+    if (duplicate) return res.status(409).json({ error: "Another statement row already has the same Bank, Date, Particulars, Voucher and Amount. Please check the duplicate." });
+    update.normalized_particulars = keyText(next.particulars_name);
+    update.source_key = nextSourceKey;
+    const row = await Transaction.findOneAndUpdate(
+      { _id: current._id, company_id: companyId },
+      { $set: update },
+      { new: true, runValidators: true }
+    ).lean();
+    await refreshImportBatch(companyId, current.import_batch_id);
+    if (current.import_batch_id !== next.import_batch_id) await refreshImportBatch(companyId, next.import_batch_id);
+    const ctx = await loadReportContext(companyId, {});
+    return res.json(mapTransaction(row, ctx));
+  } catch (error) { return res.status(500).json({ error: error.message || "Could not update Bank Statement row." }); }
 });
 
 router.get("/reports/groupwise", async (req, res) => {
