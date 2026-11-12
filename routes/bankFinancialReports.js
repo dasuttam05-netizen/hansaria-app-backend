@@ -96,6 +96,8 @@ const Transaction = collectionModel("BankFinancialTransaction", "bankfinancialtr
   voucher_number: String,
   receipt_amount: { type: Number, default: 0 },
   payment_amount: { type: Number, default: 0 },
+  // Optional split accounting allocations; the original bank statement row and its bank amount remain single.
+  allocations: { type: [mongoose.Schema.Types.Mixed], default: [] },
   import_file_name: String,
   import_batch_id: String,
   imported_by: String,
@@ -306,6 +308,57 @@ async function loadReportContext(companyId, query) {
   return { transactions, groups, subgroups, mappings, groupById, subgroupById, mappingByName };
 }
 
+function transactionAllocations(row, ctx) {
+  const saved = Array.isArray(row?.allocations) ? row.allocations.filter((item) => item && numberValue(item.amount) > 0) : [];
+  if (saved.length) {
+    return saved.map((item) => {
+      const selectedGroup = ctx.groupById.get(String(item.group_id || ""));
+      const subgroup = item.subgroup_id ? ctx.subgroupById.get(String(item.subgroup_id)) : null;
+      const group = subgroup ? ctx.groupById.get(String(subgroup.group_id)) || selectedGroup : selectedGroup;
+      return {
+        ...item,
+        ledger_name: text(item.ledger_name) || "Unspecified Ledger",
+        group_id: group ? String(group._id) : String(item.group_id || ""),
+        group_name: group?.name || item.group_name || "Unmapped",
+        subgroup_id: subgroup ? String(subgroup._id) : String(item.subgroup_id || ""),
+        subgroup_name: subgroup?.name || item.subgroup_name || "",
+        group_company: text(item.group_company),
+        nature: group?.nature || item.nature || "",
+        report_placement: group?.report_placement || item.report_placement || "",
+        side: item.side === "receipt" ? "receipt" : "payment",
+        amount: numberValue(item.amount),
+      };
+    });
+  }
+  const mapping = ctx.mappingByName.get(row?.normalized_particulars) || null;
+  if (!mapping) {
+    const amount = numberValue(row.receipt_amount) || numberValue(row.payment_amount);
+    if (!amount) return [];
+    return [{
+      ledger_name: transactionLedgerName(row, null),
+      group_id: "", group_name: "Unmapped", subgroup_id: "", subgroup_name: "",
+      group_company: transactionGroupCompany(row, null), nature: "", report_placement: "",
+      side: numberValue(row.receipt_amount) > 0 ? "receipt" : "payment", amount,
+    }];
+  }
+  const group = ctx.groupById.get(String(mapping.group_id));
+  const subgroup = mapping.subgroup_id ? ctx.subgroupById.get(String(mapping.subgroup_id)) : null;
+  const amount = numberValue(row.receipt_amount) || numberValue(row.payment_amount);
+  if (!amount) return [];
+  return [{
+    ledger_name: transactionLedgerName(row, mapping),
+    group_id: String(mapping.group_id || ""),
+    group_name: group?.name || mapping.group_name || "Unmapped",
+    subgroup_id: String(mapping.subgroup_id || ""),
+    subgroup_name: subgroup?.name || mapping.subgroup_name || "",
+    group_company: transactionGroupCompany(row, mapping),
+    nature: group?.nature || mapping.nature || "",
+    report_placement: group?.report_placement || mapping.report_placement || "",
+    side: numberValue(row.receipt_amount) > 0 ? "receipt" : "payment",
+    amount,
+  }];
+}
+
 function mapTransaction(row, ctx) {
   const baseMapping = ctx.mappingByName.get(row.normalized_particulars) || null;
   const group = baseMapping ? ctx.groupById.get(String(baseMapping.group_id)) : null;
@@ -327,6 +380,9 @@ function mapTransaction(row, ctx) {
     id: String(row._id),
     // Keep the original Excel L-column Particulars while displaying an optional Excel Q-column Ledger Name.
     ledger_name: ledgerName,
+    allocations: transactionAllocations(row, ctx),
+    // Raw saved split rows only; legacy mapped transactions use an on-the-fly fallback for reports.
+    split_allocations: Array.isArray(row.allocations) ? row.allocations : [],
     mapping: mapping ? {
       group_id: baseMapping?.group_id || "",
       group_name: group?.name || baseMapping?.group_name || "",
@@ -823,7 +879,10 @@ router.get("/transactions", async (req, res) => {
     const ctx = await loadReportContext(companyId, req.query);
     const mappedRows = rows.map((row) => mapTransaction(row, ctx));
     const requested = requestedGroupCompany(req.query);
-    return res.json(requested ? mappedRows.filter((row) => matchesGroupCompany(row.mapping, requested)) : mappedRows);
+    return res.json(requested ? mappedRows.filter((row) => row.allocations?.some((allocation) => {
+      const actual = keyText(allocation.group_company);
+      return requested === "__unassigned__" ? !actual : actual === requested;
+    }) || (!row.allocations?.length && matchesGroupCompany(row.mapping, requested))) : mappedRows);
   } catch (error) { return res.status(500).json({ error: error.message || "Could not load Bank Statement." }); }
 });
 
@@ -857,6 +916,59 @@ router.put("/transactions/:id", async (req, res) => {
     if (numberValue(next.receipt_amount) > 0 && numberValue(next.payment_amount) > 0) {
       return res.status(400).json({ error: "A row cannot contain both Receipt and Payment amounts. Correct the row before saving." });
     }
+    if (Array.isArray(req.body?.allocations)) {
+      const bankSide = numberValue(next.receipt_amount) > 0 ? "receipt" : "payment";
+      const bankAmount = numberValue(next.receipt_amount) || numberValue(next.payment_amount);
+      const submitted = req.body.allocations.filter((item) => item && (text(item.ledger_name) || text(item.group_id) || numberValue(item.amount) > 0));
+      if (!submitted.length) {
+        update.allocations = [];
+      } else {
+        if (!bankAmount) return res.status(400).json({ error: "A split allocation requires a non-zero Receipt or Payment amount." });
+        const groupIds = [...new Set(submitted.map((item) => text(item.group_id)).filter(Boolean))];
+        const subgroupIds = [...new Set(submitted.map((item) => text(item.subgroup_id)).filter(Boolean))];
+        if (groupIds.some((id) => !mongoose.Types.ObjectId.isValid(id)) || subgroupIds.some((id) => !mongoose.Types.ObjectId.isValid(id))) {
+          return res.status(400).json({ error: "One or more selected Groups / Sub-groups are invalid. Please select them again." });
+        }
+        const [allocationGroups, allocationSubgroups] = await Promise.all([
+          Group.find({ company_id: companyId, _id: { $in: groupIds }, active: true }).lean(),
+          SubGroup.find({ company_id: companyId, _id: { $in: subgroupIds }, active: true }).lean(),
+        ]);
+        const allocationGroupMap = new Map(allocationGroups.map((item) => [String(item._id), item]));
+        const allocationSubgroupMap = new Map(allocationSubgroups.map((item) => [String(item._id), item]));
+        const cleaned = [];
+        for (const item of submitted) {
+          const ledgerName = text(item.ledger_name);
+          const groupId = text(item.group_id);
+          const subgroupId = text(item.subgroup_id);
+          const amount = numberValue(item.amount);
+          const group = allocationGroupMap.get(groupId);
+          if (!ledgerName || !group) return res.status(400).json({ error: "Each split row needs a Ledger Name and a valid Bank Statement Group." });
+          if (amount <= 0) return res.status(400).json({ error: "Each split row amount must be greater than zero." });
+          if (group.source_type && group.source_type !== "bank_statement") return res.status(400).json({ error: "Split allocations can use Bank Statement Groups only." });
+          const subgroup = subgroupId ? allocationSubgroupMap.get(subgroupId) : null;
+          if (subgroupId && (!subgroup || String(subgroup.group_id) !== groupId)) {
+            return res.status(400).json({ error: `Sub-group does not belong to ${group.name}.` });
+          }
+          cleaned.push({
+            ledger_name: ledgerName,
+            group_id: groupId,
+            group_name: group.name,
+            subgroup_id: subgroup ? String(subgroup._id) : "",
+            subgroup_name: subgroup?.name || "",
+            group_company: text(item.group_company),
+            nature: group.nature,
+            report_placement: group.report_placement,
+            side: bankSide,
+            amount: Number(amount.toFixed(2)),
+          });
+        }
+        const allocatedTotal = cleaned.reduce((sum, item) => sum + item.amount, 0);
+        if (Math.abs(allocatedTotal - bankAmount) > 0.01) {
+          return res.status(400).json({ error: `Split total ${allocatedTotal.toFixed(2)} must equal the Bank Statement amount ${bankAmount.toFixed(2)}.` });
+        }
+        update.allocations = cleaned;
+      }
+    }
     const nextSourceKey = buildTransactionSourceKey(companyId, next);
     const duplicate = await Transaction.findOne({ company_id: companyId, source_key: nextSourceKey, _id: { $ne: current._id } }).select("_id").lean();
     if (duplicate) return res.status(409).json({ error: "Another statement row already has the same Bank, Date, Particulars, Voucher and Amount. Please check the duplicate." });
@@ -881,31 +993,37 @@ router.get("/reports/groupwise", async (req, res) => {
     const ctx = await loadReportContext(companyId, req.query);
     const result = new Map();
     for (const tx of ctx.transactions) {
-      const mapping = ctx.mappingByName.get(tx.normalized_particulars);
-      if (!matchesTransactionGroupCompany(tx, mapping, req.query.group_company)) continue;
-      const group = mapping ? ctx.groupById.get(String(mapping.group_id)) : null;
-      const subgroup = mapping?.subgroup_id ? ctx.subgroupById.get(String(mapping.subgroup_id)) : null;
-      const groupCompany = transactionGroupCompany(tx, mapping) || "Unassigned";
-      const ledgerName = transactionLedgerName(tx, mapping);
-      const key = mapping && group ? `${group._id}|${subgroup?._id || ""}|${keyText(groupCompany)}` : `unmapped|${keyText(groupCompany)}`;
-      if (!result.has(key)) result.set(key, {
-        group_id: group ? String(group._id) : "",
-        group_name: group?.name || "Unmapped",
-        subgroup_id: subgroup ? String(subgroup._id) : "",
-        subgroup_name: subgroup?.name || (mapping ? "No Sub-group" : "Needs Mapping"),
-        group_company: groupCompany,
-        nature: group?.nature || "",
-        report_placement: group?.report_placement || "",
-        transactions: 0, receipts: 0, payments: 0, net_movement: 0, ledger_names: new Set(),
-      });
-      const row = result.get(key);
-      if (ledgerName) row.ledger_names.add(ledgerName);
-      row.transactions += 1;
-      row.receipts += numberValue(tx.receipt_amount);
-      row.payments += numberValue(tx.payment_amount);
-      if (group?.nature === "asset") row.net_movement += numberValue(tx.payment_amount) - numberValue(tx.receipt_amount);
-      else if (["liability", "equity", "income"].includes(group?.nature)) row.net_movement += numberValue(tx.receipt_amount) - numberValue(tx.payment_amount);
-      else if (group?.nature === "expense") row.net_movement += numberValue(tx.payment_amount) - numberValue(tx.receipt_amount);
+      const allocations = transactionAllocations(tx, ctx);
+      const transactionBuckets = new Set();
+      for (const allocation of allocations) {
+        const group = allocation.group_id ? ctx.groupById.get(String(allocation.group_id)) : null;
+        const subgroup = allocation.subgroup_id ? ctx.subgroupById.get(String(allocation.subgroup_id)) : null;
+        const groupCompanyValue = allocation.group_company || "";
+        if (!matchesGroupCompany({ group_company: groupCompanyValue }, req.query.group_company)) continue;
+        const groupCompany = groupCompanyValue || "Unassigned";
+        const ledgerName = allocation.ledger_name || "";
+        const key = group ? `${group._id}|${subgroup?._id || ""}|${keyText(groupCompany)}` : `unmapped|${keyText(groupCompany)}`;
+        if (!result.has(key)) result.set(key, {
+          group_id: group ? String(group._id) : "",
+          group_name: group?.name || allocation.group_name || "Unmapped",
+          subgroup_id: subgroup ? String(subgroup._id) : "",
+          subgroup_name: subgroup?.name || allocation.subgroup_name || (group ? "No Sub-group" : "Needs Mapping"),
+          group_company: groupCompany,
+          nature: group?.nature || allocation.nature || "",
+          report_placement: group?.report_placement || allocation.report_placement || "",
+          transactions: 0, receipts: 0, payments: 0, net_movement: 0, ledger_names: new Set(),
+        });
+        const row = result.get(key);
+        if (ledgerName) row.ledger_names.add(ledgerName);
+        if (!transactionBuckets.has(key)) { row.transactions += 1; transactionBuckets.add(key); }
+        const receipt = allocation.side === "receipt" ? numberValue(allocation.amount) : 0;
+        const payment = allocation.side === "payment" ? numberValue(allocation.amount) : 0;
+        row.receipts += receipt;
+        row.payments += payment;
+        if (row.nature === "asset") row.net_movement += payment - receipt;
+        else if (["liability", "equity", "income"].includes(row.nature)) row.net_movement += receipt - payment;
+        else if (row.nature === "expense") row.net_movement += payment - receipt;
+      }
     }
     const groupCompanySelection = requestedGroupCompany(req.query);
     const sourceGroups = ctx.groups.filter((group) => ["warehouse_sale", "warehouse_purchase"].includes(group.source_type));
@@ -942,28 +1060,32 @@ router.get("/reports/group-company", async (req, res) => {
     const ctx = await loadReportContext(companyId, req.query);
     const result = new Map();
     for (const tx of ctx.transactions) {
-      const mapping = ctx.mappingByName.get(tx.normalized_particulars);
-      const groupCompany = transactionGroupCompany(tx, mapping) || "Unassigned";
-      if (!matchesTransactionGroupCompany(tx, mapping, req.query.group_company)) continue;
-      const ledgerName = transactionLedgerName(tx, mapping);
-      const key = keyText(groupCompany);
-      if (!result.has(key)) result.set(key, {
-        group_company: groupCompany, transactions: 0, ledgers: new Set(), receipts: 0, payments: 0,
-        income: 0, expenses: 0, asset_movement: 0, liability_movement: 0,
-      });
-      const row = result.get(key);
-      row.transactions += 1;
-      if (ledgerName) row.ledgers.add(ledgerName);
-      const receipt = numberValue(tx.receipt_amount);
-      const payment = numberValue(tx.payment_amount);
-      row.receipts += receipt;
-      row.payments += payment;
-      const group = mapping ? ctx.groupById.get(String(mapping.group_id)) : null;
-      if (!group || String(tx.voucher_type || "").toLowerCase() === "contra") continue;
-      if (group.nature === "income" && group.report_placement === "profit_loss") row.income += receipt - payment;
-      else if (group.nature === "expense" && group.report_placement === "profit_loss") row.expenses += payment - receipt;
-      else if (group.nature === "asset") row.asset_movement += payment - receipt;
-      else if (group.nature === "liability" || group.nature === "equity") row.liability_movement += receipt - payment;
+      const allocations = transactionAllocations(tx, ctx);
+      const transactionCompanies = new Set();
+      for (const allocation of allocations) {
+        const groupCompanyValue = allocation.group_company || "";
+        if (!matchesGroupCompany({ group_company: groupCompanyValue }, req.query.group_company)) continue;
+        const groupCompany = groupCompanyValue || "Unassigned";
+        const ledgerName = allocation.ledger_name || "";
+        const key = keyText(groupCompany);
+        if (!result.has(key)) result.set(key, {
+          group_company: groupCompany, transactions: 0, ledgers: new Set(), receipts: 0, payments: 0,
+          income: 0, expenses: 0, asset_movement: 0, liability_movement: 0,
+        });
+        const row = result.get(key);
+        if (!transactionCompanies.has(key)) { row.transactions += 1; transactionCompanies.add(key); }
+        if (ledgerName) row.ledgers.add(ledgerName);
+        const receipt = allocation.side === "receipt" ? numberValue(allocation.amount) : 0;
+        const payment = allocation.side === "payment" ? numberValue(allocation.amount) : 0;
+        row.receipts += receipt;
+        row.payments += payment;
+        const group = allocation.group_id ? ctx.groupById.get(String(allocation.group_id)) : null;
+        if (!group || String(tx.voucher_type || "").toLowerCase() === "contra") continue;
+        if (group.nature === "income" && group.report_placement === "profit_loss") row.income += receipt - payment;
+        else if (group.nature === "expense" && group.report_placement === "profit_loss") row.expenses += payment - receipt;
+        else if (group.nature === "asset") row.asset_movement += payment - receipt;
+        else if (group.nature === "liability" || group.nature === "equity") row.liability_movement += receipt - payment;
+      }
     }
     return res.json([...result.values()].map((row) => ({
       ...row,
@@ -984,22 +1106,33 @@ router.get("/reports/profit-loss", async (req, res) => {
     let expense = 0;
     let excludedContra = 0;
     for (const tx of ctx.transactions) {
-      const mapping = ctx.mappingByName.get(tx.normalized_particulars);
-      if (!matchesTransactionGroupCompany(tx, mapping, req.query.group_company)) continue;
-      const group = mapping ? ctx.groupById.get(String(mapping.group_id)) : null;
-      if (!group || group.report_placement !== "profit_loss") continue;
       if (String(tx.voucher_type || "").toLowerCase() === "contra") { excludedContra += 1; continue; }
-      let amount = 0;
-      if (group.nature === "income") amount = numberValue(tx.receipt_amount) - numberValue(tx.payment_amount);
-      else if (group.nature === "expense") amount = numberValue(tx.payment_amount) - numberValue(tx.receipt_amount);
-      else continue;
-      const isIncome = group.nature === "income";
-      if (isIncome) income += amount; else expense += amount;
-      const groupCompany = transactionGroupCompany(tx, mapping) || "Unassigned";
-      const ledgerName = transactionLedgerName(tx, mapping);
-      const key = `${group._id}|${mapping.subgroup_id || ""}|${keyText(groupCompany)}|${keyText(ledgerName)}`;
-      if (!groups.has(key)) groups.set(key, { group_name: group.name, subgroup_name: mapping.subgroup_name || "", ledger_name: ledgerName, group_company: groupCompany, nature: group.nature, amount: 0 });
-      groups.get(key).amount += amount;
+      for (const allocation of transactionAllocations(tx, ctx)) {
+        const groupCompanyValue = allocation.group_company || "";
+        if (!matchesGroupCompany({ group_company: groupCompanyValue }, req.query.group_company)) continue;
+        const groupCompany = groupCompanyValue || "Unassigned";
+        const group = allocation.group_id ? ctx.groupById.get(String(allocation.group_id)) : null;
+        if (!group || group.report_placement !== "profit_loss") continue;
+        const side = allocation.side;
+        const allocatedAmount = numberValue(allocation.amount);
+        let amount = 0;
+        if (group.nature === "income") amount = side === "receipt" ? allocatedAmount : -allocatedAmount;
+        else if (group.nature === "expense") amount = side === "payment" ? allocatedAmount : -allocatedAmount;
+        else continue;
+        const isIncome = group.nature === "income";
+        if (isIncome) income += amount; else expense += amount;
+        const ledgerName = allocation.ledger_name || "Unspecified Ledger";
+        const key = `${group._id}|${allocation.subgroup_id || ""}|${keyText(groupCompany)}|${keyText(ledgerName)}`;
+        if (!groups.has(key)) groups.set(key, {
+          group_name: group.name,
+          subgroup_name: allocation.subgroup_name || "",
+          ledger_name: ledgerName,
+          group_company: groupCompany,
+          nature: group.nature,
+          amount: 0,
+        });
+        groups.get(key).amount += amount;
+      }
     }
     const groupCompanySelection = requestedGroupCompany(req.query);
     const sourceGroups = ctx.groups.filter((group) => ["warehouse_sale", "warehouse_purchase"].includes(group.source_type));
@@ -1021,7 +1154,7 @@ router.get("/reports/profit-loss", async (req, res) => {
         groups.set(key, { group_name: group.name, subgroup_name: "Warehouse Vouchers", group_company: "Unassigned", nature: group.nature, amount });
       }
     }
-    return res.json({ income, expense, net_profit: income - expense, excluded_contra_rows: excludedContra, rows: [...groups.values()].sort((a,b) => a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name) || a.ledger_name.localeCompare(b.ledger_name)) });
+    return res.json({ income, expense, net_profit: income - expense, excluded_contra_rows: excludedContra, rows: [...groups.values()].sort((a,b) => a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name) || String(a.ledger_name || "").localeCompare(String(b.ledger_name || ""))) });
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Profit & Loss." }); }
 });
 
@@ -1043,7 +1176,7 @@ router.get("/reports/balance-sheet", async (req, res) => {
       const group = ctx.groupById.get(String(mapping.group_id));
       if (!group || group.report_placement !== "balance_sheet" || !["asset", "liability", "equity"].includes(group.nature)) continue;
       const normalSide = group.nature === "asset" ? "dr" : "cr";
-      const ledgerTransactions = ctx.transactions.filter((tx) => tx.normalized_particulars === mapping.normalized_name);
+      const ledgerTransactions = ctx.transactions.filter((tx) => tx.normalized_particulars === mapping.normalized_name && !(Array.isArray(tx.allocations) && tx.allocations.length));
       const buckets = new Map();
       const addBucket = (ledgerName, groupCompany) => {
         const key = `${keyText(ledgerName)}|${keyText(groupCompany)}`;
@@ -1092,6 +1225,40 @@ router.get("/reports/balance-sheet", async (req, res) => {
         if (group.nature === "asset") totalAssets += balance;
         else if (group.nature === "liability") totalLiabilities += balance;
         else totalEquity += balance;
+      }
+    }
+
+    // Split statement rows are included from their individual ledger allocations, without double-counting the original mapped row.
+    for (const tx of ctx.transactions) {
+      if (!Array.isArray(tx.allocations) || !tx.allocations.length) continue;
+      for (const allocation of transactionAllocations(tx, ctx)) {
+        const group = allocation.group_id ? ctx.groupById.get(String(allocation.group_id)) : null;
+        if (!group || group.report_placement !== "balance_sheet" || !["asset", "liability", "equity"].includes(group.nature)) continue;
+        const groupCompanyValue = allocation.group_company || "";
+        if (!matchesGroupCompany({ group_company: groupCompanyValue }, req.query.group_company)) continue;
+        const amount = numberValue(allocation.amount);
+        const signed = group.nature === "asset"
+          ? (allocation.side === "payment" ? amount : -amount)
+          : (allocation.side === "receipt" ? amount : -amount);
+        const groupCompany = groupCompanyValue || "Unassigned";
+        const subgroupName = allocation.subgroup_name || "";
+        const key = `${group._id}|${allocation.subgroup_id || ""}|${keyText(groupCompany)}`;
+        if (!groups.has(key)) groups.set(key, { group_name: group.name, subgroup_name: subgroupName, group_company: groupCompany, nature: group.nature, balance: 0, ledgers: [] });
+        const groupRow = groups.get(key);
+        groupRow.balance += signed;
+        const ledgerName = allocation.ledger_name || "Unspecified Ledger";
+        let ledgerRow = groupRow.ledgers.find((item) => keyText(item.particulars_name) === keyText(ledgerName));
+        if (!ledgerRow) {
+          ledgerRow = { particulars_name: ledgerName, original_particulars_name: tx.particulars_name, group_company: groupCompany, nature: group.nature, normal_balance: 0, debit_balance: 0, credit_balance: 0 };
+          groupRow.ledgers.push(ledgerRow);
+        }
+        ledgerRow.normal_balance += signed;
+        ledgerRow.debit_balance = group.nature === "asset" ? Math.max(0, ledgerRow.normal_balance) : Math.max(0, -ledgerRow.normal_balance);
+        ledgerRow.credit_balance = group.nature === "asset" ? Math.max(0, -ledgerRow.normal_balance) : Math.max(0, ledgerRow.normal_balance);
+        groupRow.ledger_names = groupRow.ledgers.map((ledger) => ledger.particulars_name).filter(Boolean);
+        if (group.nature === "asset") totalAssets += signed;
+        else if (group.nature === "liability") totalLiabilities += signed;
+        else totalEquity += signed;
       }
     }
 
