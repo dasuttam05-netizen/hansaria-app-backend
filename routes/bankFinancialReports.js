@@ -118,6 +118,18 @@ const ImportBatch = collectionModel("BankFinancialImportBatch", "bankfinancialim
   date_to: Date,
 });
 
+// One manually maintained opening balance per bank account.
+const BankOpeningBalance = collectionModel("BankFinancialOpeningBalance", "bankfinancialopeningbalances", {
+  company_id: { type: String, default: "default" },
+  bank_name: { type: String, required: true },
+  normalized_bank_name: { type: String, required: true },
+  effective_date: { type: Date, required: true },
+  opening_balance: { type: Number, default: 0 },
+  opening_balance_type: { type: String, enum: ["dr", "cr"], default: "dr" },
+  notes: { type: String, default: "" },
+  active: { type: Boolean, default: true },
+}, [{ fields: { company_id: 1, normalized_bank_name: 1 }, options: { unique: true } }]);
+
 function mongoReady(res) {
   if (!isMongoMirrorReady() || !mongoose.connection?.db) {
     res.status(503).json({ error: "MongoDB is not connected" });
@@ -150,6 +162,30 @@ function matchesGroupCompany(mapping, requested) {
   if (required === "__unassigned__") return !actual;
   return actual === required;
 }
+
+function matchesAllocationFilters(allocation, query = {}) {
+  if (text(query.group_id) && String(allocation?.group_id || "") !== text(query.group_id)) return false;
+  if (text(query.subgroup_id) && String(allocation?.subgroup_id || "") !== text(query.subgroup_id)) return false;
+  return true;
+}
+
+function reportPeriodLabel(value, periodType) {
+  const mode = String(periodType || "range").toLowerCase();
+  if (mode !== "daily" && mode !== "monthly") return "Selected Period";
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Unknown Date";
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  return mode === "monthly" ? `${year}-${month}` : `${year}-${month}-${String(date.getUTCDate()).padStart(2, "0")}`;
+}
+
+function signedBankOpening(record) {
+  const amount = Math.abs(numberValue(record?.opening_balance));
+  return String(record?.opening_balance_type || "dr").toLowerCase() === "cr" ? -amount : amount;
+}
+
+function transactionBankReceipt(tx) { return numberValue(tx?.bank_credit) || numberValue(tx?.receipt_amount); }
+function transactionBankPayment(tx) { return numberValue(tx?.bank_debit) || numberValue(tx?.payment_amount); }
 
 function transactionLedgerName(tx, mapping) {
   return text(tx?.ledger_name_override) || text(mapping?.ledger_name) || text(mapping?.particulars_name) || text(tx?.particulars_name) || "Unmapped Ledger";
@@ -884,6 +920,138 @@ router.post("/ledger-mappings", async (req, res) => {
   } catch (error) { return res.status(500).json({ error: error.message || "Could not save Particulars mapping." }); }
 });
 
+router.get("/bank-opening-balances", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const filter = { company_id: companyId, active: true };
+    if (text(req.query.bank_name)) filter.normalized_bank_name = keyText(req.query.bank_name);
+    const rows = await BankOpeningBalance.find(filter).sort({ bank_name: 1 }).lean();
+    return res.json(rows.map((row) => ({ ...row, id: String(row._id) })));
+  } catch (error) { return res.status(500).json({ error: error.message || "Could not load Bank Opening Balances." }); }
+});
+
+router.post("/bank-opening-balances", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const bankName = text(req.body?.bank_name);
+    const effectiveDate = excelDate(req.body?.effective_date);
+    const openingBalance = Math.abs(numberValue(req.body?.opening_balance));
+    const openingBalanceType = String(req.body?.opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr";
+    if (!bankName || !effectiveDate) return res.status(400).json({ error: "Bank Name and Opening Balance Date are required." });
+    const saved = await BankOpeningBalance.findOneAndUpdate(
+      { company_id: companyId, normalized_bank_name: keyText(bankName) },
+      { $set: { bank_name: bankName, normalized_bank_name: keyText(bankName), effective_date: effectiveDate, opening_balance: openingBalance, opening_balance_type: openingBalanceType, notes: text(req.body?.notes), active: true } },
+      { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
+    ).lean();
+    return res.json({ ...saved, id: String(saved._id) });
+  } catch (error) { return res.status(500).json({ error: error.message || "Could not save Bank Opening Balance." }); }
+});
+
+router.delete("/bank-opening-balances/:id", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const deleted = await BankOpeningBalance.findOneAndUpdate({ _id: req.params.id, company_id: companyId }, { $set: { active: false } }, { new: true }).lean();
+    if (!deleted) return res.status(404).json({ error: "Bank Opening Balance not found." });
+    return res.json({ success: true });
+  } catch (error) { return res.status(500).json({ error: error.message || "Could not remove Bank Opening Balance." }); }
+});
+
+router.get("/reports/bank-balance", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const selectedBank = keyText(req.query.bank_name);
+    const toDate = text(req.query.to_date) ? new Date(`${text(req.query.to_date)}T23:59:59.999Z`) : new Date();
+    const txFilter = { company_id: companyId, bank_date: { $lte: toDate } };
+    if (selectedBank) {
+      const escapedBankName = text(req.query.bank_name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      txFilter.bank_name = new RegExp(`^${escapedBankName}$`, "i");
+    }
+    const [allTransactions, openingRecords] = await Promise.all([
+      Transaction.find(txFilter).sort({ bank_date: 1, _id: 1 }).limit(100000).lean(),
+      BankOpeningBalance.find({ company_id: companyId, active: true, ...(selectedBank ? { normalized_bank_name: selectedBank } : {}) }).lean(),
+    ]);
+    const bankNames = [...new Set([...allTransactions.map((row) => text(row.bank_name)), ...openingRecords.map((row) => text(row.bank_name))].filter(Boolean))].sort((a,b) => a.localeCompare(b));
+    const candidateDates = [...allTransactions.map((row) => new Date(row.bank_date).getTime()), ...openingRecords.map((row) => new Date(row.effective_date).getTime())].filter(Number.isFinite);
+    const fromDate = text(req.query.from_date) ? new Date(`${text(req.query.from_date)}T00:00:00.000Z`) : new Date(candidateDates.length ? Math.min(...candidateDates) : toDate.getTime());
+    if (fromDate > toDate) return res.status(400).json({ error: "From Date cannot be later than To Date." });
+    const periodType = ["daily", "monthly"].includes(String(req.query.period_type || "").toLowerCase()) ? String(req.query.period_type).toLowerCase() : "range";
+    const rows = [];
+    const totals = { opening_balance: 0, receipts: 0, payments: 0, closing_balance: 0, transactions: 0 };
+    const missingBanks = [];
+    for (const bankName of bankNames) {
+      const bankTx = allTransactions.filter((row) => keyText(row.bank_name) === keyText(bankName));
+      const candidates = openingRecords.filter((row) => keyText(row.bank_name) === keyText(bankName) && new Date(row.effective_date) <= fromDate)
+        .sort((a,b) => new Date(b.effective_date) - new Date(a.effective_date));
+      const openingRecord = candidates[0] || null;
+      let openingBalance = openingRecord ? signedBankOpening(openingRecord) : 0;
+      const manualOpeningSet = Boolean(openingRecord);
+      let openingSource = openingRecord ? "Manual" : "Missing";
+      if (openingRecord) {
+        for (const tx of bankTx) {
+          const date = new Date(tx.bank_date);
+          if (date >= new Date(openingRecord.effective_date) && date < fromDate) openingBalance += transactionBankReceipt(tx) - transactionBankPayment(tx);
+        }
+      } else {
+        const previous = bankTx.filter((tx) => new Date(tx.bank_date) < fromDate).sort((a,b) => new Date(b.bank_date) - new Date(a.bank_date))[0];
+        if (previous && Number.isFinite(Number(previous.bank_balance))) {
+          openingBalance = numberValue(previous.bank_balance);
+          openingSource = "Statement Balance";
+        } else {
+          const firstTransaction = bankTx.find((tx) => new Date(tx.bank_date) >= fromDate);
+          if (firstTransaction && Number(firstTransaction.bank_balance || 0) !== 0) {
+            openingBalance = numberValue(firstTransaction.bank_balance) - transactionBankReceipt(firstTransaction) + transactionBankPayment(firstTransaction);
+            openingSource = "Derived from Statement";
+          }
+        }
+      }
+      if (!manualOpeningSet) missingBanks.push(bankName);
+      const selectedTransactions = bankTx.filter((tx) => new Date(tx.bank_date) >= fromDate && new Date(tx.bank_date) <= toDate);
+      const buckets = new Map();
+      for (const tx of selectedTransactions) {
+        const period = periodType === "range" ? "Selected Period" : reportPeriodLabel(tx.bank_date, periodType);
+        if (!buckets.has(period)) buckets.set(period, { period, receipts: 0, payments: 0, transactions: 0 });
+        const bucket = buckets.get(period);
+        bucket.receipts += transactionBankReceipt(tx);
+        bucket.payments += transactionBankPayment(tx);
+        bucket.transactions += 1;
+      }
+      if (!buckets.size) {
+        const emptyPeriod = periodType === "range" ? "Selected Period" : reportPeriodLabel(fromDate, periodType);
+        buckets.set(emptyPeriod, { period: emptyPeriod, receipts: 0, payments: 0, transactions: 0 });
+      }
+      let running = openingBalance;
+      let bankReceipts = 0, bankPayments = 0, bankCount = 0;
+      for (const bucket of [...buckets.values()].sort((a,b) => String(a.period).localeCompare(String(b.period)))) {
+        const periodOpening = running;
+        running += bucket.receipts - bucket.payments;
+        bankReceipts += bucket.receipts; bankPayments += bucket.payments; bankCount += bucket.transactions;
+        rows.push({ bank_name: bankName, period: bucket.period, opening_balance: periodOpening, receipts: bucket.receipts, payments: bucket.payments, closing_balance: running, transactions: bucket.transactions, opening_balance_set: manualOpeningSet, opening_balance_source: openingSource, opening_balance_date: openingRecord?.effective_date || null });
+      }
+      totals.opening_balance += openingBalance; totals.receipts += bankReceipts; totals.payments += bankPayments; totals.closing_balance += running; totals.transactions += bankCount;
+    }
+    if (!selectedBank && bankNames.length > 1) {
+      const periodTotals = new Map();
+      for (const row of rows) {
+        if (!periodTotals.has(row.period)) periodTotals.set(row.period, { period: row.period, opening_balance: 0, receipts: 0, payments: 0, closing_balance: 0, transactions: 0, opening_balance_set: true });
+        const total = periodTotals.get(row.period);
+        total.opening_balance += row.opening_balance;
+        total.receipts += row.receipts;
+        total.payments += row.payments;
+        total.closing_balance += row.closing_balance;
+        total.transactions += row.transactions;
+        total.opening_balance_set = total.opening_balance_set && row.opening_balance_set;
+      }
+      for (const total of periodTotals.values()) rows.push({ bank_name: "ALL BANKS", ...total });
+    }
+    rows.sort((a,b) => String(a.period).localeCompare(String(b.period)) || (a.bank_name === "ALL BANKS" ? -1 : b.bank_name === "ALL BANKS" ? 1 : a.bank_name.localeCompare(b.bank_name)));
+    return res.json({ from_date: fromDate, to_date: toDate, period_type: periodType, banks: bankNames, totals, rows, opening_balance_missing_banks: missingBanks });
+  } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Bank Balance report." }); }
+});
+
 router.get("/transactions", async (req, res) => {
   try {
     if (!mongoReady(res)) return;
@@ -1011,14 +1179,17 @@ router.get("/reports/groupwise", async (req, res) => {
       const allocations = transactionAllocations(tx, ctx);
       const transactionBuckets = new Set();
       for (const allocation of allocations) {
+        if (!matchesAllocationFilters(allocation, req.query)) continue;
         const group = allocation.group_id ? ctx.groupById.get(String(allocation.group_id)) : null;
         const subgroup = allocation.subgroup_id ? ctx.subgroupById.get(String(allocation.subgroup_id)) : null;
         const groupCompanyValue = allocation.group_company || "";
         if (!matchesGroupCompany({ group_company: groupCompanyValue }, req.query.group_company)) continue;
         const groupCompany = groupCompanyValue || "Unassigned";
         const ledgerName = allocation.ledger_name || "";
-        const key = group ? `${group._id}|${subgroup?._id || ""}|${keyText(groupCompany)}` : `unmapped|${keyText(groupCompany)}`;
+        const periodLabel = reportPeriodLabel(tx.bank_date, req.query.period_type);
+        const key = `${group ? group._id : "unmapped"}|${subgroup?._id || ""}|${keyText(groupCompany)}|${keyText(periodLabel)}`;
         if (!result.has(key)) result.set(key, {
+          period_label: periodLabel,
           group_id: group ? String(group._id) : "",
           group_name: group?.name || allocation.group_name || "Unmapped",
           subgroup_id: subgroup ? String(subgroup._id) : "",
@@ -1041,7 +1212,9 @@ router.get("/reports/groupwise", async (req, res) => {
       }
     }
     const groupCompanySelection = requestedGroupCompany(req.query);
-    const sourceGroups = ctx.groups.filter((group) => ["warehouse_sale", "warehouse_purchase"].includes(group.source_type));
+    const sourceGroups = ctx.groups.filter((group) => ["warehouse_sale", "warehouse_purchase"].includes(group.source_type)
+      && (!text(req.query.group_id) || String(group._id) === text(req.query.group_id))
+      && !text(req.query.subgroup_id));
     if ((!groupCompanySelection || groupCompanySelection === "__unassigned__") && sourceGroups.length) {
       const dateFilterForVouchers = voucherDateFilter(req.query);
       const warehouseFilter = assignedWarehouseMongoFilter(req.user);
@@ -1064,7 +1237,7 @@ router.get("/reports/groupwise", async (req, res) => {
         result.set(`${group._id}|warehouse-vouchers`, row);
       }
     }
-    return res.json([...result.values()].map((row) => ({ ...row, ledger_names: [...(row.ledger_names || [])].sort((a, b) => a.localeCompare(b)) })).sort((a,b) => a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name)));
+    return res.json([...result.values()].map((row) => ({ ...row, ledger_names: [...(row.ledger_names || [])].sort((a, b) => a.localeCompare(b)) })).sort((a,b) => String(a.period_label || "").localeCompare(String(b.period_label || "")) || a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name)));
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Group-wise report." }); }
 });
 
@@ -1078,12 +1251,15 @@ router.get("/reports/group-company", async (req, res) => {
       const allocations = transactionAllocations(tx, ctx);
       const transactionCompanies = new Set();
       for (const allocation of allocations) {
+        if (!matchesAllocationFilters(allocation, req.query)) continue;
         const groupCompanyValue = allocation.group_company || "";
         if (!matchesGroupCompany({ group_company: groupCompanyValue }, req.query.group_company)) continue;
         const groupCompany = groupCompanyValue || "Unassigned";
         const ledgerName = allocation.ledger_name || "";
-        const key = keyText(groupCompany);
+        const periodLabel = reportPeriodLabel(tx.bank_date, req.query.period_type);
+        const key = `${keyText(groupCompany)}|${keyText(periodLabel)}`;
         if (!result.has(key)) result.set(key, {
+          period_label: periodLabel,
           group_company: groupCompany, transactions: 0, ledgers: new Set(), receipts: 0, payments: 0,
           income: 0, expenses: 0, asset_movement: 0, liability_movement: 0,
         });
@@ -1107,7 +1283,7 @@ router.get("/reports/group-company", async (req, res) => {
       ledger_names: [...row.ledgers].sort((a, b) => a.localeCompare(b)),
       ledgers: row.ledgers.size,
       net_profit: row.income - row.expenses,
-    })).sort((a, b) => a.group_company.localeCompare(b.group_company)));
+    })).sort((a, b) => String(a.period_label || "").localeCompare(String(b.period_label || "")) || a.group_company.localeCompare(b.group_company)));
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Group Company report." }); }
 });
 
@@ -1123,6 +1299,7 @@ router.get("/reports/profit-loss", async (req, res) => {
     for (const tx of ctx.transactions) {
       if (String(tx.voucher_type || "").toLowerCase() === "contra") { excludedContra += 1; continue; }
       for (const allocation of transactionAllocations(tx, ctx)) {
+        if (!matchesAllocationFilters(allocation, req.query)) continue;
         const groupCompanyValue = allocation.group_company || "";
         if (!matchesGroupCompany({ group_company: groupCompanyValue }, req.query.group_company)) continue;
         const groupCompany = groupCompanyValue || "Unassigned";
@@ -1137,8 +1314,10 @@ router.get("/reports/profit-loss", async (req, res) => {
         const isIncome = group.nature === "income";
         if (isIncome) income += amount; else expense += amount;
         const ledgerName = allocation.ledger_name || "Unspecified Ledger";
-        const key = `${group._id}|${allocation.subgroup_id || ""}|${keyText(groupCompany)}|${keyText(ledgerName)}`;
+        const periodLabel = reportPeriodLabel(tx.bank_date, req.query.period_type);
+        const key = `${group._id}|${allocation.subgroup_id || ""}|${keyText(groupCompany)}|${keyText(ledgerName)}|${keyText(periodLabel)}`;
         if (!groups.has(key)) groups.set(key, {
+          period_label: periodLabel,
           group_name: group.name,
           subgroup_name: allocation.subgroup_name || "",
           ledger_name: ledgerName,
@@ -1150,7 +1329,9 @@ router.get("/reports/profit-loss", async (req, res) => {
       }
     }
     const groupCompanySelection = requestedGroupCompany(req.query);
-    const sourceGroups = ctx.groups.filter((group) => ["warehouse_sale", "warehouse_purchase"].includes(group.source_type));
+    const sourceGroups = ctx.groups.filter((group) => ["warehouse_sale", "warehouse_purchase"].includes(group.source_type)
+      && (!text(req.query.group_id) || String(group._id) === text(req.query.group_id))
+      && !text(req.query.subgroup_id));
     if ((!groupCompanySelection || groupCompanySelection === "__unassigned__") && sourceGroups.length) {
       const dateFilterForVouchers = voucherDateFilter(req.query);
       const warehouseFilter = assignedWarehouseMongoFilter(req.user);
@@ -1169,7 +1350,7 @@ router.get("/reports/profit-loss", async (req, res) => {
         groups.set(key, { group_name: group.name, subgroup_name: "Warehouse Vouchers", group_company: "Unassigned", nature: group.nature, amount });
       }
     }
-    return res.json({ income, expense, net_profit: income - expense, excluded_contra_rows: excludedContra, rows: [...groups.values()].sort((a,b) => a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name) || String(a.ledger_name || "").localeCompare(String(b.ledger_name || ""))) });
+    return res.json({ income, expense, net_profit: income - expense, excluded_contra_rows: excludedContra, rows: [...groups.values()].sort((a,b) => String(a.period_label || "").localeCompare(String(b.period_label || "")) || a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name) || String(a.ledger_name || "").localeCompare(String(b.ledger_name || ""))) });
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Profit & Loss." }); }
 });
 
@@ -1190,6 +1371,8 @@ router.get("/reports/balance-sheet", async (req, res) => {
     for (const mapping of ctx.mappings) {
       const group = ctx.groupById.get(String(mapping.group_id));
       if (!group || group.report_placement !== "balance_sheet" || !["asset", "liability", "equity"].includes(group.nature)) continue;
+      if (text(req.query.group_id) && String(mapping.group_id) !== text(req.query.group_id)) continue;
+      if (text(req.query.subgroup_id) && String(mapping.subgroup_id || "") !== text(req.query.subgroup_id)) continue;
       const normalSide = group.nature === "asset" ? "dr" : "cr";
       const ledgerTransactions = ctx.transactions.filter((tx) => tx.normalized_particulars === mapping.normalized_name && !(Array.isArray(tx.allocations) && tx.allocations.length));
       const buckets = new Map();
@@ -1247,6 +1430,7 @@ router.get("/reports/balance-sheet", async (req, res) => {
     for (const tx of ctx.transactions) {
       if (!Array.isArray(tx.allocations) || !tx.allocations.length) continue;
       for (const allocation of transactionAllocations(tx, ctx)) {
+        if (!matchesAllocationFilters(allocation, req.query)) continue;
         const group = allocation.group_id ? ctx.groupById.get(String(allocation.group_id)) : null;
         if (!group || group.report_placement !== "balance_sheet" || !["asset", "liability", "equity"].includes(group.nature)) continue;
         const groupCompanyValue = allocation.group_company || "";
@@ -1282,18 +1466,21 @@ router.get("/reports/balance-sheet", async (req, res) => {
     // a negative bank balance is shown as a Bank Overdraft liability.
     const latestBankRows = new Map();
     const groupCompanySelectionForBalance = requestedGroupCompany(req.query);
-    // Bank accounts are not assigned to an L-column Particulars ledger. Hide them
-    // when a specific Group Company filter is used rather than misattribute balances.
-    for (const tx of (groupCompanySelectionForBalance ? [] : ctx.transactions)) {
-      const bankName = text(tx.bank_name);
-      if (!bankName) continue;
-      const current = latestBankRows.get(bankName);
-      if (!current || new Date(tx.bank_date).getTime() >= new Date(current.bank_date).getTime()) {
-        latestBankRows.set(bankName, tx);
-      }
-    }
-    for (const [bankName, tx] of latestBankRows.entries()) {
-      const closingBalance = numberValue(tx.bank_balance);
+    const selectedBalanceGroup = text(req.query.group_id) ? ctx.groupById.get(text(req.query.group_id)) : null;
+    const canShowBankAccounts = !selectedBalanceGroup || ["current assets", "loans (liability)"].includes(keyText(selectedBalanceGroup.name));
+    const openingBankRecords = (groupCompanySelectionForBalance || !canShowBankAccounts || text(req.query.subgroup_id)) ? [] : await BankOpeningBalance.find({ company_id: companyId, active: true, ...(req.query.to_date ? { effective_date: { $lte: new Date(`${text(req.query.to_date)}T23:59:59.999Z`) } } : {}) }).lean();
+    const allBankNames = new Set((groupCompanySelectionForBalance || !canShowBankAccounts || text(req.query.subgroup_id)) ? [] : [...ctx.transactions.map((tx) => text(tx.bank_name)), ...openingBankRecords.map((row) => text(row.bank_name))].filter(Boolean));
+    for (const bankName of allBankNames) {
+      const bankTransactions = ctx.transactions.filter((tx) => keyText(tx.bank_name) === keyText(bankName));
+      const openingRecord = openingBankRecords.filter((row) => keyText(row.bank_name) === keyText(bankName)).sort((a,b) => new Date(b.effective_date) - new Date(a.effective_date))[0];
+      const latestTx = bankTransactions.reduce((latest, tx) => !latest || new Date(tx.bank_date) >= new Date(latest.bank_date) ? tx : latest, null);
+      if (!openingRecord && !latestTx) continue;
+      let closingBalance;
+      if (openingRecord) {
+        closingBalance = signedBankOpening(openingRecord);
+        for (const tx of bankTransactions) if (new Date(tx.bank_date) >= new Date(openingRecord.effective_date)) closingBalance += transactionBankReceipt(tx) - transactionBankPayment(tx);
+      } else closingBalance = numberValue(latestTx.bank_balance);
+      const tx = latestTx || { bank_date: openingRecord?.effective_date };
       const isOverdraft = closingBalance < 0;
       const amount = Math.abs(closingBalance);
       const nature = isOverdraft ? "liability" : "asset";
@@ -1309,7 +1496,9 @@ router.get("/reports/balance-sheet", async (req, res) => {
         normal_balance: isOverdraft ? -amount : amount,
         debit_balance: isOverdraft ? 0 : amount,
         credit_balance: isOverdraft ? amount : 0,
-        source: "bank_statement_column_h",
+        source: openingRecord ? "manual_opening_plus_statement_movements" : "bank_statement_column_h",
+        opening_balance: openingRecord ? signedBankOpening(openingRecord) : null,
+        opening_balance_date: openingRecord?.effective_date || null,
         balance_date: tx.bank_date,
       };
       groups.set(rowKey, { group_name: groupName, subgroup_name: bankName, nature, balance: amount, ledgers: [row] });
