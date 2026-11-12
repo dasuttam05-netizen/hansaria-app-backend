@@ -308,6 +308,21 @@ async function loadReportContext(companyId, query) {
   return { transactions, groups, subgroups, mappings, groupById, subgroupById, mappingByName };
 }
 
+function transactionEntrySide(row = {}) {
+  if (numberValue(row.receipt_amount) > 0) return "receipt";
+  if (numberValue(row.payment_amount) > 0) return "payment";
+  if (numberValue(row.bank_credit) > 0) return "receipt";
+  if (numberValue(row.bank_debit) > 0) return "payment";
+  return "receipt";
+}
+
+function transactionEntryAmount(row = {}) {
+  const side = transactionEntrySide(row);
+  const explicitAmount = side === "receipt" ? numberValue(row.receipt_amount) : numberValue(row.payment_amount);
+  if (explicitAmount > 0) return explicitAmount;
+  return side === "receipt" ? numberValue(row.bank_credit) : numberValue(row.bank_debit);
+}
+
 function transactionAllocations(row, ctx) {
   const saved = Array.isArray(row?.allocations) ? row.allocations.filter((item) => item && numberValue(item.amount) > 0) : [];
   if (saved.length) {
@@ -332,18 +347,18 @@ function transactionAllocations(row, ctx) {
   }
   const mapping = ctx.mappingByName.get(row?.normalized_particulars) || null;
   if (!mapping) {
-    const amount = numberValue(row.receipt_amount) || numberValue(row.payment_amount);
+    const amount = transactionEntryAmount(row);
     if (!amount) return [];
     return [{
       ledger_name: transactionLedgerName(row, null),
       group_id: "", group_name: "Unmapped", subgroup_id: "", subgroup_name: "",
       group_company: transactionGroupCompany(row, null), nature: "", report_placement: "",
-      side: numberValue(row.receipt_amount) > 0 ? "receipt" : "payment", amount,
+      side: transactionEntrySide(row), amount,
     }];
   }
   const group = ctx.groupById.get(String(mapping.group_id));
   const subgroup = mapping.subgroup_id ? ctx.subgroupById.get(String(mapping.subgroup_id)) : null;
-  const amount = numberValue(row.receipt_amount) || numberValue(row.payment_amount);
+  const amount = transactionEntryAmount(row);
   if (!amount) return [];
   return [{
     ledger_name: transactionLedgerName(row, mapping),
@@ -354,7 +369,7 @@ function transactionAllocations(row, ctx) {
     group_company: transactionGroupCompany(row, mapping),
     nature: group?.nature || mapping.nature || "",
     report_placement: group?.report_placement || mapping.report_placement || "",
-    side: numberValue(row.receipt_amount) > 0 ? "receipt" : "payment",
+    side: transactionEntrySide(row),
     amount,
   }];
 }
@@ -917,8 +932,8 @@ router.put("/transactions/:id", async (req, res) => {
       return res.status(400).json({ error: "A row cannot contain both Receipt and Payment amounts. Correct the row before saving." });
     }
     if (Array.isArray(req.body?.allocations)) {
-      const bankSide = numberValue(next.receipt_amount) > 0 ? "receipt" : "payment";
-      const bankAmount = numberValue(next.receipt_amount) || numberValue(next.payment_amount);
+      const bankSide = transactionEntrySide(next);
+      const bankAmount = transactionEntryAmount(next);
       const submitted = req.body.allocations.filter((item) => item && (text(item.ledger_name) || text(item.group_id) || numberValue(item.amount) > 0));
       if (!submitted.length) {
         update.allocations = [];
