@@ -1014,7 +1014,14 @@ router.get("/reports/bank-balance", async (req, res) => {
     const fromDate = text(req.query.from_date) ? new Date(`${text(req.query.from_date)}T00:00:00.000Z`) : new Date(candidateDates.length ? Math.min(...candidateDates) : toDate.getTime());
     if (fromDate > toDate) return res.status(400).json({ error: "From Date cannot be later than To Date." });
     const periodType = ["daily", "monthly"].includes(String(req.query.period_type || "").toLowerCase()) ? String(req.query.period_type).toLowerCase() : "range";
+    // Load master mappings independently of the display filters so that
+    // bank-level opening / closing balances always include every movement.
+    const reportContext = await loadReportContext(companyId, {});
+    const requestedCompany = requestedGroupCompany(req.query);
+    const requestedGroupId = text(req.query.group_id);
+    const requestedSubgroupId = text(req.query.subgroup_id);
     const rows = [];
+    const details = [];
     const totals = { opening_balance: 0, receipts: 0, payments: 0, closing_balance: 0, transactions: 0 };
     const missingBanks = [];
     for (const bankName of bankNames) {
@@ -1045,6 +1052,61 @@ router.get("/reports/bank-balance", async (req, res) => {
       }
       if (!manualOpeningSet) missingBanks.push(bankName);
       const selectedTransactions = bankTx.filter((tx) => new Date(tx.bank_date) >= fromDate && new Date(tx.bank_date) <= toDate);
+      // Produce a ledger-level detail line for every saved split allocation (or
+      // the ordinary mapped ledger). Running bank balance is calculated once
+      // per original transaction, never once per split line.
+      let detailRunningBalance = openingBalance;
+      for (const tx of selectedTransactions) {
+        const bankReceipt = transactionBankReceipt(tx);
+        const bankPayment = transactionBankPayment(tx);
+        detailRunningBalance += bankReceipt - bankPayment;
+        // Voucher type / imported file filters narrow the ledger detail only;
+        // they must not change the bank's actual running balance.
+        if (text(req.query.voucher_type) && !new RegExp(`^${text(req.query.voucher_type)}$`, "i").test(text(tx.voucher_type))) continue;
+        if (text(req.query.import_batch_id) && text(tx.import_batch_id) !== text(req.query.import_batch_id)) continue;
+        const mapped = mapTransaction(tx, reportContext);
+        const allocations = Array.isArray(mapped.allocations) ? mapped.allocations : [];
+        const visibleAllocations = allocations.filter((allocation) => {
+          if (requestedGroupId && String(allocation.group_id || "") !== requestedGroupId) return false;
+          if (requestedSubgroupId && String(allocation.subgroup_id || "") !== requestedSubgroupId) return false;
+          return matchesGroupCompany(allocation, requestedCompany);
+        });
+        visibleAllocations.forEach((allocation, allocationIndex) => {
+          const side = allocation.side === "receipt" ? "receipt" : "payment";
+          const amount = numberValue(allocation.amount);
+          details.push({
+            id: `${String(tx._id)}:${allocationIndex}`,
+            transaction_id: String(tx._id),
+            bank_date: tx.bank_date,
+            bank_time: tx.bank_time || "",
+            bank_name: text(tx.bank_name),
+            original_particulars: text(tx.particulars_name),
+            ledger_name: text(allocation.ledger_name) || mapped.ledger_name || "Unmapped Ledger",
+            voucher_type: text(tx.voucher_type),
+            voucher_number: text(tx.voucher_number),
+            group_company: text(allocation.group_company),
+            group_name: text(allocation.group_name) || "Unmapped",
+            subgroup_name: text(allocation.subgroup_name),
+            receipt_amount: side === "receipt" ? amount : 0,
+            payment_amount: side === "payment" ? amount : 0,
+            allocation_amount: amount,
+            allocation_side: side,
+            statement_debit: allocationIndex === 0 ? numberValue(tx.bank_debit) : null,
+            statement_credit: allocationIndex === 0 ? numberValue(tx.bank_credit) : null,
+            bank_balance: allocationIndex === 0 ? (tx.bank_balance === undefined || tx.bank_balance === null ? null : numberValue(tx.bank_balance)) : null,
+            running_balance: allocationIndex === 0 ? detailRunningBalance : null,
+            bank_remarks: text(tx.bank_remarks),
+            instrument_type: text(tx.instrument_type),
+            instrument_no: text(tx.instrument_no),
+            transaction_reference: text(tx.transaction_id),
+            bank_status: text(tx.bank_status),
+            tally_date: tx.tally_date || null,
+            allocation_index: allocationIndex,
+            allocation_count: visibleAllocations.length,
+            split: Array.isArray(tx.allocations) && tx.allocations.length > 1,
+          });
+        });
+      }
       const buckets = new Map();
       for (const tx of selectedTransactions) {
         const period = periodType === "range" ? "Selected Period" : reportPeriodLabel(tx.bank_date, periodType);
@@ -1083,7 +1145,7 @@ router.get("/reports/bank-balance", async (req, res) => {
       for (const total of periodTotals.values()) rows.push({ bank_name: "ALL BANKS", ...total });
     }
     rows.sort((a,b) => String(a.period).localeCompare(String(b.period)) || (a.bank_name === "ALL BANKS" ? -1 : b.bank_name === "ALL BANKS" ? 1 : a.bank_name.localeCompare(b.bank_name)));
-    return res.json({ from_date: fromDate, to_date: toDate, period_type: periodType, banks: bankNames, totals, rows, opening_balance_missing_banks: missingBanks });
+    return res.json({ from_date: fromDate, to_date: toDate, period_type: periodType, banks: bankNames, totals, rows, details, detail_count: details.length, opening_balance_missing_banks: missingBanks });
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Bank Balance report." }); }
 });
 
