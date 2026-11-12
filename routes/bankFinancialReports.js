@@ -619,6 +619,7 @@ router.get("/import-batches", async (req, res) => {
         _id: "$import_batch_id",
         file_name: { $first: "$import_file_name" },
         imported_by: { $first: "$imported_by" },
+        bank_names: { $addToSet: "$bank_name" },
         total_rows: { $sum: 1 },
         total_receipts: { $sum: "$receipt_amount" },
         total_payments: { $sum: "$payment_amount" },
@@ -633,6 +634,7 @@ router.get("/import-batches", async (req, res) => {
       batch_id: row._id || "",
       file_name: row.file_name || "Imported Bank Statement",
       imported_by: row.imported_by || "",
+      bank_names: (row.bank_names || []).map((name) => text(name)).filter(Boolean),
       total_rows: row.total_rows || 0,
       total_receipts: row.total_receipts || 0,
       total_payments: row.total_payments || 0,
@@ -641,6 +643,39 @@ router.get("/import-batches", async (req, res) => {
       last_updated: row.last_updated || null,
     })));
   } catch (error) { return res.status(500).json({ error: error.message || "Could not load import history." }); }
+});
+
+// Assign one Bank Name to every transaction in a selected import batch.
+// This updates existing rows in place; amounts, dates, mappings, allocations,
+// bank balances and the import batch identity are deliberately preserved.
+router.patch("/import-batches/:batchId/bank-name", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const batchId = text(req.params.batchId);
+    const bankName = text(req.body?.bank_name);
+    if (!batchId) return res.status(400).json({ error: "Select a valid imported statement." });
+    if (!bankName) return res.status(400).json({ error: "Please enter or select a Bank Name." });
+    if (bankName.length > 120) return res.status(400).json({ error: "Bank Name cannot exceed 120 characters." });
+
+    const filter = { company_id: companyId, import_batch_id: batchId };
+    const existingRows = await Transaction.countDocuments(filter);
+    if (!existingRows) return res.status(404).json({ error: "No transactions were found for this imported statement." });
+
+    const result = await Transaction.updateMany(filter, { $set: { bank_name: bankName } });
+    await refreshImportBatch(companyId, batchId);
+    const updatedRows = Number(result.modifiedCount ?? result.nModified ?? 0);
+    return res.json({
+      success: true,
+      batch_id: batchId,
+      bank_name: bankName,
+      total_rows: existingRows,
+      updated_rows: updatedRows,
+      message: `Bank Name updated for ${existingRows} imported rows.`,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Could not update Bank Name for this imported statement." });
+  }
 });
 
 router.get("/summary", async (req, res) => {
