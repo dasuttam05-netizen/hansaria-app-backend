@@ -150,7 +150,7 @@ const ContraMatch = collectionModel("BankFinancialContraMatch", "bankfinancialco
   receipt_date: Date,
   payment_reference: String,
   receipt_reference: String,
-  match_method: { type: String, enum: ["utr", "amount_date", "manual"], default: "manual" },
+  match_method: { type: String, enum: ["strict_reference", "utr", "amount_date", "manual"], default: "manual" },
   status: { type: String, enum: ["matched", "cancelled"], default: "matched" },
   matched_by: String,
 }, [
@@ -388,12 +388,64 @@ function transactionEntryAmount(row = {}) {
   return side === "receipt" ? numberValue(row.bank_credit) : numberValue(row.bank_debit);
 }
 
-function normalizedBankReference(row = {}) {
-  // Transaction ID is preferred; Instrument Number is a useful fallback for
-  // NEFT / RTGS / IMPS UTRs. Voucher numbers are deliberately not used here.
-  const raw = text(row.transaction_id || row.instrument_no || row.instrument_number).toUpperCase();
-  if (["", "NA", "N/A", "-", "0", "NONE", "NULL", "NOT AVAILABLE", "NOT PROVIDED"].includes(raw)) return "";
+function normalizeContraField(value) {
+  const raw = text(value).toUpperCase();
+  if (["", "NA", "N/A", "-", "0", "NONE", "NULL", "NOT AVAILABLE", "NOT PROVIDED"].includes(raw) || /^0+(?:\.0+)?$/.test(raw)) return "";
   return raw.replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizedBankReference(row = {}) {
+  // Strict matching uses the actual Transaction ID only. Instrument Number is
+  // validated separately and must also match; it is never used as a fallback.
+  return normalizeContraField(row.transaction_id);
+}
+
+function strictContraPairChecks(payment = {}, receipt = {}) {
+  const paymentAmountCents = Math.round(transactionEntryAmount(payment) * 100);
+  const receiptAmountCents = Math.round(transactionEntryAmount(receipt) * 100);
+  const paymentTransactionId = normalizeContraField(payment.transaction_id);
+  const receiptTransactionId = normalizeContraField(receipt.transaction_id);
+  const paymentRemarks = normalizeContraField(payment.bank_remarks);
+  const receiptRemarks = normalizeContraField(receipt.bank_remarks);
+  const paymentInstrument = normalizeContraField(payment.instrument_no);
+  const receiptInstrument = normalizeContraField(receipt.instrument_no);
+  const paymentVoucherType = normalizeContraField(payment.voucher_type);
+  const receiptVoucherType = normalizeContraField(receipt.voucher_type);
+
+  const checks = {
+    voucher_type: paymentVoucherType === "CONTRA" && receiptVoucherType === "CONTRA",
+    amount: paymentAmountCents > 0 && paymentAmountCents === receiptAmountCents,
+    transaction_id: Boolean(paymentTransactionId && receiptTransactionId && paymentTransactionId === receiptTransactionId),
+    bank_remarks: Boolean(paymentRemarks && receiptRemarks && paymentRemarks === receiptRemarks),
+    instrument_no: Boolean(paymentInstrument && receiptInstrument && paymentInstrument === receiptInstrument),
+  };
+  const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([key]) => key);
+  return {
+    valid: failed.length === 0,
+    checks,
+    failed,
+    payment_reference: paymentTransactionId,
+    receipt_reference: receiptTransactionId,
+  };
+}
+
+function bankTimeSortMinutes(value) {
+  const raw = text(value);
+  if (!raw) return Number.POSITIVE_INFINITY;
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric >= 0 && numeric < 1) return Math.round(numeric * 1440);
+  const match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (!match) return Number.POSITIVE_INFINITY;
+  let hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (minutes > 59 || hours > 24 || (hours === 24 && (minutes !== 0 || Number(match[3] || 0) !== 0))) return Number.POSITIVE_INFINITY;
+  const meridiem = (match[4] || "").toUpperCase();
+  if (meridiem) {
+    if (hours < 1 || hours > 12) return Number.POSITIVE_INFINITY;
+    if (meridiem === "AM") hours = hours === 12 ? 0 : hours;
+    else hours = hours === 12 ? 12 : hours + 12;
+  }
+  return hours * 60 + minutes;
 }
 
 function contraTransactionView(row = {}, mappingByName = null) {
@@ -409,6 +461,7 @@ function contraTransactionView(row = {}, mappingByName = null) {
     ledger_name: text(row.ledger_name_override) || transactionLedgerName(row, mapping),
     group_company: transactionGroupCompany(row, mapping) || "",
     transaction_id: text(row.transaction_id),
+    bank_remarks: text(row.bank_remarks),
     instrument_no: text(row.instrument_no),
     voucher_type: text(row.voucher_type),
     voucher_number: text(row.voucher_number),
@@ -419,32 +472,30 @@ function contraTransactionView(row = {}, mappingByName = null) {
 }
 
 function buildContraSuggestions(rows, mappingByName = new Map()) {
-  const payments = rows.filter((row) => transactionEntrySide(row) === "payment" && transactionEntryAmount(row) > 0 && text(row.bank_name));
-  const receipts = rows.filter((row) => transactionEntrySide(row) === "receipt" && transactionEntryAmount(row) > 0 && text(row.bank_name));
+  // Build review candidates only for opposite-side rows with matching amount,
+  // Contra voucher types, different Banks and a nearby date. Only candidates
+  // passing every identifying-field check can be auto-linked or confirmed.
+  // This keeps ordinary customer receipts (e.g. FARMART) out of Contra.
+  const payments = rows.filter((row) => transactionEntrySide(row) === "payment"
+    && transactionEntryAmount(row) > 0 && text(row.bank_name)
+    && normalizeContraField(row.voucher_type) === "CONTRA");
+  const receipts = rows.filter((row) => transactionEntrySide(row) === "receipt"
+    && transactionEntryAmount(row) > 0 && text(row.bank_name)
+    && normalizeContraField(row.voucher_type) === "CONTRA");
   const byPayment = new Map();
   const byReceipt = new Map();
-  const rowsById = new Map(rows.map((row) => [String(row._id), row]));
   const candidates = [];
-  const receiptByCents = new Map();
-  receipts.forEach((row) => {
-    const cents = Math.round(transactionEntryAmount(row) * 100);
-    if (!receiptByCents.has(cents)) receiptByCents.set(cents, []);
-    receiptByCents.get(cents).push(row);
-  });
 
   payments.forEach((payment) => {
-    const cents = Math.round(transactionEntryAmount(payment) * 100);
-    const possibleReceipts = [
-      ...(receiptByCents.get(cents - 1) || []),
-      ...(receiptByCents.get(cents) || []),
-      ...(receiptByCents.get(cents + 1) || []),
-    ];
-    possibleReceipts.forEach((receipt) => {
+    receipts.forEach((receipt) => {
       if (keyText(payment.bank_name) === keyText(receipt.bank_name)) return;
+      const paymentAmountCents = Math.round(transactionEntryAmount(payment) * 100);
+      const receiptAmountCents = Math.round(transactionEntryAmount(receipt) * 100);
+      if (!paymentAmountCents || paymentAmountCents !== receiptAmountCents) return;
+      const checks = strictContraPairChecks(payment, receipt);
+
       const paymentCompany = keyText(transactionGroupCompany(payment, mappingByName.get(payment.normalized_particulars)));
       const receiptCompany = keyText(transactionGroupCompany(receipt, mappingByName.get(receipt.normalized_particulars)));
-      // If both sides are explicitly assigned to different Group Companies,
-      // never suggest them as an inter-bank transfer.
       if (paymentCompany && receiptCompany && paymentCompany !== receiptCompany) return;
       const sameGroupCompany = Boolean(paymentCompany && receiptCompany && paymentCompany === receiptCompany);
       const noGroupCompanyLabels = !paymentCompany && !receiptCompany;
@@ -452,27 +503,25 @@ function buildContraSuggestions(rows, mappingByName = new Map()) {
       const receiptDate = new Date(receipt.bank_date).getTime();
       const dayGap = Math.abs(paymentDate - receiptDate) / 86400000;
       if (!Number.isFinite(dayGap) || dayGap > 3) return;
-      const paymentReference = normalizedBankReference(payment);
-      const receiptReference = normalizedBankReference(receipt);
-      const hasBothReferences = Boolean(paymentReference && receiptReference);
-      const referenceMatch = hasBothReferences && paymentReference === receiptReference;
-      const referenceConflict = hasBothReferences && paymentReference !== receiptReference;
-      // A conflicting UTR is still displayed for manual review, but it can
-      // never be auto-matched. The user may confirm only after checking both rows.
+
       const amount = transactionEntryAmount(payment);
-      const amountDifference = Math.abs(amount - transactionEntryAmount(receipt));
       const pair = {
         payment_transaction_id: String(payment._id),
         receipt_transaction_id: String(receipt._id),
         payment: contraTransactionView(payment, mappingByName),
         receipt: contraTransactionView(receipt, mappingByName),
         amount,
-        amount_difference: amountDifference,
+        amount_difference: 0,
         day_gap: Number(dayGap.toFixed(2)),
-        reference_match: referenceMatch,
-        reference_conflict: referenceConflict,
-        match_reason: referenceConflict ? "UTR differs — verify manually" : referenceMatch ? "UTR / Transaction ID matches" : (dayGap < 0.01 ? "Same amount and same date" : "Same amount; dates are within 3 days"),
-        match_method: referenceMatch ? "utr" : "amount_date",
+        reference_match: checks.checks.transaction_id,
+        reference_conflict: checks.failed.includes("transaction_id"),
+        strict_valid: checks.valid,
+        strict_checks: checks.checks,
+        failed_checks: checks.failed,
+        match_reason: checks.valid
+          ? "Voucher Type, Amount, Transaction ID, Bank Remarks and Instrument Number all match"
+          : `Not eligible for Contra: ${checks.failed.map((key) => ({ voucher_type: "Voucher Type", amount: "Amount", transaction_id: "Transaction ID", bank_remarks: "Bank Remarks", instrument_no: "Instrument Number" }[key] || key)).join(", ")} do not all match`,
+        match_method: checks.valid ? "strict_reference" : "review_required",
         same_group_company: sameGroupCompany,
         no_group_company_labels: noGroupCompanyLabels,
       };
@@ -487,21 +536,47 @@ function buildContraSuggestions(rows, mappingByName = new Map()) {
   return candidates.map((pair) => {
     const paymentCount = byPayment.get(pair.payment_transaction_id)?.length || 0;
     const receiptCount = byReceipt.get(pair.receipt_transaction_id)?.length || 0;
-    // Safe auto-match requires a unique reciprocal one-to-one candidate and
-    // either an exact reference or same-calendar-day amount match with no UTRs.
-    const noReferences = !normalizedBankReference(rowsById.get(pair.payment_transaction_id) || {})
-      && !normalizedBankReference(rowsById.get(pair.receipt_transaction_id) || {});
     return {
       ...pair,
       ambiguous: paymentCount > 1 || receiptCount > 1,
-      auto_safe: paymentCount === 1 && receiptCount === 1 && !pair.reference_conflict && (
-        (pair.reference_match && (pair.same_group_company || pair.no_group_company_labels))
-        || (noReferences && pair.same_group_company && pair.day_gap < 0.01)
-      ),
+      auto_safe: pair.strict_valid && paymentCount === 1 && receiptCount === 1
+        && (pair.same_group_company || pair.no_group_company_labels),
     };
-  }).sort((a, b) => Number(b.reference_match) - Number(a.reference_match)
+  }).sort((a, b) => Number(b.same_group_company) - Number(a.same_group_company)
     || Number(a.day_gap) - Number(b.day_gap)
     || new Date(a.payment.bank_date).getTime() - new Date(b.payment.bank_date).getTime());
+}
+
+async function revalidateExistingContraMatches(companyId) {
+  const existingMatches = await ContraMatch.find({ company_id: companyId, status: "matched" }).limit(10000).lean();
+  if (!existingMatches.length) return 0;
+  const transactionIds = [...new Set(existingMatches.flatMap((row) => [row.payment_transaction_id, row.receipt_transaction_id]).filter(Boolean).map(String))];
+  const [transactions, mappings] = await Promise.all([
+    transactionIds.length ? Transaction.find({ company_id: companyId, _id: { $in: transactionIds } }).lean() : [],
+    LedgerMapping.find({ company_id: companyId, active: true }).lean(),
+  ]);
+  const byId = new Map(transactions.map((row) => [String(row._id), row]));
+  const mappingByName = new Map(mappings.map((row) => [row.normalized_name, row]));
+  const invalidMatchIds = [];
+  for (const match of existingMatches) {
+    const payment = byId.get(String(match.payment_transaction_id));
+    const receipt = byId.get(String(match.receipt_transaction_id));
+    const paymentCompany = payment ? keyText(transactionGroupCompany(payment, mappingByName.get(payment.normalized_particulars))) : "";
+    const receiptCompany = receipt ? keyText(transactionGroupCompany(receipt, mappingByName.get(receipt.normalized_particulars))) : "";
+    if (!payment || !receipt || !strictContraPairChecks(payment, receipt).valid
+      || transactionEntrySide(payment) !== "payment" || transactionEntrySide(receipt) !== "receipt"
+      || keyText(payment.bank_name) === keyText(receipt.bank_name)
+      || (paymentCompany && receiptCompany && paymentCompany !== receiptCompany)) {
+      invalidMatchIds.push(String(match._id));
+    }
+  }
+  if (!invalidMatchIds.length) return 0;
+  await Transaction.updateMany(
+    { company_id: companyId, contra_match_id: { $in: invalidMatchIds } },
+    { $unset: { contra_match_id: 1, contra_match_status: 1, contra_counter_bank: 1 } }
+  );
+  await ContraMatch.deleteMany({ company_id: companyId, _id: { $in: invalidMatchIds } });
+  return invalidMatchIds.length;
 }
 
 async function createContraMatch(companyId, paymentId, receiptId, req, method = "manual") {
@@ -524,6 +599,19 @@ async function createContraMatch(companyId, paymentId, receiptId, req, method = 
   if (Math.abs(paymentAmount - receiptAmount) > 0.01) {
     const error = new Error(`Payment ${paymentAmount.toFixed(2)} and Receipt ${receiptAmount.toFixed(2)} must have the same amount.`); error.status = 400; throw error;
   }
+  const strictChecks = strictContraPairChecks(payment, receipt);
+  if (!strictChecks.valid) {
+    const labels = {
+      voucher_type: "Voucher Type must be Contra on both rows",
+      amount: "Receipt and Payment amounts must match exactly",
+      transaction_id: "Transaction ID must be present and match",
+      bank_remarks: "Bank Remarks must be present and match",
+      instrument_no: "Instrument Number must be present and match",
+    };
+    const error = new Error(`Contra Match rejected: ${strictChecks.failed.map((key) => labels[key] || key).join("; ")}.`);
+    error.status = 400;
+    throw error;
+  }
   if (text(payment.contra_match_id) || text(receipt.contra_match_id)) {
     const error = new Error("One of these transactions is already linked to another Contra Transfer."); error.status = 409; throw error;
   }
@@ -540,9 +628,6 @@ async function createContraMatch(companyId, paymentId, receiptId, req, method = 
   }
   const paymentReference = normalizedBankReference(payment);
   const receiptReference = normalizedBankReference(receipt);
-  if (paymentReference && receiptReference && paymentReference !== receiptReference && method !== "manual") {
-    const error = new Error("The UTR / Transaction ID values do not match. Please review before linking manually."); error.status = 400; throw error;
-  }
   const transferId = `CTR-${crypto.randomBytes(6).toString("hex").toUpperCase()}`;
   const match = await ContraMatch.create({
     company_id: companyId,
@@ -581,6 +666,9 @@ async function createContraMatch(companyId, paymentId, receiptId, req, method = 
 }
 
 async function autoMatchUniqueContraTransfers(companyId, req) {
+  // Remove historical unsafe auto/manual links that do not satisfy the new
+  // strict Contra rule. The original statement rows and balances are retained.
+  const releasedLegacyMatches = await revalidateExistingContraMatches(companyId);
   const unmatchedRows = await Transaction.find({
     company_id: companyId,
     $or: [{ contra_match_id: { $exists: false } }, { contra_match_id: "" }, { contra_match_id: null }],
@@ -601,6 +689,7 @@ async function autoMatchUniqueContraTransfers(companyId, req) {
     matched_count: created.length,
     review_required_count: suggestions.filter((row) => !row.auto_safe).length,
     suggestions_count: suggestions.length,
+    released_legacy_matches: releasedLegacyMatches,
   };
 }
 
@@ -1588,9 +1677,12 @@ router.post("/contra-matches/auto-match", async (req, res) => {
       matched_count: result.matched_count,
       matches: result.matches,
       review_required_count: result.review_required_count,
+      released_legacy_matches: result.released_legacy_matches || 0,
       message: result.matched_count
-        ? `${result.matched_count} unique Contra Transfer(s) matched. Original Bank Statement rows and balances were not duplicated or changed.`
-        : "No unique safe Contra Match was found. Review the suggested pairs and confirm the correct transfer manually.",
+        ? `${result.matched_count} strict Contra Transfer(s) matched. ${result.released_legacy_matches || 0} previous link(s) that failed strict checks were unlinked. Original Bank Statement rows and balances were not changed.`
+        : result.released_legacy_matches
+          ? `${result.released_legacy_matches} previous Contra link(s) failed the strict checks and were unlinked. No new pair matched all required fields.`
+          : "No strict Contra Match was found. Both rows must have Voucher Type Contra, the exact same amount, Transaction ID, Bank Remarks and Instrument Number.",
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || "Could not run Contra Auto Matching." });
@@ -1637,7 +1729,14 @@ router.get("/transactions", async (req, res) => {
     const companyId = companyIdFrom(req);
     const filter = { company_id: companyId, ...dateFilter(req.query) };
     const limit = Math.min(2000, Math.max(1, Number(req.query.limit || 500)));
-    const rows = await Transaction.find(filter).sort({ bank_date: -1, _id: -1 }).limit(limit).lean();
+    const rows = await Transaction.find(filter).sort({ bank_date: 1, _id: 1 }).limit(limit).lean();
+    rows.sort((a, b) => {
+      const dateDiff = new Date(a.bank_date).getTime() - new Date(b.bank_date).getTime();
+      if (dateDiff) return dateDiff;
+      const timeDiff = bankTimeSortMinutes(a.bank_time) - bankTimeSortMinutes(b.bank_time);
+      if (timeDiff) return timeDiff;
+      return String(a._id).localeCompare(String(b._id));
+    });
     const ctx = await loadReportContext(companyId, req.query);
     const mappedRows = rows.map((row) => mapTransaction(row, ctx));
     const requested = requestedGroupCompany(req.query);
