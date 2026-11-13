@@ -1270,6 +1270,50 @@ router.get("/reports/bank-balance", async (req, res) => {
     // Load master mappings independently of the display filters so that
     // bank-level opening / closing balances always include every movement.
     const reportContext = await loadReportContext(companyId, {});
+
+    // Resolve saved Contra Match links for the selected statement rows. A matched
+    // transfer must be reported as a Bank-to-Bank movement (Current Assets /
+    // Bank Accounts), even when the original bank particulars have no ledger
+    // mapping or were previously mapped to an unrelated expense head.
+    const selectedContraMatchIds = [...new Set(allTransactions.map((row) => text(row.contra_match_id)).filter(Boolean))];
+    const matchedContraRecords = selectedContraMatchIds.length
+      ? await ContraMatch.find({ company_id: companyId, status: "matched", _id: { $in: selectedContraMatchIds } }).lean()
+      : [];
+    const linkedContraTransactionIds = [...new Set(matchedContraRecords.flatMap((row) => [text(row.payment_transaction_id), text(row.receipt_transaction_id)]).filter(Boolean))];
+    const alreadyLoadedIds = new Set(allTransactions.map((row) => String(row._id)));
+    const missingContraTransactionIds = linkedContraTransactionIds.filter((id) => !alreadyLoadedIds.has(id));
+    const missingContraRows = missingContraTransactionIds.length
+      ? await Transaction.find({ company_id: companyId, _id: { $in: missingContraTransactionIds } }).lean()
+      : [];
+    const contraTransactionById = new Map([...allTransactions, ...missingContraRows].map((row) => [String(row._id), row]));
+    const currentAssetsGroup = reportContext.groups.find((row) => keyText(row.name) === "current assets")
+      || reportContext.groups.find((row) => keyText(row.nature) === "asset" && keyText(row.report_placement) === "balance_sheet");
+    const bankAccountsSubgroup = reportContext.subgroups.find((row) => keyText(row.name) === "bank accounts"
+      && (!currentAssetsGroup || String(row.group_id) === String(currentAssetsGroup._id)));
+    const contraInfoByTransaction = new Map();
+    for (const match of matchedContraRecords) {
+      const paymentRow = contraTransactionById.get(String(match.payment_transaction_id));
+      const receiptRow = contraTransactionById.get(String(match.receipt_transaction_id));
+      if (!paymentRow || !receiptRow) continue;
+      const paymentMapping = reportContext.mappingByName.get(paymentRow.normalized_particulars) || null;
+      const receiptMapping = reportContext.mappingByName.get(receiptRow.normalized_particulars) || null;
+      const sharedGroupCompany = transactionGroupCompany(paymentRow, paymentMapping)
+        || transactionGroupCompany(receiptRow, receiptMapping)
+        || "";
+      contraInfoByTransaction.set(String(paymentRow._id), {
+        counter_bank: text(match.receipt_bank || receiptRow.bank_name),
+        group_company: sharedGroupCompany,
+        transfer_id: text(match.transfer_id),
+        match_id: String(match._id),
+      });
+      contraInfoByTransaction.set(String(receiptRow._id), {
+        counter_bank: text(match.payment_bank || paymentRow.bank_name),
+        group_company: sharedGroupCompany,
+        transfer_id: text(match.transfer_id),
+        match_id: String(match._id),
+      });
+    }
+
     const requestedCompany = requestedGroupCompany(req.query);
     const requestedGroupId = text(req.query.group_id);
     const requestedSubgroupId = text(req.query.subgroup_id);
@@ -1314,11 +1358,30 @@ router.get("/reports/bank-balance", async (req, res) => {
         const bankPayment = transactionBankPayment(tx);
         detailRunningBalance += bankReceipt - bankPayment;
         // Voucher type / imported file filters narrow the ledger detail only;
-        // they must not change the bank's actual running balance.
-        if (text(req.query.voucher_type) && !new RegExp(`^${text(req.query.voucher_type)}$`, "i").test(text(tx.voucher_type))) continue;
+        // they must not change the bank's actual running balance. Matched rows
+        // are exposed as Contra as well as retaining their original Receipt /
+        // Payment side for statement reconciliation.
+        const contraInfo = contraInfoByTransaction.get(String(tx._id)) || null;
+        const isContra = Boolean(contraInfo) || keyText(tx.voucher_type) === "contra";
+        const requestedVoucherType = keyText(req.query.voucher_type);
+        const rowVoucherTypes = isContra
+          ? new Set(["contra", keyText(tx.voucher_type)])
+          : new Set([keyText(tx.voucher_type)]);
+        if (requestedVoucherType && !rowVoucherTypes.has(requestedVoucherType)) continue;
         if (text(req.query.import_batch_id) && text(tx.import_batch_id) !== text(req.query.import_batch_id)) continue;
         const mapped = mapTransaction(tx, reportContext);
-        const allocations = Array.isArray(mapped.allocations) ? mapped.allocations : [];
+        const allocations = isContra
+          ? [{
+              ledger_name: text(contraInfo?.counter_bank) || transactionLedgerName(tx, reportContext.mappingByName.get(tx.normalized_particulars) || null),
+              group_id: currentAssetsGroup ? String(currentAssetsGroup._id) : "",
+              group_name: currentAssetsGroup?.name || "Current Assets",
+              subgroup_id: bankAccountsSubgroup ? String(bankAccountsSubgroup._id) : "",
+              subgroup_name: bankAccountsSubgroup?.name || "Bank Accounts",
+              group_company: text(contraInfo?.group_company) || transactionGroupCompany(tx, reportContext.mappingByName.get(tx.normalized_particulars) || null),
+              side: transactionEntrySide(tx),
+              amount: transactionEntryAmount(tx),
+            }]
+          : (Array.isArray(mapped.allocations) ? mapped.allocations : []);
         const visibleAllocations = allocations.filter((allocation) => {
           if (requestedGroupId && String(allocation.group_id || "") !== requestedGroupId) return false;
           if (requestedSubgroupId && String(allocation.subgroup_id || "") !== requestedSubgroupId) return false;
@@ -1335,8 +1398,11 @@ router.get("/reports/bank-balance", async (req, res) => {
             bank_name: text(tx.bank_name),
             original_particulars: text(tx.particulars_name),
             ledger_name: text(allocation.ledger_name) || mapped.ledger_name || "Unmapped Ledger",
-            voucher_type: text(tx.voucher_type),
+            voucher_type: isContra ? "Contra" : text(tx.voucher_type),
             voucher_number: text(tx.voucher_number),
+            contra_transfer_id: text(contraInfo?.transfer_id),
+            contra_match_id: text(contraInfo?.match_id || tx.contra_match_id),
+            contra_counter_bank: text(contraInfo?.counter_bank || tx.contra_counter_bank),
             group_company: text(allocation.group_company),
             group_id: text(allocation.group_id),
             group_name: text(allocation.group_name) || "Unmapped",
