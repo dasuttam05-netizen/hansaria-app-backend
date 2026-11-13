@@ -1431,6 +1431,10 @@ router.get("/reports/bank-balance", async (req, res) => {
         : (bankNames.length === 1 ? bankNames[0] : "All Selected Banks");
       const summaryIdentity = [periodSortKey, companyValue, text(detail.group_id), groupName, text(detail.subgroup_id), subgroupName].join("|\u001f|");
       const summaryKey = crypto.createHash("sha1").update(summaryIdentity).digest("hex");
+      // The Sub-group details popup groups detail rows by summary_key on the
+      // frontend. Attach the exact same key used by summary_rows to every
+      // allocation detail so the clicked summary row resolves its transactions.
+      detail.summary_key = summaryKey;
       if (!summaryMap.has(summaryKey)) {
         summaryMap.set(summaryKey, {
           summary_key: summaryKey,
