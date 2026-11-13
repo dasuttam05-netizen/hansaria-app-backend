@@ -83,7 +83,6 @@ const Transaction = collectionModel("BankFinancialTransaction", "bankfinancialtr
   bank_debit: { type: Number, default: 0 },
   bank_credit: { type: Number, default: 0 },
   bank_balance: { type: Number, default: 0 },
-  bank_balance_provided: { type: Boolean, default: false },
   transaction_id: String,
   bank_status: String,
   tally_date: Date,
@@ -102,6 +101,11 @@ const Transaction = collectionModel("BankFinancialTransaction", "bankfinancialtr
   import_file_name: String,
   import_batch_id: String,
   imported_by: String,
+  // A matched inter-bank transfer links the two original statement rows without
+  // creating a second bank movement or changing either imported amount.
+  contra_match_id: String,
+  contra_match_status: String,
+  contra_counter_bank: String,
 }, [{ fields: { company_id: 1, source_key: 1 }, options: { unique: true } }]);
 
 const ImportBatch = collectionModel("BankFinancialImportBatch", "bankfinancialimportbatches", {
@@ -130,6 +134,30 @@ const BankOpeningBalance = collectionModel("BankFinancialOpeningBalance", "bankf
   notes: { type: String, default: "" },
   active: { type: Boolean, default: true },
 }, [{ fields: { company_id: 1, normalized_bank_name: 1 }, options: { unique: true } }]);
+
+// One match represents a single inter-bank contra transfer linking exactly two
+// already-imported rows: one Payment from the source bank and one Receipt at the
+// destination bank. No duplicate statement transaction is created.
+const ContraMatch = collectionModel("BankFinancialContraMatch", "bankfinancialcontramatches", {
+  company_id: { type: String, default: "default" },
+  transfer_id: { type: String, required: true },
+  payment_transaction_id: { type: String, required: true },
+  receipt_transaction_id: { type: String, required: true },
+  payment_bank: { type: String, required: true },
+  receipt_bank: { type: String, required: true },
+  amount: { type: Number, required: true },
+  payment_date: Date,
+  receipt_date: Date,
+  payment_reference: String,
+  receipt_reference: String,
+  match_method: { type: String, enum: ["utr", "amount_date", "manual"], default: "manual" },
+  status: { type: String, enum: ["matched", "cancelled"], default: "matched" },
+  matched_by: String,
+}, [
+  { fields: { company_id: 1, transfer_id: 1 }, options: { unique: true } },
+  { fields: { company_id: 1, payment_transaction_id: 1 }, options: { unique: true } },
+  { fields: { company_id: 1, receipt_transaction_id: 1 }, options: { unique: true } },
+]);
 
 function mongoReady(res) {
   if (!isMongoMirrorReady() || !mongoose.connection?.db) {
@@ -180,86 +208,13 @@ function reportPeriodLabel(value, periodType) {
   return mode === "monthly" ? `${year}-${month}` : `${year}-${month}-${String(date.getUTCDate()).padStart(2, "0")}`;
 }
 
-function bankBalancePeriodLabel(value, periodType) {
-  const mode = String(periodType || "range").toLowerCase();
-  if (mode !== "daily" && mode !== "monthly") return "Selected Period";
-  const date = value instanceof Date ? value : new Date(value);
-  if (!Number.isFinite(date.getTime())) return "Unknown Date";
-  return mode === "monthly"
-    ? new Intl.DateTimeFormat("en-IN", { month: "long", year: "numeric", timeZone: "UTC" }).format(date)
-    : new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" }).format(date);
-}
-
-function bankBalancePeriodSortKey(value, periodType) {
-  const date = value instanceof Date ? value : new Date(value);
-  if (!Number.isFinite(date.getTime())) return "9999-99-99";
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(date.getUTCDate()).padStart(2, "0");
-  return String(periodType || "range").toLowerCase() === "monthly" ? `${year}-${month}` : `${year}-${month}-${day}`;
-}
-
 function signedBankOpening(record) {
   const amount = Math.abs(numberValue(record?.opening_balance));
   return String(record?.opening_balance_type || "dr").toLowerCase() === "cr" ? -amount : amount;
 }
 
-function hasStatementMovementColumns(tx) {
-  return tx?.bank_balance_provided === true
-    || Math.abs(numberValue(tx?.bank_debit)) > 0.000001
-    || Math.abs(numberValue(tx?.bank_credit)) > 0.000001;
-}
-function transactionBankReceipt(tx) {
-  return hasStatementMovementColumns(tx) ? numberValue(tx?.bank_credit) : numberValue(tx?.receipt_amount);
-}
-function transactionBankPayment(tx) {
-  return hasStatementMovementColumns(tx) ? numberValue(tx?.bank_debit) : numberValue(tx?.payment_amount);
-}
-
-function bankTimeSortValue(value) {
-  const raw = text(value).trim().toUpperCase();
-  if (!raw) return -1;
-  const match = raw.match(/^(\d{1,2})[:.](\d{2})(?:[:.](\d{2}))?\s*(AM|PM)?$/);
-  if (!match) return -1;
-  let hour = Number(match[1]);
-  const minute = Number(match[2]);
-  const second = Number(match[3] || 0);
-  const meridiem = match[4] || "";
-  if (meridiem && hour <= 12) {
-    if (meridiem === "AM" && hour === 12) hour = 0;
-    if (meridiem === "PM" && hour !== 12) hour += 12;
-  }
-  if (hour > 23 || minute > 59 || second > 59) return -1;
-  return hour * 3600 + minute * 60 + second;
-}
-
-function compareBankTransactionOrder(a, b) {
-  const dateDifference = new Date(a?.bank_date || 0).getTime() - new Date(b?.bank_date || 0).getTime();
-  if (dateDifference) return dateDifference;
-  const timeA = bankTimeSortValue(a?.bank_time);
-  const timeB = bankTimeSortValue(b?.bank_time);
-  if (timeA !== timeB) {
-    if (timeA < 0) return 1;
-    if (timeB < 0) return -1;
-    return timeA - timeB;
-  }
-  return String(a?._id || "").localeCompare(String(b?._id || ""));
-}
-
-function transactionHasStatementBalance(tx) {
-  if (tx?.bank_balance_provided === true) return true;
-  const value = Number(tx?.bank_balance);
-  // Older imported records do not have the explicit presence flag. A non-zero
-  // saved balance is known data; a zero remains usable when the calculated
-  // balance also reaches zero.
-  return Number.isFinite(value) && Math.abs(value) > 0.000001;
-}
-
-function transactionStatementBalance(tx, calculatedBalance) {
-  const value = numberValue(tx?.bank_balance);
-  if (transactionHasStatementBalance(tx) || Math.abs(calculatedBalance) < 0.005 && Number.isFinite(Number(tx?.bank_balance))) return value;
-  return calculatedBalance;
-}
+function transactionBankReceipt(tx) { return numberValue(tx?.bank_credit) || numberValue(tx?.receipt_amount); }
+function transactionBankPayment(tx) { return numberValue(tx?.bank_debit) || numberValue(tx?.payment_amount); }
 
 function transactionLedgerName(tx, mapping) {
   return text(tx?.ledger_name_override) || text(mapping?.ledger_name) || text(mapping?.particulars_name) || text(tx?.particulars_name) || "Unmapped Ledger";
@@ -433,6 +388,222 @@ function transactionEntryAmount(row = {}) {
   return side === "receipt" ? numberValue(row.bank_credit) : numberValue(row.bank_debit);
 }
 
+function normalizedBankReference(row = {}) {
+  // Transaction ID is preferred; Instrument Number is a useful fallback for
+  // NEFT / RTGS / IMPS UTRs. Voucher numbers are deliberately not used here.
+  const raw = text(row.transaction_id || row.instrument_no || row.instrument_number).toUpperCase();
+  if (["", "NA", "N/A", "-", "0", "NONE", "NULL", "NOT AVAILABLE", "NOT PROVIDED"].includes(raw)) return "";
+  return raw.replace(/[^A-Z0-9]/g, "");
+}
+
+function contraTransactionView(row = {}, mappingByName = null) {
+  const mapping = mappingByName?.get(row?.normalized_particulars) || null;
+  return {
+    id: String(row._id),
+    bank_name: text(row.bank_name),
+    bank_date: row.bank_date || null,
+    bank_time: text(row.bank_time),
+    side: transactionEntrySide(row),
+    amount: transactionEntryAmount(row),
+    particulars_name: text(row.particulars_name),
+    ledger_name: text(row.ledger_name_override) || transactionLedgerName(row, mapping),
+    group_company: transactionGroupCompany(row, mapping) || "",
+    transaction_id: text(row.transaction_id),
+    instrument_no: text(row.instrument_no),
+    voucher_type: text(row.voucher_type),
+    voucher_number: text(row.voucher_number),
+    import_file_name: text(row.import_file_name),
+    import_batch_id: text(row.import_batch_id),
+    contra_match_id: text(row.contra_match_id),
+  };
+}
+
+function buildContraSuggestions(rows, mappingByName = new Map()) {
+  const payments = rows.filter((row) => transactionEntrySide(row) === "payment" && transactionEntryAmount(row) > 0 && text(row.bank_name));
+  const receipts = rows.filter((row) => transactionEntrySide(row) === "receipt" && transactionEntryAmount(row) > 0 && text(row.bank_name));
+  const byPayment = new Map();
+  const byReceipt = new Map();
+  const rowsById = new Map(rows.map((row) => [String(row._id), row]));
+  const candidates = [];
+  const receiptByCents = new Map();
+  receipts.forEach((row) => {
+    const cents = Math.round(transactionEntryAmount(row) * 100);
+    if (!receiptByCents.has(cents)) receiptByCents.set(cents, []);
+    receiptByCents.get(cents).push(row);
+  });
+
+  payments.forEach((payment) => {
+    const cents = Math.round(transactionEntryAmount(payment) * 100);
+    const possibleReceipts = [
+      ...(receiptByCents.get(cents - 1) || []),
+      ...(receiptByCents.get(cents) || []),
+      ...(receiptByCents.get(cents + 1) || []),
+    ];
+    possibleReceipts.forEach((receipt) => {
+      if (keyText(payment.bank_name) === keyText(receipt.bank_name)) return;
+      const paymentCompany = keyText(transactionGroupCompany(payment, mappingByName.get(payment.normalized_particulars)));
+      const receiptCompany = keyText(transactionGroupCompany(receipt, mappingByName.get(receipt.normalized_particulars)));
+      // If both sides are explicitly assigned to different Group Companies,
+      // never suggest them as an inter-bank transfer.
+      if (paymentCompany && receiptCompany && paymentCompany !== receiptCompany) return;
+      const sameGroupCompany = Boolean(paymentCompany && receiptCompany && paymentCompany === receiptCompany);
+      const noGroupCompanyLabels = !paymentCompany && !receiptCompany;
+      const paymentDate = new Date(payment.bank_date).getTime();
+      const receiptDate = new Date(receipt.bank_date).getTime();
+      const dayGap = Math.abs(paymentDate - receiptDate) / 86400000;
+      if (!Number.isFinite(dayGap) || dayGap > 3) return;
+      const paymentReference = normalizedBankReference(payment);
+      const receiptReference = normalizedBankReference(receipt);
+      const hasBothReferences = Boolean(paymentReference && receiptReference);
+      const referenceMatch = hasBothReferences && paymentReference === receiptReference;
+      const referenceConflict = hasBothReferences && paymentReference !== receiptReference;
+      // A conflicting UTR is still displayed for manual review, but it can
+      // never be auto-matched. The user may confirm only after checking both rows.
+      const amount = transactionEntryAmount(payment);
+      const amountDifference = Math.abs(amount - transactionEntryAmount(receipt));
+      const pair = {
+        payment_transaction_id: String(payment._id),
+        receipt_transaction_id: String(receipt._id),
+        payment: contraTransactionView(payment, mappingByName),
+        receipt: contraTransactionView(receipt, mappingByName),
+        amount,
+        amount_difference: amountDifference,
+        day_gap: Number(dayGap.toFixed(2)),
+        reference_match: referenceMatch,
+        reference_conflict: referenceConflict,
+        match_reason: referenceConflict ? "UTR differs — verify manually" : referenceMatch ? "UTR / Transaction ID matches" : (dayGap < 0.01 ? "Same amount and same date" : "Same amount; dates are within 3 days"),
+        match_method: referenceMatch ? "utr" : "amount_date",
+        same_group_company: sameGroupCompany,
+        no_group_company_labels: noGroupCompanyLabels,
+      };
+      candidates.push(pair);
+      if (!byPayment.has(pair.payment_transaction_id)) byPayment.set(pair.payment_transaction_id, []);
+      if (!byReceipt.has(pair.receipt_transaction_id)) byReceipt.set(pair.receipt_transaction_id, []);
+      byPayment.get(pair.payment_transaction_id).push(pair);
+      byReceipt.get(pair.receipt_transaction_id).push(pair);
+    });
+  });
+
+  return candidates.map((pair) => {
+    const paymentCount = byPayment.get(pair.payment_transaction_id)?.length || 0;
+    const receiptCount = byReceipt.get(pair.receipt_transaction_id)?.length || 0;
+    // Safe auto-match requires a unique reciprocal one-to-one candidate and
+    // either an exact reference or same-calendar-day amount match with no UTRs.
+    const noReferences = !normalizedBankReference(rowsById.get(pair.payment_transaction_id) || {})
+      && !normalizedBankReference(rowsById.get(pair.receipt_transaction_id) || {});
+    return {
+      ...pair,
+      ambiguous: paymentCount > 1 || receiptCount > 1,
+      auto_safe: paymentCount === 1 && receiptCount === 1 && !pair.reference_conflict && (
+        (pair.reference_match && (pair.same_group_company || pair.no_group_company_labels))
+        || (noReferences && pair.same_group_company && pair.day_gap < 0.01)
+      ),
+    };
+  }).sort((a, b) => Number(b.reference_match) - Number(a.reference_match)
+    || Number(a.day_gap) - Number(b.day_gap)
+    || new Date(a.payment.bank_date).getTime() - new Date(b.payment.bank_date).getTime());
+}
+
+async function createContraMatch(companyId, paymentId, receiptId, req, method = "manual") {
+  if (!mongoose.Types.ObjectId.isValid(paymentId) || !mongoose.Types.ObjectId.isValid(receiptId) || paymentId === receiptId) {
+    const error = new Error("Select two different valid Bank Statement rows."); error.status = 400; throw error;
+  }
+  const [payment, receipt] = await Promise.all([
+    Transaction.findOne({ _id: paymentId, company_id: companyId }).lean(),
+    Transaction.findOne({ _id: receiptId, company_id: companyId }).lean(),
+  ]);
+  if (!payment || !receipt) { const error = new Error("One or both Bank Statement rows were not found in this company."); error.status = 404; throw error; }
+  if (transactionEntrySide(payment) !== "payment" || transactionEntrySide(receipt) !== "receipt") {
+    const error = new Error("Contra Match requires one Payment row and one Receipt row."); error.status = 400; throw error;
+  }
+  if (!text(payment.bank_name) || !text(receipt.bank_name) || keyText(payment.bank_name) === keyText(receipt.bank_name)) {
+    const error = new Error("Contra Match must connect two different Bank Accounts."); error.status = 400; throw error;
+  }
+  const paymentAmount = transactionEntryAmount(payment);
+  const receiptAmount = transactionEntryAmount(receipt);
+  if (Math.abs(paymentAmount - receiptAmount) > 0.01) {
+    const error = new Error(`Payment ${paymentAmount.toFixed(2)} and Receipt ${receiptAmount.toFixed(2)} must have the same amount.`); error.status = 400; throw error;
+  }
+  if (text(payment.contra_match_id) || text(receipt.contra_match_id)) {
+    const error = new Error("One of these transactions is already linked to another Contra Transfer."); error.status = 409; throw error;
+  }
+  const contraMappings = await LedgerMapping.find({
+    company_id: companyId,
+    active: true,
+    normalized_name: { $in: [payment.normalized_particulars, receipt.normalized_particulars].filter(Boolean) },
+  }).lean();
+  const contraMappingByName = new Map(contraMappings.map((row) => [row.normalized_name, row]));
+  const paymentCompany = keyText(transactionGroupCompany(payment, contraMappingByName.get(payment.normalized_particulars)));
+  const receiptCompany = keyText(transactionGroupCompany(receipt, contraMappingByName.get(receipt.normalized_particulars)));
+  if (paymentCompany && receiptCompany && paymentCompany !== receiptCompany) {
+    const error = new Error("These Bank rows belong to different Group Companies and cannot be linked as an intra-company Contra Transfer."); error.status = 400; throw error;
+  }
+  const paymentReference = normalizedBankReference(payment);
+  const receiptReference = normalizedBankReference(receipt);
+  if (paymentReference && receiptReference && paymentReference !== receiptReference && method !== "manual") {
+    const error = new Error("The UTR / Transaction ID values do not match. Please review before linking manually."); error.status = 400; throw error;
+  }
+  const transferId = `CTR-${crypto.randomBytes(6).toString("hex").toUpperCase()}`;
+  const match = await ContraMatch.create({
+    company_id: companyId,
+    transfer_id: transferId,
+    payment_transaction_id: String(payment._id),
+    receipt_transaction_id: String(receipt._id),
+    payment_bank: text(payment.bank_name),
+    receipt_bank: text(receipt.bank_name),
+    amount: paymentAmount,
+    payment_date: payment.bank_date,
+    receipt_date: receipt.bank_date,
+    payment_reference: paymentReference || "",
+    receipt_reference: receiptReference || "",
+    match_method: method,
+    status: "matched",
+    matched_by: text(req.user?.name || req.user?.username || req.user?.employee_name || req.user?._id),
+  });
+  const matchId = String(match._id);
+  try {
+    const paymentUpdate = await Transaction.updateOne(
+      { _id: payment._id, company_id: companyId, $or: [{ contra_match_id: { $exists: false } }, { contra_match_id: "" }, { contra_match_id: null }] },
+      { $set: { contra_match_id: matchId, contra_match_status: "matched", contra_counter_bank: text(receipt.bank_name) } }
+    );
+    if (Number(paymentUpdate.modifiedCount ?? paymentUpdate.nModified ?? 0) !== 1) throw new Error("Payment row was matched by another user. Refresh and try again.");
+    const receiptUpdate = await Transaction.updateOne(
+      { _id: receipt._id, company_id: companyId, $or: [{ contra_match_id: { $exists: false } }, { contra_match_id: "" }, { contra_match_id: null }] },
+      { $set: { contra_match_id: matchId, contra_match_status: "matched", contra_counter_bank: text(payment.bank_name) } }
+    );
+    if (Number(receiptUpdate.modifiedCount ?? receiptUpdate.nModified ?? 0) !== 1) throw new Error("Receipt row was matched by another user. Refresh and try again.");
+  } catch (error) {
+    await Transaction.updateMany({ company_id: companyId, contra_match_id: matchId }, { $unset: { contra_match_id: 1, contra_match_status: 1, contra_counter_bank: 1 } });
+    await ContraMatch.deleteOne({ _id: match._id, company_id: companyId });
+    throw error;
+  }
+  return { ...match.toObject(), id: matchId, payment: contraTransactionView(payment), receipt: contraTransactionView(receipt) };
+}
+
+async function autoMatchUniqueContraTransfers(companyId, req) {
+  const unmatchedRows = await Transaction.find({
+    company_id: companyId,
+    $or: [{ contra_match_id: { $exists: false } }, { contra_match_id: "" }, { contra_match_id: null }],
+  }).sort({ bank_date: 1, bank_time: 1, _id: 1 }).limit(10000).lean();
+  const mappings = await LedgerMapping.find({ company_id: companyId, active: true }).lean();
+  const mappingByName = new Map(mappings.map((row) => [row.normalized_name, row]));
+  const suggestions = buildContraSuggestions(unmatchedRows, mappingByName);
+  const created = [];
+  for (const row of suggestions.filter((item) => item.auto_safe)) {
+    try {
+      created.push(await createContraMatch(companyId, row.payment_transaction_id, row.receipt_transaction_id, req, row.match_method));
+    } catch (error) {
+      if (![11000, 409].includes(Number(error.code || error.status))) console.warn("Contra auto-match candidate skipped:", error.message);
+    }
+  }
+  return {
+    matches: created,
+    matched_count: created.length,
+    review_required_count: suggestions.filter((row) => !row.auto_safe).length,
+    suggestions_count: suggestions.length,
+  };
+}
+
 function transactionAllocations(row, ctx) {
   const saved = Array.isArray(row?.allocations) ? row.allocations.filter((item) => item && numberValue(item.amount) > 0) : [];
   if (saved.length) {
@@ -590,7 +761,6 @@ router.post("/import", upload.single("file"), async (req, res) => {
         bank_debit: statementDebit,
         bank_credit: statementCredit,
         bank_balance: numberValue(row[7]),
-        bank_balance_provided: row[7] !== null && row[7] !== undefined && String(row[7]).trim() !== "",
         transaction_id: transactionId,
         bank_status: text(row[9]),
         tally_date: excelDate(row[10]),
@@ -658,6 +828,12 @@ router.post("/import", upload.single("file"), async (req, res) => {
       date_from: minDate,
       date_to: maxDate,
     });
+    // When a later Bank Statement is imported (for example AGRI BANK 0008
+    // after AGRI BANK 2956), automatically link only unique safe contra pairs.
+    // Ambiguous pairs remain visible for manual confirmation in the Contra tab.
+    let contraAutoResult = { matched_count: 0, review_required_count: 0 };
+    try { contraAutoResult = await autoMatchUniqueContraTransfers(companyId, req); }
+    catch (matchError) { console.warn("Post-import Contra Auto Matching skipped:", matchError.message); }
     return res.json({
       success: true,
       batch_id: batchId,
@@ -677,6 +853,8 @@ router.post("/import", upload.single("file"), async (req, res) => {
       date_from: minDate,
       date_to: maxDate,
       bank_names: [...new Set(records.map((row) => row.bank_name))],
+      contra_auto_matched_count: contraAutoResult.matched_count || 0,
+      contra_review_required_count: contraAutoResult.review_required_count || 0,
     });
   } catch (error) {
     console.error("Bank financial report import failed:", error);
@@ -1080,108 +1258,63 @@ router.get("/reports/bank-balance", async (req, res) => {
       const escapedBankName = text(req.query.bank_name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       txFilter.bank_name = new RegExp(`^${escapedBankName}$`, "i");
     }
-    const [allTransactionsRaw, openingRecords] = await Promise.all([
+    const [allTransactions, openingRecords] = await Promise.all([
       Transaction.find(txFilter).sort({ bank_date: 1, _id: 1 }).limit(100000).lean(),
       BankOpeningBalance.find({ company_id: companyId, active: true, ...(selectedBank ? { normalized_bank_name: selectedBank } : {}) }).lean(),
     ]);
-    const allTransactions = allTransactionsRaw.sort(compareBankTransactionOrder);
     const bankNames = [...new Set([...allTransactions.map((row) => text(row.bank_name)), ...openingRecords.map((row) => text(row.bank_name))].filter(Boolean))].sort((a,b) => a.localeCompare(b));
     const candidateDates = [...allTransactions.map((row) => new Date(row.bank_date).getTime()), ...openingRecords.map((row) => new Date(row.effective_date).getTime())].filter(Number.isFinite);
     const fromDate = text(req.query.from_date) ? new Date(`${text(req.query.from_date)}T00:00:00.000Z`) : new Date(candidateDates.length ? Math.min(...candidateDates) : toDate.getTime());
     if (fromDate > toDate) return res.status(400).json({ error: "From Date cannot be later than To Date." });
     const periodType = ["daily", "monthly"].includes(String(req.query.period_type || "").toLowerCase()) ? String(req.query.period_type).toLowerCase() : "range";
+    // Load master mappings independently of the display filters so that
+    // bank-level opening / closing balances always include every movement.
     const reportContext = await loadReportContext(companyId, {});
     const requestedCompany = requestedGroupCompany(req.query);
     const requestedGroupId = text(req.query.group_id);
     const requestedSubgroupId = text(req.query.subgroup_id);
     const rows = [];
     const details = [];
-    const summaryMap = new Map();
     const totals = { opening_balance: 0, receipts: 0, payments: 0, closing_balance: 0, transactions: 0 };
     const missingBanks = [];
-
     for (const bankName of bankNames) {
-      const bankTx = allTransactions.filter((row) => keyText(row.bank_name) === keyText(bankName)).sort(compareBankTransactionOrder);
+      const bankTx = allTransactions.filter((row) => keyText(row.bank_name) === keyText(bankName));
       const candidates = openingRecords.filter((row) => keyText(row.bank_name) === keyText(bankName) && new Date(row.effective_date) <= fromDate)
         .sort((a,b) => new Date(b.effective_date) - new Date(a.effective_date));
       const openingRecord = candidates[0] || null;
+      let openingBalance = openingRecord ? signedBankOpening(openingRecord) : 0;
       const manualOpeningSet = Boolean(openingRecord);
       let openingSource = openingRecord ? "Manual" : "Missing";
-      let openingBalance = openingRecord ? signedBankOpening(openingRecord) : 0;
-
       if (openingRecord) {
-        // Manual opening is the starting point at the beginning of Effective Date.
-        // Reconcile every intervening statement row in bank date + bank time order.
         for (const tx of bankTx) {
-          const txDate = new Date(tx.bank_date);
-          if (txDate < new Date(openingRecord.effective_date) || txDate >= fromDate) continue;
-          const calculated = openingBalance + transactionBankReceipt(tx) - transactionBankPayment(tx);
-          openingBalance = transactionStatementBalance(tx, calculated);
+          const date = new Date(tx.bank_date);
+          if (date >= new Date(openingRecord.effective_date) && date < fromDate) openingBalance += transactionBankReceipt(tx) - transactionBankPayment(tx);
         }
       } else {
-        const previousTransactions = bankTx.filter((tx) => new Date(tx.bank_date) < fromDate);
-        const previous = previousTransactions.length ? previousTransactions[previousTransactions.length - 1] : null;
-        if (previous) {
-          if (transactionHasStatementBalance(previous)) {
-            openingBalance = numberValue(previous.bank_balance);
-            openingSource = "Statement Balance";
-          } else {
-            // Rebuild from the first usable statement balance, then roll forward
-            // to the last transaction before From Date.
-            const firstWithBalanceIndex = bankTx.findIndex(transactionHasStatementBalance);
-            if (firstWithBalanceIndex >= 0) {
-              const firstWithBalance = bankTx[firstWithBalanceIndex];
-              let reconstructed = numberValue(firstWithBalance.bank_balance) - transactionBankReceipt(firstWithBalance) + transactionBankPayment(firstWithBalance);
-              for (let i = firstWithBalanceIndex; i < bankTx.length && bankTx[i] !== previous; i += 1) {
-                const tx = bankTx[i];
-                const calculated = reconstructed + transactionBankReceipt(tx) - transactionBankPayment(tx);
-                reconstructed = transactionStatementBalance(tx, calculated);
-              }
-              openingBalance = reconstructed;
-              openingSource = "Calculated from Statement";
-            } else {
-              openingBalance = previousTransactions.reduce((balance, tx) => balance + transactionBankReceipt(tx) - transactionBankPayment(tx), 0);
-              openingSource = "Calculated from Transactions";
-            }
-          }
+        const previous = bankTx.filter((tx) => new Date(tx.bank_date) < fromDate).sort((a,b) => new Date(b.bank_date) - new Date(a.bank_date))[0];
+        if (previous && Number.isFinite(Number(previous.bank_balance))) {
+          openingBalance = numberValue(previous.bank_balance);
+          openingSource = "Statement Balance";
         } else {
           const firstTransaction = bankTx.find((tx) => new Date(tx.bank_date) >= fromDate);
-          if (firstTransaction && transactionHasStatementBalance(firstTransaction)) {
+          if (firstTransaction && Number(firstTransaction.bank_balance || 0) !== 0) {
             openingBalance = numberValue(firstTransaction.bank_balance) - transactionBankReceipt(firstTransaction) + transactionBankPayment(firstTransaction);
             openingSource = "Derived from Statement";
           }
         }
       }
       if (!manualOpeningSet) missingBanks.push(bankName);
-
-      const selectedTransactions = bankTx.filter((tx) => new Date(tx.bank_date) >= fromDate && new Date(tx.bank_date) <= toDate).sort(compareBankTransactionOrder);
+      const selectedTransactions = bankTx.filter((tx) => new Date(tx.bank_date) >= fromDate && new Date(tx.bank_date) <= toDate);
+      // Produce a ledger-level detail line for every saved split allocation (or
+      // the ordinary mapped ledger). Running bank balance is calculated once
+      // per original transaction, never once per split line.
       let detailRunningBalance = openingBalance;
-      const buckets = new Map();
-      let bankReceipts = 0;
-      let bankPayments = 0;
-      let bankCount = 0;
-
       for (const tx of selectedTransactions) {
         const bankReceipt = transactionBankReceipt(tx);
         const bankPayment = transactionBankPayment(tx);
-        const calculatedRunning = detailRunningBalance + bankReceipt - bankPayment;
-        // Bank Balance (Excel H) is the reconciliation anchor when supplied.
-        // Otherwise calculate from Opening + Receipt - Payment.
-        detailRunningBalance = transactionStatementBalance(tx, calculatedRunning);
-
-        const period = periodType === "range" ? "Selected Period" : bankBalancePeriodLabel(tx.bank_date, periodType);
-        if (!buckets.has(period)) buckets.set(period, { period, period_sort_key: bankBalancePeriodSortKey(tx.bank_date, periodType), opening_balance: detailRunningBalance - (bankReceipt - bankPayment), receipts: 0, payments: 0, transactions: 0, closing_balance: detailRunningBalance });
-        const bucket = buckets.get(period);
-        bucket.receipts += bankReceipt;
-        bucket.payments += bankPayment;
-        bucket.transactions += 1;
-        bucket.closing_balance = detailRunningBalance;
-        bankReceipts += bankReceipt;
-        bankPayments += bankPayment;
-        bankCount += 1;
-
-        // Voucher / import-batch and classification filters affect the ledger
-        // report only; the Bank's running balance above always uses all rows.
+        detailRunningBalance += bankReceipt - bankPayment;
+        // Voucher type / imported file filters narrow the ledger detail only;
+        // they must not change the bank's actual running balance.
         if (text(req.query.voucher_type) && !new RegExp(`^${text(req.query.voucher_type)}$`, "i").test(text(tx.voucher_type))) continue;
         if (text(req.query.import_batch_id) && text(tx.import_batch_id) !== text(req.query.import_batch_id)) continue;
         const mapped = mapTransaction(tx, reportContext);
@@ -1191,67 +1324,30 @@ router.get("/reports/bank-balance", async (req, res) => {
           if (requestedSubgroupId && String(allocation.subgroup_id || "") !== requestedSubgroupId) return false;
           return matchesGroupCompany(allocation, requestedCompany);
         });
-
         visibleAllocations.forEach((allocation, allocationIndex) => {
           const side = allocation.side === "receipt" ? "receipt" : "payment";
           const amount = numberValue(allocation.amount);
-          const ledgerName = text(allocation.ledger_name) || mapped.ledger_name || "Unmapped Ledger";
-          const companyName = text(allocation.group_company);
-          const groupName = text(allocation.group_name) || "Unmapped";
-          const subgroupName = text(allocation.subgroup_name);
-          const summaryPeriod = periodType === "range" ? "Selected Period" : bankBalancePeriodLabel(tx.bank_date, periodType);
-          // Summary is one row per Period + Company + Group + Sub-group.
-          // Multiple ledgers and banks within that Sub-group roll into one total.
-          const summaryIdentity = [summaryPeriod, companyName, text(allocation.group_id), groupName, text(allocation.subgroup_id), subgroupName].join("|\u001f|");
-          const summaryKey = crypto.createHash("sha1").update(summaryIdentity).digest("hex");
-          if (!summaryMap.has(summaryKey)) {
-            summaryMap.set(summaryKey, {
-              summary_key: summaryKey,
-              period: summaryPeriod,
-              period_sort_key: bankBalancePeriodSortKey(tx.bank_date, periodType),
-              bank_name: selectedBank ? text(req.query.bank_name) : (bankNames.length === 1 ? bankNames[0] : "All Selected Banks"),
-              bank_names: new Set(),
-              ledger_names: new Set(),
-              group_company: companyName,
-              group_id: text(allocation.group_id),
-              group_name: groupName,
-              subgroup_id: text(allocation.subgroup_id),
-              subgroup_name: subgroupName,
-              receipts: 0,
-              payments: 0,
-              transactions: 0,
-              transaction_ids: new Set(),
-            });
-          }
-          const summary = summaryMap.get(summaryKey);
-          if (side === "receipt") summary.receipts += amount;
-          else summary.payments += amount;
-          if (text(tx.bank_name)) summary.bank_names.add(text(tx.bank_name));
-          if (ledgerName) summary.ledger_names.add(ledgerName);
-          summary.transaction_ids.add(String(tx._id));
-
           details.push({
             id: `${String(tx._id)}:${allocationIndex}`,
-            summary_key: summaryKey,
             transaction_id: String(tx._id),
             bank_date: tx.bank_date,
             bank_time: tx.bank_time || "",
             bank_name: text(tx.bank_name),
             original_particulars: text(tx.particulars_name),
-            ledger_name: ledgerName,
+            ledger_name: text(allocation.ledger_name) || mapped.ledger_name || "Unmapped Ledger",
             voucher_type: text(tx.voucher_type),
             voucher_number: text(tx.voucher_number),
-            group_company: companyName,
-            group_name: groupName,
-            subgroup_name: subgroupName,
+            group_company: text(allocation.group_company),
+            group_name: text(allocation.group_name) || "Unmapped",
+            subgroup_name: text(allocation.subgroup_name),
             receipt_amount: side === "receipt" ? amount : 0,
             payment_amount: side === "payment" ? amount : 0,
             allocation_amount: amount,
             allocation_side: side,
-            statement_debit: numberValue(tx.bank_debit),
-            statement_credit: numberValue(tx.bank_credit),
-            bank_balance: transactionHasStatementBalance(tx) || Math.abs(detailRunningBalance) < 0.005 ? numberValue(tx.bank_balance) : null,
-            running_balance: detailRunningBalance,
+            statement_debit: allocationIndex === 0 ? numberValue(tx.bank_debit) : null,
+            statement_credit: allocationIndex === 0 ? numberValue(tx.bank_credit) : null,
+            bank_balance: allocationIndex === 0 ? (tx.bank_balance === undefined || tx.bank_balance === null ? null : numberValue(tx.bank_balance)) : null,
+            running_balance: allocationIndex === 0 ? detailRunningBalance : null,
             bank_remarks: text(tx.bank_remarks),
             instrument_type: text(tx.instrument_type),
             instrument_no: text(tx.instrument_no),
@@ -1264,25 +1360,33 @@ router.get("/reports/bank-balance", async (req, res) => {
           });
         });
       }
-
+      const buckets = new Map();
+      for (const tx of selectedTransactions) {
+        const period = periodType === "range" ? "Selected Period" : reportPeriodLabel(tx.bank_date, periodType);
+        if (!buckets.has(period)) buckets.set(period, { period, receipts: 0, payments: 0, transactions: 0 });
+        const bucket = buckets.get(period);
+        bucket.receipts += transactionBankReceipt(tx);
+        bucket.payments += transactionBankPayment(tx);
+        bucket.transactions += 1;
+      }
       if (!buckets.size) {
-        const emptyPeriod = periodType === "range" ? "Selected Period" : bankBalancePeriodLabel(fromDate, periodType);
-        buckets.set(emptyPeriod, { period: emptyPeriod, period_sort_key: bankBalancePeriodSortKey(fromDate, periodType), opening_balance: openingBalance, receipts: 0, payments: 0, transactions: 0, closing_balance: openingBalance });
+        const emptyPeriod = periodType === "range" ? "Selected Period" : reportPeriodLabel(fromDate, periodType);
+        buckets.set(emptyPeriod, { period: emptyPeriod, receipts: 0, payments: 0, transactions: 0 });
       }
-      for (const bucket of [...buckets.values()].sort((a,b) => String(a.period_sort_key || a.period).localeCompare(String(b.period_sort_key || b.period)))) {
-        rows.push({ bank_name: bankName, ...bucket, opening_balance_set: manualOpeningSet, opening_balance_source: openingSource, opening_balance_date: openingRecord?.effective_date || null });
+      let running = openingBalance;
+      let bankReceipts = 0, bankPayments = 0, bankCount = 0;
+      for (const bucket of [...buckets.values()].sort((a,b) => String(a.period).localeCompare(String(b.period)))) {
+        const periodOpening = running;
+        running += bucket.receipts - bucket.payments;
+        bankReceipts += bucket.receipts; bankPayments += bucket.payments; bankCount += bucket.transactions;
+        rows.push({ bank_name: bankName, period: bucket.period, opening_balance: periodOpening, receipts: bucket.receipts, payments: bucket.payments, closing_balance: running, transactions: bucket.transactions, opening_balance_set: manualOpeningSet, opening_balance_source: openingSource, opening_balance_date: openingRecord?.effective_date || null });
       }
-      totals.opening_balance += openingBalance;
-      totals.receipts += bankReceipts;
-      totals.payments += bankPayments;
-      totals.closing_balance += detailRunningBalance;
-      totals.transactions += bankCount;
+      totals.opening_balance += openingBalance; totals.receipts += bankReceipts; totals.payments += bankPayments; totals.closing_balance += running; totals.transactions += bankCount;
     }
-
     if (!selectedBank && bankNames.length > 1) {
       const periodTotals = new Map();
       for (const row of rows) {
-        if (!periodTotals.has(row.period)) periodTotals.set(row.period, { period: row.period, period_sort_key: row.period_sort_key || row.period, opening_balance: 0, receipts: 0, payments: 0, closing_balance: 0, transactions: 0, opening_balance_set: true });
+        if (!periodTotals.has(row.period)) periodTotals.set(row.period, { period: row.period, opening_balance: 0, receipts: 0, payments: 0, closing_balance: 0, transactions: 0, opening_balance_set: true });
         const total = periodTotals.get(row.period);
         total.opening_balance += row.opening_balance;
         total.receipts += row.receipts;
@@ -1293,19 +1397,99 @@ router.get("/reports/bank-balance", async (req, res) => {
       }
       for (const total of periodTotals.values()) rows.push({ bank_name: "ALL BANKS", ...total });
     }
-
-    const summaryRows = [...summaryMap.values()].map((row) => ({
-      ...row,
-      bank_names: [...row.bank_names].sort((a, b) => a.localeCompare(b)),
-      ledger_names: [...row.ledger_names].sort((a, b) => a.localeCompare(b)),
-      total_amount: row.receipts + row.payments,
-      transactions: row.transaction_ids.size,
-      transaction_ids: undefined,
-    })).sort((a,b) => String(a.period_sort_key || a.period).localeCompare(String(b.period_sort_key || b.period)) || a.group_company.localeCompare(b.group_company) || a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name));
-    details.sort((a,b) => compareBankTransactionOrder(a, b) || a.bank_name.localeCompare(b.bank_name) || a.allocation_index - b.allocation_index);
-    rows.sort((a,b) => String(a.period_sort_key || a.period).localeCompare(String(b.period_sort_key || b.period)) || (a.bank_name === "ALL BANKS" ? -1 : b.bank_name === "ALL BANKS" ? 1 : a.bank_name.localeCompare(b.bank_name)));
-    return res.json({ from_date: fromDate, to_date: toDate, period_type: periodType, banks: bankNames, totals, rows, summary_rows: summaryRows, details, detail_count: details.length, opening_balance_missing_banks: missingBanks });
+    rows.sort((a,b) => String(a.period).localeCompare(String(b.period)) || (a.bank_name === "ALL BANKS" ? -1 : b.bank_name === "ALL BANKS" ? 1 : a.bank_name.localeCompare(b.bank_name)));
+    return res.json({ from_date: fromDate, to_date: toDate, period_type: periodType, banks: bankNames, totals, rows, details, detail_count: details.length, opening_balance_missing_banks: missingBanks });
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Bank Balance report." }); }
+});
+
+// Contra Auto Matching: suggestions and saved transfer links. Both original
+// statement rows remain intact; the match record is the one contra relationship.
+router.get("/contra-matches", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const [unmatchedRows, matchedRows, mappings] = await Promise.all([
+      Transaction.find({
+        company_id: companyId,
+        $or: [{ contra_match_id: { $exists: false } }, { contra_match_id: "" }, { contra_match_id: null }],
+      }).sort({ bank_date: 1, bank_time: 1, _id: 1 }).limit(10000).lean(),
+      ContraMatch.find({ company_id: companyId, status: "matched" }).sort({ createdAt: -1 }).limit(500).lean(),
+      LedgerMapping.find({ company_id: companyId, active: true }).lean(),
+    ]);
+    const mappingByName = new Map(mappings.map((row) => [row.normalized_name, row]));
+    const suggestions = buildContraSuggestions(unmatchedRows, mappingByName).slice(0, 500);
+    const transactionIds = [...new Set(matchedRows.flatMap((row) => [row.payment_transaction_id, row.receipt_transaction_id]))];
+    const linkedTransactions = transactionIds.length ? await Transaction.find({ company_id: companyId, _id: { $in: transactionIds } }).lean() : [];
+    const linkedMap = new Map(linkedTransactions.map((row) => [String(row._id), row]));
+    const matches = matchedRows.map((row) => ({
+      ...row,
+      id: String(row._id),
+      payment: contraTransactionView(linkedMap.get(String(row.payment_transaction_id)) || {}, mappingByName),
+      receipt: contraTransactionView(linkedMap.get(String(row.receipt_transaction_id)) || {}, mappingByName),
+    }));
+    return res.json({
+      suggestions,
+      matches,
+      unmatched_transactions: unmatchedRows.length,
+      safe_auto_match_count: suggestions.filter((row) => row.auto_safe).length,
+      review_required_count: suggestions.filter((row) => !row.auto_safe).length,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Could not load Contra Match suggestions." });
+  }
+});
+
+router.post("/contra-matches/auto-match", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const result = await autoMatchUniqueContraTransfers(companyId, req);
+    return res.json({
+      success: true,
+      matched_count: result.matched_count,
+      matches: result.matches,
+      review_required_count: result.review_required_count,
+      message: result.matched_count
+        ? `${result.matched_count} unique Contra Transfer(s) matched. Original Bank Statement rows and balances were not duplicated or changed.`
+        : "No unique safe Contra Match was found. Review the suggested pairs and confirm the correct transfer manually.",
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Could not run Contra Auto Matching." });
+  }
+});
+
+router.post("/contra-matches", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const match = await createContraMatch(
+      companyId,
+      text(req.body?.payment_transaction_id),
+      text(req.body?.receipt_transaction_id),
+      req,
+      "manual"
+    );
+    return res.status(201).json({ success: true, match, message: `Contra Transfer ${match.transfer_id} linked successfully.` });
+  } catch (error) {
+    return res.status(error.status || (error.code === 11000 ? 409 : 500)).json({ error: error.message || "Could not confirm Contra Match." });
+  }
+});
+
+router.delete("/contra-matches/:id", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const match = await ContraMatch.findOne({ _id: req.params.id, company_id: companyId, status: "matched" }).lean();
+    if (!match) return res.status(404).json({ error: "Contra Match not found." });
+    await Transaction.updateMany(
+      { company_id: companyId, contra_match_id: String(match._id) },
+      { $unset: { contra_match_id: 1, contra_match_status: 1, contra_counter_bank: 1 } }
+    );
+    await ContraMatch.deleteOne({ _id: match._id, company_id: companyId });
+    return res.json({ success: true, message: `Contra Transfer ${match.transfer_id} was unlinked. Original Statement rows remain unchanged.` });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Could not remove Contra Match." });
+  }
 });
 
 router.get("/transactions", async (req, res) => {
