@@ -237,14 +237,73 @@ function optionalHeaderIndex(headers, acceptedNames) {
   return headers.findIndex((header) => accepted.has(keyText(header).replace(/[^a-z0-9]/g, "")));
 }
 
+function canonicalBankTimeIdentity(value) {
+  const raw = text(value);
+  if (!raw) return "";
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric >= 0 && numeric < 1) return String(Math.round(numeric * 86400));
+  const match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (match) {
+    let hours = Number(match[1]);
+    const minutes = Number(match[2]);
+    const seconds = Number(match[3] || 0);
+    const meridiem = (match[4] || "").toUpperCase();
+    if (minutes <= 59 && seconds <= 59 && hours <= 24) {
+      if (meridiem) {
+        if (hours < 1 || hours > 12) return keyText(raw);
+        if (meridiem === "AM") hours = hours === 12 ? 0 : hours;
+        else hours = hours === 12 ? 12 : hours + 12;
+      }
+      return String(hours * 3600 + minutes * 60 + seconds);
+    }
+  }
+  return keyText(raw);
+}
+
+function amountIdentity(value) {
+  return numberValue(value).toFixed(2);
+}
+
+// A transaction ID is not always unique within a Bank + Date in exported
+// statements. Include the stable voucher, instrument, particulars, time and
+// debit/credit amounts as well, so distinct rows are not silently discarded.
 function buildTransactionSourceKey(companyId, row) {
   const bankDate = row.bank_date instanceof Date ? row.bank_date : excelDate(row.bank_date);
   const dateKey = bankDate ? bankDate.toISOString().slice(0, 10) : "";
-  const transactionId = text(row.transaction_id);
-  const keySource = transactionId
-    ? `${companyId}|${keyText(row.bank_name)}|${transactionId}|${dateKey}`
-    : `${companyId}|${keyText(row.bank_name)}|${dateKey}|${keyText(row.particulars_name)}|${keyText(row.voucher_type)}|${text(row.voucher_number)}|${numberValue(row.receipt_amount)}|${numberValue(row.payment_amount)}`;
+  const keySource = [
+    companyId,
+    keyText(row.bank_name),
+    dateKey,
+    canonicalBankTimeIdentity(row.bank_time),
+    keyText(row.transaction_id),
+    keyText(row.instrument_no),
+    keyText(row.particulars_name),
+    keyText(row.voucher_type),
+    keyText(row.voucher_number),
+    amountIdentity(row.receipt_amount),
+    amountIdentity(row.payment_amount),
+    amountIdentity(row.bank_debit),
+    amountIdentity(row.bank_credit),
+  ].join("|");
   return crypto.createHash("sha256").update(keySource).digest("hex");
+}
+
+function importDuplicateView(record, reason, existing = null) {
+  return {
+    excel_row: record.excel_row_number || null,
+    bank_date: record.bank_date || null,
+    bank_name: text(record.bank_name),
+    particulars_name: text(record.particulars_name),
+    voucher_type: text(record.voucher_type),
+    voucher_number: text(record.voucher_number),
+    transaction_id: text(record.transaction_id),
+    instrument_no: text(record.instrument_no),
+    receipt_amount: numberValue(record.receipt_amount),
+    payment_amount: numberValue(record.payment_amount),
+    reason,
+    existing_file_name: text(existing?.import_file_name),
+    existing_batch_id: text(existing?.import_batch_id),
+  };
 }
 
 async function refreshImportBatch(companyId, batchId) {
@@ -834,17 +893,22 @@ router.post("/import", upload.single("file"), async (req, res) => {
       const transactionId = text(row[8]);
       const sourceKey = buildTransactionSourceKey(companyId, {
         bank_date: bankDate,
+        bank_time: text(row[1]),
         bank_name: bankName,
+        instrument_no: text(row[4]),
         transaction_id: transactionId,
         particulars_name: particulars,
         voucher_type: voucherType,
         voucher_number: voucherNo,
         receipt_amount: receiptAmount,
         payment_amount: paymentAmount,
+        bank_debit: statementDebit,
+        bank_credit: statementCredit,
       });
       records.push({
         company_id: companyId,
         source_key: sourceKey,
+        excel_row_number: index + 1,
         bank_date: bankDate,
         bank_time: text(row[1]),
         bank_remarks: text(row[2]),
@@ -877,26 +941,65 @@ router.post("/import", upload.single("file"), async (req, res) => {
     if (!records.length) {
       return res.status(400).json({ error: "No valid transaction rows were found.", invalid_rows: invalidRows.slice(0, 30) });
     }
-    const operations = records.map((record) => {
+    // Look up transactions already stored for the same Bank + date window and
+    // compare their full transaction identity. This also recognizes old rows
+    // created by the previous, weaker Bank+Date+Transaction-ID key.
+    const bankNamesForImport = [...new Set(records.map((record) => record.bank_name).filter(Boolean))];
+    const endDateExclusive = new Date(maxDate);
+    endDateExclusive.setUTCDate(endDateExclusive.getUTCDate() + 1);
+    const existingTransactions = await Transaction.find({
+      company_id: companyId,
+      bank_name: { $in: bankNamesForImport },
+      bank_date: { $gte: minDate, $lt: endDateExclusive },
+    }).select("_id source_key bank_date bank_time bank_name instrument_no transaction_id particulars_name voucher_type voucher_number receipt_amount payment_amount bank_debit bank_credit import_file_name import_batch_id").lean();
+    const existingByIdentity = new Map();
+    existingTransactions.forEach((existing) => {
+      const identity = buildTransactionSourceKey(companyId, existing);
+      if (!existingByIdentity.has(identity)) existingByIdentity.set(identity, existing);
+    });
+
+    const operations = [];
+    const seenInThisFile = new Set();
+    const duplicateDetails = [];
+    for (const record of records) {
+      const existing = existingByIdentity.get(record.source_key);
+      if (existing) {
+        duplicateDetails.push(importDuplicateView(record, "Already exists in Hansaria with matching transaction details.", existing));
+        // Preserve the existing transaction but allow Q/R aliases to be filled
+        // when the same file is re-imported after adding Ledger Name / Group Company.
+        const overrideSet = {};
+        if (text(record.ledger_name_override)) overrideSet.ledger_name_override = text(record.ledger_name_override);
+        if (text(record.group_company_override)) overrideSet.group_company_override = text(record.group_company_override);
+        if (Object.keys(overrideSet).length) {
+          operations.push({ updateOne: { filter: { _id: existing._id, company_id: companyId }, update: { $set: overrideSet } } });
+        }
+        continue;
+      }
+      if (seenInThisFile.has(record.source_key)) {
+        duplicateDetails.push(importDuplicateView(record, "Repeated identical transaction row inside this uploaded Excel file."));
+        continue;
+      }
+      seenInThisFile.add(record.source_key);
       const insertRecord = { ...record };
+      delete insertRecord.excel_row_number;
       delete insertRecord.ledger_name_override;
       delete insertRecord.group_company_override;
       const overrideSet = {};
       if (text(record.ledger_name_override)) overrideSet.ledger_name_override = text(record.ledger_name_override);
       if (text(record.group_company_override)) overrideSet.group_company_override = text(record.group_company_override);
       const update = { $setOnInsert: insertRecord };
-      // Re-importing the same statement with Q/R filled later updates only these aliases;
-      // bank amounts, dates, voucher identifiers and source particulars remain untouched.
       if (Object.keys(overrideSet).length) update.$set = overrideSet;
-      return {
+      operations.push({
         updateOne: {
           filter: { company_id: companyId, source_key: record.source_key },
           update,
           upsert: true,
         },
-      };
-    });
-    const writeResult = await Transaction.bulkWrite(operations, { ordered: false });
+      });
+    }
+    const writeResult = operations.length
+      ? await Transaction.bulkWrite(operations, { ordered: false })
+      : { upsertedCount: 0 };
     const importedRows = Number(writeResult.upsertedCount || 0);
     const duplicateRows = Math.max(0, records.length - importedRows);
     const existingMappings = await LedgerMapping.find({
@@ -935,6 +1038,8 @@ router.post("/import", upload.single("file"), async (req, res) => {
       total_rows: records.length + invalidRows.length,
       imported_rows: importedRows,
       duplicate_rows: duplicateRows,
+      duplicate_details: duplicateDetails.slice(0, 200),
+      duplicate_details_truncated: duplicateDetails.length > 200,
       auto_mapped_rows: autoMappedRows,
       unmapped_rows: unmappedRows,
       excel_ledger_names: ledgerNameColumn >= 0 ? records.filter((row) => text(row.ledger_name_override)).length : 0,
