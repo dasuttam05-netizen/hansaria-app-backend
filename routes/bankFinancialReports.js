@@ -1024,6 +1024,73 @@ router.patch("/import-batches/:batchId/bank-name", async (req, res) => {
   }
 });
 
+
+// Delete every transaction belonging to one imported file/batch while keeping
+// all reusable masters (Groups, Sub-groups, Ledger Mappings and bank openings).
+// Any Contra Match that references a deleted row is unlinked on BOTH sides so
+// a surviving statement row is not left with a dangling transfer reference.
+router.delete("/import-batches/:batchId", async (req, res) => {
+  try {
+    if (!mongoReady(res)) return;
+    const companyId = companyIdFrom(req);
+    const batchId = text(req.params.batchId);
+    if (!batchId) return res.status(400).json({ error: "Select a valid imported statement." });
+
+    const batchFilter = { company_id: companyId, import_batch_id: batchId };
+    const rows = await Transaction.find(batchFilter).select("_id contra_match_id").lean();
+    if (!rows.length) {
+      // Remove an orphaned batch-history record if it exists, but never touch
+      // any other batch or reusable ledger/group mapping.
+      await ImportBatch.deleteOne({ company_id: companyId, batch_id: batchId });
+      return res.status(404).json({ error: "No imported transactions were found for this file. The batch history record was checked." });
+    }
+
+    const transactionIds = rows.map((row) => String(row._id));
+    const rowMatchIds = [...new Set(rows.map((row) => text(row.contra_match_id)).filter(Boolean))];
+    const relatedMatches = await ContraMatch.find({
+      company_id: companyId,
+      $or: [
+        { payment_transaction_id: { $in: transactionIds } },
+        { receipt_transaction_id: { $in: transactionIds } },
+        ...(rowMatchIds.length ? [{ _id: { $in: rowMatchIds.filter((id) => mongoose.Types.ObjectId.isValid(id)) } }] : []),
+      ],
+    }).select("_id transfer_id payment_transaction_id receipt_transaction_id").lean();
+
+    const contraMatchIds = [...new Set([
+      ...rowMatchIds,
+      ...relatedMatches.map((match) => String(match._id)),
+    ].filter(Boolean))];
+    let unlinkedRows = 0;
+    if (contraMatchIds.length) {
+      const unlinkResult = await Transaction.updateMany(
+        { company_id: companyId, contra_match_id: { $in: contraMatchIds } },
+        { $unset: { contra_match_id: 1, contra_match_status: 1, contra_counter_bank: 1 } }
+      );
+      unlinkedRows = Number(unlinkResult.modifiedCount ?? unlinkResult.nModified ?? 0);
+      await ContraMatch.deleteMany({
+        company_id: companyId,
+        _id: { $in: contraMatchIds.filter((id) => mongoose.Types.ObjectId.isValid(id)) },
+      });
+    }
+
+    const deleteResult = await Transaction.deleteMany(batchFilter);
+    await ImportBatch.deleteOne({ company_id: companyId, batch_id: batchId });
+
+    return res.json({
+      success: true,
+      batch_id: batchId,
+      deleted_rows: Number(deleteResult.deletedCount ?? deleteResult.n ?? 0),
+      removed_contra_matches: relatedMatches.length,
+      unlinked_statement_rows: unlinkedRows,
+      preserved: ["Ledger / Particulars Mappings", "Groups", "Sub-groups", "Group Companies", "Bank Opening Balances"],
+      message: `Imported file deleted: ${Number(deleteResult.deletedCount ?? deleteResult.n ?? 0)} statement entries removed. Ledger and Group mappings were preserved.`,
+    });
+  } catch (error) {
+    console.error("Bank statement import batch delete failed:", error);
+    return res.status(500).json({ error: error.message || "Could not delete this imported statement." });
+  }
+});
+
 router.get("/summary", async (req, res) => {
   try {
     if (!mongoReady(res)) return;
