@@ -412,17 +412,19 @@ function strictContraPairChecks(payment = {}, receipt = {}) {
   const paymentVoucherType = normalizeContraField(payment.voucher_type);
   const receiptVoucherType = normalizeContraField(receipt.voucher_type);
 
+  // Required Contra matching keys: Voucher Type, Amount, Transaction ID and
+  // Instrument Number. Bank Remarks are retained for display/audit only and
+  // intentionally do not block an otherwise valid match.
   const checks = {
     voucher_type: paymentVoucherType === "CONTRA" && receiptVoucherType === "CONTRA",
     amount: paymentAmountCents > 0 && paymentAmountCents === receiptAmountCents,
     transaction_id: Boolean(paymentTransactionId && receiptTransactionId && paymentTransactionId === receiptTransactionId),
-    bank_remarks: Boolean(paymentRemarks && receiptRemarks && paymentRemarks === receiptRemarks),
     instrument_no: Boolean(paymentInstrument && receiptInstrument && paymentInstrument === receiptInstrument),
   };
   const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([key]) => key);
   return {
     valid: failed.length === 0,
-    checks,
+    checks: { ...checks, bank_remarks_match: Boolean(paymentRemarks && receiptRemarks && paymentRemarks === receiptRemarks) },
     failed,
     payment_reference: paymentTransactionId,
     receipt_reference: receiptTransactionId,
@@ -501,8 +503,10 @@ function buildContraSuggestions(rows, mappingByName = new Map()) {
       const noGroupCompanyLabels = !paymentCompany && !receiptCompany;
       const paymentDate = new Date(payment.bank_date).getTime();
       const receiptDate = new Date(receipt.bank_date).getTime();
-      const dayGap = Math.abs(paymentDate - receiptDate) / 86400000;
-      if (!Number.isFinite(dayGap) || dayGap > 3) return;
+      const rawDayGap = Math.abs(paymentDate - receiptDate) / 86400000;
+      // Bank Date is shown as context and used for ordering only; the four
+      // identifiers below are the actual match criteria.
+      const dayGap = Number.isFinite(rawDayGap) ? Number(rawDayGap.toFixed(2)) : null;
 
       const amount = transactionEntryAmount(payment);
       const pair = {
@@ -512,15 +516,16 @@ function buildContraSuggestions(rows, mappingByName = new Map()) {
         receipt: contraTransactionView(receipt, mappingByName),
         amount,
         amount_difference: 0,
-        day_gap: Number(dayGap.toFixed(2)),
+        day_gap: dayGap,
+        remarks_match: Boolean(checks.checks.bank_remarks_match),
         reference_match: checks.checks.transaction_id,
         reference_conflict: checks.failed.includes("transaction_id"),
         strict_valid: checks.valid,
         strict_checks: checks.checks,
         failed_checks: checks.failed,
         match_reason: checks.valid
-          ? "Voucher Type, Amount, Transaction ID, Bank Remarks and Instrument Number all match"
-          : `Not eligible for Contra: ${checks.failed.map((key) => ({ voucher_type: "Voucher Type", amount: "Amount", transaction_id: "Transaction ID", bank_remarks: "Bank Remarks", instrument_no: "Instrument Number" }[key] || key)).join(", ")} do not all match`,
+          ? "Voucher Type, Amount, Transaction ID and Instrument Number match; Bank Remarks may differ"
+          : `Not eligible for Contra: ${checks.failed.map((key) => ({ voucher_type: "Voucher Type", amount: "Amount", transaction_id: "Transaction ID", instrument_no: "Instrument Number" }[key] || key)).join(", ")} do not all match`,
         match_method: checks.valid ? "strict_reference" : "review_required",
         same_group_company: sameGroupCompany,
         no_group_company_labels: noGroupCompanyLabels,
@@ -543,7 +548,7 @@ function buildContraSuggestions(rows, mappingByName = new Map()) {
         && (pair.same_group_company || pair.no_group_company_labels),
     };
   }).sort((a, b) => Number(b.same_group_company) - Number(a.same_group_company)
-    || Number(a.day_gap) - Number(b.day_gap)
+    || Number(a.day_gap ?? Number.POSITIVE_INFINITY) - Number(b.day_gap ?? Number.POSITIVE_INFINITY)
     || new Date(a.payment.bank_date).getTime() - new Date(b.payment.bank_date).getTime());
 }
 
@@ -605,7 +610,6 @@ async function createContraMatch(companyId, paymentId, receiptId, req, method = 
       voucher_type: "Voucher Type must be Contra on both rows",
       amount: "Receipt and Payment amounts must match exactly",
       transaction_id: "Transaction ID must be present and match",
-      bank_remarks: "Bank Remarks must be present and match",
       instrument_no: "Instrument Number must be present and match",
     };
     const error = new Error(`Contra Match rejected: ${strictChecks.failed.map((key) => labels[key] || key).join("; ")}.`);
@@ -1682,7 +1686,7 @@ router.post("/contra-matches/auto-match", async (req, res) => {
         ? `${result.matched_count} strict Contra Transfer(s) matched. ${result.released_legacy_matches || 0} previous link(s) that failed strict checks were unlinked. Original Bank Statement rows and balances were not changed.`
         : result.released_legacy_matches
           ? `${result.released_legacy_matches} previous Contra link(s) failed the strict checks and were unlinked. No new pair matched all required fields.`
-          : "No strict Contra Match was found. Both rows must have Voucher Type Contra, the exact same amount, Transaction ID, Bank Remarks and Instrument Number.",
+          : "No Contra Match was found. Both rows must have Voucher Type Contra, the exact same amount, Transaction ID and Instrument Number. Bank Remarks may differ.",
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || "Could not run Contra Auto Matching." });
