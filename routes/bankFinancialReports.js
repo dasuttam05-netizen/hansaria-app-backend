@@ -180,6 +180,25 @@ function reportPeriodLabel(value, periodType) {
   return mode === "monthly" ? `${year}-${month}` : `${year}-${month}-${String(date.getUTCDate()).padStart(2, "0")}`;
 }
 
+function bankBalancePeriodLabel(value, periodType) {
+  const mode = String(periodType || "range").toLowerCase();
+  if (mode !== "daily" && mode !== "monthly") return "Selected Period";
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Unknown Date";
+  return mode === "monthly"
+    ? new Intl.DateTimeFormat("en-IN", { month: "long", year: "numeric", timeZone: "UTC" }).format(date)
+    : new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" }).format(date);
+}
+
+function bankBalancePeriodSortKey(value, periodType) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return "9999-99-99";
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return String(periodType || "range").toLowerCase() === "monthly" ? `${year}-${month}` : `${year}-${month}-${day}`;
+}
+
 function signedBankOpening(record) {
   const amount = Math.abs(numberValue(record?.opening_balance));
   return String(record?.opening_balance_type || "dr").toLowerCase() === "cr" ? -amount : amount;
@@ -1150,8 +1169,8 @@ router.get("/reports/bank-balance", async (req, res) => {
         // Otherwise calculate from Opening + Receipt - Payment.
         detailRunningBalance = transactionStatementBalance(tx, calculatedRunning);
 
-        const period = periodType === "range" ? "Selected Period" : reportPeriodLabel(tx.bank_date, periodType);
-        if (!buckets.has(period)) buckets.set(period, { period, opening_balance: detailRunningBalance - (bankReceipt - bankPayment), receipts: 0, payments: 0, transactions: 0, closing_balance: detailRunningBalance });
+        const period = periodType === "range" ? "Selected Period" : bankBalancePeriodLabel(tx.bank_date, periodType);
+        if (!buckets.has(period)) buckets.set(period, { period, period_sort_key: bankBalancePeriodSortKey(tx.bank_date, periodType), opening_balance: detailRunningBalance - (bankReceipt - bankPayment), receipts: 0, payments: 0, transactions: 0, closing_balance: detailRunningBalance });
         const bucket = buckets.get(period);
         bucket.receipts += bankReceipt;
         bucket.payments += bankPayment;
@@ -1180,15 +1199,19 @@ router.get("/reports/bank-balance", async (req, res) => {
           const companyName = text(allocation.group_company);
           const groupName = text(allocation.group_name) || "Unmapped";
           const subgroupName = text(allocation.subgroup_name);
-          const summaryPeriod = periodType === "range" ? "Selected Period" : reportPeriodLabel(tx.bank_date, periodType);
-          const summaryIdentity = [summaryPeriod, text(tx.bank_name), companyName, text(allocation.group_id), groupName, text(allocation.subgroup_id), subgroupName, ledgerName].join("|\u001f|");
+          const summaryPeriod = periodType === "range" ? "Selected Period" : bankBalancePeriodLabel(tx.bank_date, periodType);
+          // Summary is one row per Period + Company + Group + Sub-group.
+          // Multiple ledgers and banks within that Sub-group roll into one total.
+          const summaryIdentity = [summaryPeriod, companyName, text(allocation.group_id), groupName, text(allocation.subgroup_id), subgroupName].join("|\u001f|");
           const summaryKey = crypto.createHash("sha1").update(summaryIdentity).digest("hex");
           if (!summaryMap.has(summaryKey)) {
             summaryMap.set(summaryKey, {
               summary_key: summaryKey,
               period: summaryPeriod,
-              bank_name: text(tx.bank_name),
-              ledger_name: ledgerName,
+              period_sort_key: bankBalancePeriodSortKey(tx.bank_date, periodType),
+              bank_name: selectedBank ? text(req.query.bank_name) : (bankNames.length === 1 ? bankNames[0] : "All Selected Banks"),
+              bank_names: new Set(),
+              ledger_names: new Set(),
               group_company: companyName,
               group_id: text(allocation.group_id),
               group_name: groupName,
@@ -1203,6 +1226,8 @@ router.get("/reports/bank-balance", async (req, res) => {
           const summary = summaryMap.get(summaryKey);
           if (side === "receipt") summary.receipts += amount;
           else summary.payments += amount;
+          if (text(tx.bank_name)) summary.bank_names.add(text(tx.bank_name));
+          if (ledgerName) summary.ledger_names.add(ledgerName);
           summary.transaction_ids.add(String(tx._id));
 
           details.push({
@@ -1241,10 +1266,10 @@ router.get("/reports/bank-balance", async (req, res) => {
       }
 
       if (!buckets.size) {
-        const emptyPeriod = periodType === "range" ? "Selected Period" : reportPeriodLabel(fromDate, periodType);
-        buckets.set(emptyPeriod, { period: emptyPeriod, opening_balance: openingBalance, receipts: 0, payments: 0, transactions: 0, closing_balance: openingBalance });
+        const emptyPeriod = periodType === "range" ? "Selected Period" : bankBalancePeriodLabel(fromDate, periodType);
+        buckets.set(emptyPeriod, { period: emptyPeriod, period_sort_key: bankBalancePeriodSortKey(fromDate, periodType), opening_balance: openingBalance, receipts: 0, payments: 0, transactions: 0, closing_balance: openingBalance });
       }
-      for (const bucket of [...buckets.values()].sort((a,b) => String(a.period).localeCompare(String(b.period)))) {
+      for (const bucket of [...buckets.values()].sort((a,b) => String(a.period_sort_key || a.period).localeCompare(String(b.period_sort_key || b.period)))) {
         rows.push({ bank_name: bankName, ...bucket, opening_balance_set: manualOpeningSet, opening_balance_source: openingSource, opening_balance_date: openingRecord?.effective_date || null });
       }
       totals.opening_balance += openingBalance;
@@ -1257,7 +1282,7 @@ router.get("/reports/bank-balance", async (req, res) => {
     if (!selectedBank && bankNames.length > 1) {
       const periodTotals = new Map();
       for (const row of rows) {
-        if (!periodTotals.has(row.period)) periodTotals.set(row.period, { period: row.period, opening_balance: 0, receipts: 0, payments: 0, closing_balance: 0, transactions: 0, opening_balance_set: true });
+        if (!periodTotals.has(row.period)) periodTotals.set(row.period, { period: row.period, period_sort_key: row.period_sort_key || row.period, opening_balance: 0, receipts: 0, payments: 0, closing_balance: 0, transactions: 0, opening_balance_set: true });
         const total = periodTotals.get(row.period);
         total.opening_balance += row.opening_balance;
         total.receipts += row.receipts;
@@ -1271,11 +1296,14 @@ router.get("/reports/bank-balance", async (req, res) => {
 
     const summaryRows = [...summaryMap.values()].map((row) => ({
       ...row,
+      bank_names: [...row.bank_names].sort((a, b) => a.localeCompare(b)),
+      ledger_names: [...row.ledger_names].sort((a, b) => a.localeCompare(b)),
+      total_amount: row.receipts + row.payments,
       transactions: row.transaction_ids.size,
       transaction_ids: undefined,
-    })).sort((a,b) => String(a.period).localeCompare(String(b.period)) || a.bank_name.localeCompare(b.bank_name) || a.group_company.localeCompare(b.group_company) || a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name) || a.ledger_name.localeCompare(b.ledger_name));
+    })).sort((a,b) => String(a.period_sort_key || a.period).localeCompare(String(b.period_sort_key || b.period)) || a.group_company.localeCompare(b.group_company) || a.group_name.localeCompare(b.group_name) || a.subgroup_name.localeCompare(b.subgroup_name));
     details.sort((a,b) => compareBankTransactionOrder(a, b) || a.bank_name.localeCompare(b.bank_name) || a.allocation_index - b.allocation_index);
-    rows.sort((a,b) => String(a.period).localeCompare(String(b.period)) || (a.bank_name === "ALL BANKS" ? -1 : b.bank_name === "ALL BANKS" ? 1 : a.bank_name.localeCompare(b.bank_name)));
+    rows.sort((a,b) => String(a.period_sort_key || a.period).localeCompare(String(b.period_sort_key || b.period)) || (a.bank_name === "ALL BANKS" ? -1 : b.bank_name === "ALL BANKS" ? 1 : a.bank_name.localeCompare(b.bank_name)));
     return res.json({ from_date: fromDate, to_date: toDate, period_type: periodType, banks: bankNames, totals, rows, summary_rows: summaryRows, details, detail_count: details.length, opening_balance_missing_banks: missingBanks });
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Bank Balance report." }); }
 });
