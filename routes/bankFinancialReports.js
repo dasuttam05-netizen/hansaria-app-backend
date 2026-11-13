@@ -1338,7 +1338,9 @@ router.get("/reports/bank-balance", async (req, res) => {
             voucher_type: text(tx.voucher_type),
             voucher_number: text(tx.voucher_number),
             group_company: text(allocation.group_company),
+            group_id: text(allocation.group_id),
             group_name: text(allocation.group_name) || "Unmapped",
+            subgroup_id: text(allocation.subgroup_id),
             subgroup_name: text(allocation.subgroup_name),
             receipt_amount: side === "receipt" ? amount : 0,
             payment_amount: side === "payment" ? amount : 0,
@@ -1398,7 +1400,74 @@ router.get("/reports/bank-balance", async (req, res) => {
       for (const total of periodTotals.values()) rows.push({ bank_name: "ALL BANKS", ...total });
     }
     rows.sort((a,b) => String(a.period).localeCompare(String(b.period)) || (a.bank_name === "ALL BANKS" ? -1 : b.bank_name === "ALL BANKS" ? 1 : a.bank_name.localeCompare(b.bank_name)));
-    return res.json({ from_date: fromDate, to_date: toDate, period_type: periodType, banks: bankNames, totals, rows, details, detail_count: details.length, opening_balance_missing_banks: missingBanks });
+
+    // Build the Sub-group summary from the same filtered allocation details
+    // returned to the report. This keeps Summary and Full Details consistent,
+    // and ensures each split allocation rolls into its one Sub-group total.
+    // The Contra Match link does not remove either original statement row.
+    const summaryMap = new Map();
+    for (const detail of details) {
+      const date = detail.bank_date ? new Date(detail.bank_date) : null;
+      const validDate = date && Number.isFinite(date.getTime());
+      const year = validDate ? date.getUTCFullYear() : 0;
+      const month = validDate ? date.getUTCMonth() : 0;
+      const day = validDate ? date.getUTCDate() : 0;
+      const periodSortKey = periodType === "daily" && validDate
+        ? `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+        : periodType === "monthly" && validDate
+          ? `${year}-${String(month + 1).padStart(2, "0")}`
+          : "0000-00-00";
+      const period = periodType === "daily" && validDate
+        ? new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" }).format(date)
+        : periodType === "monthly" && validDate
+          ? new Intl.DateTimeFormat("en-IN", { month: "long", year: "numeric", timeZone: "UTC" }).format(date)
+          : "Selected Period";
+      const companyValue = text(detail.group_company);
+      const groupCompany = companyValue || "Unassigned";
+      const groupName = text(detail.group_name) || "Unmapped";
+      const subgroupName = text(detail.subgroup_name) || "No Sub-group";
+      const bankDisplay = selectedBank
+        ? text(req.query.bank_name)
+        : (bankNames.length === 1 ? bankNames[0] : "All Selected Banks");
+      const summaryIdentity = [periodSortKey, companyValue, text(detail.group_id), groupName, text(detail.subgroup_id), subgroupName].join("|\u001f|");
+      const summaryKey = crypto.createHash("sha1").update(summaryIdentity).digest("hex");
+      if (!summaryMap.has(summaryKey)) {
+        summaryMap.set(summaryKey, {
+          summary_key: summaryKey,
+          period,
+          period_sort_key: periodSortKey,
+          bank_name: bankDisplay,
+          bank_names: new Set(),
+          ledger_names: new Set(),
+          group_company: groupCompany,
+          group_name: groupName,
+          subgroup_name: subgroupName,
+          receipts: 0,
+          payments: 0,
+          transaction_ids: new Set(),
+        });
+      }
+      const summary = summaryMap.get(summaryKey);
+      summary.receipts += numberValue(detail.receipt_amount);
+      summary.payments += numberValue(detail.payment_amount);
+      if (text(detail.bank_name)) summary.bank_names.add(text(detail.bank_name));
+      if (text(detail.ledger_name)) summary.ledger_names.add(text(detail.ledger_name));
+      if (text(detail.transaction_id)) summary.transaction_ids.add(String(detail.transaction_id));
+    }
+    const summaryRows = [...summaryMap.values()].map((summary) => ({
+      ...summary,
+      bank_names: [...summary.bank_names].sort((a, b) => a.localeCompare(b)),
+      ledger_names: [...summary.ledger_names].sort((a, b) => a.localeCompare(b)),
+      transactions: summary.transaction_ids.size,
+      net_amount: summary.receipts - summary.payments,
+      total_amount: summary.receipts - summary.payments,
+      transaction_ids: undefined,
+    })).sort((a,b) => String(a.period_sort_key).localeCompare(String(b.period_sort_key))
+      || a.group_company.localeCompare(b.group_company)
+      || a.group_name.localeCompare(b.group_name)
+      || a.subgroup_name.localeCompare(b.subgroup_name));
+
+    return res.json({ from_date: fromDate, to_date: toDate, period_type: periodType, banks: bankNames, totals, rows, summary_rows: summaryRows, details, detail_count: details.length, opening_balance_missing_banks: missingBanks });
   } catch (error) { return res.status(500).json({ error: error.message || "Could not calculate Bank Balance report." }); }
 });
 
