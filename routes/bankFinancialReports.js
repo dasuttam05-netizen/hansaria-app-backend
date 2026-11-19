@@ -179,9 +179,10 @@ function text(value) {
 }
 
 // Bank Excel L-column Particulars sometimes contains a ledger name followed by
-// a transaction amount (for example: "NIREN ROY(DIRECT) - ₹4,96,314.00").
-// Keep the original Particulars unchanged, but remove this trailing amount
-// from the Ledger Name saved for reporting.
+// a transaction amount. Both examples below are cleaned correctly:
+// "NIREN ROY(DIRECT) - ₹4,96,314.00" -> "NIREN ROY(DIRECT)"
+// "NIREN ROY-(DIRECT) - ₹4,96,314.00" -> "NIREN ROY-(DIRECT)"
+// Only the final amount suffix is removed; the original Particulars stays intact.
 function cleanImportedLedgerName(value) {
   return text(value).replace(
     /\s+[-–—]\s*(?:₹|INR\b|Rs\.?)\s*-?\s*\(?\s*\d[\d,]*(?:\.\d{1,2})?\s*\)?\s*$/i,
