@@ -184,8 +184,13 @@ function text(value) {
 // "NIREN ROY-(DIRECT) - ₹4,96,314.00" -> "NIREN ROY-(DIRECT)"
 // Only the final amount suffix is removed; the original Particulars stays intact.
 function cleanImportedLedgerName(value) {
-  return text(value).replace(
-    /\s+[-–—]\s*(?:₹|INR\b|Rs\.?)\s*-?\s*\(?\s*\d[\d,]*(?:\.\d{1,2})?\s*\)?\s*$/i,
+  const ledgerName = text(value);
+  if (!ledgerName) return "";
+
+  // Remove only a trailing separator + currency amount. A hyphen that is part
+  // of the ledger name (for example, ROY-(DIRECT)) is kept unchanged.
+  return ledgerName.replace(
+    /\s+[-–—]\s*(?:₹\s*|INR\s*|Rs\.?\s*)[-+]?\s*\(?\s*\d[\d,]*(?:\.\d{1,2})?\s*\)?\s*$/i,
     ""
   ).trim();
 }
@@ -286,7 +291,13 @@ function compareBankTransactionOrder(a, b) {
 }
 
 function transactionLedgerName(tx, mapping) {
-  return text(tx?.ledger_name_override) || text(mapping?.ledger_name) || text(mapping?.particulars_name) || text(tx?.particulars_name) || "Unmapped Ledger";
+  const sourceName = text(tx?.ledger_name_override)
+    || text(mapping?.ledger_name)
+    || text(mapping?.particulars_name)
+    || text(tx?.particulars_name)
+    || "Unmapped Ledger";
+  // Also clean legacy rows and manually saved mappings at display time.
+  return cleanImportedLedgerName(sourceName) || "Unmapped Ledger";
 }
 
 function transactionGroupCompany(tx, mapping) {
@@ -1494,7 +1505,7 @@ router.get("/ledger-mappings", async (req, res) => {
       const subgroup = mapping?.subgroup_id ? subMap.get(String(mapping.subgroup_id)) : null;
       return {
         ...item,
-        ledger_name: text(mapping?.ledger_name) || item.particulars_name,
+        ledger_name: cleanImportedLedgerName(mapping?.ledger_name) || cleanImportedLedgerName(item.particulars_name),
         group_id: mapping?.group_id || "",
         group_name: group?.name || mapping?.group_name || "",
         subgroup_id: mapping?.subgroup_id || "",
