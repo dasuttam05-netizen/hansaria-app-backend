@@ -178,6 +178,17 @@ function text(value) {
   return value === undefined || value === null ? "" : String(value).trim().replace(/\s+/g, " ");
 }
 
+// Bank Excel L-column Particulars sometimes contains a ledger name followed by
+// a transaction amount (for example: "NIREN ROY(DIRECT) - ₹4,96,314.00").
+// Keep the original Particulars unchanged, but remove this trailing amount
+// from the Ledger Name saved for reporting.
+function cleanImportedLedgerName(value) {
+  return text(value).replace(
+    /\s+[-–—]\s*(?:₹|INR\b|Rs\.?)\s*-?\s*\(?\s*\d[\d,]*(?:\.\d{1,2})?\s*\)?\s*$/i,
+    ""
+  ).trim();
+}
+
 function keyText(value) {
   return text(value).toLowerCase();
 }
@@ -937,6 +948,10 @@ router.post("/import", upload.single("file"), async (req, res) => {
       const bankDate = excelDate(row[0]);
       const bankName = text(row[3]);
       const particulars = text(row[11]);
+      // If an appended Ledger Name column exists, use it; otherwise derive
+      // the Ledger Name from L-column Particulars after removing its amount.
+      const ledgerNameSource = (ledgerNameColumn >= 0 && text(row[ledgerNameColumn])) || particulars;
+      const importedLedgerName = cleanImportedLedgerName(ledgerNameSource);
       const voucherType = text(row[12]);
       const voucherNo = text(row[13]);
       if (!bankDate || !bankName || !particulars || !voucherType || !voucherNo) {
@@ -981,7 +996,7 @@ router.post("/import", upload.single("file"), async (req, res) => {
         tally_date: excelDate(row[10]),
         particulars_name: particulars,
         normalized_particulars: keyText(particulars),
-        ledger_name_override: ledgerNameColumn >= 0 ? text(row[ledgerNameColumn]) : "",
+        ledger_name_override: importedLedgerName,
         group_company_override: groupCompanyColumn >= 0 ? text(row[groupCompanyColumn]) : "",
         voucher_type: voucherType,
         voucher_number: voucherNo,
