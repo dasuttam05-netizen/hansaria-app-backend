@@ -182,7 +182,7 @@ function text(value) {
 // a transaction amount. Both examples below are cleaned correctly:
 // "NIREN ROY(DIRECT) - ₹4,96,314.00" -> "NIREN ROY(DIRECT)"
 // "NIREN ROY-(DIRECT) - ₹4,96,314.00" -> "NIREN ROY-(DIRECT)"
-// Only the final amount suffix is removed; the original Particulars stays intact.
+// Only the final amount suffix is removed from the L-column display / mapping name.
 function cleanImportedLedgerName(value) {
   const ledgerName = text(value);
   if (!ledgerName) return "";
@@ -197,6 +197,37 @@ function cleanImportedLedgerName(value) {
 
 function keyText(value) {
   return text(value).toLowerCase();
+}
+
+// Use the cleaned L-column Particulars as the one identity for a ledger.
+// This merges legacy rows such as "AADHAR GREEN INDUSTRIES LLP - ₹3,15,917.00"
+// with "AADHAR GREEN INDUSTRIES LLP" without changing their transaction amounts.
+function ledgerIdentityKey(value) {
+  return keyText(cleanImportedLedgerName(value));
+}
+
+// Legacy imports may already have created more than one mapping for the same
+// ledger (one with an amount suffix and one without it). Prefer a saved mapping
+// that has a Group, then use the most recently updated record as the tie-breaker.
+function buildLedgerMappingMap(mappings = []) {
+  const result = new Map();
+  for (const mapping of mappings) {
+    const key = ledgerIdentityKey(mapping?.normalized_name || mapping?.particulars_name);
+    if (!key) continue;
+    const current = result.get(key);
+    const hasGroup = Boolean(text(mapping?.group_id));
+    const currentHasGroup = Boolean(text(current?.group_id));
+    const mappingTime = new Date(mapping?.updatedAt || mapping?.createdAt || 0).getTime();
+    const currentTime = new Date(current?.updatedAt || current?.createdAt || 0).getTime();
+    if (!current || (hasGroup && !currentHasGroup) || (hasGroup === currentHasGroup && mappingTime > currentTime)) {
+      result.set(key, mapping);
+    }
+  }
+  return result;
+}
+
+function mappingForTransaction(row, mappingByName) {
+  return mappingByName?.get(ledgerIdentityKey(row?.normalized_particulars || row?.particulars_name)) || null;
 }
 
 function requestedGroupCompany(query) {
@@ -357,7 +388,7 @@ function buildTransactionSourceKey(companyId, row) {
     canonicalBankTimeIdentity(row.bank_time),
     keyText(row.transaction_id),
     keyText(row.instrument_no),
-    keyText(row.particulars_name),
+    ledgerIdentityKey(row.particulars_name),
     keyText(row.voucher_type),
     keyText(row.voucher_number),
     amountIdentity(row.receipt_amount),
@@ -373,7 +404,7 @@ function importDuplicateView(record, reason, existing = null) {
     excel_row: record.excel_row_number || null,
     bank_date: record.bank_date || null,
     bank_name: text(record.bank_name),
-    particulars_name: text(record.particulars_name),
+    particulars_name: cleanImportedLedgerName(record.particulars_name),
     voucher_type: text(record.voucher_type),
     voucher_number: text(record.voucher_number),
     transaction_id: text(record.transaction_id),
@@ -508,8 +539,9 @@ async function loadReportContext(companyId, query) {
   ]);
   const groupById = new Map(groups.map((row) => [String(row._id), row]));
   const subgroupById = new Map(subgroups.map((row) => [String(row._id), row]));
-  const mappingByName = new Map(mappings.map((row) => [row.normalized_name, row]));
-  return { transactions, groups, subgroups, mappings, groupById, subgroupById, mappingByName };
+  const mappingByName = buildLedgerMappingMap(mappings);
+  const canonicalMappings = [...mappingByName.values()];
+  return { transactions, groups, subgroups, mappings: canonicalMappings, groupById, subgroupById, mappingByName };
 }
 
 function transactionEntrySide(row = {}) {
@@ -590,7 +622,7 @@ function bankTimeSortMinutes(value) {
 }
 
 function contraTransactionView(row = {}, mappingByName = null) {
-  const mapping = mappingByName?.get(row?.normalized_particulars) || null;
+  const mapping = mappingForTransaction(row, mappingByName);
   return {
     id: String(row._id),
     bank_name: text(row.bank_name),
@@ -598,7 +630,7 @@ function contraTransactionView(row = {}, mappingByName = null) {
     bank_time: text(row.bank_time),
     side: transactionEntrySide(row),
     amount: transactionEntryAmount(row),
-    particulars_name: text(row.particulars_name),
+    particulars_name: cleanImportedLedgerName(row.particulars_name),
     ledger_name: text(row.ledger_name_override) || transactionLedgerName(row, mapping),
     group_company: transactionGroupCompany(row, mapping) || "",
     transaction_id: text(row.transaction_id),
@@ -635,8 +667,8 @@ function buildContraSuggestions(rows, mappingByName = new Map()) {
       if (!paymentAmountCents || paymentAmountCents !== receiptAmountCents) return;
       const checks = strictContraPairChecks(payment, receipt);
 
-      const paymentCompany = keyText(transactionGroupCompany(payment, mappingByName.get(payment.normalized_particulars)));
-      const receiptCompany = keyText(transactionGroupCompany(receipt, mappingByName.get(receipt.normalized_particulars)));
+      const paymentCompany = keyText(transactionGroupCompany(payment, mappingForTransaction(payment, mappingByName)));
+      const receiptCompany = keyText(transactionGroupCompany(receipt, mappingForTransaction(receipt, mappingByName)));
       if (paymentCompany && receiptCompany && paymentCompany !== receiptCompany) return;
       const sameGroupCompany = Boolean(paymentCompany && receiptCompany && paymentCompany === receiptCompany);
       const noGroupCompanyLabels = !paymentCompany && !receiptCompany;
@@ -700,13 +732,13 @@ async function revalidateExistingContraMatches(companyId) {
     LedgerMapping.find({ company_id: companyId, active: true }).lean(),
   ]);
   const byId = new Map(transactions.map((row) => [String(row._id), row]));
-  const mappingByName = new Map(mappings.map((row) => [row.normalized_name, row]));
+  const mappingByName = buildLedgerMappingMap(mappings);
   const invalidMatchIds = [];
   for (const match of existingMatches) {
     const payment = byId.get(String(match.payment_transaction_id));
     const receipt = byId.get(String(match.receipt_transaction_id));
-    const paymentCompany = payment ? keyText(transactionGroupCompany(payment, mappingByName.get(payment.normalized_particulars))) : "";
-    const receiptCompany = receipt ? keyText(transactionGroupCompany(receipt, mappingByName.get(receipt.normalized_particulars))) : "";
+    const paymentCompany = payment ? keyText(transactionGroupCompany(payment, mappingForTransaction(payment, mappingByName))) : "";
+    const receiptCompany = receipt ? keyText(transactionGroupCompany(receipt, mappingForTransaction(receipt, mappingByName))) : "";
     if (!payment || !receipt || !strictContraPairChecks(payment, receipt).valid
       || transactionEntrySide(payment) !== "payment" || transactionEntrySide(receipt) !== "receipt"
       || keyText(payment.bank_name) === keyText(receipt.bank_name)
@@ -758,14 +790,10 @@ async function createContraMatch(companyId, paymentId, receiptId, req, method = 
   if (text(payment.contra_match_id) || text(receipt.contra_match_id)) {
     const error = new Error("One of these transactions is already linked to another Contra Transfer."); error.status = 409; throw error;
   }
-  const contraMappings = await LedgerMapping.find({
-    company_id: companyId,
-    active: true,
-    normalized_name: { $in: [payment.normalized_particulars, receipt.normalized_particulars].filter(Boolean) },
-  }).lean();
-  const contraMappingByName = new Map(contraMappings.map((row) => [row.normalized_name, row]));
-  const paymentCompany = keyText(transactionGroupCompany(payment, contraMappingByName.get(payment.normalized_particulars)));
-  const receiptCompany = keyText(transactionGroupCompany(receipt, contraMappingByName.get(receipt.normalized_particulars)));
+  const contraMappings = await LedgerMapping.find({ company_id: companyId, active: true }).lean();
+  const contraMappingByName = buildLedgerMappingMap(contraMappings);
+  const paymentCompany = keyText(transactionGroupCompany(payment, mappingForTransaction(payment, contraMappingByName)));
+  const receiptCompany = keyText(transactionGroupCompany(receipt, mappingForTransaction(receipt, contraMappingByName)));
   if (paymentCompany && receiptCompany && paymentCompany !== receiptCompany) {
     const error = new Error("These Bank rows belong to different Group Companies and cannot be linked as an intra-company Contra Transfer."); error.status = 400; throw error;
   }
@@ -817,7 +845,7 @@ async function autoMatchUniqueContraTransfers(companyId, req) {
     $or: [{ contra_match_id: { $exists: false } }, { contra_match_id: "" }, { contra_match_id: null }],
   }).sort({ bank_date: 1, bank_time: 1, _id: 1 }).limit(10000).lean();
   const mappings = await LedgerMapping.find({ company_id: companyId, active: true }).lean();
-  const mappingByName = new Map(mappings.map((row) => [row.normalized_name, row]));
+  const mappingByName = buildLedgerMappingMap(mappings);
   const suggestions = buildContraSuggestions(unmatchedRows, mappingByName);
   const created = [];
   for (const row of suggestions.filter((item) => item.auto_safe)) {
@@ -845,7 +873,7 @@ function transactionAllocations(row, ctx) {
       const group = subgroup ? ctx.groupById.get(String(subgroup.group_id)) || selectedGroup : selectedGroup;
       return {
         ...item,
-        ledger_name: text(item.ledger_name) || "Unspecified Ledger",
+        ledger_name: cleanImportedLedgerName(item.ledger_name) || "Unspecified Ledger",
         group_id: group ? String(group._id) : String(item.group_id || ""),
         group_name: group?.name || item.group_name || "Unmapped",
         subgroup_id: subgroup ? String(subgroup._id) : String(item.subgroup_id || ""),
@@ -858,7 +886,7 @@ function transactionAllocations(row, ctx) {
       };
     });
   }
-  const mapping = ctx.mappingByName.get(row?.normalized_particulars) || null;
+  const mapping = mappingForTransaction(row, ctx.mappingByName);
   if (!mapping) {
     const amount = transactionEntryAmount(row);
     if (!amount) return [];
@@ -888,7 +916,7 @@ function transactionAllocations(row, ctx) {
 }
 
 function mapTransaction(row, ctx) {
-  const baseMapping = ctx.mappingByName.get(row.normalized_particulars) || null;
+  const baseMapping = mappingForTransaction(row, ctx.mappingByName);
   const group = baseMapping ? ctx.groupById.get(String(baseMapping.group_id)) : null;
   const subgroup = baseMapping?.subgroup_id ? ctx.subgroupById.get(String(baseMapping.subgroup_id)) : null;
   const ledgerName = transactionLedgerName(row, baseMapping);
@@ -899,14 +927,15 @@ function mapTransaction(row, ctx) {
     ledger_name: ledgerName,
     group_company: groupCompany,
   } : (hasRowOverrides ? {
-    particulars_name: row.particulars_name,
+    particulars_name: cleanImportedLedgerName(row.particulars_name),
     ledger_name: ledgerName,
     group_company: groupCompany,
   } : null);
   return {
     ...row,
     id: String(row._id),
-    // Keep the original Excel L-column Particulars while displaying an optional Excel Q-column Ledger Name.
+    // Display the normalized L-column Particulars without its trailing amount.
+    particulars_name: cleanImportedLedgerName(row.particulars_name),
     ledger_name: ledgerName,
     allocations: transactionAllocations(row, ctx),
     // Raw saved split rows only; legacy mapped transactions use an on-the-fly fallback for reports.
@@ -915,7 +944,7 @@ function mapTransaction(row, ctx) {
       group_id: baseMapping?.group_id || "",
       group_name: group?.name || baseMapping?.group_name || "",
       ledger_name: ledgerName,
-      original_particulars_name: row.particulars_name,
+      original_particulars_name: cleanImportedLedgerName(row.particulars_name),
       subgroup_id: baseMapping?.subgroup_id || "",
       subgroup_name: subgroup?.name || baseMapping?.subgroup_name || "",
       group_company: groupCompany,
@@ -959,9 +988,13 @@ router.post("/import", upload.single("file"), async (req, res) => {
       if (row.every((value) => value === null || value === undefined || value === "")) continue;
       const bankDate = excelDate(row[0]);
       const bankName = text(row[3]);
-      const particulars = text(row[11]);
-      // If an appended Ledger Name column exists, use it; otherwise derive
-      // the Ledger Name from L-column Particulars after removing its amount.
+      const rawParticulars = text(row[11]);
+      // Clean the L-column value itself for the Original Bank Particulars display
+      // and for mapping identity. The raw amount remains in the numeric Bank
+      // Receipt / Payment columns and is never removed from transaction values.
+      const particulars = cleanImportedLedgerName(rawParticulars);
+      // If an appended Ledger Name column exists, use it; otherwise use the
+      // cleaned L-column Particulars as the imported Ledger Name.
       const ledgerNameSource = (ledgerNameColumn >= 0 && text(row[ledgerNameColumn])) || particulars;
       const importedLedgerName = cleanImportedLedgerName(ledgerNameSource);
       const voucherType = text(row[12]);
@@ -1007,7 +1040,7 @@ router.post("/import", upload.single("file"), async (req, res) => {
         bank_status: text(row[9]),
         tally_date: excelDate(row[10]),
         particulars_name: particulars,
-        normalized_particulars: keyText(particulars),
+        normalized_particulars: ledgerIdentityKey(particulars),
         ledger_name_override: importedLedgerName,
         group_company_override: groupCompanyColumn >= 0 ? text(row[groupCompanyColumn]) : "",
         voucher_type: voucherType,
@@ -1052,8 +1085,11 @@ router.post("/import", upload.single("file"), async (req, res) => {
         duplicateDetails.push(importDuplicateView(record, "Already exists in Hansaria with matching transaction details.", existing));
         // Preserve the existing transaction but allow Q/R aliases to be filled
         // when the same file is re-imported after adding Ledger Name / Group Company.
-        const overrideSet = {};
-        if (text(record.ledger_name_override)) overrideSet.ledger_name_override = text(record.ledger_name_override);
+        const overrideSet = {
+          particulars_name: cleanImportedLedgerName(record.particulars_name),
+          normalized_particulars: ledgerIdentityKey(record.particulars_name),
+        };
+        if (text(record.ledger_name_override)) overrideSet.ledger_name_override = cleanImportedLedgerName(record.ledger_name_override);
         if (text(record.group_company_override)) overrideSet.group_company_override = text(record.group_company_override);
         if (record.bank_balance_provided) {
           overrideSet.bank_balance = numberValue(record.bank_balance);
@@ -1074,7 +1110,7 @@ router.post("/import", upload.single("file"), async (req, res) => {
       delete insertRecord.ledger_name_override;
       delete insertRecord.group_company_override;
       const overrideSet = {};
-      if (text(record.ledger_name_override)) overrideSet.ledger_name_override = text(record.ledger_name_override);
+      if (text(record.ledger_name_override)) overrideSet.ledger_name_override = cleanImportedLedgerName(record.ledger_name_override);
       if (text(record.group_company_override)) overrideSet.group_company_override = text(record.group_company_override);
       const update = { $setOnInsert: insertRecord };
       if (Object.keys(overrideSet).length) update.$set = overrideSet;
@@ -1091,13 +1127,12 @@ router.post("/import", upload.single("file"), async (req, res) => {
       : { upsertedCount: 0 };
     const importedRows = Number(writeResult.upsertedCount || 0);
     const duplicateRows = Math.max(0, records.length - importedRows);
-    const existingMappings = await LedgerMapping.find({
-      company_id: companyId,
-      active: true,
-      normalized_name: { $in: [...new Set(records.map((row) => row.normalized_particulars))] },
-    }).select("normalized_name").lean();
-    const mappedNameSet = new Set(existingMappings.map((row) => row.normalized_name));
-    const autoMappedRows = records.filter((row) => mappedNameSet.has(row.normalized_particulars)).length;
+    const existingMappings = await LedgerMapping.find({ company_id: companyId, active: true })
+      .select("normalized_name particulars_name group_id updatedAt createdAt").lean();
+    const mappedNameSet = new Set(existingMappings
+      .filter((row) => text(row.group_id))
+      .map((row) => ledgerIdentityKey(row.normalized_name || row.particulars_name)));
+    const autoMappedRows = records.filter((row) => mappedNameSet.has(ledgerIdentityKey(row.normalized_particulars))).length;
     const unmappedRows = Math.max(0, records.length - autoMappedRows);
     const batch = await ImportBatch.create({
       company_id: companyId,
@@ -1290,16 +1325,19 @@ router.get("/summary", async (req, res) => {
     if (!mongoReady(res)) return;
     const companyId = companyIdFrom(req);
     const filter = { company_id: companyId, ...dateFilter(req.query) };
-    const [total, rows, unmapped] = await Promise.all([
+    const [total, rows, unmapped, mappings] = await Promise.all([
       Transaction.countDocuments(filter),
       Transaction.aggregate([
         { $match: filter },
         { $group: { _id: null, receipts: { $sum: "$receipt_amount" }, payments: { $sum: "$payment_amount" }, bank_debit: { $sum: "$bank_debit" }, bank_credit: { $sum: "$bank_credit" }, banks: { $addToSet: "$bank_name" }, types: { $push: "$voucher_type" } } },
       ]),
       Transaction.distinct("normalized_particulars", filter),
+      LedgerMapping.find({ company_id: companyId, active: true }).select("normalized_name particulars_name group_id").lean(),
     ]);
-    const mapped = await LedgerMapping.distinct("normalized_name", { company_id: companyId, active: true });
-    const mappedSet = new Set(mapped);
+    const mappedSet = new Set(mappings
+      .filter((row) => text(row.group_id))
+      .map((row) => ledgerIdentityKey(row.normalized_name || row.particulars_name)));
+    const canonicalUnmapped = [...new Set(unmapped.map((name) => ledgerIdentityKey(name)).filter(Boolean))];
     const typeCounts = {};
     (rows[0]?.types || []).forEach((value) => { const key = text(value) || "Unknown"; typeCounts[key] = (typeCounts[key] || 0) + 1; });
     return res.json({
@@ -1310,9 +1348,9 @@ router.get("/summary", async (req, res) => {
       bank_credit: rows[0]?.bank_credit || 0,
       bank_names: rows[0]?.banks || [],
       voucher_type_counts: typeCounts,
-      distinct_particulars: unmapped.length,
-      mapped_particulars: unmapped.filter((name) => mappedSet.has(name)).length,
-      unmapped_particulars: unmapped.filter((name) => !mappedSet.has(name)).length,
+      distinct_particulars: canonicalUnmapped.length,
+      mapped_particulars: canonicalUnmapped.filter((name) => mappedSet.has(name)).length,
+      unmapped_particulars: canonicalUnmapped.filter((name) => !mappedSet.has(name)).length,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || "Could not load bank report summary." });
@@ -1488,17 +1526,40 @@ router.get("/ledger-mappings", async (req, res) => {
         { $sort: { name: 1 } },
       ]),
     ]);
-    const mappingMap = new Map(mappings.map((row) => [row.normalized_name, row]));
+    const mappingMap = buildLedgerMappingMap(mappings);
     const groupMap = new Map(groups.map((row) => [String(row._id), row]));
     const subMap = new Map(subgroups.map((row) => [String(row._id), row]));
     const namesMap = new Map();
-    rawNames.forEach((item) => namesMap.set(item._id, { normalized_name: item._id, particulars_name: item.name || item._id, transaction_count: item.count }));
+
+    // Merge legacy Particulars values that differ only by a trailing amount.
+    // Example: both "AADHAR GREEN INDUSTRIES LLP" and
+    // "AADHAR GREEN INDUSTRIES LLP - ₹3,15,917.00" become one mapping row.
+    rawNames.forEach((item) => {
+      const cleanName = cleanImportedLedgerName(item.name || item._id);
+      const normalizedName = ledgerIdentityKey(cleanName);
+      if (!normalizedName) return;
+      const existing = namesMap.get(normalizedName);
+      namesMap.set(normalizedName, {
+        normalized_name: normalizedName,
+        particulars_name: cleanName,
+        transaction_count: Number(existing?.transaction_count || 0) + Number(item.count || 0),
+      });
+    });
+
     // Keep saved mappings visible even when the current statement has no rows for that ledger.
     mappings.forEach((mapping) => {
-      if (!namesMap.has(mapping.normalized_name)) {
-        namesMap.set(mapping.normalized_name, { normalized_name: mapping.normalized_name, particulars_name: mapping.particulars_name, transaction_count: 0 });
+      const normalizedName = ledgerIdentityKey(mapping.normalized_name || mapping.particulars_name);
+      if (!normalizedName) return;
+      const existing = namesMap.get(normalizedName);
+      if (!existing) {
+        namesMap.set(normalizedName, {
+          normalized_name: normalizedName,
+          particulars_name: cleanImportedLedgerName(mapping.particulars_name || mapping.normalized_name),
+          transaction_count: 0,
+        });
       }
     });
+
     return res.json([...namesMap.values()].sort((a, b) => a.particulars_name.localeCompare(b.particulars_name)).map((item) => {
       const mapping = mappingMap.get(item.normalized_name);
       const group = mapping ? groupMap.get(String(mapping.group_id)) : null;
@@ -1526,7 +1587,7 @@ router.post("/ledger-mappings", async (req, res) => {
   try {
     if (!mongoReady(res)) return;
     const companyId = companyIdFrom(req);
-    const particularsName = text(req.body?.particulars_name);
+    const particularsName = cleanImportedLedgerName(req.body?.particulars_name);
     const groupId = text(req.body?.group_id);
     const subgroupId = text(req.body?.subgroup_id);
     if (!particularsName || !groupId || !mongoose.Types.ObjectId.isValid(groupId)) return res.status(400).json({ error: "Particulars Name and Group are required." });
@@ -1541,10 +1602,10 @@ router.post("/ledger-mappings", async (req, res) => {
     }
     const balance = numberValue(req.body?.opening_balance);
     const row = await LedgerMapping.findOneAndUpdate(
-      { company_id: companyId, normalized_name: keyText(particularsName) },
+      { company_id: companyId, normalized_name: ledgerIdentityKey(particularsName) },
       { $set: {
         particulars_name: particularsName,
-        ledger_name: text(req.body?.ledger_name) || particularsName,
+        ledger_name: cleanImportedLedgerName(req.body?.ledger_name) || particularsName,
         group_id: groupId,
         group_name: group.name,
         subgroup_id: subgroup ? String(subgroup._id) : "",
@@ -1555,7 +1616,7 @@ router.post("/ledger-mappings", async (req, res) => {
         opening_balance: Math.abs(balance),
         opening_balance_type: String(req.body?.opening_balance_type || "dr").toLowerCase() === "cr" ? "cr" : "dr",
         active: true,
-      }, $setOnInsert: { company_id: companyId, normalized_name: keyText(particularsName) } },
+      }, $setOnInsert: { company_id: companyId, normalized_name: ledgerIdentityKey(particularsName) } },
       { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
     ).lean();
     return res.json({ ...row, id: String(row._id) });
@@ -1650,8 +1711,8 @@ router.get("/reports/bank-balance", async (req, res) => {
       const paymentRow = contraTransactionById.get(String(match.payment_transaction_id));
       const receiptRow = contraTransactionById.get(String(match.receipt_transaction_id));
       if (!paymentRow || !receiptRow) continue;
-      const paymentMapping = reportContext.mappingByName.get(paymentRow.normalized_particulars) || null;
-      const receiptMapping = reportContext.mappingByName.get(receiptRow.normalized_particulars) || null;
+      const paymentMapping = mappingForTransaction(paymentRow, reportContext.mappingByName);
+      const receiptMapping = mappingForTransaction(receiptRow, reportContext.mappingByName);
       const sharedGroupCompany = transactionGroupCompany(paymentRow, paymentMapping)
         || transactionGroupCompany(receiptRow, receiptMapping)
         || "";
@@ -1768,12 +1829,12 @@ router.get("/reports/bank-balance", async (req, res) => {
         const mapped = mapTransaction(tx, reportContext);
         const allocations = isContra
           ? [{
-              ledger_name: text(contraInfo?.counter_bank) || transactionLedgerName(tx, reportContext.mappingByName.get(tx.normalized_particulars) || null),
+              ledger_name: text(contraInfo?.counter_bank) || transactionLedgerName(tx, mappingForTransaction(tx, reportContext.mappingByName)),
               group_id: currentAssetsGroup ? String(currentAssetsGroup._id) : "",
               group_name: currentAssetsGroup?.name || "Current Assets",
               subgroup_id: bankAccountsSubgroup ? String(bankAccountsSubgroup._id) : "",
               subgroup_name: bankAccountsSubgroup?.name || "Bank Accounts",
-              group_company: text(contraInfo?.group_company) || transactionGroupCompany(tx, reportContext.mappingByName.get(tx.normalized_particulars) || null),
+              group_company: text(contraInfo?.group_company) || transactionGroupCompany(tx, mappingForTransaction(tx, reportContext.mappingByName)),
               side: transactionEntrySide(tx),
               amount: transactionEntryAmount(tx),
             }]
@@ -1792,7 +1853,7 @@ router.get("/reports/bank-balance", async (req, res) => {
             bank_date: tx.bank_date,
             bank_time: tx.bank_time || "",
             bank_name: text(tx.bank_name),
-            original_particulars: text(tx.particulars_name),
+            original_particulars: cleanImportedLedgerName(tx.particulars_name),
             ledger_name: text(allocation.ledger_name) || mapped.ledger_name || "Unmapped Ledger",
             voucher_type: isContra ? "Contra" : text(tx.voucher_type),
             voucher_number: text(tx.voucher_number),
@@ -1966,7 +2027,7 @@ router.get("/contra-matches", async (req, res) => {
       ContraMatch.find({ company_id: companyId, status: "matched" }).sort({ createdAt: -1 }).limit(500).lean(),
       LedgerMapping.find({ company_id: companyId, active: true }).lean(),
     ]);
-    const mappingByName = new Map(mappings.map((row) => [row.normalized_name, row]));
+    const mappingByName = buildLedgerMappingMap(mappings);
     const suggestions = buildContraSuggestions(unmatchedRows, mappingByName).slice(0, 500);
     const transactionIds = [...new Set(matchedRows.flatMap((row) => [row.payment_transaction_id, row.receipt_transaction_id]))];
     const linkedTransactions = transactionIds.length ? await Transaction.find({ company_id: companyId, _id: { $in: transactionIds } }).lean() : [];
@@ -2078,7 +2139,11 @@ router.put("/transactions/:id", async (req, res) => {
     const update = {};
     const allowedText = ["bank_name", "bank_time", "bank_remarks", "instrument_type", "instrument_no", "transaction_id", "bank_status", "particulars_name", "ledger_name_override", "group_company_override", "voucher_type", "voucher_number"];
     allowedText.forEach((key) => {
-      if (req.body?.[key] !== undefined) update[key] = text(req.body[key]);
+      if (req.body?.[key] !== undefined) {
+        update[key] = key === "particulars_name"
+          ? cleanImportedLedgerName(req.body[key])
+          : text(req.body[key]);
+      }
     });
     if (req.body?.bank_date !== undefined) {
       const parsedDate = excelDate(req.body.bank_date);
@@ -2158,7 +2223,7 @@ router.put("/transactions/:id", async (req, res) => {
     const nextSourceKey = buildTransactionSourceKey(companyId, next);
     const duplicate = await Transaction.findOne({ company_id: companyId, source_key: nextSourceKey, _id: { $ne: current._id } }).select("_id").lean();
     if (duplicate) return res.status(409).json({ error: "Another statement row already has the same Bank, Date, Particulars, Voucher and Amount. Please check the duplicate." });
-    update.normalized_particulars = keyText(next.particulars_name);
+    update.normalized_particulars = ledgerIdentityKey(next.particulars_name);
     update.source_key = nextSourceKey;
     const row = await Transaction.findOneAndUpdate(
       { _id: current._id, company_id: companyId },
@@ -2377,14 +2442,14 @@ router.get("/reports/balance-sheet", async (req, res) => {
       if (text(req.query.group_id) && String(mapping.group_id) !== text(req.query.group_id)) continue;
       if (text(req.query.subgroup_id) && String(mapping.subgroup_id || "") !== text(req.query.subgroup_id)) continue;
       const normalSide = group.nature === "asset" ? "dr" : "cr";
-      const ledgerTransactions = ctx.transactions.filter((tx) => tx.normalized_particulars === mapping.normalized_name && !(Array.isArray(tx.allocations) && tx.allocations.length));
+      const ledgerTransactions = ctx.transactions.filter((tx) => ledgerIdentityKey(tx.normalized_particulars || tx.particulars_name) === ledgerIdentityKey(mapping.normalized_name || mapping.particulars_name) && !(Array.isArray(tx.allocations) && tx.allocations.length));
       const buckets = new Map();
       const addBucket = (ledgerName, groupCompany) => {
         const key = `${keyText(ledgerName)}|${keyText(groupCompany)}`;
         if (!buckets.has(key)) buckets.set(key, { ledger_name: ledgerName, group_company: groupCompany || "Unassigned", transactions: [], opening: 0 });
         return buckets.get(key);
       };
-      const defaultLedgerName = text(mapping.ledger_name) || mapping.particulars_name;
+      const defaultLedgerName = cleanImportedLedgerName(mapping.ledger_name) || cleanImportedLedgerName(mapping.particulars_name);
       const defaultGroupCompany = text(mapping.group_company);
       for (const tx of ledgerTransactions) {
         const groupCompanyValue = transactionGroupCompany(tx, mapping);
@@ -2411,7 +2476,7 @@ router.get("/reports/balance-sheet", async (req, res) => {
           group_name: group.name,
           subgroup_name: mapping.subgroup_name || "",
           particulars_name: bucket.ledger_name,
-          original_particulars_name: mapping.particulars_name,
+          original_particulars_name: cleanImportedLedgerName(mapping.particulars_name),
           group_company: groupCompany,
           nature: group.nature,
           normal_balance: balance,
@@ -2451,7 +2516,7 @@ router.get("/reports/balance-sheet", async (req, res) => {
         const ledgerName = allocation.ledger_name || "Unspecified Ledger";
         let ledgerRow = groupRow.ledgers.find((item) => keyText(item.particulars_name) === keyText(ledgerName));
         if (!ledgerRow) {
-          ledgerRow = { particulars_name: ledgerName, original_particulars_name: tx.particulars_name, group_company: groupCompany, nature: group.nature, normal_balance: 0, debit_balance: 0, credit_balance: 0 };
+          ledgerRow = { particulars_name: cleanImportedLedgerName(ledgerName), original_particulars_name: cleanImportedLedgerName(tx.particulars_name), group_company: groupCompany, nature: group.nature, normal_balance: 0, debit_balance: 0, credit_balance: 0 };
           groupRow.ledgers.push(ledgerRow);
         }
         ledgerRow.normal_balance += signed;
