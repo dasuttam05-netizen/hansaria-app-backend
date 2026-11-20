@@ -471,6 +471,24 @@ async function getPurchaseVoucherPage(req) {
   return voucherListResponse(rows, total, options);
 }
 
+function normalizeSaleInvoiceNo(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+
+function escapeRegExpLiteral(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function findDuplicateSaleInvoiceNo(value, excludeId = "") {
+  const normalized = normalizeSaleInvoiceNo(value);
+  if (!normalized) return null;
+  const filter = { voucher_no: { $regex: `^\\s*${escapeRegExpLiteral(String(value).trim())}\\s*$`, $options: "i" } };
+  if (excludeId && mongoose.Types.ObjectId.isValid(String(excludeId))) filter._id = { $ne: String(excludeId) };
+  return SaleVoucher.findOne(filter).select("_id voucher_no").lean();
+}
+
+
 async function getSaleVoucherPage(req) {
   const options = parseVoucherListOptions(req);
   const filter = applyVoucherListFilters({ user: req.user }, options, "sale");
@@ -4274,6 +4292,7 @@ router.post("/sale/import-confirm", async (req, res) => {
 
     const imported = [];
     const errors = [];
+    const importInvoiceNos = new Set();
     for (let index = 0; index < rows.length; index += 1) {
       const input = rows[index] || {};
       const rowNo = Number(input.row) || index + 2;
@@ -4324,6 +4343,13 @@ router.post("/sale/import-confirm", async (req, res) => {
           company_account_gstin: account?.gst_no || account?.gst || account?.gstin || account?.gst_number || "",
         };
         const existingVoucherNo = String(data.voucher_no || "").trim();
+        const normalizedInvoiceNo = normalizeSaleInvoiceNo(existingVoucherNo);
+        if (normalizedInvoiceNo) {
+          if (importInvoiceNos.has(normalizedInvoiceNo)) throw new Error(`Duplicate Sale Invoice No. ${existingVoucherNo} already exists in this Excel file.`);
+          const duplicate = await findDuplicateSaleInvoiceNo(existingVoucherNo);
+          if (duplicate) throw new Error(`Duplicate Sale Invoice No. ${existingVoucherNo} already exists.`);
+          importInvoiceNos.add(normalizedInvoiceNo);
+        }
         const generatedVoucherNo = await new Promise((resolve, reject) => {
           createVoucherNoIfMissing("sale", existingVoucherNo, (err, generated) => {
             if (err) return reject(err);
@@ -4437,6 +4463,7 @@ router.post("/sale/import-xlsx", upload.single("file"), async (req, res) => {
 
     const imported = [];
     const errors = [];
+    const importInvoiceNos = new Set();
 
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
@@ -4524,7 +4551,14 @@ router.post("/sale/import-xlsx", upload.single("file"), async (req, res) => {
           description: String(firstValue(row, ["Narration", "Description", "description"]) || ""),
         }, null);
 
-        const existingVoucherNo = payload.voucher_no;
+        const existingVoucherNo = String(payload.voucher_no || "").trim();
+        const normalizedInvoiceNo = normalizeSaleInvoiceNo(existingVoucherNo);
+        if (normalizedInvoiceNo) {
+          if (importInvoiceNos.has(normalizedInvoiceNo)) throw new Error(`Duplicate Sale Invoice No. ${existingVoucherNo} already exists in this Excel file.`);
+          const duplicate = await findDuplicateSaleInvoiceNo(existingVoucherNo);
+          if (duplicate) throw new Error(`Duplicate Sale Invoice No. ${existingVoucherNo} already exists.`);
+          importInvoiceNos.add(normalizedInvoiceNo);
+        }
         await new Promise((resolve, reject) => {
           createVoucherNoIfMissing("sale", existingVoucherNo, (err, generated) => {
             if (err) return reject(err);
@@ -5302,7 +5336,7 @@ router.get("/sale", (req, res) => {
   getSaleVoucherRows(req, res);
 });
 
-router.post("/sale", (req, res) => {
+router.post("/sale", async (req, res) => {
   if (!userHasPermission(req.user, "warehouse.trading.sale.create")) {
     return res.status(403).json({ error: "Permission denied" });
   }
@@ -5322,6 +5356,8 @@ router.post("/sale", (req, res) => {
   if (!ensureWarehouseAccess(req, res, req.body.warehouse_id)) return;
 
   if (mongoReady()) {
+    const duplicate = await findDuplicateSaleInvoiceNo(voucher_no);
+    if (duplicate) return res.status(400).json({ error: `Duplicate Sale Invoice No. ${String(voucher_no || "").trim()} already exists. Please change the Invoice No. and try again.` });
     return createVoucherNoIfMissing("sale", voucher_no, async (err, generatedVoucherNo) => {
       if (err) return res.status(500).json({ error: err.message });
       try {
